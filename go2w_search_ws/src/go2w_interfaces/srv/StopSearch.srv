@@ -1,0 +1,7 @@
+# 停止搜索任务
+string mission_id          # 任务ID (空=当前任务)
+bool return_to_start       # 是否返回起点
+---
+bool success
+string message
+uint32 targets_found

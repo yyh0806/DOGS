@@ -1,0 +1,10 @@
+# 开始搜索任务
+float64 width              # 搜索区域宽度 (米)
+float64 height             # 搜索区域高度 (米)
+string pattern             # 搜索模式: "lawnmower" | "spiral"
+string[] target_classes    # 目标类别列表 (空=检测所有)
+float64 spacing            # 行间距 (米, 0=自动)
+---
+bool success
+string message
+string mission_id

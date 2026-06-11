@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Go2W 控制面板</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: #0a0a0a; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
+
+header { background: #141414; border-bottom: 1px solid #2a2a2a; padding: 10px 20px; display: flex; align-items: center; justify-content: space-between; }
+header h1 { font-size: 16px; font-weight: 600; color: #fff; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+.status-dot.off { background: #666; }
+.status-dot.on { background: #4caf50; animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+.conn-info { font-size: 12px; color: #888; }
+
+.main { display: flex; flex: 1; overflow: hidden; }
+
+/* 左栏: 视频 */
+.left { flex: 2; display: flex; flex-direction: column; border-right: 1px solid #2a2a2a; }
+.video-wrap { flex: 1; background: #000; position: relative; display: flex; align-items: center; justify-content: center; }
+.video-wrap img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.video-overlay { position: absolute; top: 10px; left: 10px; display: flex; gap: 8px; }
+.badge { background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 4px; font-size: 11px; }
+.badge.green { color: #4caf50; }
+.badge.orange { color: #ff9800; }
+.no-video { color: #555; font-size: 14px; }
+
+/* 右栏: 任务 + 指令 */
+.right { flex: 1; display: flex; flex-direction: column; min-width: 320px; }
+
+.section { border-bottom: 1px solid #2a2a2a; }
+.section-header { padding: 10px 14px; font-size: 12px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.5px; background: #111; }
+
+/* 指令输入 */
+.cmd-section { padding: 14px; background: #0f0f0f; }
+.cmd-input-wrap { display: flex; gap: 8px; }
+.cmd-input { flex: 1; padding: 10px 14px; background: #1a1a1a; border: 1px solid #333; border-radius: 6px; color: #fff; font-size: 14px; outline: none; }
+.cmd-input:focus { border-color: #1565c0; }
+.cmd-input::placeholder { color: #555; }
+.cmd-send { padding: 10px 20px; background: #1565c0; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; }
+.cmd-send:hover { background: #1976d2; }
+
+.quick-cmds { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+.quick-btn { padding: 5px 12px; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 14px; color: #aaa; font-size: 12px; cursor: pointer; }
+.quick-btn:hover { border-color: #555; color: #fff; }
+
+/* 任务列表 */
+.task-list { flex: 1; overflow-y: auto; padding: 8px 14px; }
+.task-empty { color: #555; font-size: 13px; text-align: center; padding: 30px; }
+.task-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 6px; margin-bottom: 4px; transition: background 0.2s; }
+.task-item:hover { background: #1a1a1a; }
+.task-icon { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; }
+.task-icon.pending { background: #1a237e; color: #7986cb; }
+.task-icon.active { background: #e65100; color: #fff; animation: pulse 1.5s infinite; }
+.task-icon.completed { background: #1b5e20; color: #81c784; }
+.task-icon.failed { background: #b71c1c; color: #ef9a9a; }
+.task-icon.cancelled { background: #333; color: #666; }
+.task-info { flex: 1; min-width: 0; }
+.task-type { font-size: 13px; font-weight: 500; color: #ddd; }
+.task-params { font-size: 11px; color: #666; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task-status { font-size: 11px; padding: 2px 8px; border-radius: 3px; }
+.task-status.pending { color: #7986cb; }
+.task-status.active { color: #ff9800; }
+.task-status.completed { color: #81c784; }
+.task-status.failed { color: #ef9a9a; }
+
+/* 对话 */
+.chat-section { flex: 1; overflow-y: auto; padding: 10px 14px; min-height: 120px; }
+.chat-msg { margin-bottom: 10px; }
+.chat-user { font-size: 13px; color: #90caf9; margin-bottom: 2px; }
+.chat-bot { font-size: 13px; color: #a5d6a7; padding: 6px 10px; background: #1a2e1a; border-radius: 6px; }
+.chat-time { font-size: 10px; color: #555; margin-top: 2px; }
+
+/* 底部控制栏 */
+.bottom-bar {
+  background: #141414;
+  border-top: 1px solid #2a2a2a;
+  padding: 12px 20px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.ctrl-group {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.ctrl-group.move-pad {
+  margin-left: auto;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(2, 1fr);
+  gap: 4px;
+  width: 220px;
+}
+.btn { padding: 8px 16px; border: 1px solid #333; background: #1a1a1a; color: #ccc; border-radius: 4px; cursor: pointer; font-size: 13px; transition: all 0.15s; user-select: none; -webkit-user-select: none; }
+.btn:hover { background: #252525; border-color: #555; color: #fff; }
+.btn:active { background: #333; transform: scale(0.96); }
+.btn.primary { background: #1565c0; border-color: #1565c0; color: #fff; }
+.btn.primary:hover { background: #1976d2; }
+.btn.danger { background: #c62828; border-color: #c62828; color: #fff; }
+.btn.danger:hover { background: #d32f2f; }
+.btn.danger:active { background: #b71c1c; }
+.btn.move-btn { background: #1b3a1b; border-color: #2e5a2e; color: #81c784; font-size: 18px; padding: 10px 0; text-align: center; border-radius: 6px; }
+.btn.move-btn:hover { background: #2e5a2e; color: #a5d6a7; }
+.btn.move-btn:active { background: #4caf50; color: #fff; }
+.divider { width: 1px; height: 32px; background: #2a2a2a; }
+</style>
+</head>
+<body>
+
+<header>
+  <div style="display:flex;align-items:center;gap:12px;">
+    <h1>Go2W 控制面板</h1>
+    <span><span class="status-dot off" id="connDot"></span><span class="conn-info" id="connText">未连接</span></span>
+  </div>
+  <div class="conn-info" id="imuInfo">IMU: --</div>
+</header>
+
+<div class="main">
+  <!-- 左栏: 视频 -->
+  <div class="left">
+    <div class="video-wrap">
+      <div class="video-overlay">
+        <span class="badge green" id="fpsBadge">-- FPS</span>
+        <span class="badge orange" id="detBadge">0 目标</span>
+      </div>
+      <span class="no-video" id="noVideo">等待连接...</span>
+      <img id="videoImg" style="display:none" />
+    </div>
+  </div>
+
+  <!-- 右栏: 指令 + 任务 + 对话 -->
+  <div class="right">
+    <div class="section">
+      <div class="section-header">指令输入</div>
+      <div class="cmd-section">
+        <div class="cmd-input-wrap">
+          <input class="cmd-input" id="cmdInput" placeholder="输入指令: 搜索左边房间、跟着那个人、前进..." onkeydown="if(event.key==='Enter')sendCmd()" />
+          <button class="cmd-send" onclick="sendCmd()">发送</button>
+        </div>
+        <div class="quick-cmds">
+          <span class="quick-btn" onclick="quickCmd('搜索这个区域')">搜索区域</span>
+          <span class="quick-btn" onclick="quickCmd('前进两米')">前进</span>
+          <span class="quick-btn" onclick="quickCmd('后退一米')">后退</span>
+          <span class="quick-btn" onclick="quickCmd('左转90度')">左转</span>
+          <span class="quick-btn" onclick="quickCmd('右转90度')">右转</span>
+          <span class="quick-btn" onclick="quickCmd('停下来')">停止</span>
+          <span class="quick-btn" onclick="quickCmd('回来')">返回</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="section" style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
+      <div class="section-header" style="display:flex;justify-content:space-between;align-items:center;">
+        任务队列
+        <span id="taskCount" style="font-weight:400;color:#555;">0 待执行</span>
+      </div>
+      <div class="task-list" id="taskList">
+        <div class="task-empty">暂无任务</div>
+      </div>
+    </div>
+
+    <div class="section" style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
+      <div class="section-header">对话记录</div>
+      <div class="chat-section" id="chatBox"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 底部控制栏: 所有动作按钮 -->
+<div class="bottom-bar">
+  <div class="ctrl-group">
+    <button class="btn primary" onclick="connect()">连接并站立</button>
+    <button class="btn" onclick="stand()">站立</button>
+    <button class="btn" onclick="sit()">坐下</button>
+    <button class="btn danger" onclick="stop()">急停</button>
+  </div>
+  <div class="divider"></div>
+  <div class="ctrl-group move-pad">
+    <div></div>
+    <button class="btn move-btn" onmousedown="move(0.3,0,0)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0.3,0,0)" ontouchend="stopMove()">↑</button>
+    <div></div>
+    <button class="btn move-btn" onmousedown="move(0,0,0.5)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0,0,0.5)" ontouchend="stopMove()">↺</button>
+    <button class="btn move-btn" onmousedown="move(-0.4,0,0)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(-0.4,0,0)" ontouchend="stopMove()">↓</button>
+    <button class="btn move-btn" onmousedown="move(0,0,-0.5)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0,0,-0.5)" ontouchend="stopMove()">↻</button>
+  </div>
+</div>
+
+<script>
+let ws, connected = false, frameCount = 0, lastFpsTime = Date.now(), _moveInterval = null;
+
+function move(vx,vy,vyaw) {
+  clearInterval(_moveInterval);
+  fetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, {method:'POST'});
+  _moveInterval = setInterval(() => {
+    fetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, {method:'POST'});
+  }, 300);
+}
+function stopMove() {
+  clearInterval(_moveInterval);
+  _moveInterval = null;
+  fetch('/api/stop', {method:'POST'});
+}
+
+function connect() {
+  fetch('/api/connect', {method:'POST'}).then(r=>r.json()).then(d => {
+    if (d.ok) { connected = true; updateConn(true); addLog(d.msg); }
+  });
+}
+function stand() { fetch('/api/stand', {method:'POST'}); }
+function sit() { fetch('/api/sit', {method:'POST'}); }
+function stop() { clearInterval(_moveInterval); _moveInterval = null; fetch('/api/e_stop', {method:'POST'}); }
+
+function sendCmd() {
+  const input = document.getElementById('cmdInput');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  addChat('user', text);
+  fetch('/api/command', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
+}
+function quickCmd(text) {
+  document.getElementById('cmdInput').value = text;
+  sendCmd();
+}
+
+function updateConn(on) {
+  const dot = document.getElementById('connDot');
+  const txt = document.getElementById('connText');
+  dot.className = 'status-dot ' + (on ? 'on' : 'off');
+  txt.textContent = on ? '已连接' : '未连接';
+}
+
+function updateTasks(data) {
+  const el = document.getElementById('taskList');
+  const countEl = document.getElementById('taskCount');
+  const active = data.active;
+  const pending = data.pending || [];
+
+  let html = '';
+  if (active) {
+    html += taskHTML(active);
+  }
+  for (const t of pending) {
+    html += taskHTML(t);
+  }
+  if (!html) html = '<div class="task-empty">暂无任务</div>';
+  el.innerHTML = html;
+  countEl.textContent = `${pending.length} 待执行`;
+}
+
+function taskHTML(t) {
+  const icons = {navigate:'→',search_area:'◎',follow:'◎',move:'→',stop:'■',return_home:'↩',observe:'◎',wait:'◎'};
+  const typeNames = {navigate:'导航',search_area:'区域搜索',follow:'跟踪',move:'移动',stop:'停止',return_home:'返回',observe:'观察',wait:'等待'};
+  return `<div class="task-item">
+    <div class="task-icon ${t.status}">${icons[t.type]||'?'}</div>
+    <div class="task-info">
+      <div class="task-type">${typeNames[t.type]||t.type}</div>
+      <div class="task-params">${JSON.stringify(t.params).slice(0,50)}</div>
+    </div>
+    <span class="task-status ${t.status}">${t.status}</span>
+  </div>`;
+}
+
+function addChat(role, text) {
+  const el = document.getElementById('chatBox');
+  const time = new Date().toLocaleTimeString();
+  const cls = role === 'user' ? 'chat-user' : 'chat-bot';
+  const label = role === 'user' ? '你' : 'Go2W';
+  el.innerHTML += `<div class="chat-msg"><div class="${cls}"><b>${label}:</b> ${text}</div><div class="chat-time">${time}</div></div>`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function addLog(msg) {
+  console.log('[Go2W]', msg);
+}
+
+// WebSocket
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsUrl = `${proto}://${location.hostname}:8001`;
+  console.log('[WS] connecting to', wsUrl);
+  ws = new WebSocket(wsUrl);
+  ws.onopen = () => { console.log('[WS] connected'); document.getElementById('noVideo').textContent = '视频加载中...'; };
+  ws.onerror = (e) => { console.error('[WS] error', e); };
+  ws.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      if (data.type === 'frame') {
+        const img = document.getElementById('videoImg');
+        const noVid = document.getElementById('noVideo');
+        img.src = 'data:image/jpeg;base64,' + data.data;
+        img.style.display = 'block';
+        noVid.style.display = 'none';
+        document.getElementById('detBadge').textContent = data.detections + ' 目标';
+        frameCount++;
+      } else if (data.type === 'status') {
+        if (data.imu_yaw !== undefined) {
+          document.getElementById('imuInfo').textContent = `IMU yaw: ${data.imu_yaw.toFixed(2)} rad (${(data.imu_yaw * 180 / Math.PI).toFixed(1)}°)`;
+        }
+        if (data.tasks) updateTasks(data.tasks);
+      } else if (data.type === 'tasks') {
+        updateTasks(data.data);
+      } else if (data.type === 'vlm') {
+        const d = data.data;
+        if (d.response) addChat('bot', d.response);
+      }
+    } catch (err) { console.error('[WS] parse error', err); }
+  };
+  ws.onclose = () => { console.log('[WS] closed, reconnecting...'); setTimeout(connectWS, 2000); };
+}
+connectWS();
+
+// FPS 计算
+setInterval(() => {
+  const now = Date.now();
+  const fps = Math.round(frameCount / ((now - lastFpsTime) / 1000));
+  document.getElementById('fpsBadge').textContent = fps + ' FPS';
+  frameCount = 0;
+  lastFpsTime = now;
+}, 1000);
+
+// 状态轮询
+setInterval(() => {
+  fetch('/api/status').then(r=>r.json()).then(d => {
+    connected = d.connected;
+    updateConn(connected);
+    if (d.imu_yaw !== undefined) {
+      document.getElementById('imuInfo').textContent = `IMU yaw: ${d.imu_yaw.toFixed(2)} rad (${(d.imu_yaw*180/Math.PI).toFixed(1)}°)`;
+    }
+  }).catch(()=>{});
+}, 3000);
+</script>
+</body>
+</html>

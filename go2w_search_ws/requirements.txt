@@ -1,0 +1,29 @@
+# Go2W 搜索系统依赖
+# 安装: pip install -r requirements.txt
+
+# --- 基础 ---
+numpy
+opencv-python
+
+# --- Web 服务 ---
+websockets
+
+# --- YOLO 检测 ---
+ultralytics
+
+# --- AI 模型 (VLM: Qwen2.5-VL) ---
+# 注意: bitsandbytes 在 aarch64 (Jetson NX) 上不可用
+transformers>=4.40.0
+accelerate
+torch>=2.0.0
+torchvision
+Pillow
+
+# --- 语音 ---
+sounddevice
+webrtcvad
+# whisper.cpp: 从源码编译 https://github.com/ggerganov/whisper.cpp
+# 或使用 Python whisper 作为降级: pip install openai-whisper
+
+# --- Go2W SDK ---
+# unitree_sdk2py  # 需从源码安装: pip install git+https://github.com/unitreerobotics/unitree_sdk2_python.git
