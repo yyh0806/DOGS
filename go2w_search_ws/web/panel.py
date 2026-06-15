@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
 """Go2W 独立 Web 控制面板。
 
-无需 ROS2，直连 SDK。
-实时: 视频流 + SLAM地图 + 任务队列 + 语音/文本指令。
+状态机:
+  DISCONNECTED → STANDING → STOPPED (BalanceStand 静止)
+  STOPPED → MOVING (Move @ 20Hz)
+  MOVING → STOPPED (StopMove + BalanceStand)
+  STOPPED → SITTING → SEATED (Sit)
+  SEATED → STANDING → STOPPED (RiseSit + BalanceStand)
+  任意 → EMERGENCY (Damp)
+
+规则:
+  1. 所有 SDK 调用只在控制线程内执行
+  2. STOPPED = StopMove + BalanceStand, 每 0.5s 发 Move(0,0,0) 防超时
+  3. MOVING = BalanceStand + 持续 Move @ 20Hz
+  4. 订阅 rt/sportmodestate 获取机器人真实状态反馈
+  5. 看门狗: MOVING 状态 0.3s 无指令自动停止
 """
 
-import asyncio
-import base64
-import json
-import math
-import os
-import struct
-import sys
-import time
-import threading
-import logging
-import traceback
-import cv2
-import numpy as np
-
+import asyncio, base64, json, os, sys, time, threading, logging, traceback, cv2, numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
 from ai.config import DEVICE, CUDA_AVAILABLE, memory_summary
 from ai.detector import Detector
 from ai.vlm import VLMEngine
@@ -36,12 +34,10 @@ logger = logging.getLogger("go2w.panel")
 WS_CLIENTS = set()
 WS_LOOP = None
 
-
 def ws_broadcast(data):
     if WS_LOOP and WS_CLIENTS:
         msg = json.dumps(data, ensure_ascii=False)
         asyncio.run_coroutine_threadsafe(_async_broadcast(msg), WS_LOOP)
-
 
 async def _async_broadcast(msg):
     for ws in list(WS_CLIENTS):
@@ -50,28 +46,59 @@ async def _async_broadcast(msg):
         except Exception:
             WS_CLIENTS.discard(ws)
 
-
 # ============================================================================
-# Go2W SDK 连接
+# 状态机: STOPPED / MOVING / SITTING / SEATED / STANDING / EMERGENCY
 # ============================================================================
 class RobotConnection:
+    STOPPED, MOVING, SITTING, SEATED, STANDING, EMERGENCY = range(6)
+
+    STATE_NAMES = {
+        0: "STOPPED", 1: "MOVING", 2: "SITTING",
+        3: "SEATED", 4: "STANDING", 5: "EMERGENCY"
+    }
+
+    # SportModeState.mode 值 (从机器人反馈)
+    SPORT_MODE_NORMAL = 0       # 普通/空闲
+    SPORT_MODE_GAIT = 1         # 步态/行走
+    SPORT_MODE_SIT = 2          # 坐下
+    SPORT_MODE_STANDING = 3     # 站立中
+    SPORT_MODE_DAMP = 4         # 阻尼/趴下
+
     def __init__(self, interface="enp65s0"):
         self.interface = interface
-        self.factory = None
         self.sport = None
         self.video = None
         self.connected = False
+        # IMU / LiDAR 统计
         self._imu_yaw = 0.0
         self._imu_lock = threading.Lock()
-        self._lidar_queue = []
         self._imu_count = 0
         self._lidar_count = 0
-        self._moving = False
+        # 机器人反馈状态
+        self._robot_mode = 0     # SportModeState.mode
+        self._robot_progress = 0.0
+        self._robot_velocity = [0.0, 0.0, 0.0]
+        self._feedback_lock = threading.Lock()
+        # 状态机变量
+        self._lock = threading.RLock()
+        self._state = self.STOPPED
+        self._vx = 0.0
+        self._vy = 0.0
+        self._vyaw = 0.0
+        self._last_cmd = 0.0             # 最后一次收到 move() 的时间戳
+        self._cmd = None                 # 待处理命令: 'stand' | 'sit' | 'estop'
+        self._balance_done = False       # BalanceStand 是否已执行
+        self._stand_done = threading.Event()
+        self._ctrl_ready = threading.Event()  # 控制线程就绪
 
+    # ========================================================================
+    # 连接 + 启动控制线程
+    # ========================================================================
     def connect(self):
         from unitree_sdk2py.core.channel import ChannelFactory
         from unitree_sdk2py.go2.sport.sport_client import SportClient
         from unitree_sdk2py.go2.video.video_client import VideoClient
+        from unitree_sdk2py.idl.unitree_go.msg.dds_._SportModeState_ import SportModeState_
         from unitree_sdk2py.idl.sensor_msgs.msg.dds_._PointCloud2_ import PointCloud2_
         from unitree_sdk2py.idl.unitree_go.msg.dds_._LowState_ import LowState_
 
@@ -92,21 +119,25 @@ class RobotConnection:
                 self._imu_count += 1
 
         def on_lidar(msg):
-            self._lidar_queue.append({
-                'data': bytes(msg.data),
-                'point_step': int(msg.point_step),
-                'width': int(msg.width),
-            })
-            if len(self._lidar_queue) > 10:
-                self._lidar_queue.pop(0)
             self._lidar_count += 1
+
+        def on_sport_state(msg):
+            with self._feedback_lock:
+                self._robot_mode = msg.mode
+                self._robot_progress = msg.progress
+                self._robot_velocity = [msg.velocity[0], msg.velocity[1], msg.velocity[2]]
 
         ch1 = self.factory.CreateRecvChannel('rt/lowstate', LowState_)
         ch1.SetReader(handler=on_imu)
         ch2 = self.factory.CreateRecvChannel('rt/utlidar/cloud', PointCloud2_)
         ch2.SetReader(handler=on_lidar)
+        ch3 = self.factory.CreateRecvChannel('rt/sportmodestate', SportModeState_)
+        ch3.SetReader(handler=on_sport_state)
 
+        threading.Thread(target=self._ctrl_loop, daemon=True).start()
+        self._ctrl_ready.wait(5)  # 等待控制线程就绪
         self.connected = True
+        logger.info("DDS 连接成功, 控制线程启动, 已订阅 rt/sportmodestate")
 
     def get_frame(self):
         if not self.video:
@@ -119,59 +150,186 @@ class RobotConnection:
             pass
         return None
 
+    # ========================================================================
+    # 控制线程 — 唯一允许调用 SDK 的地方
+    # ========================================================================
+    def _ctrl_loop(self):
+        logger.info("CTRL 启动")
+        self._ctrl_ready.set()
+
+        last_zero_move = 0  # STOPPED 状态发送 Move(0,0,0) 的时间
+
+        while True:
+            # --- 0. 读取机器人反馈 ---
+            robot_mode = 0
+            with self._feedback_lock:
+                robot_mode = self._robot_mode
+
+            # --- 1. 处理特殊命令 ---
+            cmd = None
+            with self._lock:
+                cmd = self._cmd
+                self._cmd = None
+
+            if cmd == 'stand':
+                self._do_stand()
+                last_zero_move = 0
+                continue
+            if cmd == 'sit':
+                self._do_sit()
+                last_zero_move = 0
+                continue
+            if cmd == 'estop':
+                self._do_estop()
+                last_zero_move = 0
+                continue
+
+            # --- 2. 读取当前状态 ---
+            state = self.STOPPED
+            vx = vy = vyaw = 0.0
+            with self._lock:
+                state = self._state
+                vx, vy, vyaw = self._vx, self._vy, self._vyaw
+
+            # --- 3. 状态机主循环 ---
+            if state == self.STOPPED:
+                # STOPPED: 保持 BalanceStand + 定期 Move(0,0,0) 防超时
+                now = time.time()
+                if now - last_zero_move > 0.5:
+                    try:
+                        self.sport.Move(0, 0, 0)
+                    except Exception as e:
+                        logger.error(f"STOPPED Move(0,0,0) 失败: {e}")
+                    last_zero_move = now
+
+            elif state == self.MOVING:
+                # MOVING: 发送速度指令
+                try:
+                    self.sport.Move(vx, vy, vyaw)
+                except Exception as e:
+                    logger.error(f"Move 失败: {e}")
+
+            # SEATED / SITTING / STANDING / EMERGENCY: 不发送任何命令
+
+            time.sleep(0.05)  # 20Hz
+
+    # ---- 特殊命令实现 (在控制线程内执行) ----
+    def _do_stand(self):
+        """站立序列: StandUp → BalanceStand → STOPPED"""
+        try:
+            with self._lock:
+                self._state = self.STANDING
+            logger.info("STANDING: StandUp → BalanceStand")
+            code = self.sport.StandUp()
+            logger.info(f"STANDING: StandUp → code={code}")
+            time.sleep(2)
+            code = self.sport.BalanceStand()
+            logger.info(f"STANDING: BalanceStand → code={code}")
+            time.sleep(0.5)
+            self.sport.Move(0, 0, 0)
+            with self._lock:
+                self._state = self.STOPPED
+                self._vx = self._vy = self._vyaw = 0.0
+                self._last_cmd = 0.0
+            logger.info("STANDING: → STOPPED")
+            self._stand_done.set()
+        except Exception as e:
+            logger.error(f"站立失败: {e}")
+            traceback.print_exc()
+            with self._lock:
+                self._state = self.STOPPED
+
+    def _do_sit(self):
+        """坐下: Move(0,0,0) → StopMove → Damp → SEATED"""
+        try:
+            with self._lock:
+                self._state = self.SITTING
+            logger.info("SITTING: Move(0,0,0) → StopMove → Damp")
+            self.sport.Move(0, 0, 0)
+            time.sleep(0.05)
+            code = self.sport.StopMove()
+            logger.info(f"SITTING: StopMove → code={code}")
+            time.sleep(0.3)
+            code = self.sport.Damp()
+            logger.info(f"SITTING: Damp → code={code}")
+            with self._lock:
+                self._state = self.SEATED
+                self._last_cmd = 0.0
+            logger.info("SITTING: → SEATED")
+        except Exception as e:
+            logger.error(f"坐下失败: {e}")
+            traceback.print_exc()
+            with self._lock:
+                self._state = self.STOPPED
+
+    def _do_estop(self):
+        """急停: Damp → EMERGENCY"""
+        try:
+            with self._lock:
+                self._state = self.EMERGENCY
+            code = self.sport.Damp()
+            logger.info(f"EMERGENCY: Damp → code={code}")
+            with self._lock:
+                self._last_cmd = 0.0
+        except Exception as e:
+            logger.error(f"急停失败: {e}")
+            traceback.print_exc()
+
+    # ========================================================================
+    # 公开 API — 非阻塞，只设标志/状态
+    # ========================================================================
     def stand(self):
-        if self.sport:
-            try:
-                # 必须经过 StandDown→Sit 才能进入可移动模式
-                self.sport.StandDown()
-                time.sleep(1)
-                self.sport.Sit()
-                time.sleep(1)
-                self.sport.StandUp()
-                time.sleep(2)
-                self.sport.BalanceStand()
-                self._moving = False
-                logger.info("Stand: StandDown→Sit→StandUp→BalanceStand")
-            except Exception as e:
-                logger.error(f"Stand failed: {e}")
+        with self._lock:
+            self._cmd = 'stand'
+        logger.info("API: stand 入队")
 
     def sit(self):
-        if self.sport:
-            try:
-                self.sport.Move(0, 0, 0)
-                self.sport.StandDown()
-                self._moving = False
-                logger.info("Sit: StandDown")
-            except Exception as e:
-                logger.error(f"Sit failed: {e}")
-
-    def move(self, vx, vy, vyaw):
-        if self.sport:
-            try:
-                if not self._moving:
-                    self.sport.BalanceStand()
-                    self._moving = True
-                self.sport.Move(vx, vy, vyaw)
-            except Exception as e:
-                logger.error(f"Move failed: {e}")
-
-    def stop_move(self):
-        if self.sport:
-            try:
-                self.sport.Move(0, 0, 0)
-                self._moving = False
-                logger.info("StopMove: Move(0,0,0)")
-            except Exception as e:
-                logger.error(f"StopMove failed: {e}")
+        with self._lock:
+            self._cmd = 'sit'
+        logger.info("API: sit 入队")
 
     def e_stop(self):
-        if self.sport:
-            try:
-                self.sport.Damp()
-                self._moving = False
-                logger.info("E-Stop: Damp()")
-            except Exception as e:
-                logger.error(f"E-Stop failed: {e}")
+        with self._lock:
+            self._cmd = 'estop'
+        logger.info("API: estop 入队")
+
+    def move(self, vx, vy, vyaw):
+        """设置运动速度: STOPPED → MOVING, 或更新 MOVING 速度"""
+        with self._lock:
+            if self._state not in (self.STOPPED, self.MOVING):
+                logger.info(f"MOVE: 忽略 (state={self.STATE_NAMES.get(self._state, '?')})")
+                return
+            self._state = self.MOVING
+            self._vx = vx
+            self._vy = vy
+            self._vyaw = vyaw
+            self._last_cmd = time.time()
+
+    def stop_move(self):
+        """停止运动: MOVING → STOPPED (StopMove + BalanceStand)"""
+        with self._lock:
+            if self._state not in (self.MOVING,):
+                return
+            self._state = self.STOPPED
+            self._vx = self._vy = self._vyaw = 0.0
+            self._last_cmd = 0.0
+        # 控制线程下次循环会进入 STOPPED 分支: 发送 Move(0,0,0) 保持静止
+        logger.info("API: stop → STOPPED")
+
+    def start_watchdog(self):
+        """看门狗: MOVING 状态 0.3s 无新 move() 自动停止"""
+        def wd():
+            while True:
+                state, last = self.STOPPED, 0.0
+                with self._lock:
+                    state = self._state
+                    last = self._last_cmd
+                if state == self.MOVING and last > 0 and time.time() - last > 0.3:
+                    logger.info("看门狗: 0.3s 无指令, 自动停止")
+                    self.stop_move()
+                time.sleep(0.1)
+        threading.Thread(target=wd, daemon=True).start()
+        logger.info("看门狗启动")
 
     @property
     def imu_yaw(self):
@@ -179,8 +337,25 @@ class RobotConnection:
             return self._imu_yaw
 
     @property
+    def robot_mode(self):
+        with self._feedback_lock:
+            return self._robot_mode
+
+    @property
+    def robot_velocity(self):
+        with self._feedback_lock:
+            return list(self._robot_velocity)
+
+    @property
     def stats(self):
-        return {"imu_count": self._imu_count, "lidar_count": self._lidar_count}
+        with self._feedback_lock:
+            return {
+                "imu_count": self._imu_count,
+                "lidar_count": self._lidar_count,
+                "robot_mode": self._robot_mode,
+                "robot_progress": self._robot_progress,
+                "robot_velocity": list(self._robot_velocity),
+            }
 
 
 # ============================================================================
@@ -212,14 +387,11 @@ class TaskManager:
         self._tasks = []
         self._active = None
         self._running = False
-        self._thread = None
-        self._detections = []
 
     def add(self, task):
         with self._lock:
             self._tasks.append(task)
         ws_broadcast({"type": "tasks", "data": self.get_state()})
-        logger.info(f"任务加入: {task.type} (优先级 {task.priority})")
 
     def add_list(self, tasks):
         with self._lock:
@@ -247,95 +419,73 @@ class TaskManager:
             }
 
     def process_command(self, text):
-        """VLM 解析指令或降级解析，加入任务队列。"""
-        thread = threading.Thread(target=self._process_command_bg, args=(text,), daemon=True)
-        thread.start()
+        threading.Thread(target=self._process_command_bg, args=(text,), daemon=True).start()
 
     def _process_command_bg(self, text):
         try:
-            if self.vlm and self.vlm.loaded:
-                from go2w_orchestrator.vlm_integration import VLMIntegration
-                integ = VLMIntegration()
-                integ._engine = self.vlm
-                result = integ.process_command(text)
-            else:
-                result = self._fallback_parse(text)
-
+            result = self._vlm_parse_command(text) if (self.vlm and self.vlm.loaded) else self._fallback_parse(text)
             response = result.get("response", "")
             tasks = result.get("tasks", [])
-
             ws_broadcast({"type": "vlm", "data": {"text": text, "response": response, "tasks": tasks}})
-
             if tasks:
-                task_items = []
-                for t in tasks:
-                    task_items.append(Task(t.get("type", "navigate"), t.get("params", {}), t.get("priority", 5)))
-                self.add_list(task_items)
-                logger.info(f"VLM 拆解: {len(task_items)} 个子任务")
+                self.add_list([Task(t.get("type", "navigate"), t.get("params", {}), t.get("priority", 5)) for t in tasks])
             else:
-                # 单条指令直接处理
                 self._handle_simple(text)
-
         except Exception as e:
             logger.error(f"指令处理失败: {e}")
-            traceback.print_exc()
-            ws_broadcast({"type": "vlm", "data": {"text": text, "response": f"处理失败: {e}", "tasks": []}})
 
     def _handle_simple(self, text):
-        text_lower = text.lower()
-        if "停" in text:
-            self.cancel_all()
-        elif "前进" in text or "向前" in text:
-            self.add(Task("move", {"vx": 0.5, "duration": 2.0}, 6))
-        elif "后退" in text or "向后" in text:
-            self.add(Task("move", {"vx": -0.3, "duration": 2.0}, 6))
-        elif "左转" in text:
-            self.add(Task("move", {"vyaw": 0.5, "duration": 2.0}, 6))
-        elif "右转" in text:
-            self.add(Task("move", {"vyaw": -0.5, "duration": 2.0}, 6))
+        if "停" in text: self.cancel_all()
+        elif "前进" in text or "向前" in text: self.add(Task("move", {"vx": 0.5, "duration": 2.0}, 6))
+        elif "后退" in text or "向后" in text: self.add(Task("move", {"vx": -0.5, "duration": 2.0}, 6))
+        elif "左转" in text: self.add(Task("move", {"vyaw": 0.5, "duration": 2.0}, 6))
+        elif "右转" in text: self.add(Task("move", {"vyaw": -0.5, "duration": 2.0}, 6))
+
+    def _vlm_parse_command(self, text):
+        sys_prompt = """你是一个机器狗助手。将用户指令分解为任务序列。
+可用任务：navigate/move/follow/search_area/observe/wait/stop/return_home
+输出 JSON: {"understanding":"...","tasks":[{"type":"...","priority":1-10,"params":{...}}],"response":"..."}"""
+        response = self.vlm.chat([
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": text}
+        ], max_new_tokens=300)
+        import re as _re, json as _json
+        try:
+            m = _re.search(r'\{[^}]*"tasks"[^}]*\}', response, _re.DOTALL)
+            if m: return _json.loads(m.group())
+        except Exception: pass
+        return self._fallback_parse(text)
 
     @staticmethod
     def _fallback_parse(text):
-        result = {"understanding": text, "tasks": [], "response": ""}
+        r = {"understanding": text, "tasks": [], "response": ""}
         if "跟着" in text or "跟随" in text:
-            target = ""
             for kw in ["跟着", "跟随"]:
-                if kw in text:
-                    target = text[text.index(kw)+len(kw):].strip().rstrip("。，！？")
-            result["tasks"] = [{"type": "follow", "priority": 8, "params": {"target": target}}]
-            result["response"] = f"好的，跟踪{target}"
+                if kw in text: target = text[text.index(kw)+len(kw):].strip().rstrip("。，！？")
+            r["tasks"] = [{"type": "follow", "priority": 8, "params": {"target": target}}]
+            r["response"] = f"跟踪{target}"
         elif "搜索" in text or "找" in text:
-            result["tasks"] = [{"type": "search_area", "priority": 5, "params": {"pattern": "lawnmower", "width": 10, "height": 10}}]
-            result["response"] = "好的，开始搜索"
+            r["tasks"] = [{"type": "search_area", "priority": 5, "params": {"pattern": "lawnmower", "width": 10, "height": 10}}]
+            r["response"] = "开始搜索"
         elif "停" in text:
-            result["tasks"] = [{"type": "stop", "priority": 10, "params": {}}]
-            result["response"] = "已停止"
+            r["tasks"] = [{"type": "stop", "priority": 10, "params": {}}]; r["response"] = "已停止"
         elif "回来" in text or "返回" in text:
-            result["tasks"] = [{"type": "return_home", "priority": 7, "params": {}}]
-            result["response"] = "正在返回"
+            r["tasks"] = [{"type": "return_home", "priority": 7, "params": {}}]; r["response"] = "返回"
         elif "前进" in text or "向前" in text:
-            result["tasks"] = [{"type": "move", "priority": 6, "params": {"vx": 0.5, "duration": 2.0}}]
-            result["response"] = "前进"
+            r["tasks"] = [{"type": "move", "priority": 6, "params": {"vx": 0.5, "duration": 2.0}}]; r["response"] = "前进"
         elif "后退" in text or "向后" in text:
-            result["tasks"] = [{"type": "move", "priority": 6, "params": {"vx": -0.3, "duration": 2.0}}]
-            result["response"] = "后退"
+            r["tasks"] = [{"type": "move", "priority": 6, "params": {"vx": -0.5, "duration": 2.0}}]; r["response"] = "后退"
         elif "左转" in text:
-            result["tasks"] = [{"type": "move", "priority": 6, "params": {"vyaw": 0.5, "duration": 2.0}}]
-            result["response"] = "左转"
+            r["tasks"] = [{"type": "move", "priority": 6, "params": {"vyaw": 0.5, "duration": 2.0}}]; r["response"] = "左转"
         elif "右转" in text:
-            result["tasks"] = [{"type": "move", "priority": 6, "params": {"vyaw": -0.5, "duration": 2.0}}]
-            result["response"] = "右转"
+            r["tasks"] = [{"type": "move", "priority": 6, "params": {"vyaw": -0.5, "duration": 2.0}}]; r["response"] = "右转"
         else:
-            result["response"] = f"收到: {text}（暂不支持此指令）"
-        return result
+            r["response"] = f"收到: {text}"
+        return r
 
     def start_worker(self):
         self._running = True
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
-
-    def stop_worker(self):
-        self._running = False
+        threading.Thread(target=self._worker, daemon=True).start()
 
     def _worker(self):
         while self._running:
@@ -348,14 +498,10 @@ class TaskManager:
                             self._active = t
                             task = t
                             break
-
             if task is None:
                 time.sleep(0.1)
                 continue
-
             ws_broadcast({"type": "tasks", "data": self.get_state()})
-            logger.info(f"执行任务: {task.type}")
-
             try:
                 if task.type == "move":
                     p = task.params
@@ -363,162 +509,102 @@ class TaskManager:
                     time.sleep(p.get("duration", 1.0))
                     self.robot.stop_move()
                     task.status = "completed"
-                    task.result = "done"
-
                 elif task.type == "stop":
-                    self.robot.stop_move()
-                    self.cancel_all()
-                    task.status = "completed"
-
-                elif task.type == "search_area":
-                    # 简单的前方扫描模拟
-                    p = task.params
-                    task.result = f"搜索 {p.get('width', 10)}x{p.get('height', 10)}m"
-                    task.status = "completed"
-
-                elif task.type == "follow":
-                    task.result = "跟踪模式需要视觉支持"
-                    task.status = "completed"
-
-                elif task.type == "return_home":
-                    self.robot.stop_move()
-                    task.status = "completed"
-                    task.result = "已停止（无导航目标）"
-
+                    self.robot.stop_move(); self.cancel_all(); task.status = "completed"
                 else:
                     task.status = "completed"
-                    task.result = f"未实现: {task.type}"
-
             except Exception as e:
-                task.status = "failed"
-                task.result = str(e)
-                logger.error(f"任务失败: {e}")
-
+                task.status = "failed"; task.result = str(e)
             with self._lock:
                 self._tasks = [t for t in self._tasks if t.id != task.id]
                 self._active = None
-
             ws_broadcast({"type": "tasks", "data": self.get_state()})
 
 
 # ============================================================================
-# HTTP + WebSocket 服务器
+# HTTP + WebSocket
 # ============================================================================
-robot: RobotConnection = None
-task_mgr: TaskManager = None
-detector: Detector = None
+robot = task_mgr = detector = None
 
-
-def create_server(host, port, ws_port, static_dir):
+def create_server(host, port, static_dir):
     global robot, task_mgr, detector
 
-    class Handler(BaseHTTPRequestHandler):
+    class H(BaseHTTPRequestHandler):
         def do_GET(self):
-            parsed = urlparse(self.path)
-            if parsed.path in ('/', '/index.html'):
-                self._serve_file(os.path.join(static_dir, 'panel.html'), 'text/html')
-            elif parsed.path == '/api/status':
-                data = {
+            p = urlparse(self.path)
+            if p.path in ('/', '/index.html'):
+                self._serve(os.path.join(static_dir, 'panel.html'), 'text/html')
+            elif p.path == '/api/status':
+                self._json({
                     "connected": robot.connected if robot else False,
                     "imu_yaw": robot.imu_yaw if robot else 0,
                     "stats": robot.stats if robot else {},
                     "tasks": task_mgr.get_state() if task_mgr else {},
-                }
-                self._json(data)
-            elif parsed.path == '/api/capture':
-                frame = robot.get_frame() if robot else None
-                if frame is not None:
-                    _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'image/jpeg')
-                    self.end_headers()
-                    self.wfile.write(jpeg.tobytes())
-                else:
-                    self.send_error(404)
+                })
             else:
                 self.send_error(404)
 
         def do_POST(self):
-            parsed = urlparse(self.path)
-            params = parse_qs(parsed.query)
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length).decode() if length else ''
+            p = urlparse(self.path)
+            q = parse_qs(p.query)
+            L = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(L).decode() if L else ''
 
-            if parsed.path == '/api/connect':
+            if p.path == '/api/connect':
                 if not robot.connected:
                     robot.connect()
                     robot.stand()
-                    time.sleep(1)
-                    self._json({"ok": True, "msg": "已连接并站立"})
-                else:
-                    self._json({"ok": True, "msg": "已连接"})
+                self._json({"ok": True, "msg": "已连接"})
 
-            elif parsed.path == '/api/stand':
-                logger.info("API: stand requested")
+            elif p.path == '/api/stand':
                 robot.stand()
                 self._json({"ok": True})
 
-            elif parsed.path == '/api/sit':
-                logger.info("API: sit requested")
+            elif p.path == '/api/sit':
                 robot.sit()
                 self._json({"ok": True})
 
-            elif parsed.path == '/api/stop':
-                logger.info("API: stop_move requested")
+            elif p.path == '/api/stop':
                 robot.stop_move()
                 self._json({"ok": True})
 
-            elif parsed.path == '/api/e_stop':
-                logger.info("API: e_stop requested")
+            elif p.path == '/api/e_stop':
                 robot.e_stop()
                 task_mgr.cancel_all()
                 self._json({"ok": True})
 
-            elif parsed.path == '/api/move':
-                vx = float(params.get('vx', ['0'])[0])
-                vy = float(params.get('vy', ['0'])[0])
-                vyaw = float(params.get('vyaw', ['0'])[0])
-                logger.info(f"API: move vx={vx} vy={vy} vyaw={vyaw}")
+            elif p.path == '/api/move':
+                vx = float(q.get('vx', ['0'])[0])
+                vy = float(q.get('vy', ['0'])[0])
+                vyaw = float(q.get('vyaw', ['0'])[0])
                 robot.move(vx, vy, vyaw)
                 self._json({"ok": True})
 
-            elif parsed.path == '/api/command':
-                text = params.get('text', [''])[0] or body or json.loads(body).get('text', '') if body else ''
-                if not text and body:
-                    try:
-                        text = json.loads(body).get('text', '')
-                    except Exception:
-                        text = body
+            elif p.path == '/api/command':
+                text = q.get('text', [''])[0] or body
+                if body:
+                    try: text = json.loads(body).get('text', '')
+                    except Exception: text = body
                 if text:
                     task_mgr.process_command(text)
-                    self._json({"ok": True, "text": text})
-                else:
-                    self._json({"ok": False, "msg": "空指令"})
-
-            elif parsed.path == '/api/detect':
-                frame = robot.get_frame() if robot else None
-                if frame is not None and detector:
-                    dets = detector.detect(frame)
-                    self._json({"ok": True, "detections": dets})
-                else:
-                    self._json({"ok": False, "detections": []})
+                self._json({"ok": True, "text": text})
 
             else:
                 self.send_error(404)
 
-        def _json(self, data):
+        def _json(self, d):
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
+            self.wfile.write(json.dumps(d, ensure_ascii=False).encode())
 
-        def _serve_file(self, path, ctype):
+        def _serve(self, path, ct):
             if os.path.exists(path):
                 with open(path, 'rb') as f:
                     data = f.read()
                 self.send_response(200)
-                self.send_header('Content-Type', ctype)
+                self.send_header('Content-Type', ct)
                 self.send_header('Content-Length', len(data))
                 self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
                 self.end_headers()
@@ -526,69 +612,47 @@ def create_server(host, port, ws_port, static_dir):
             else:
                 self.send_error(404)
 
-        def log_message(self, *args):
+        def log_message(self, *a):
             pass
 
-    return HTTPServer((host, port), Handler)
+    return HTTPServer((host, port), H)
 
 
 def run_ws(host, port):
     global WS_LOOP
     import websockets
 
-    async def handler(websocket, path):
-        WS_CLIENTS.add(websocket)
-        try:
-            await websocket.wait_closed()
-        finally:
-            WS_CLIENTS.discard(websocket)
+    async def h(ws, path):
+        WS_CLIENTS.add(ws)
+        try: await ws.wait_closed()
+        finally: WS_CLIENTS.discard(ws)
 
     WS_LOOP = asyncio.new_event_loop()
     asyncio.set_event_loop(WS_LOOP)
-    WS_LOOP.run_until_complete(websockets.serve(handler, host, port))
+    WS_LOOP.run_until_complete(websockets.serve(h, host, port))
     WS_LOOP.run_forever()
 
 
-# ============================================================================
-# 后台广播线程
-# ============================================================================
 def broadcast_loop():
-    logger.info("广播线程启动")
-    frame_count = 0
+    logger.info("广播启动")
     while True:
         try:
             if robot and robot.connected:
-                # 视频
                 frame = robot.get_frame()
+                dets = []
                 if frame is not None:
-                    # 检测
-                    dets = []
                     if detector:
                         dets = detector.detect(frame)
-                        if dets:
-                            frame = detector.annotate(frame, dets)
-
+                        if dets: frame = detector.annotate(frame, dets)
                     _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
-                    b64 = base64.b64encode(jpeg.tobytes()).decode()
-                    ws_broadcast({"type": "frame", "data": b64, "detections": len(dets)})
-                    frame_count += 1
-                    if frame_count == 1:
-                        logger.info(f"首帧广播成功, {frame.shape}, clients={len(WS_CLIENTS)}")
-                else:
-                    if frame_count == 0:
-                        logger.warning("get_frame() 返回 None，视频不可用")
-
-                # 状态
-                ws_broadcast({
-                    "type": "status",
-                    "imu_yaw": round(robot.imu_yaw, 3),
-                    "stats": robot.stats,
-                    "tasks": task_mgr.get_state() if task_mgr else {},
-                })
-
-            time.sleep(0.15)  # ~6-7 FPS
+                    ws_broadcast({"type": "frame", "data": base64.b64encode(jpeg.tobytes()).decode(),
+                                  "detections": len(dets)})
+                ws_broadcast({"type": "status", "imu_yaw": round(robot.imu_yaw, 3),
+                              "stats": robot.stats,
+                              "tasks": task_mgr.get_state() if task_mgr else {}})
+            time.sleep(0.15)
         except Exception as e:
-            logger.warning(f"广播错误: {e}")
+            logger.warning(f"广播: {e}")
             time.sleep(0.5)
 
 
@@ -604,43 +668,39 @@ def main():
     interface = os.environ.get("GO2W_INTERFACE", "enp65s0")
 
     robot = RobotConnection(interface)
-    task_mgr = TaskManager(robot)
+    logger.info("加载 VLM 模型...")
+    vlm = VLMEngine()
+    if not vlm.load():
+        logger.warning("VLM 加载失败，将使用关键词匹配")
+        vlm = None
+    else:
+        logger.info("VLM 就绪")
+
+    task_mgr = TaskManager(robot, vlm_engine=vlm)
     detector = Detector()
 
-    # 启动时自动连接 Go2W
+    # 连接 + 自动站立
     try:
-        logger.info("连接 Go2W...")
+        logger.info("连接 Go2W ...")
         robot.connect()
-        logger.info("Go2W 已连接! 发送站立指令...")
-        robot.sport.StandDown()
-        time.sleep(1)
-        robot.sport.Sit()
-        time.sleep(1)
-        robot.sport.StandUp()
-        time.sleep(2)
-        robot.sport.BalanceStand()
-        logger.info("已站立")
+        logger.info("已连接，执行站立序列 ...")
+        robot._stand_done.clear()
+        with robot._lock:
+            robot._cmd = 'stand'
+        robot._stand_done.wait(10)
+        robot.start_watchdog()
+        logger.info("就绪 — STOPPED 状态，机器人静止")
     except Exception as e:
-        logger.warning(f"Go2W 连接失败: {e}，可稍后通过页面连接")
+        logger.warning(f"连接失败: {e}")
 
     static_dir = os.path.join(os.path.dirname(__file__), 'static')
+    logger.info(f"Web: http://{host}:{port}  WS: ws://{host}:{ws_port}")
 
-    logger.info(f"启动 Web 面板: http://{host}:{port}")
-    logger.info(f"WebSocket: ws://{host}:{ws_port}")
-    logger.info(f"网卡: {interface}")
-
-    # 启动 WebSocket
     threading.Thread(target=run_ws, args=(host, ws_port), daemon=True).start()
-
-    # 启动任务 worker
     task_mgr.start_worker()
-
-    # 启动广播
     threading.Thread(target=broadcast_loop, daemon=True).start()
 
-    # 启动 HTTP
-    server = create_server(host, port, ws_port, static_dir)
-    logger.info("就绪! 浏览器打开 http://localhost:8000")
+    server = create_server(host, port, static_dir)
     server.serve_forever()
 
 

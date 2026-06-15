@@ -36,7 +36,7 @@ WHISPER_BINARY = os.environ.get("GO2W_WHISPER_BIN", "whisper-cpp")
 # --- Qwen2.5-VL (视觉定位) ---
 VLM_MODEL_NAME = os.environ.get(
     "GO2W_VLM_MODEL",
-    "Qwen/Qwen2.5-VL-3B-Instruct"
+    "/home/nhy/ZCodeProject/models/Qwen/Qwen2___5-VL-3B-Instruct"
 )
 VLM_QUANT = os.environ.get("GO2W_VLM_QUANT", "fp16")
 

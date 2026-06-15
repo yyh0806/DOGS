@@ -3,7 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Go2W 控制面板</title>
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>Go2W 控制面板 v2</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: #0a0a0a; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
@@ -183,10 +186,10 @@ header h1 { font-size: 16px; font-weight: 600; color: #fff; }
   <div class="divider"></div>
   <div class="ctrl-group move-pad">
     <div></div>
-    <button class="btn move-btn" onmousedown="move(0.3,0,0)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0.3,0,0)" ontouchend="stopMove()">↑</button>
+    <button class="btn move-btn" onmousedown="move(0.5,0,0)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0.5,0,0)" ontouchend="stopMove()">↑</button>
     <div></div>
     <button class="btn move-btn" onmousedown="move(0,0,0.5)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0,0,0.5)" ontouchend="stopMove()">↺</button>
-    <button class="btn move-btn" onmousedown="move(-0.4,0,0)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(-0.4,0,0)" ontouchend="stopMove()">↓</button>
+    <button class="btn move-btn" onmousedown="move(-0.5,0,0)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(-0.5,0,0)" ontouchend="stopMove()">↓</button>
     <button class="btn move-btn" onmousedown="move(0,0,-0.5)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0,0,-0.5)" ontouchend="stopMove()">↻</button>
   </div>
 </div>
@@ -199,7 +202,7 @@ function move(vx,vy,vyaw) {
   fetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, {method:'POST'});
   _moveInterval = setInterval(() => {
     fetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, {method:'POST'});
-  }, 300);
+  }, 200);
 }
 function stopMove() {
   clearInterval(_moveInterval);
@@ -335,6 +338,35 @@ setInterval(() => {
     }
   }).catch(()=>{});
 }, 3000);
+
+// 键盘控制
+const keyState = {};
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (keyState[e.key]) return;
+  keyState[e.key] = true;
+
+  switch(e.key) {
+    case 'ArrowUp':    move(0.5, 0, 0); break;
+    case 'ArrowDown':  move(-0.5, 0, 0); break;
+    case 'ArrowLeft':  move(0, 0, 0.5); break;
+    case 'ArrowRight': move(0, 0, -0.5); break;
+  }
+});
+
+document.addEventListener('keyup', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  keyState[e.key] = false;
+
+  const anyDown = Object.values(keyState).some(v => v);
+  if (!anyDown) stopMove();
+});
+
+// 页面失焦时自动停止
+window.addEventListener('blur', () => {
+  Object.keys(keyState).forEach(k => keyState[k] = false);
+  stopMove();
+});
 </script>
 </body>
 </html>
