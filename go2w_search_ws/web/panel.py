@@ -423,37 +423,87 @@ class TaskManager:
 
     def _process_command_bg(self, text):
         try:
-            result = self._vlm_parse_command(text) if (self.vlm and self.vlm.loaded) else self._fallback_parse(text)
+            # 简单指令直接关键词匹配，不经过 VLM（快）
+            if self._handle_simple(text):
+                return
+            # 复杂指令走 VLM
+            if self.vlm and self.vlm.loaded:
+                result = self._vlm_parse_command(text)
+            else:
+                result = self._fallback_parse(text)
             response = result.get("response", "")
             tasks = result.get("tasks", [])
+            logger.info(f"指令解析: '{text}' → response='{response}' tasks={len(tasks)}")
             ws_broadcast({"type": "vlm", "data": {"text": text, "response": response, "tasks": tasks}})
             if tasks:
-                self.add_list([Task(t.get("type", "navigate"), t.get("params", {}), t.get("priority", 5)) for t in tasks])
-            else:
-                self._handle_simple(text)
+                self.add_list([Task(t.get("type", "move"), t.get("params", {}), t.get("priority", 5)) for t in tasks])
         except Exception as e:
             logger.error(f"指令处理失败: {e}")
+            traceback.print_exc()
 
     def _handle_simple(self, text):
-        if "停" in text: self.cancel_all()
-        elif "前进" in text or "向前" in text: self.add(Task("move", {"vx": 0.5, "duration": 2.0}, 6))
-        elif "后退" in text or "向后" in text: self.add(Task("move", {"vx": -0.5, "duration": 2.0}, 6))
-        elif "左转" in text: self.add(Task("move", {"vyaw": 0.5, "duration": 2.0}, 6))
-        elif "右转" in text: self.add(Task("move", {"vyaw": -0.5, "duration": 2.0}, 6))
+        """简单指令关键词匹配。返回 True 表示已处理，False 表示需要 VLM。"""
+        if "停" in text:
+            self.cancel_all()
+            ws_broadcast({"type": "vlm", "data": {"text": text, "response": "已停止", "tasks": []}})
+            return True
+        elif "前进" in text or "向前" in text:
+            self.add(Task("move", {"vx": 0.5, "duration": 2.0}, 6))
+            ws_broadcast({"type": "vlm", "data": {"text": text, "response": "前进", "tasks": [{"type": "move", "params": {"vx": 0.5, "duration": 2.0}}]}})
+            return True
+        elif "后退" in text or "向后" in text:
+            self.add(Task("move", {"vx": -0.5, "duration": 2.0}, 6))
+            ws_broadcast({"type": "vlm", "data": {"text": text, "response": "后退", "tasks": [{"type": "move", "params": {"vx": -0.5, "duration": 2.0}}]}})
+            return True
+        elif "左转" in text:
+            self.add(Task("move", {"vyaw": 0.5, "duration": 2.0}, 6))
+            ws_broadcast({"type": "vlm", "data": {"text": text, "response": "左转", "tasks": [{"type": "move", "params": {"vyaw": 0.5, "duration": 2.0}}]}})
+            return True
+        elif "右转" in text:
+            self.add(Task("move", {"vyaw": -0.5, "duration": 2.0}, 6))
+            ws_broadcast({"type": "vlm", "data": {"text": text, "response": "右转", "tasks": [{"type": "move", "params": {"vyaw": -0.5, "duration": 2.0}}]}})
+            return True
+        elif "坐下" in text or "趴下" in text:
+            self.robot.sit()
+            ws_broadcast({"type": "vlm", "data": {"text": text, "response": "坐下", "tasks": []}})
+            return True
+        elif "站" in text and ("起" in text or "立" in text):
+            self.robot.stand()
+            ws_broadcast({"type": "vlm", "data": {"text": text, "response": "站立", "tasks": []}})
+            return True
+        return False
 
     def _vlm_parse_command(self, text):
         sys_prompt = """你是一个机器狗助手。将用户指令分解为任务序列。
-可用任务：navigate/move/follow/search_area/observe/wait/stop/return_home
+可用任务：move/follow/search_area/stop/return_home
+move 参数: {"vx": 前进速度, "vy": 侧移速度, "vyaw": 旋转速度, "duration": 持续秒数}
 输出 JSON: {"understanding":"...","tasks":[{"type":"...","priority":1-10,"params":{...}}],"response":"..."}"""
         response = self.vlm.chat([
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": text}
         ], max_new_tokens=300)
         import re as _re, json as _json
+        logger.info(f"VLM 原始响应: {response[:200]}")
         try:
-            m = _re.search(r'\{[^}]*"tasks"[^}]*\}', response, _re.DOTALL)
-            if m: return _json.loads(m.group())
-        except Exception: pass
+            # 用括号匹配提取最外层 JSON，而非简单正则
+            m = _re.search(r'\{', response)
+            if m:
+                start = m.start()
+                depth = 0
+                end = start
+                for i, ch in enumerate(response[start:], start):
+                    if ch == '{': depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+                json_str = response[start:end]
+                data = _json.loads(json_str)
+                if "tasks" in data:
+                    return data
+        except Exception as e:
+            logger.warning(f"VLM JSON 解析失败: {e}")
         return self._fallback_parse(text)
 
     @staticmethod
@@ -503,15 +553,22 @@ class TaskManager:
                 continue
             ws_broadcast({"type": "tasks", "data": self.get_state()})
             try:
-                if task.type == "move":
-                    p = task.params
-                    self.robot.move(p.get("vx", 0), p.get("vy", 0), p.get("vyaw", 0))
-                    time.sleep(p.get("duration", 1.0))
+                p = task.params
+                if task.type in ("move", "navigate"):
+                    duration = p.get("duration", 1.0)
+                    vx = p.get("vx", 0)
+                    vy = p.get("vy", 0)
+                    vyaw = p.get("vyaw", 0)
+                    end_time = time.time() + duration
+                    while time.time() < end_time:
+                        self.robot.move(vx, vy, vyaw)
+                        time.sleep(0.1)
                     self.robot.stop_move()
                     task.status = "completed"
                 elif task.type == "stop":
                     self.robot.stop_move(); self.cancel_all(); task.status = "completed"
                 else:
+                    logger.warning(f"未知任务类型: {task.type}, 跳过")
                     task.status = "completed"
             except Exception as e:
                 task.status = "failed"; task.result = str(e)
