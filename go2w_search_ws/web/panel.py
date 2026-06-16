@@ -134,7 +134,7 @@ class RobotConnection:
         from unitree_sdk2py.idl.sensor_msgs.msg.dds_._PointCloud2_ import PointCloud2_
         from unitree_sdk2py.idl.unitree_go.msg.dds_._LowState_ import LowState_
         self.factory = ChannelFactory(); self.factory.Init(0, self.interface)
-        self.sport = SportClient(); self.sport.SetTimeout(10.0); self.sport.Init()
+        self.sport = SportClient(enableLease=True); self.sport.SetTimeout(10.0); self.sport.Init()
         self.video = VideoClient(); self.video.SetTimeout(10.0); self.video.Init()
         def on_imu(msg):
             with self._imu_lock: self._imu_yaw = float(msg.imu_state.rpy[2]); self._imu_count += 1
