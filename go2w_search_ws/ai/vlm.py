@@ -142,7 +142,7 @@ class VLMEngine:
                     text=[text_input],
                     images=images if images else None,
                     return_tensors="pt",
-                ).to(DEVICE)
+                ).to(self._model.device)
 
                 with torch.no_grad():
                     output_ids = self._model.generate(
@@ -230,7 +230,7 @@ class VLMEngine:
                     text=[text_input],
                     images=[pil_img],
                     return_tensors="pt",
-                ).to(DEVICE)
+                ).to(self._model.device)
 
                 # 生成
                 with torch.no_grad():
