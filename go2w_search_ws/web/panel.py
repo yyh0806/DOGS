@@ -130,22 +130,17 @@ class RobotConnection:
         from unitree_sdk2py.core.channel import ChannelFactory
         from unitree_sdk2py.go2.sport.sport_client import SportClient
         from unitree_sdk2py.go2.video.video_client import VideoClient
-        from unitree_sdk2py.idl.unitree_go.msg.dds_._SportModeState_ import SportModeState_
-        from unitree_sdk2py.idl.sensor_msgs.msg.dds_._PointCloud2_ import PointCloud2_
         from unitree_sdk2py.idl.unitree_go.msg.dds_._LowState_ import LowState_
         self.factory = ChannelFactory(); self.factory.Init(0, self.interface)
         self.sport = SportClient(enableLease=True); self.sport.SetTimeout(10.0); self.sport.Init()
         self.video = VideoClient(); self.video.SetTimeout(10.0); self.video.Init()
         def on_imu(msg):
             with self._imu_lock: self._imu_yaw = float(msg.imu_state.rpy[2]); self._imu_count += 1
-        def on_lidar(msg): self._lidar_count += 1
-        def on_sport_state(msg):
-            with self._feedback_lock:
-                self._robot_mode = msg.mode; self._robot_progress = msg.progress
-                self._robot_velocity = [msg.velocity[0], msg.velocity[1], msg.velocity[2]]
         ch1 = self.factory.CreateRecvChannel('rt/lowstate', LowState_); ch1.SetReader(handler=on_imu)
-        ch2 = self.factory.CreateRecvChannel('rt/utlidar/cloud', PointCloud2_); ch2.SetReader(handler=on_lidar)
-        ch3 = self.factory.CreateRecvChannel('rt/sportmodestate', SportModeState_); ch3.SetReader(handler=on_sport_state)
+        # 注意: SportModeState 和 LiDAR 在某些 CycloneDDS 版本会导致 segfault,
+        # 暂时禁用, 用 IMU + 状态机内部状态代替
+        # ch2 = self.factory.CreateRecvChannel('rt/utlidar/cloud', PointCloud2_); ch2.SetReader(handler=on_lidar)
+        # ch3 = self.factory.CreateRecvChannel('rt/sportmodestate', SportModeState_); ch3.SetReader(handler=on_sport_state)
         threading.Thread(target=self._ctrl_loop, daemon=True).start()
         self._ctrl_ready.wait(5); self.connected = True
         logger.info("DDS 连接成功, 控制线程启动")
