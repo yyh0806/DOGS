@@ -423,10 +423,6 @@ class TaskManager:
 
     def _process_command_bg(self, text):
         try:
-            # 简单指令直接关键词匹配，不经过 VLM（快）
-            if self._handle_simple(text):
-                return
-            # 复杂指令走 VLM
             if self.vlm and self.vlm.loaded:
                 result = self._vlm_parse_command(text)
             else:
@@ -440,38 +436,6 @@ class TaskManager:
         except Exception as e:
             logger.error(f"指令处理失败: {e}")
             traceback.print_exc()
-
-    def _handle_simple(self, text):
-        """简单指令关键词匹配。返回 True 表示已处理，False 表示需要 VLM。"""
-        if "停" in text:
-            self.cancel_all()
-            ws_broadcast({"type": "vlm", "data": {"text": text, "response": "已停止", "tasks": []}})
-            return True
-        elif "前进" in text or "向前" in text:
-            self.add(Task("move", {"vx": 0.5, "duration": 2.0}, 6))
-            ws_broadcast({"type": "vlm", "data": {"text": text, "response": "前进", "tasks": [{"type": "move", "params": {"vx": 0.5, "duration": 2.0}}]}})
-            return True
-        elif "后退" in text or "向后" in text:
-            self.add(Task("move", {"vx": -0.5, "duration": 2.0}, 6))
-            ws_broadcast({"type": "vlm", "data": {"text": text, "response": "后退", "tasks": [{"type": "move", "params": {"vx": -0.5, "duration": 2.0}}]}})
-            return True
-        elif "左转" in text:
-            self.add(Task("move", {"vyaw": 0.5, "duration": 2.0}, 6))
-            ws_broadcast({"type": "vlm", "data": {"text": text, "response": "左转", "tasks": [{"type": "move", "params": {"vyaw": 0.5, "duration": 2.0}}]}})
-            return True
-        elif "右转" in text:
-            self.add(Task("move", {"vyaw": -0.5, "duration": 2.0}, 6))
-            ws_broadcast({"type": "vlm", "data": {"text": text, "response": "右转", "tasks": [{"type": "move", "params": {"vyaw": -0.5, "duration": 2.0}}]}})
-            return True
-        elif "坐下" in text or "趴下" in text:
-            self.robot.sit()
-            ws_broadcast({"type": "vlm", "data": {"text": text, "response": "坐下", "tasks": []}})
-            return True
-        elif "站" in text and ("起" in text or "立" in text):
-            self.robot.stand()
-            ws_broadcast({"type": "vlm", "data": {"text": text, "response": "站立", "tasks": []}})
-            return True
-        return False
 
     def _vlm_parse_command(self, text):
         sys_prompt = """你是一个机器狗助手。将用户指令分解为任务序列。
