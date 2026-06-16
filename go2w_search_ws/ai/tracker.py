@@ -128,11 +128,14 @@ class TargetTracker:
                         logger.info(f"搜索超时 ({self._search_timeout}s), 未找到目标, 停止跟踪")
                         self.stop()
                         return
-                    # 慢速旋转搜索目标
-                    self._robot.move(0.0, 0.0, 0.3)  # 原地旋转
-                    # 定期用 VLM 检测
+                    # 先停下再检测 (不要边转边找, 容易看不清)
+                    self._robot.move(0.0, 0.0, 0.0)
                     if time.time() - self._last_update >= self._search_interval:
-                        self._search_vlm(frame, target)
+                        if not self._search_vlm(frame, target):
+                            # 没找到, 转45°再找
+                            self._robot.move(0.0, 0.0, 0.4)
+                            time.sleep(0.8)
+                            self._robot.move(0.0, 0.0, 0.0)
 
                 elif state == self.TRACKING:
                     # 跟踪目标
@@ -159,10 +162,13 @@ class TargetTracker:
                                 logger.info("目标丢失，进入恢复模式")
 
                 elif state == self.RECOVERING:
-                    # 恢复策略：转回寻找
-                    self._robot.move(0.0, 0.0, 0.4)  # 旋转搜索
+                    # 恢复策略：停下来转45°再找
+                    self._robot.move(0.0, 0.0, 0.0)
                     if time.time() - self._last_update >= self._search_interval:
-                        self._search_vlm(frame, target)
+                        if not self._search_vlm(frame, target):
+                            self._robot.move(0.0, 0.0, 0.5)
+                            time.sleep(0.8)
+                            self._robot.move(0.0, 0.0, 0.0)
                     # 超时检查
                     if recover_start and time.time() - recover_start > self._recover_timeout:
                         logger.info("恢复超时，停止跟踪")
@@ -175,8 +181,8 @@ class TargetTracker:
                 logger.error(f"跟踪循环异常: {e}")
                 time.sleep(0.5)
 
-    def _search_vlm(self, frame: np.ndarray, target: str):
-        """用 VLM 搜索目标，找到后切换到 TRACKING。"""
+    def _search_vlm(self, frame: np.ndarray, target: str) -> bool:
+        """用 VLM 搜索目标，找到后切换到 TRACKING。返回是否找到。"""
         result = self._vlm.locate(frame, target)
         if result["found"]:
             with self._lock:
@@ -186,6 +192,8 @@ class TargetTracker:
             self._last_update = time.time()
             self._robot.stop()
             logger.info(f"找到目标: {result.get('description', target)}")
+            return True
         else:
             self._last_update = time.time()
             logger.debug(f"未找到目标: {target}")
+            return False

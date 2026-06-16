@@ -225,7 +225,10 @@ class RobotConnection:
     def move(self, vx, vy, vyaw):
         with self._lock:
             if self._state not in (self.STOPPED, self.MOVING): return
-            self._state = self.MOVING; self._vx = vx; self._vy = vy; self._vyaw = vyaw
+            self._state = self.MOVING
+            # Go2W 轮式坐标系: SDK Move(x,y,z) 中 x=左右, y=前后
+            # 调用者用 body frame (vx=前后, vy=左右), 需要交换
+            self._vy = vx; self._vx = vy; self._vyaw = vyaw
             self._last_cmd = time.time()
 
     def stop_move(self):
@@ -233,6 +236,9 @@ class RobotConnection:
             if self._state not in (self.MOVING,): return
             self._state = self.STOPPED; self._vx = self._vy = self._vyaw = 0.0; self._last_cmd = 0.0
         logger.info("API: stop → STOPPED")
+
+    # alias for TargetTracker compatibility
+    def stop(self): self.stop_move()
 
     def start_watchdog(self):
         def wd():
@@ -439,6 +445,7 @@ class TaskManager:
                 task.status = "failed"; task.result = str(e)
             with self._lock:
                 self._tasks = [t for t in self._tasks if t.id != task.id]; self._active = None
+            ws_broadcast({"type": "tasks", "data": self.get_state()})
             ws_broadcast({"type": "tasks", "data": self.get_state()})
 
     # ------------------------------------------------------------------
