@@ -305,6 +305,7 @@ class TaskManager:
         self.robot.stop_move()
         if self._tracker and self._follow_active:
             self._tracker.stop(); self._follow_active = False
+            ws_broadcast({"type": "follow", "data": {"status": "stopped"}})
         ws_broadcast({"type": "tasks", "data": self.get_state()})
 
     def get_state(self):
@@ -347,7 +348,10 @@ class TaskManager:
 输入"跟着前面的人"
 输出: {"tasks":[{"type":"follow","priority":8,"params":{"target":"前面的人"}}]}
 
-只输出JSON, 不要解释, 不要markdown代码块。"""
+输入"后退"
+输出: {"tasks":[{"type":"move","priority":6,"params":{"vx":-0.5,"duration":2.0}}]}
+
+只输出JSON, 不要解释, 不要markdown代码块。注意: 后退要用vx负数, 不是vyaw!"""
         response = self.vlm.chat([
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": text}
@@ -448,10 +452,9 @@ class TaskManager:
         self._follow_active = True
         ws_broadcast({"type": "follow", "data": {"status": "started", "target": target}})
         self._tracker.start_follow(target)
-        while self._follow_active and self._tracker.state != TargetTracker.IDLE:
-            time.sleep(0.5)
-        self._follow_active = False; task.status = "completed"; task.result = "跟踪结束"
-        ws_broadcast({"type": "follow", "data": {"status": "stopped"}})
+        # 不阻塞worker! 跟踪在后台线程运行, 通过 cancel_all/stop 停止
+        task.status = "completed"
+        task.result = "跟踪已启动 (后台运行)"
 
     # ------------------------------------------------------------------
     # search_area — 覆盖路径搜索

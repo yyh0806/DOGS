@@ -57,6 +57,7 @@ class TargetTracker:
         self._search_interval = 2.0   # SEARCHING 时 VLM 推理间隔（秒）
         self._track_interval = 0.5    # TRACKING 时 VLM 推理间隔
         self._recover_timeout = 5.0   # RECOVERING 超时
+        self._search_timeout = 30.0   # SEARCHING 总超时 (找不到目标自动停止)
         self._lost_frames = 0         # 连续丢失帧数
         self._max_lost = 3            # 连续丢失多少帧进入 RECOVERING
         # 跟踪结果
@@ -108,6 +109,7 @@ class TargetTracker:
     def _tracking_loop(self):
         """跟踪主循环，在独立线程中运行。"""
         recover_start = None
+        search_start = time.time()  # SEARCHING 开始时间
 
         while self._running:
             try:
@@ -121,6 +123,11 @@ class TargetTracker:
                 target = self.target
 
                 if state == self.SEARCHING:
+                    # 搜索超时检查
+                    if time.time() - search_start > self._search_timeout:
+                        logger.info(f"搜索超时 ({self._search_timeout}s), 未找到目标, 停止跟踪")
+                        self.stop()
+                        return
                     # 慢速旋转搜索目标
                     self._robot.move(0.0, 0.0, 0.3)  # 原地旋转
                     # 定期用 VLM 检测
