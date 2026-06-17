@@ -139,10 +139,8 @@ class RobotConnection:
             self.factory.Init(0, None)
         self.sport = SportClient(enableLease=True); self.sport.SetTimeout(10.0); self.sport.Init()
         self.video = VideoClient(); self.video.SetTimeout(10.0); self.video.Init()
-        # 关键: 不在主进程创建任何 DDS reader!
-        # CycloneDDS 同进程 reader+writer 会 segfault
-        # IMU 数据从独立子进程获取
-        self._start_imu_subprocess()
+        # IMU 子进程延迟5秒启动, 确保lease先获取
+        threading.Timer(5.0, self._start_imu_subprocess).start()
         threading.Thread(target=self._ctrl_loop, daemon=True).start()
         self._ctrl_ready.wait(5); self.connected = True
         logger.info("DDS 连接成功, 控制线程启动")
@@ -267,17 +265,14 @@ class RobotConnection:
         logger.info("API: estop 入队")
 
     def move(self, vx, vy, vyaw):
-        """body frame → Go2W SDK 映射。
-        调用者: vx=前后(正=前进), vy=左右(正=左), vyaw=旋转(正=左转)
-        Go2W SDK: Move(x=左右正=左, y=前后正=后退, z=旋转)
-        映射: sdk_x = vy, sdk_y = -vx, sdk_z = vyaw
+        """body frame → Go2W SDK。
+        Go2W SDK Move(x,y,z): x=前后(正=前进), y=左右, z=旋转(正=左转)
+        与调用者一致, 不需要映射。
         """
         with self._lock:
             if self._state not in (self.STOPPED, self.MOVING): return
             self._state = self.MOVING
-            self._vx = vy        # SDK x = 左右
-            self._vy = -vx       # SDK y = 前后(反转)
-            self._vyaw = vyaw
+            self._vx = vx; self._vy = vy; self._vyaw = vyaw
             self._last_cmd = time.time()
 
     def stop_move(self):
