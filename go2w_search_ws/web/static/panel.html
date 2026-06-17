@@ -315,8 +315,14 @@ function connectWS() {
       }
     } catch (err) { console.error('[WS] parse error', err); }
   };
-  ws.onclose = () => { console.log('[WS] closed, reconnecting...'); setTimeout(connectWS, 2000); };
+  ws.onclose = () => {
+    console.log('[WS] closed, reconnecting...');
+    clearInterval(_moveInterval); _moveInterval = null;  // 断线时停止运动
+    setTimeout(connectWS, 2000);
+  };
 }
+// 页面加载时先发停止, 防止重连后残留运动
+fetch('/api/stop', {method:'POST'});
 connectWS();
 
 // FPS 计算

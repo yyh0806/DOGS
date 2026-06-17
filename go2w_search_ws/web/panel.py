@@ -121,6 +121,7 @@ class RobotConnection:
         self._robot_mode = 0; self._robot_progress = 0.0
         self._robot_velocity = [0.0, 0.0, 0.0]; self._feedback_lock = threading.Lock()
         self._last_logged_vx = self._last_logged_vy = self._last_logged_vyaw = None
+        self._start_time = time.time()  # 启动时间, 用于move保护
         self._lock = threading.RLock(); self._state = self.STOPPED
         self._vx = 0.0; self._vy = 0.0; self._vyaw = 0.0
         self._last_cmd = 0.0; self._cmd = None
@@ -132,7 +133,11 @@ class RobotConnection:
         from unitree_sdk2py.go2.sport.sport_client import SportClient
         from unitree_sdk2py.go2.video.video_client import VideoClient
         from unitree_sdk2py.idl.unitree_go.msg.dds_._LowState_ import LowState_
-        self.factory = ChannelFactory(); self.factory.Init(0, self.interface)
+        self.factory = ChannelFactory()
+        # 先尝试指定网卡，失败则自动检测 (某些情况下网卡NO-CARRIER但仍可通信)
+        if not self.factory.Init(0, self.interface):
+            logger.warning(f"网卡 {self.interface} 初始化失败, 尝试自动检测")
+            self.factory.Init(0, None)
         self.sport = SportClient(enableLease=True); self.sport.SetTimeout(10.0); self.sport.Init()
         self.video = VideoClient(); self.video.SetTimeout(10.0); self.video.Init()
         def on_imu(msg):
@@ -184,7 +189,9 @@ class RobotConnection:
 
     def _do_stand(self):
         try:
-            with self._lock: self._state = self.STANDING
+            with self._lock:
+                self._state = self.STANDING
+                self._vx = self._vy = self._vyaw = 0.0  # 清零速度防冲
             logger.info("STANDING: StandUp → BalanceStand")
             self.sport.StandUp(); time.sleep(2)
             self.sport.BalanceStand(); time.sleep(0.5)
@@ -235,6 +242,8 @@ class RobotConnection:
         """
         with self._lock:
             if self._state not in (self.STOPPED, self.MOVING): return
+            # 安全保护: 启动后3秒内拒绝move, 防止前端重连残留指令冲车
+            if time.time() - self._start_time < 3.0: return
             self._state = self.MOVING
             self._vx = vy        # SDK x = 左右
             self._vy = -vx       # SDK y = 前后(反转)
