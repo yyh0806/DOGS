@@ -132,24 +132,56 @@ class RobotConnection:
         from unitree_sdk2py.core.channel import ChannelFactory
         from unitree_sdk2py.go2.sport.sport_client import SportClient
         from unitree_sdk2py.go2.video.video_client import VideoClient
-        from unitree_sdk2py.idl.unitree_go.msg.dds_._LowState_ import LowState_
         self.factory = ChannelFactory()
-        # 先尝试指定网卡，失败则自动检测 (某些情况下网卡NO-CARRIER但仍可通信)
+        # 先尝试指定网卡，失败则自动检测
         if not self.factory.Init(0, self.interface):
             logger.warning(f"网卡 {self.interface} 初始化失败, 尝试自动检测")
             self.factory.Init(0, None)
         self.sport = SportClient(enableLease=True); self.sport.SetTimeout(10.0); self.sport.Init()
         self.video = VideoClient(); self.video.SetTimeout(10.0); self.video.Init()
-        def on_imu(msg):
-            with self._imu_lock: self._imu_yaw = float(msg.imu_state.rpy[2]); self._imu_count += 1
-        ch1 = self.factory.CreateRecvChannel('rt/lowstate', LowState_); ch1.SetReader(handler=on_imu)
-        # 注意: SportModeState 和 LiDAR 在某些 CycloneDDS 版本会导致 segfault,
-        # 暂时禁用, 用 IMU + 状态机内部状态代替
-        # ch2 = self.factory.CreateRecvChannel('rt/utlidar/cloud', PointCloud2_); ch2.SetReader(handler=on_lidar)
-        # ch3 = self.factory.CreateRecvChannel('rt/sportmodestate', SportModeState_); ch3.SetReader(handler=on_sport_state)
+        # 关键: 不在主进程创建任何 DDS reader!
+        # CycloneDDS 同进程 reader+writer 会 segfault
+        # IMU 数据从独立子进程获取
+        self._start_imu_subprocess()
         threading.Thread(target=self._ctrl_loop, daemon=True).start()
         self._ctrl_ready.wait(5); self.connected = True
         logger.info("DDS 连接成功, 控制线程启动")
+
+    def _start_imu_subprocess(self):
+        """独立子进程读取IMU yaw, 避免同进程 reader+writer segfault"""
+        import subprocess
+        self._imu_file = "/tmp/go2w_imu.json"
+        # 用系统python3跑子进程 (只需要cyclonedds, 不需要torch)
+        script = (
+            "import sys,time,json,multiprocessing\n"
+            "from unitree_sdk2py.core.channel import ChannelFactory\n"
+            "from unitree_sdk2py.idl.unitree_go.msg.dds_._LowState_ import LowState_\n"
+            "f=ChannelFactory();f.Init(0,None)\n"
+            "st={'yaw':0.0,'count':0}\n"
+            "def cb(msg):\n"
+            "    st['yaw']=float(msg.imu_state.rpy[2]);st['count']+=1\n"
+            "    if st['count']%20==0:\n"
+            "        json.dump(st,open('/tmp/go2w_imu.json','w'))\n"
+            "f.CreateRecvChannel('rt/lowstate',LowState_).SetReader(handler=cb)\n"
+            "while True:time.sleep(1)\n"
+        )
+        self._imu_proc = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        logger.info(f"IMU 子进程 PID={self._imu_proc.pid}")
+        def reader():
+            import os
+            while True:
+                try:
+                    if os.path.exists(self._imu_file):
+                        with open(self._imu_file) as fp:
+                            d = json.load(fp)
+                            with self._imu_lock:
+                                self._imu_yaw = d.get("yaw", 0.0)
+                                self._imu_count = d.get("count", 0)
+                except Exception: pass
+                time.sleep(0.2)
+        threading.Thread(target=reader, daemon=True).start()
 
     def get_frame(self):
         if not self.video: return None
