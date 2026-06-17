@@ -120,6 +120,7 @@ class RobotConnection:
         self._lidar_count = 0
         self._robot_mode = 0; self._robot_progress = 0.0
         self._robot_velocity = [0.0, 0.0, 0.0]; self._feedback_lock = threading.Lock()
+        self._last_logged_vx = self._last_logged_vy = self._last_logged_vyaw = None
         self._lock = threading.RLock(); self._state = self.STOPPED
         self._vx = 0.0; self._vy = 0.0; self._vyaw = 0.0
         self._last_cmd = 0.0; self._cmd = None
@@ -173,7 +174,11 @@ class RobotConnection:
                     except Exception as e: logger.error(f"STOPPED Move(0,0,0) 失败: {e}")
                     last_zero_move = now
             elif state == self.MOVING:
-                try: self.sport.Move(vx, vy, vyaw)
+                try:
+                    if vx != self._last_logged_vx or vy != self._last_logged_vy or vyaw != self._last_logged_vyaw:
+                        logger.info(f"CTRL Move: sport.Move({vx}, {vy}, {vyaw})")
+                        self._last_logged_vx = vx; self._last_logged_vy = vy; self._last_logged_vyaw = vyaw
+                    self.sport.Move(vx, vy, vyaw)
                 except Exception as e: logger.error(f"Move 失败: {e}")
             time.sleep(0.05)
 
@@ -223,12 +228,17 @@ class RobotConnection:
         logger.info("API: estop 入队")
 
     def move(self, vx, vy, vyaw):
+        """body frame → Go2W SDK 映射。
+        调用者: vx=前后(正=前进), vy=左右(正=左), vyaw=旋转(正=左转)
+        Go2W SDK: Move(x=左右正=左, y=前后正=后退, z=旋转)
+        映射: sdk_x = vy, sdk_y = -vx, sdk_z = vyaw
+        """
         with self._lock:
             if self._state not in (self.STOPPED, self.MOVING): return
             self._state = self.MOVING
-            # Go2W 轮式坐标系: SDK Move(x,y,z) 中 x=左右, y=前后
-            # 调用者用 body frame (vx=前后, vy=左右), 需要交换
-            self._vy = vx; self._vx = vy; self._vyaw = vyaw
+            self._vx = vy        # SDK x = 左右
+            self._vy = -vx       # SDK y = 前后(反转)
+            self._vyaw = vyaw
             self._last_cmd = time.time()
 
     def stop_move(self):
