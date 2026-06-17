@@ -242,8 +242,6 @@ class RobotConnection:
         """
         with self._lock:
             if self._state not in (self.STOPPED, self.MOVING): return
-            # 安全保护: 启动后3秒内拒绝move, 防止前端重连残留指令冲车
-            if time.time() - self._start_time < 3.0: return
             self._state = self.MOVING
             self._vx = vy        # SDK x = 左右
             self._vy = -vx       # SDK y = 前后(反转)
@@ -264,9 +262,9 @@ class RobotConnection:
             while True:
                 state, last = self.STOPPED, 0.0
                 with self._lock: state = self._state; last = self._last_cmd
-                if state == self.MOVING and last > 0 and time.time() - last > 0.3:
-                    logger.info("看门狗: 0.3s 无指令, 自动停止"); self.stop_move()
-                time.sleep(0.1)
+                if state == self.MOVING and last > 0 and time.time() - last > 1.0:
+                    logger.info("看门狗: 1.0s 无指令, 自动停止"); self.stop_move()
+                time.sleep(0.2)
         threading.Thread(target=wd, daemon=True).start(); logger.info("看门狗启动")
 
     @property
@@ -445,9 +443,12 @@ class TaskManager:
             try:
                 p = task.params
                 if task.type in ("move", "navigate"):
-                    duration = p.get("duration", 1.0); vx = p.get("vx", 0); vy = p.get("vy", 0); vyaw = p.get("vyaw", 0)
+                    duration = min(p.get("duration", 1.0), 8.0)  # 最多8秒防失控
+                    vx = p.get("vx", 0); vy = p.get("vy", 0); vyaw = p.get("vyaw", 0)
                     end_time = time.time() + duration
                     while time.time() < end_time:
+                        # 随时可被 cancel_all / stop 任务中断
+                        if task.status == "cancelled": break
                         self.robot.move(vx, vy, vyaw); time.sleep(0.1)
                     self.robot.stop_move(); task.status = "completed"
                 elif task.type == "stop":
