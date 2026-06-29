@@ -23,6 +23,7 @@
 """
 
 import math
+import os
 import struct
 import threading
 import time
@@ -52,8 +53,9 @@ class NxSensorNode(Node):
     def __init__(self):
         super().__init__('nx_sensor_node')
 
-        # 参数
-        self.declare_parameter('dog_interface', 'enxc8a362616c4c')  # 连狗的USB网卡
+        # 参数: 连狗网卡优先用环境变量 (部署时传入), 兜底硬编码默认
+        _default_iface = os.environ.get('DOG_INTERFACE', 'enxc8a362616c4c')
+        self.declare_parameter('dog_interface', _default_iface)  # 连狗的USB网卡
         self.declare_parameter('publish_imu', True)
         self.declare_parameter('publish_odom', True)
         self.declare_parameter('publish_scan', True)

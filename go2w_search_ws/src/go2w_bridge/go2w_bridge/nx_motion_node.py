@@ -25,6 +25,7 @@ ROS2 接口:
 
 import json
 import math
+import os
 import threading
 import time
 
@@ -50,7 +51,10 @@ class NxMotionNode(Node):
     def __init__(self):
         super().__init__('nx_motion_node')
 
-        self.declare_parameter('dog_interface', 'enxc8a362616c4c')
+        # 连狗网卡: 优先用 DOG_INTERFACE 环境变量 (service 部署时传入),
+        # 兜底硬编码默认值 (老 NX 的网卡名, 新 NX 部署时会被覆盖)
+        _default_iface = os.environ.get('DOG_INTERFACE', 'enxc8a362616c4c')
+        self.declare_parameter('dog_interface', _default_iface)
         self.declare_parameter('stand_on_start', True)
         self.declare_parameter('cmd_timeout', 1.0)   # 看门狗超时
         self.declare_parameter('move_rate', 20.0)     # MOVING发Move频率
