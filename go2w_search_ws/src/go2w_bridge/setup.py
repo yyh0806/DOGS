@@ -24,6 +24,7 @@ setup(
             'sport_client = go2w_bridge.sport_client:main',
             'nx_sensor_node = go2w_bridge.nx_sensor_node:main',
             'nx_motion_node = go2w_bridge.nx_motion_node:main',
+            'nx_panel_bridge = go2w_bridge.nx_panel_bridge:main',
         ],
     },
 )
