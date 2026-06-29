@@ -1,0 +1,25 @@
+[Unit]
+Description=Go2W NX Motion Node (控狗, 持续持有lease压制残留乱跑程序)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nx
+# 关键环境: CycloneDDS库 + ROS2 humble
+Environment=LD_LIBRARY_PATH=/home/nx/CycloneDDS/lib
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=ROS_DOMAIN_ID=0
+# 狗主控网卡 + 启动自动站立
+Environment=DOG_INTERFACE=enxc8a362616c4c
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec python3 -u /home/nx/go2w_ws/nx_motion_node.py'
+WorkingDirectory=/home/nx/go2w_ws
+# 崩溃自动重启 (lease持有者绝不能长时间离线, 否则狗主控残留程序接管乱跑)
+Restart=always
+RestartSec=2
+# 正常停止: SIGTERM 触发 destroy_node → Damp趴下 → 释放lease
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

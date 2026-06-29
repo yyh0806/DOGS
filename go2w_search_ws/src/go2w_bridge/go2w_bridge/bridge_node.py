@@ -19,6 +19,7 @@
 
 import math
 import struct
+import sys
 import time
 import logging
 import threading
@@ -82,6 +83,7 @@ class Go2WBridgeNode(Node):
 
         # LiDAR 数据队列（DDS 回调写入，定时器消费）
         self._pointcloud_queue = []
+        self._sensor_data = {}  # 子进程传感器数据
 
         # 速度指令状态
         self._last_cmd_time = 0.0
@@ -135,44 +137,108 @@ class Go2WBridgeNode(Node):
             from unitree_sdk2py.go2.sport.sport_client import SportClient
             from unitree_sdk2py.go2.video.video_client import VideoClient
 
+            # 主进程: 只创建 SportClient writer + VideoClient (不创建reader!)
+            # reader 放到子进程, 避免 CycloneDDS 同进程 reader+writer segfault
             factory = ChannelFactory()
-            factory.Init(0, self.get_parameter('network_interface')
-                         .get_parameter_value().string_value or "")
+            interface = self.get_parameter('network_interface').get_parameter_value().string_value
+            # 尝试指定网卡, 失败则自动检测
+            if interface:
+                try:
+                    factory.Init(0, interface)
+                except Exception:
+                    self.get_logger().warn(f"网卡 {interface} 不可用, 自动检测")
+                    factory.Init(0, None)
+            else:
+                factory.Init(0, None)
             self._dds_inited = True
 
-            self._sport._client = SportClient()
+            self._sport._client = SportClient(enableLease=True)
             self._sport._client.SetTimeout(10.0)
             self._sport._client.Init()
             self._sport._connected = True
+            time.sleep(1)  # 等 lease
 
             self._video_client = VideoClient()
             self._video_client.SetTimeout(10.0)
             self._video_client.Init()
 
-            self._subscribe_imu(factory)
-            time.sleep(0.3)
-            self._subscribe_lidar(factory)
+            # 启动传感器子进程 (DDS reader 独立进程)
+            self._start_sensor_subprocess("")  # 空字符串=自动检测
 
             if self._stand_on_start:
                 self._sport.balance_stand()
                 self.get_logger().info("Go2W 已站立")
                 time.sleep(1.0)
 
-                if self._use_driving:
-                    self._sport.switch_to_drive_mode()
-                    self.get_logger().info("已切换到轮式驱动模式")
-
-            # 校准 yaw
-            time.sleep(0.5)
-            self._odom_pub.calibrate_yaw()
-
             self._connected = True
-            self.get_logger().info("Go2W 连接成功! (IMU + LiDAR + Video)")
+            self.get_logger().info("Go2W 连接成功! (SportClient + 子进程传感器)")
 
         except Exception as e:
             self.get_logger().error(f"Go2W 连接失败: {e}")
             self.get_logger().warn("将在模拟模式运行")
             self._connected = True
+
+    def _start_sensor_subprocess(self, interface):
+        """启动独立子进程读取 IMU + LiDAR, 写入共享文件。"""
+        import subprocess, os
+        self._sensor_file = "/tmp/go2w_sensors.json"
+
+        iface_arg = repr(interface) if interface else 'None'
+        script = (
+            "import sys, time, json, struct, math\n"
+            "from unitree_sdk2py.core.channel import ChannelFactory\n"
+            "from unitree_sdk2py.idl.unitree_go.msg.dds_._LowState_ import LowState_\n"
+            "from unitree_sdk2py.idl.sensor_msgs.msg.dds_._PointCloud2_ import PointCloud2_\n"
+            f"f = ChannelFactory(); f.Init(0, {iface_arg})\n"
+            "state = {'yaw': 0.0, 'roll': 0.0, 'pitch': 0.0, 'imu_count': 0, 'ranges': []}\n"
+            "def on_imu(msg):\n"
+            "    state['yaw'] = float(msg.imu_state.rpy[2])\n"
+            "    state['roll'] = float(msg.imu_state.rpy[0])\n"
+            "    state['pitch'] = float(msg.imu_state.rpy[1])\n"
+            "    state['imu_count'] += 1\n"
+            "def on_lidar(msg):\n"
+            "    ranges = [10.0] * 360\n"
+            "    step = msg.point_step\n"
+            "    data = bytes(msg.data)\n"
+            "    for i in range(msg.width):\n"
+            "        off = i * step\n"
+            "        if off + 8 <= len(data):\n"
+            "            x, y = struct.unpack_from('ff', data, off)\n"
+            "            r = math.sqrt(x*x + y*y)\n"
+            "            if r < 0.1 or r > 10.0: continue\n"
+            "            angle = int((math.atan2(y, x) + math.pi) / (2*math.pi) * 360) % 360\n"
+            "            if r < ranges[angle]: ranges[angle] = r\n"
+            "    state['ranges'] = [round(r, 2) for r in ranges]\n"
+            "f.CreateRecvChannel('rt/lowstate', LowState_).SetReader(handler=on_imu)\n"
+            "f.CreateRecvChannel('rt/utlidar/cloud', PointCloud2_).SetReader(handler=on_lidar)\n"
+            "cnt = 0\n"
+            "while True:\n"
+            "    time.sleep(0.1)\n"
+            "    cnt += 1\n"
+            "    if cnt % 5 == 0:\n"
+            "        try: json.dump(state, open('/tmp/go2w_sensors.json', 'w'))\n"
+            "        except: pass\n"
+        )
+        # 用conda python (有unitree_sdk2py)
+        conda_python = "/home/nhy/miniconda3/envs/go2w/bin/python"
+        self._sensor_proc = subprocess.Popen(
+            [conda_python, '-c', script],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.get_logger().info(f"传感器子进程启动 PID={self._sensor_proc.pid}")
+
+        # 启动读取线程
+        def read_sensors():
+            while True:
+                try:
+                    if os.path.exists(self._sensor_file):
+                        with open(self._sensor_file) as fp:
+                            d = json.load(fp)
+                            self._sensor_data = d
+                except Exception:
+                    pass
+                time.sleep(0.1)
+        self._sensor_data = {}
+        threading.Thread(target=read_sensors, daemon=True).start()
 
     def _subscribe_imu(self, factory):
         """订阅 IMU 数据 (DDS rt/lowstate)。"""
@@ -240,28 +306,35 @@ class Go2WBridgeNode(Node):
             self._odom_pub.set_cmd_vel(0.0, 0.0, 0.0)
 
     def _process_lidar(self):
-        """LiDAR 定时器: 处理点云，发布 LaserScan + 更新里程计。"""
-        if not self._pointcloud_queue:
+        """LiDAR 定时器: 从子进程数据发布 LaserScan。"""
+        ranges = self._sensor_data.get('ranges', [])
+        if not ranges:
             return
 
-        info = self._pointcloud_queue.pop(0)
-        _, imu_yaw = self._odom_pub.position[:2], self._odom_pub.position[2] if self._odom_pub.position else 0.0
-        imu_yaw = self._odom_pub.position[2]
-
-        laser_scan, icp_dx, icp_dy = self._lidar_pub.process_frame(imu_yaw)
-
-        if laser_scan is not None:
-            # 更新时间戳
-            laser_scan.header.stamp = self.get_clock().now().to_msg()
-            self._scan_pub.publish(laser_scan)
-
-        if abs(icp_dx) > 0.001 or abs(icp_dy) > 0.001:
-            self._odom_pub.update_icp(icp_dx, icp_dy)
+        # 发布 LaserScan
+        laser_scan = LaserScan()
+        laser_scan.header.stamp = self.get_clock().now().to_msg()
+        laser_scan.header.frame_id = 'base_link'
+        laser_scan.angle_min = -math.pi
+        laser_scan.angle_max = math.pi
+        laser_scan.angle_increment = 2 * math.pi / len(ranges)
+        laser_scan.time_increment = 0.0
+        laser_scan.scan_time = 0.1
+        laser_scan.range_min = 0.15
+        laser_scan.range_max = 10.0
+        laser_scan.ranges = [float(r) for r in ranges]
+        laser_scan.intensities = []
+        self._scan_pub.publish(laser_scan)
 
     def _publish_odom(self):
-        """Odometry 定时器: 发布里程计和 TF。"""
-        if self._connected:
-            self._odom_pub.publish()
+        """Odometry 定时器: 用IMU更新里程计和TF。"""
+        if not self._connected:
+            return
+
+        # 从子进程获取IMU yaw
+        yaw = self._sensor_data.get('yaw', 0.0)
+        self._odom_pub.update_imu(yaw)
+        self._odom_pub.publish()
 
     def _publish_camera(self):
         """摄像头定时器: 发布图像。"""

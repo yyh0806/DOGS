@@ -1,178 +1,103 @@
-"""Go2W 全系统启动文件。
+"""Go2W 全系统启动文件 (ROS2 原生模式)。
 
-启动顺序:
-  1. go2w_bridge       - 连接 Go2W SDK，发布 /scan, /odom, /tf, /camera
-  2. slam_toolbox      - 实时 SLAM 建图
-  3. nav2              - 导航栈 (路径规划 + 避障)
-  4. go2w_detector     - YOLO 目标检测
-  5. go2w_orchestrator - 任务编排 + VLM
-  6. go2w_web          - Web 控制面板
+不使用 go2w_bridge (CycloneDDS segfault 问题)。
+直接订阅 Go2W 机器狗原生 ROS2 topic:
+  - /utlidar/cloud_base → pointcloud_to_laserscan → /scan
+  - /cmd_vel → 机器狗运动控制
+  - /uslam/frontend/odom → 里程计
 
 用法:
   ros2 launch go2w_bringup search.launch.py
-  ros2 launch go2w_bringup search.launch.py network_interface:=enx001e06300000
 """
 
 import os
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, LogInfo, TimerAction
+from launch.actions import DeclareLaunchArgument, TimerAction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    config_file = os.path.join(
-        os.path.dirname(__file__), '..', 'config', 'default.yaml'
-    )
-    nav_dir = os.path.join(
-        os.path.dirname(__file__), '..', '..', 'go2w_nav'
-    )
+    nav_dir = get_package_share_directory('go2w_nav')
+    bringup_dir = get_package_share_directory('go2w_bringup')
+    nav2_params = os.path.join(nav_dir, 'config', 'nav2_params.yaml')
+    config_file = os.path.join(bringup_dir, 'config', 'default.yaml')
 
-    # 参数
-    network_interface_arg = DeclareLaunchArgument(
-        'network_interface', default_value='',
-        description='Go2W 连接网卡名'
-    )
-
-    # 节点 1: Bridge（立即启动）
-    bridge_node = Node(
-        package='go2w_bridge',
-        executable='bridge_node',
-        name='go2w_bridge',
-        output='screen',
-        parameters=[config_file, {
-            'network_interface': LaunchConfiguration('network_interface'),
+    # 1. PointCloud2 → LaserScan 转换 (机器人发 /utlidar/cloud_base)
+    pc_to_scan = Node(
+        package='pointcloud_to_laserscan', executable='pointcloud_to_laserscan_node',
+        name='pc_to_scan', output='screen',
+        remappings=[
+            ('cloud_in', '/utlidar/cloud_base'),
+            ('scan', '/scan'),
+        ],
+        parameters=[{
+            'target_frame': 'base_link',
+            'transform_tolerance': 0.01,
+            'min_height': 0.0,
+            'max_height': 1.0,
+            'angle_min': -3.14159,
+            'angle_max': 3.14159,
+            'angle_increment': 0.00872,
+            'scan_time': 0.1,
+            'range_min': 0.15,
+            'range_max': 10.0,
+            'use_inf': True,
+            'inf_epsilon': 1.0,
         }],
     )
 
-    # 节点 2: SLAM Toolbox（延迟 2 秒，等 /scan 就绪）
-    slam_node = TimerAction(
-        period=2.0,
-        actions=[Node(
-            package='slam_toolbox',
-            executable='async_slam_toolbox_node',
-            name='slam_toolbox',
-            output='screen',
-            parameters=[
-                os.path.join(nav_dir, 'config', 'slam_toolbox.yaml'),
-                {'use_sim_time': False},
-            ],
-        )],
-    )
+    # 2. SLAM Toolbox (延迟2秒, 等/scan就绪)
+    slam_params = os.path.join(nav_dir, 'config', 'slam_toolbox.yaml')
+    slam_node = TimerAction(period=2.0, actions=[Node(
+        package='slam_toolbox', executable='async_slam_toolbox_node',
+        name='slam_toolbox', output='screen',
+        parameters=[slam_params, {'use_sim_time': False}],
+    )])
 
-    # 节点 3: Nav2（延迟 5 秒，等 SLAM 就绪）
-    nav2_params = os.path.join(nav_dir, 'config', 'nav2_params.yaml')
-    nav2_lifecycle = TimerAction(
-        period=5.0,
-        actions=[Node(
-            package='nav2_lifecycle_manager',
-            executable='lifecycle_manager',
-            name='lifecycle_manager_navigation',
-            output='screen',
-            parameters=[{
-                'use_sim_time': False,
-                'autostart': True,
-                'node_names': [
-                    'controller_server',
-                    'planner_server',
-                    'behavior_server',
-                    'bt_navigator',
-                    'waypoint_follower',
-                ],
-            }],
-        )],
-    )
+    # 3. Nav2 导航栈 (延迟6秒, 让节点先注册)
+    nav2_lifecycle = TimerAction(period=6.0, actions=[Node(
+        package='nav2_lifecycle_manager', executable='lifecycle_manager',
+        name='lifecycle_manager_navigation', output='screen',
+        parameters=[{
+            'use_sim_time': False, 'autostart': True,
+            'node_names': ['controller_server', 'planner_server',
+                           'behavior_server', 'bt_navigator'],
+        }],
+    )])
 
-    nav2_controller = TimerAction(
-        period=5.5,
-        actions=[Node(
-            package='nav2_controller',
-            executable='controller_server',
-            name='controller_server',
-            output='screen',
-            parameters=[nav2_params, {'use_sim_time': False}],
-        )],
-    )
+    nav2_controller = TimerAction(period=5.5, actions=[Node(
+        package='nav2_controller', executable='controller_server',
+        name='controller_server', output='screen',
+        parameters=[nav2_params, {'use_sim_time': False}],
+        remappings=[('/cmd_vel', '/cmd_vel')],
+    )])
 
-    nav2_planner = TimerAction(
-        period=5.5,
-        actions=[Node(
-            package='nav2_planner',
-            executable='planner_server',
-            name='planner_server',
-            output='screen',
-            parameters=[nav2_params, {'use_sim_time': False}],
-        )],
-    )
+    nav2_planner = TimerAction(period=5.5, actions=[Node(
+        package='nav2_planner', executable='planner_server',
+        name='planner_server', output='screen',
+        parameters=[nav2_params, {'use_sim_time': False}],
+    )])
 
-    nav2_behavior = TimerAction(
-        period=5.5,
-        actions=[Node(
-            package='nav2_behaviors',
-            executable='behavior_server',
-            name='behavior_server',
-            output='screen',
-            parameters=[nav2_params, {'use_sim_time': False}],
-        )],
-    )
+    nav2_behavior = TimerAction(period=5.5, actions=[Node(
+        package='nav2_recoveries', executable='recoveries_server',
+        name='behavior_server', output='screen',
+        parameters=[nav2_params, {'use_sim_time': False}],
+    )])
 
-    nav2_bt = TimerAction(
-        period=5.5,
-        actions=[Node(
-            package='nav2_bt_navigator',
-            executable='bt_navigator',
-            name='bt_navigator',
-            output='screen',
-            parameters=[nav2_params, {'use_sim_time': False}],
-        )],
-    )
-
-    # 节点 4: 检测器（延迟 3 秒）
-    detector_node = TimerAction(
-        period=3.0,
-        actions=[Node(
-            package='go2w_detector',
-            executable='detector_node',
-            name='go2w_detector',
-            output='screen',
-            parameters=[config_file],
-        )],
-    )
-
-    # 节点 5: 编排器（延迟 7 秒，等 Nav2 就绪）
-    orchestrator_node = TimerAction(
-        period=7.0,
-        actions=[Node(
-            package='go2w_orchestrator',
-            executable='orchestrator_node',
-            name='go2w_orchestrator',
-            output='screen',
-            parameters=[config_file],
-        )],
-    )
-
-    # 节点 6: Web 桥接（延迟 8 秒）
-    web_node = TimerAction(
-        period=8.0,
-        actions=[Node(
-            package='go2w_web',
-            executable='web_bridge_node',
-            name='go2w_web_bridge',
-            output='screen',
-            parameters=[config_file],
-        )],
-    )
+    nav2_bt = TimerAction(period=5.5, actions=[Node(
+        package='nav2_bt_navigator', executable='bt_navigator',
+        name='bt_navigator', output='screen',
+        parameters=[nav2_params, {'use_sim_time': False}],
+    )])
 
     return LaunchDescription([
-        network_interface_arg,
-        bridge_node,
+        pc_to_scan,
         slam_node,
         nav2_lifecycle,
         nav2_controller,
         nav2_planner,
         nav2_behavior,
         nav2_bt,
-        detector_node,
-        orchestrator_node,
-        web_node,
     ])

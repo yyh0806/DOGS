@@ -1,0 +1,268 @@
+"""载荷NX 运动控制节点 — 订阅 /cmd_vel + /cmd_pose → 控狗。
+
+go2w_bridge 的运动控制职责从"PC直连狗"迁移到"载荷NX"。
+这样:
+1. 控狗走网线直连狗主控(不依赖热点), 可靠
+2. 持续持有 lease → 压制狗主控里的残留乱跑程序(它抢不到lease)
+3. 看门狗在NX上 → 即使笔记本↔NX热点断了, NX也会自动停狗
+
+ROS2 接口:
+  订阅 /cmd_vel  (geometry_msgs/Twist)  - 速度指令 vx vy vyaw
+  订阅 /cmd_pose (std_msgs/String)      - "stand"/"sit"/"estop"
+  发布 /dog_state (std_msgs/String JSON) - 狗当前状态 (供监控)
+
+状态机 (复用 panel.py 验证过的逻辑):
+  DISCONNECTED → STANDING → STOPPED (BalanceStand静止, 每0.5s发零速保lease)
+  STOPPED → MOVING (Move@20Hz)
+  MOVING → STOPPED (StopMove + BalanceStand, 看门狗1s超时自动停)
+  任意 → EMERGENCY (Damp趴下)
+
+运行 (载荷NX):
+  export LD_LIBRARY_PATH=$HOME/CycloneDDS/lib:$LD_LIBRARY_PATH
+  source /opt/ros/humble/setup.bash
+  ros2 run go2w_bridge nx_motion_node
+"""
+
+import json
+import math
+import threading
+import time
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from std_msgs.msg import String
+
+try:
+    from unitree_sdk2py.core.channel import ChannelFactory
+    from unitree_sdk2py.go2.sport.sport_client import SportClient
+    SDK_OK = True
+except Exception as _e:
+    SDK_OK = False
+    _SDK_ERR = str(_e)
+
+
+# 状态
+DISCONNECTED, STANDING, STOPPED, MOVING, SITTING, SEATED, EMERGENCY = range(7)
+
+
+class NxMotionNode(Node):
+    def __init__(self):
+        super().__init__('nx_motion_node')
+
+        self.declare_parameter('dog_interface', 'enxc8a362616c4c')
+        self.declare_parameter('stand_on_start', True)
+        self.declare_parameter('cmd_timeout', 1.0)   # 看门狗超时
+        self.declare_parameter('move_rate', 20.0)     # MOVING发Move频率
+
+        if not SDK_OK:
+            self.get_logger().error(f"unitree_sdk2py 不可用: {_SDK_ERR}")
+            return
+
+        iface = self.get_parameter('dog_interface').get_parameter_value().string_value
+        self._cmd_timeout = self.get_parameter('cmd_timeout').get_parameter_value().double_value
+        self.get_logger().info(f"连接狗主控控狗, 网卡={iface} ...")
+
+        # 初始化 SDK
+        self._factory = ChannelFactory()
+        try:
+            self._factory.Init(0, iface)
+        except Exception as e:
+            self.get_logger().warning(f"网卡{iface}失败{e}, 自动"); self._factory.Init(0, None)
+
+        self._sport = SportClient(enableLease=True)
+        self._sport.SetTimeout(10.0)
+        self._sport.Init()
+        # go2 包 SDK 缺 SwitchGait (版本不完整), 这里手动注册 API 1011。
+        # Go2W 轮式狗移动前必须 SwitchGait 切轮式步态, 否则 Move 触发足式迈步→摔倒。
+        self._SWITCHGAIT_API_ID = 1011
+        self._sport._RegistApi(self._SWITCHGAIT_API_ID, 0)
+        time.sleep(2)  # 等 lease 激活
+        self.get_logger().info("SportClient lease 已激活 (持续持有, 压制残留程序)")
+
+        # 控制状态 (锁保护)
+        self._lock = threading.Lock()
+        self._state = DISCONNECTED
+        self._vx = self._vy = self._vyaw = 0.0
+        self._last_cmd_time = 0.0
+        self._pose_cmd = None  # 'stand'/'sit'/'estop'
+
+        # ROS2 接口
+        self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
+        self.create_subscription(String, '/cmd_pose', self._on_cmd_pose, 10)
+        self._state_pub = self.create_publisher(String, '/dog_state', 10)
+
+        # 启动控制线程 (独立线程, 避免 SDK 调用阻塞 ROS2 executor)
+        threading.Thread(target=self._ctrl_loop, daemon=True).start()
+
+        # 看门狗线程
+        threading.Thread(target=self._watchdog, daemon=True).start()
+
+        # 状态发布
+        self.create_timer(0.5, self._publish_state)
+
+        # 自动站立
+        if self.get_parameter('stand_on_start').get_parameter_value().bool_value:
+            with self._lock: self._pose_cmd = 'stand'
+
+    # ---- ROS2 回调 ----
+    def _on_cmd_vel(self, msg):
+        with self._lock:
+            # 坐标系: vx前后 vy左右 vyaw旋转(正=左转)
+            # 实测 Go2W SDK Move(x,y,z): z正=左转 (与cmd_vel angular.z约定一致, 无需反转)
+            self._vx = msg.linear.x
+            self._vy = msg.linear.y
+            self._vyaw = msg.angular.z
+            self._last_cmd_time = time.time()
+            if self._state in (STOPPED, MOVING):
+                self._state = MOVING
+
+    def _on_cmd_pose(self, msg):
+        cmd = msg.data.strip().lower()
+        if cmd in ('stand', 'sit', 'estop'):
+            with self._lock: self._pose_cmd = cmd
+            self.get_logger().info(f"收到姿态指令: {cmd}")
+
+    def _watchdog(self):
+        """看门狗: MOVING 状态超过 cmd_timeout 无新指令 → 自动停。"""
+        while True:
+            with self._lock:
+                state = self._state
+                last = self._last_cmd_time
+            if state == MOVING and last > 0 and time.time() - last > self._cmd_timeout:
+                with self._lock:
+                    if self._state == MOVING:
+                        self._state = STOPPED
+                        self._vx = self._vy = self._vyaw = 0.0
+                self.get_logger().info(f"看门狗: {self._cmd_timeout}s无指令, 自动停")
+            time.sleep(0.2)
+
+    def _ctrl_loop(self):
+        """控制循环 (复用 panel.py 验证过的状态机)。所有 SDK 调用只在此线程。"""
+        self.get_logger().info("控制线程启动")
+        last_zero_move = 0.0
+        while True:
+            try:
+                # 消费姿态指令 (优先)
+                cmd = None
+                with self._lock:
+                    cmd = self._pose_cmd; self._pose_cmd = None
+                if cmd == 'stand':
+                    self._do_stand(); last_zero_move = 0; continue
+                if cmd == 'sit':
+                    self._do_sit(); last_zero_move = 0; continue
+                if cmd == 'estop':
+                    self._do_estop(); last_zero_move = 0; continue
+
+                # 速度控制
+                state, vx, vy, vyaw = STOPPED, 0.0, 0.0, 0.0
+                with self._lock:
+                    state, vx, vy, vyaw = self._state, self._vx, self._vy, self._vyaw
+                if state == STOPPED:
+                    # STOPPED: 高频(20Hz)发Move(0,0,0)钉住瞬时速度,
+                    # 且每0.5s补一次StopMove清除运动控制器内部残留目标速度。
+                    # Go2W ai-w 轮式模式: 仅Move(0,0,0)无法停轮子(实测轮子仍
+                    # 以~1rad/s转), 必须StopMove()才能真正刹住。
+                    now = time.time()
+                    if now - last_zero_move > 0.5:
+                        self._sport.StopMove()
+                        last_zero_move = now
+                    self._sport.Move(0, 0, 0)
+                elif state == MOVING:
+                    self._sport.Move(vx, vy, vyaw)
+                time.sleep(0.05)
+            except Exception as e:
+                self.get_logger().error(f"控制循环异常: {e}")
+                time.sleep(0.5)
+
+    def _switch_gait(self, gait_type):
+        """切步态。go2 包 SDK 无 SwitchGait 方法, 直接用 API 1011 调用。
+        Go2W 轮式: gait_type 见官方示例 (go2w示例用1, as2示例用0)。"""
+        import json as _json
+        p = {"data": gait_type}
+        code, _ = self._sport._Call(self._SWITCHGAIT_API_ID, _json.dumps(p))
+        if code != 0:
+            self.get_logger().warning(f"SwitchGait({gait_type}) 返回 code={code}")
+        return code
+
+    def _do_stand(self):
+        try:
+            with self._lock:
+                self._state = STANDING
+                self._vx = self._vy = self._vyaw = 0.0
+            self.get_logger().info("STANDING: StandUp → StopMove")
+            # Go2W 轮式狗安全站立: 只用 StandUp + StopMove。
+            # 注意: SwitchGait(1)=trot 会触发轮子狂转(危险!), BalanceStand 触发轮子后滑。
+            # 这两个都暂时不用。移动控制的轮式步态切换需进一步研究官方文档确认正确参数。
+            # 当前状态: 站立/坐下能用, 移动待解决。
+            self._sport.StandUp(); time.sleep(2)
+            self._sport.StopMove(); time.sleep(0.3)
+            self._sport.Move(0, 0, 0)
+            with self._lock:
+                self._state = STOPPED
+                self._vx = self._vy = self._vyaw = 0.0
+                self._last_cmd_time = 0.0
+            self.get_logger().info("STANDING → STOPPED")
+        except Exception as e:
+            self.get_logger().error(f"站立失败: {e}")
+            with self._lock: self._state = STOPPED
+
+    def _do_sit(self):
+        try:
+            with self._lock: self._state = SITTING
+            self.get_logger().info("SITTING: StopMove → Damp")
+            self._sport.Move(0, 0, 0); time.sleep(0.05)
+            self._sport.StopMove(); time.sleep(0.3)
+            self._sport.Damp()
+            with self._lock:
+                self._state = SEATED
+                self._last_cmd_time = 0.0
+            self.get_logger().info("SITTING → SEATED")
+        except Exception as e:
+            self.get_logger().error(f"坐下失败: {e}")
+            with self._lock: self._state = STOPPED
+
+    def _do_estop(self):
+        try:
+            with self._lock: self._state = EMERGENCY
+            self._sport.Damp()
+            self.get_logger().warn("⚠️ EMERGENCY: Damp 趴下")
+            with self._lock: self._last_cmd_time = 0.0
+        except Exception as e:
+            self.get_logger().error(f"急停失败: {e}")
+
+    def _publish_state(self):
+        with self._lock:
+            state, vx, vy, vyaw = self._state, self._vx, self._vy, self._vyaw
+        names = ['DISCONNECTED','STANDING','STOPPED','MOVING','SITTING','SEATED','EMERGENCY']
+        msg = String()
+        msg.data = json.dumps({
+            'state': names[state] if state < len(names) else str(state),
+            'vx': round(vx, 3), 'vy': round(vy, 3), 'vyaw': round(vyaw, 3),
+        })
+        self._state_pub.publish(msg)
+
+    def destroy_node(self):
+        try:
+            self._sport.Move(0, 0, 0); time.sleep(0.05)
+            self._sport.StopMove(); time.sleep(0.2)
+            self._sport.Damp()
+            self.get_logger().info("退出: 已趴下释放")
+        except Exception: pass
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = NxMotionNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

@@ -267,12 +267,11 @@ class RobotConnection:
     def move(self, vx, vy, vyaw):
         """body frame → Go2W SDK。
         Go2W SDK Move(x,y,z): x=前后(正=前进), y=左右, z=旋转(正=左转)
-        与调用者一致, 不需要映射。
         """
         with self._lock:
             if self._state not in (self.STOPPED, self.MOVING): return
             self._state = self.MOVING
-            self._vx = vx; self._vy = vy; self._vyaw = vyaw
+            self._vx = vx; self._vy = vy; self._vyaw = -vyaw  # Go2W: z正=右转,需反转
             self._last_cmd = time.time()
 
     def stop_move(self):
@@ -312,6 +311,98 @@ class RobotConnection:
             return {"imu_count": self._imu_count, "lidar_count": self._lidar_count,
                     "robot_mode": self._robot_mode, "robot_progress": self._robot_progress,
                     "robot_velocity": list(self._robot_velocity)}
+
+
+# ============================================================================
+# RosRobotBridge — ROS2 模式下替代 RobotConnection 的控狗实现
+# ----------------------------------------------------------------------------
+# 不直连狗 SDK, 而是通过容器内常驻的 cmd_publisher.py 发 ROS2 话题
+# (/cmd_vel /cmd_pose), 由 NX 上的 nx_motion_node 控狗。
+# 公共 API 与 RobotConnection 保持一致 (move/stop_move/stand/sit/e_stop +
+# imu_yaw/connected/stats/_lock/_vx 等), 让 TaskManager / broadcast_loop 无感切换。
+# ============================================================================
+class RosRobotBridge:
+    def __init__(self):
+        self.connected = False
+        self._proc = None           # cmd_publisher.py 子进程
+        self._lock = threading.RLock()
+        self._vx = 0.0; self._vy = 0.0; self._vyaw = 0.0
+        # IMU/yaw 仍从 dog_state.json 读 (ros_to_json 写), 这里复用
+        self._imu_yaw = 0.0; self._imu_count = 0
+        # NX nx_motion_node 通过 /dog_state 上报的真实狗状态
+        self._robot_state = "UNKNOWN"   # STOPPED/MOVING/STANDING/...
+        self._state_lock = threading.Lock()
+
+    def connect(self):
+        """拉起容器内 cmd_publisher.py, 通过它的 stdin 发指令 / stdout 读状态。"""
+        import subprocess
+        try:
+            # 必须先 source ROS2 环境, 否则容器内 python3 找不到 rclpy
+            self._proc = subprocess.Popen(
+                ['docker', 'exec', '-i', 'go2w_humble', 'bash', '-c',
+                 'source /opt/ros/humble/setup.bash && exec python3 -u /workspace/web/cmd_publisher.py'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, bufsize=1, text=True)
+        except Exception as e:
+            logger.error(f"启动 cmd_publisher 失败 (容器没起?): {e}")
+            raise
+        # 后台线程读 stdout (NX /dog_state 上报)
+        threading.Thread(target=self._read_state, daemon=True).start()
+        self.connected = True
+        logger.info("RosRobotBridge 就绪 (经容器 cmd_publisher → NX nx_motion_node)")
+
+    def _read_state(self):
+        while self._proc and self._proc.stdout:
+            try:
+                line = self._proc.stdout.readline()
+                if not line:
+                    break
+                d = json.loads(line)
+                if d.get("type") == "dog_state":
+                    with self._state_lock:
+                        self._robot_state = d.get("state", "UNKNOWN")
+            except Exception:
+                pass
+        logger.info("cmd_publisher stdout 已关闭")
+
+    def _send(self, obj):
+        if not self._proc or not self._proc.stdin:
+            return
+        try:
+            self._proc.stdin.write(json.dumps(obj) + "\n")
+            self._proc.stdin.flush()
+        except Exception as e:
+            logger.warning(f"发指令失败 (cmd_publisher 挂了?): {e}")
+
+    def move(self, vx, vy, vyaw):
+        with self._lock:
+            self._vx = vx; self._vy = vy; self._vyaw = vyaw
+        self._send({"type": "vel", "vx": vx, "vy": vy, "vyaw": vyaw})
+
+    def stop_move(self):
+        with self._lock:
+            self._vx = self._vy = self._vyaw = 0.0
+        self._send({"type": "stop"})
+
+    def stand(self): self._send({"type": "pose", "cmd": "stand"})
+    def sit(self): self._send({"type": "pose", "cmd": "sit"})
+    def e_stop(self): self._send({"type": "pose", "cmd": "estop"})
+
+    @property
+    def robot_state(self):
+        with self._state_lock:
+            return self._robot_state
+
+    @property
+    def imu_yaw(self):
+        # yaw 仍从 dog_state.json 读 (broadcast_loop 的 _read_ros2_state 已处理)
+        # 这里返回 0, 真值由 broadcast_loop 直接推给前端
+        return self._imu_yaw
+
+    @property
+    def stats(self):
+        return {"imu_count": self._imu_count, "robot_mode": 0,
+                "robot_velocity": [self._vx, self._vy, self._vyaw]}
 
 
 # ============================================================================
@@ -567,6 +658,12 @@ def create_server(host, port, static_dir):
             p = urlparse(self.path)
             if p.path in ('/', '/index.html'):
                 self._serve(os.path.join(static_dir, 'panel.html'), 'text/html')
+            elif p.path == '/map.js':
+                self._serve(os.path.join(static_dir, 'map.js'), 'application/javascript')
+            elif p.path == '/api/foxglove':
+                # Foxglove bridge URL (需另起 foxglove_bridge 节点, 默认 8765)
+                host_ip = os.environ.get("GO2W_PUBLIC_IP", "localhost")
+                self._json({"url": f"http://{host_ip}:8080", "ws": f"ws://{host_ip}:8765"})
             elif p.path == '/api/status':
                 self._json({"connected": robot.connected if robot else False,
                             "imu_yaw": robot.imu_yaw if robot else 0,
@@ -595,6 +692,21 @@ def create_server(host, port, static_dir):
                     except Exception: text = body
                 if text: task_mgr.process_command(text)
                 self._json({"ok": True, "text": text})
+            elif p.path == '/api/search':
+                # 表单/地图选区搜索: width,height,spacing,origin_x,origin_y
+                w = float(q.get('width', ['8'])[0])
+                h = float(q.get('height', ['8'])[0])
+                sp = float(q.get('spacing', ['2'])[0])
+                ox = float(q.get('origin_x', ['0'])[0])
+                oy = float(q.get('origin_y', ['0'])[0])
+                pattern = q.get('pattern', ['lawnmower'])[0]
+                task_mgr.add_list([{
+                    "type": "search_area",
+                    "priority": 5,
+                    "params": {"pattern": pattern, "width": w, "height": h,
+                               "spacing": sp, "origin_x": ox, "origin_y": oy},
+                }])
+                self._json({"ok": True, "msg": f"搜索 {w}x{h}m 间距{sp}m 已入队"})
             else: self.send_error(404)
 
         def _json(self, d):
@@ -627,10 +739,105 @@ def run_ws(host, port):
     WS_LOOP.run_until_complete(websockets.serve(h, host, port)); WS_LOOP.run_forever()
 
 
+# ---- 死推算位姿 (阶段A: 没有真SLAM时, 用速度积分近似狗的位置) ----
+# 真 SLAM (FAST_LIO) 通了后, 这套会被 slam_subscriber 提供的真里程计覆盖 (阶段B)
+_dead_reckon = {"x": 0.0, "y": 0.0, "yaw": 0.0, "trail": [], "last_t": 0.0, "last_dets": []}
+
+
+def _update_dead_reckon():
+    """用当前速度 × dt 积分, 近似狗位移。yaw 用 IMU 真值(准), xy 是近似(无真里程计时)。"""
+    if not (robot and robot.connected):
+        return
+    now = time.time()
+    if _dead_reckon["last_t"] == 0.0:
+        _dead_reckon["last_t"] = now
+        return
+    dt = now - _dead_reckon["last_t"]
+    if dt > 1.0: dt = 0.15  # 异常间隔, 用默认
+    _dead_reckon["last_t"] = now
+    yaw = robot.imu_yaw  # 朝向用 IMU 真值
+    with robot._lock:
+        vx, vy, vyaw = robot._vx, robot._vy, robot._vyaw
+    # body frame → world frame 速度 (用 yaw 旋转)
+    import math as _m
+    cos_y, sin_y = _m.cos(yaw), _m.sin(yaw)
+    _dead_reckon["x"] += (vx * cos_y - vy * sin_y) * dt
+    _dead_reckon["y"] += (vx * sin_y + vy * cos_y) * dt
+    _dead_reckon["yaw"] = yaw
+    # 轨迹采样: 移动超过 0.1m 才记一个点
+    if not _dead_reckon["trail"]:
+        _dead_reckon["trail"].append([round(_dead_reckon["x"], 2), round(_dead_reckon["y"], 2)])
+    else:
+        lx, ly = _dead_reckon["trail"][-1]
+        if _m.hypot(_dead_reckon["x"] - lx, _dead_reckon["y"] - ly) > 0.1:
+            _dead_reckon["trail"].append([round(_dead_reckon["x"], 2), round(_dead_reckon["y"], 2)])
+            if len(_dead_reckon["trail"]) > 2000:
+                _dead_reckon["trail"] = _dead_reckon["trail"][-2000:]
+
+
+# ---- ROS2 模式: 从容器写的 dog_state.json 读真狗数据 ----
+ROS2_STATE_FILE = os.path.join(os.path.dirname(__file__), "dog_state.json")
+_ros2_trail = []
+
+
+def _read_ros2_state():
+    """读 ros_to_json.py 写的真狗状态。返回 None 表示文件不存在/过期。"""
+    global _ros2_trail
+    try:
+        with open(ROS2_STATE_FILE) as f:
+            d = json.load(f)
+        # 数据新鲜度检查 (3秒内的才算有效)
+        if time.time() - d.get("last_t", 0) > 3.0:
+            return None
+        # 轨迹累积 (文件里的trail会被ros_to_json截断, 这里本地保留)
+        if d.get("trail"):
+            _ros2_trail = d["trail"]
+        return d
+    except Exception:
+        return None
+
+
 def broadcast_loop():
     logger.info("广播启动")
+    slam_counter = 0
+    # Mock 模式: 没连狗时, 推假数据让前端布局可见 (转圈走的轨迹)
+    mock_t = 0.0
     while True:
         try:
+            # ROS2 模式: 从载荷NX经容器桥接来的真狗数据 (优先)
+            if os.environ.get("GO2W_USE_ROS2"):
+                st = _read_ros2_state()
+                if st:
+                    # 把扫描点转世界坐标 (机体系 → 用yaw旋转) 供地图显示
+                    import math as _rm
+                    yaw = st.get("yaw", 0.0)
+                    cos_y, sin_y = _rm.cos(yaw), _rm.sin(yaw)
+                    scan_pts = []
+                    for i, r in enumerate(st.get("ranges", [])):
+                        if 0.1 < r < 9.9:
+                            ang = -_rm.pi + i * 2 * _rm.pi / max(len(st["ranges"]), 1)
+                            lx, ly = r * _rm.cos(ang), r * _rm.sin(ang)
+                            scan_pts.append([round(cos_y * lx - sin_y * ly + st["x"], 2),
+                                             round(sin_y * lx + cos_y * ly + st["y"], 2)])
+                    ws_broadcast({"type": "slam", "data": {
+                        "x": round(st.get("x", 0.0), 2), "y": round(st.get("y", 0.0), 2),
+                        "yaw": round(st.get("yaw", 0.0), 2),
+                        "trail": _ros2_trail,
+                        "map": [], "scan": scan_pts[:200],
+                        "detections": [], "waypoints": [], "currentWP": -1,
+                        "slam_source": "ros2_nx",
+                    }})
+                    ws_broadcast({"type": "status", "imu_yaw": round(st.get("yaw", 0.0), 3),
+                                  "stats": {"imu_count": st.get("imu_count", 0),
+                                            "robot_mode": 0, "connected": True},
+                                  "dog_state": getattr(robot, "robot_state", "UNKNOWN"),
+                                  "tasks": task_mgr.get_state() if task_mgr else {}})
+                else:
+                    ws_broadcast({"type": "status", "imu_yaw": 0.0,
+                                  "dog_state": getattr(robot, "robot_state", "UNKNOWN"),
+                                  "tasks": task_mgr.get_state() if task_mgr else {}})
+                time.sleep(0.15)
+                continue
             if robot and robot.connected:
                 frame = robot.get_frame(); dets = []
                 if frame is not None:
@@ -642,6 +849,44 @@ def broadcast_loop():
                                   "detections": len(dets)})
                 ws_broadcast({"type": "status", "imu_yaw": round(robot.imu_yaw, 3),
                               "stats": robot.stats, "tasks": task_mgr.get_state() if task_mgr else {}})
+
+                # SLAM 推送 (每帧都推, 前端用 requestAnimationFrame 自己控制渲染)
+                _update_dead_reckon()
+                slam_counter += 1
+                if slam_counter % 2 == 0:  # 约 3Hz, 够画地图
+                    ws_broadcast({"type": "slam", "data": {
+                        "x": round(_dead_reckon["x"], 2),
+                        "y": round(_dead_reckon["y"], 2),
+                        "yaw": round(_dead_reckon["yaw"], 2),
+                        "trail": _dead_reckon["trail"],
+                        "map": [],          # 阶段A无栅格地图 (阶段B接nav2)
+                        "scan": [],          # 阶段A无扫描点 (阶段B接MID360)
+                        "detections": _dead_reckon["last_dets"],
+                        "waypoints": [],
+                        "currentWP": -1,
+                        "slam_source": "dead_reckon",  # 标明这是死推算, 非真SLAM
+                    }})
+            elif os.environ.get("GO2W_NO_ROBOT"):
+                # Mock 模式: 没连狗时推假数据, 让前端布局可见 (狗沿螺旋转圈走)
+                import math as _m2
+                mock_t += 0.15
+                mx = round(_m2.cos(mock_t * 0.3) * mock_t * 0.15, 2)
+                my = round(_m2.sin(mock_t * 0.3) * mock_t * 0.15, 2)
+                myaw = round(_m2.sin(mock_t * 0.5), 2)
+                ws_broadcast({"type": "slam", "data": {
+                    "x": mx, "y": my, "yaw": myaw,
+                    "trail": [[round(_m2.cos(mock_t * 0.3 - i * 0.1) * (mock_t - i * 0.15) * 0.15, 2),
+                               round(_m2.sin(mock_t * 0.3 - i * 0.1) * (mock_t - i * 0.15) * 0.15, 2)]
+                              for i in range(0, int(mock_t / 0.15), 3) if i < 40],
+                    "map": [], "scan": [],
+                    "detections": [{"x": 2.5, "y": 1.0, "class": "person"}],
+                    "waypoints": [{"x": 3.0, "y": 0.0}, {"x": 3.0, "y": 3.0}, {"x": 0.0, "y": 3.0}],
+                    "currentWP": 1,
+                    "slam_source": "mock",
+                }})
+                ws_broadcast({"type": "status", "imu_yaw": myaw,
+                              "stats": {"imu_count": int(mock_t * 10), "robot_mode": 0},
+                              "tasks": task_mgr.get_state() if task_mgr else {}})
             time.sleep(0.15)
         except Exception as e: logger.warning(f"广播: {e}"); time.sleep(0.5)
 
@@ -656,7 +901,13 @@ def main():
     ws_port = int(os.environ.get("GO2W_WS_PORT", "8001"))
     interface = os.environ.get("GO2W_INTERFACE", "enp65s0")
 
-    robot = RobotConnection(interface)
+    use_ros2 = bool(os.environ.get("GO2W_USE_ROS2"))
+    if use_ros2:
+        # ROS2 模式: 控狗经 NX 的 nx_motion_node (发 /cmd_vel /cmd_pose)
+        # 自动站立/看门狗/lease 都在 NX 节点上, PC 这边只转发指令
+        robot = RosRobotBridge()
+    else:
+        robot = RobotConnection(interface)
     logger.info("加载 VLM 模型...")
     vlm = VLMEngine()
     if not vlm.load(): logger.warning("VLM 加载失败，将使用关键词匹配"); vlm = None
@@ -666,13 +917,20 @@ def main():
     task_mgr = TaskManager(robot, vlm_engine=vlm, detector=detector)
 
     try:
-        logger.info("连接 Go2W ..."); robot.connect()
-        logger.info("已连接，执行站立序列 ...")
-        robot._stand_done.clear()
-        with robot._lock: robot._cmd = 'stand'
-        robot._stand_done.wait(10); robot.start_watchdog()
-        logger.info("就绪 — STOPPED 状态，机器人静止")
-    except Exception as e: logger.warning(f"连接失败: {e}")
+        if use_ros2:
+            logger.info("ROS2 模式: 连接 cmd_publisher (转发指令到 NX) ...")
+            robot.connect()
+            logger.info("就绪 — 指令经 /cmd_vel → NX nx_motion_node 控狗 (自动站立由NX负责)")
+        elif os.environ.get("GO2W_NO_ROBOT"):
+            logger.info("GO2W_NO_ROBOT=1, 跳过连狗 (前端验证模式)")
+        else:
+            logger.info("连接 Go2W ..."); robot.connect()
+            logger.info("已连接，执行站立序列 ...")
+            robot._stand_done.clear()
+            with robot._lock: robot._cmd = 'stand'
+            robot._stand_done.wait(10); robot.start_watchdog()
+            logger.info("就绪 — STOPPED 状态，机器人静止")
+    except Exception as e: logger.warning(f"连接失败: {e} (继续起 Web 服务, 前端可访问)")
 
     static_dir = os.path.join(os.path.dirname(__file__), 'static')
     logger.info(f"Web: http://{host}:{port}  WS: ws://{host}:{ws_port}")

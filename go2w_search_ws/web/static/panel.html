@@ -4,239 +4,350 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
-<meta http-equiv="Pragma" content="no-cache">
-<meta http-equiv="Expires" content="0">
-<title>Go2W 控制面板 v2</title>
+<title>Go2W 搜索控制台</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: #0a0a0a; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
+body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: #0a0a0a; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
 
-header { background: #141414; border-bottom: 1px solid #2a2a2a; padding: 10px 20px; display: flex; align-items: center; justify-content: space-between; }
-header h1 { font-size: 16px; font-weight: 600; color: #fff; }
-.status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
-.status-dot.off { background: #666; }
+/* 顶栏 */
+header { background: #141414; border-bottom: 1px solid #2a2a2a; padding: 8px 16px; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; }
+.status-group { display: flex; gap: 14px; align-items: center; }
+.status-item { font-size: 11px; color: #888; display: flex; align-items: center; }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 4px; background: #666; }
 .status-dot.on { background: #4caf50; animation: pulse 2s infinite; }
-@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
-.conn-info { font-size: 12px; color: #888; }
+.status-dot.warn { background: #ff9800; }
+.status-dot.off { background: #666; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+.pose-info { font-size: 11px; color: #aaa; font-family: monospace; }
 
+/* 主体: 左地图 + 右栏 */
 .main { display: flex; flex: 1; overflow: hidden; }
 
-/* 左栏: 视频 */
-.left { flex: 2; display: flex; flex-direction: column; border-right: 1px solid #2a2a2a; }
-.video-wrap { flex: 1; background: #000; position: relative; display: flex; align-items: center; justify-content: center; }
+/* 左: 地图 (60%) */
+.map-pane { flex: 6; display: flex; flex-direction: column; border-right: 1px solid #2a2a2a; position: relative; }
+.map-toolbar { background: #111; border-bottom: 1px solid #2a2a2a; padding: 6px 12px; display: flex; align-items: center; gap: 8px; flex-shrink: 0; font-size: 11px; }
+.map-toolbar .label { color: #666; }
+.map-canvas-wrap { flex: 1; position: relative; background: #0a1520; overflow: hidden; }
+#mapCanvas { width: 100%; height: 100%; display: block; cursor: crosshair; }
+.map-hint { position: absolute; bottom: 8px; left: 12px; font-size: 10px; color: #546e7a; pointer-events: none; }
+.map-source { position: absolute; top: 8px; right: 12px; font-size: 10px; color: #546e7a; background: rgba(0,0,0,0.4); padding: 2px 8px; border-radius: 3px; pointer-events: none; }
+
+/* 右栏 (40%) */
+.right-pane { flex: 4; display: flex; flex-direction: column; min-width: 300px; }
+.section { border-bottom: 1px solid #2a2a2a; display: flex; flex-direction: column; overflow: hidden; }
+.section-header { padding: 8px 14px; font-size: 11px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.5px; background: #111; flex-shrink: 0; display: flex; justify-content: space-between; align-items: center; }
+
+/* 视频 */
+.video-section { flex: 0 0 auto; }
+.video-wrap { background: #000; position: relative; width: 100%; height: 200px; display: flex; align-items: center; justify-content: center; }
 .video-wrap img { max-width: 100%; max-height: 100%; object-fit: contain; }
-.video-overlay { position: absolute; top: 10px; left: 10px; display: flex; gap: 8px; }
-.badge { background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 4px; font-size: 11px; }
-.badge.green { color: #4caf50; }
-.badge.orange { color: #ff9800; }
-.no-video { color: #555; font-size: 14px; }
+.video-overlay { position: absolute; top: 6px; left: 6px; display: flex; gap: 6px; }
+.badge { background: rgba(0,0,0,0.7); padding: 2px 7px; border-radius: 3px; font-size: 10px; }
+.badge.green { color: #4caf50; } .badge.orange { color: #ff9800; }
+.no-video { color: #555; font-size: 12px; }
 
-/* 右栏: 任务 + 指令 */
-.right { flex: 1; display: flex; flex-direction: column; min-width: 320px; }
+/* 检测列表 */
+.det-list { padding: 6px 14px; max-height: 90px; overflow-y: auto; }
+.det-item { font-size: 11px; color: #ff8a80; padding: 2px 0; display: flex; justify-content: space-between; }
+.det-empty { color: #555; font-size: 11px; text-align: center; padding: 8px; }
 
-.section { border-bottom: 1px solid #2a2a2a; }
-.section-header { padding: 10px 14px; font-size: 12px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.5px; background: #111; }
-
-/* 指令输入 */
-.cmd-section { padding: 14px; background: #0f0f0f; }
-.cmd-input-wrap { display: flex; gap: 8px; }
-.cmd-input { flex: 1; padding: 10px 14px; background: #1a1a1a; border: 1px solid #333; border-radius: 6px; color: #fff; font-size: 14px; outline: none; }
-.cmd-input:focus { border-color: #1565c0; }
-.cmd-input::placeholder { color: #555; }
-.cmd-send { padding: 10px 20px; background: #1565c0; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; }
-.cmd-send:hover { background: #1976d2; }
-
-.quick-cmds { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
-.quick-btn { padding: 5px 12px; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 14px; color: #aaa; font-size: 12px; cursor: pointer; }
-.quick-btn:hover { border-color: #555; color: #fff; }
-
-/* 任务列表 */
-.task-list { flex: 1; overflow-y: auto; padding: 8px 14px; }
-.task-empty { color: #555; font-size: 13px; text-align: center; padding: 30px; }
-.task-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 6px; margin-bottom: 4px; transition: background 0.2s; }
+/* 任务队列 */
+.task-section { flex: 1; }
+.task-list { flex: 1; overflow-y: auto; padding: 6px 14px; }
+.task-empty { color: #555; font-size: 12px; text-align: center; padding: 20px; }
+.task-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 5px; margin-bottom: 3px; }
 .task-item:hover { background: #1a1a1a; }
-.task-icon { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; }
+.task-icon { width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; flex-shrink: 0; }
 .task-icon.pending { background: #1a237e; color: #7986cb; }
 .task-icon.active { background: #e65100; color: #fff; animation: pulse 1.5s infinite; }
 .task-icon.completed { background: #1b5e20; color: #81c784; }
 .task-icon.failed { background: #b71c1c; color: #ef9a9a; }
 .task-icon.cancelled { background: #333; color: #666; }
 .task-info { flex: 1; min-width: 0; }
-.task-type { font-size: 13px; font-weight: 500; color: #ddd; }
-.task-params { font-size: 11px; color: #666; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.task-status { font-size: 11px; padding: 2px 8px; border-radius: 3px; }
-.task-status.pending { color: #7986cb; }
-.task-status.active { color: #ff9800; }
-.task-status.completed { color: #81c784; }
-.task-status.failed { color: #ef9a9a; }
+.task-type { font-size: 12px; color: #ddd; }
+.task-params { font-size: 10px; color: #666; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task-status { font-size: 10px; padding: 1px 6px; border-radius: 3px; }
+.task-status.pending { color: #7986cb; } .task-status.active { color: #ff9800; } .task-status.completed { color: #81c784; } .task-status.failed { color: #ef9a9a; }
 
-/* 对话 */
-.chat-section { flex: 1; overflow-y: auto; padding: 10px 14px; min-height: 120px; }
-.chat-msg { margin-bottom: 10px; }
-.chat-user { font-size: 13px; color: #90caf9; margin-bottom: 2px; }
-.chat-bot { font-size: 13px; color: #a5d6a7; padding: 6px 10px; background: #1a2e1a; border-radius: 6px; }
-.chat-time { font-size: 10px; color: #555; margin-top: 2px; }
+/* 底部控制区 */
+.bottom { background: #141414; border-top: 1px solid #2a2a2a; flex-shrink: 0; }
+.cmd-row { padding: 8px 14px; border-bottom: 1px solid #2a2a2a; }
+.cmd-input-wrap { display: flex; gap: 6px; }
+.cmd-input { flex: 1; padding: 7px 10px; background: #1a1a1a; border: 1px solid #333; border-radius: 5px; color: #fff; font-size: 12px; outline: none; }
+.cmd-input:focus { border-color: #1565c0; }
+.cmd-input::placeholder { color: #555; }
+.quick-cmds { display: flex; gap: 5px; margin-top: 6px; flex-wrap: wrap; }
+.quick-btn { padding: 3px 9px; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; color: #aaa; font-size: 11px; cursor: pointer; }
+.quick-btn:hover { border-color: #555; color: #fff; }
 
-/* 底部控制栏 */
-.bottom-bar {
-  background: #141414;
-  border-top: 1px solid #2a2a2a;
-  padding: 12px 20px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-shrink: 0;
-}
-.ctrl-group {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-}
-.ctrl-group.move-pad {
-  margin-left: auto;
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  grid-template-rows: repeat(2, 1fr);
-  gap: 4px;
-  width: 220px;
-}
-.btn { padding: 8px 16px; border: 1px solid #333; background: #1a1a1a; color: #ccc; border-radius: 4px; cursor: pointer; font-size: 13px; transition: all 0.15s; user-select: none; -webkit-user-select: none; }
+/* 搜索区域表单 */
+.search-form { display: flex; gap: 6px; margin-top: 6px; align-items: center; font-size: 11px; flex-wrap: wrap; }
+.search-form input { width: 42px; padding: 3px 5px; background: #1a1a1a; border: 1px solid #333; border-radius: 3px; color: #fff; font-size: 11px; text-align: center; }
+.search-form .lbl { color: #666; }
+
+/* 动作按钮栏 */
+.action-row { padding: 8px 14px; display: flex; align-items: center; gap: 10px; }
+.ctrl-group { display: flex; gap: 5px; align-items: center; }
+.btn { padding: 6px 12px; border: 1px solid #333; background: #1a1a1a; color: #ccc; border-radius: 4px; cursor: pointer; font-size: 12px; transition: all 0.12s; user-select: none; }
 .btn:hover { background: #252525; border-color: #555; color: #fff; }
-.btn:active { background: #333; transform: scale(0.96); }
+.btn:active { transform: scale(0.96); }
 .btn.primary { background: #1565c0; border-color: #1565c0; color: #fff; }
 .btn.primary:hover { background: #1976d2; }
 .btn.danger { background: #c62828; border-color: #c62828; color: #fff; }
 .btn.danger:hover { background: #d32f2f; }
-.btn.danger:active { background: #b71c1c; }
-.btn.move-btn { background: #1b3a1b; border-color: #2e5a2e; color: #81c784; font-size: 18px; padding: 10px 0; text-align: center; border-radius: 6px; }
-.btn.move-btn:hover { background: #2e5a2e; color: #a5d6a7; }
-.btn.move-btn:active { background: #4caf50; color: #fff; }
-.divider { width: 1px; height: 32px; background: #2a2a2a; }
+.btn.move-btn { background: #1b3a1b; border-color: #2e5a2e; color: #81c784; font-size: 15px; padding: 8px 0; width: 38px; text-align: center; border-radius: 5px; }
+.btn.move-btn:hover { background: #2e5a2e; } .btn.move-btn:active { background: #4caf50; color: #fff; }
+.move-pad { display: grid; grid-template-columns: repeat(3, 38px); grid-template-rows: repeat(2, 1fr); gap: 3px; margin-left: auto; }
+.divider { width: 1px; height: 28px; background: #2a2a2a; }
+.key-hint { padding: 5px 14px; font-size: 10px; color: #666; background: #0d0d0d; border-top: 1px solid #1a1a1a; flex-shrink: 0; }
+.key-hint b { color: #aaa; font-weight: 600; }
 </style>
 </head>
 <body>
 
 <header>
-  <div style="display:flex;align-items:center;gap:12px;">
-    <h1>Go2W 控制面板</h1>
-    <span><span class="status-dot off" id="connDot"></span><span class="conn-info" id="connText">未连接</span></span>
+  <div style="display:flex;align-items:center;">
+    <h1>Go2W 搜索控制台</h1>
+    <div class="status-group">
+      <span class="status-item"><span class="status-dot off" id="dogDot"></span>狗 <b id="dogStateLabel" style="color:#888;font-family:monospace;">--</b></span>
+      <span class="status-item"><span class="status-dot off" id="nxDot"></span>NX</span>
+      <span class="status-item"><span class="status-dot off" id="slamDot"></span>SLAM</span>
+    </div>
   </div>
-  <div class="conn-info" id="imuInfo">IMU: --</div>
+  <div class="pose-info" id="poseInfo">位姿: --</div>
 </header>
 
 <div class="main">
-  <!-- 左栏: 视频 -->
-  <div class="left">
-    <div class="video-wrap">
-      <div class="video-overlay">
-        <span class="badge green" id="fpsBadge">-- FPS</span>
-        <span class="badge orange" id="detBadge">0 目标</span>
-      </div>
-      <span class="no-video" id="noVideo">等待连接...</span>
-      <img id="videoImg" style="display:none" />
+  <!-- 左: 地图 -->
+  <div class="map-pane">
+    <div class="map-toolbar">
+      <span class="label">地图</span>
+      <button class="btn" style="padding:3px 9px;font-size:11px;" onclick="clearRegion()">清除选区</button>
+      <button class="btn" style="padding:3px 9px;font-size:11px;" onclick="clearTrail()">清空轨迹</button>
+      <span class="label" style="margin-left:auto;">提示: 地图上拖框选搜索区域</span>
+    </div>
+    <div class="map-canvas-wrap">
+      <canvas id="mapCanvas"></canvas>
+      <div class="map-source" id="mapSource">SLAM: 未连接</div>
+      <div class="map-hint">世界坐标系 (米) · 网格=1m · 拖框选区</div>
     </div>
   </div>
 
-  <!-- 右栏: 指令 + 任务 + 对话 -->
-  <div class="right">
-    <div class="section">
-      <div class="section-header">指令输入</div>
-      <div class="cmd-section">
-        <div class="cmd-input-wrap">
-          <input class="cmd-input" id="cmdInput" placeholder="输入指令: 搜索左边房间、跟着那个人、前进..." onkeydown="if(event.key==='Enter')sendCmd()" />
-          <button class="cmd-send" onclick="sendCmd()">发送</button>
+  <!-- 右栏: 视频+检测 / 任务 -->
+  <div class="right-pane">
+    <div class="section video-section">
+      <div class="section-header">相机 <span id="videoMeta">--</span></div>
+      <div class="video-wrap">
+        <div class="video-overlay">
+          <span class="badge green" id="fpsBadge">-- FPS</span>
+          <span class="badge orange" id="detBadge">0 目标</span>
         </div>
-        <div class="quick-cmds">
-          <span class="quick-btn" onclick="quickCmd('搜索这个区域')">搜索区域</span>
-          <span class="quick-btn" onclick="quickCmd('前进两米')">前进</span>
-          <span class="quick-btn" onclick="quickCmd('后退一米')">后退</span>
-          <span class="quick-btn" onclick="quickCmd('左转90度')">左转</span>
-          <span class="quick-btn" onclick="quickCmd('右转90度')">右转</span>
-          <span class="quick-btn" onclick="quickCmd('停下来')">停止</span>
-          <span class="quick-btn" onclick="quickCmd('回来')">返回</span>
-        </div>
+        <span class="no-video" id="noVideo">等待视频...</span>
+        <img id="videoImg" style="display:none" />
       </div>
+      <div class="det-list" id="detList"><div class="det-empty">无检测</div></div>
     </div>
 
-    <div class="section" style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
-      <div class="section-header" style="display:flex;justify-content:space-between;align-items:center;">
-        任务队列
-        <span id="taskCount" style="font-weight:400;color:#555;">0 待执行</span>
-      </div>
-      <div class="task-list" id="taskList">
-        <div class="task-empty">暂无任务</div>
-      </div>
-    </div>
-
-    <div class="section" style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
-      <div class="section-header">对话记录</div>
-      <div class="chat-section" id="chatBox"></div>
+    <div class="section task-section">
+      <div class="section-header">任务队列 <span id="taskCount" style="font-weight:400;color:#555;">0 待执行</span></div>
+      <div class="task-list" id="taskList"><div class="task-empty">暂无任务</div></div>
     </div>
   </div>
 </div>
 
-<!-- 底部控制栏: 所有动作按钮 -->
-<div class="bottom-bar">
-  <div class="ctrl-group">
-    <button class="btn primary" onclick="connect()">连接并站立</button>
-    <button class="btn" onclick="stand()">站立</button>
-    <button class="btn" onclick="sit()">坐下</button>
-    <button class="btn danger" onclick="stop()">急停</button>
+<!-- 底部: 指令 + 搜索表单 + 动作 -->
+<div class="bottom">
+  <div class="cmd-row">
+    <div class="cmd-input-wrap">
+      <input class="cmd-input" id="cmdInput" placeholder="输入指令: 搜索前方10x10米找红色背包..." onkeydown="if(event.key==='Enter')sendCmd()" />
+      <button class="btn primary" onclick="sendCmd()">发送</button>
+    </div>
+    <div class="search-form">
+      <span class="lbl">或表单搜索:</span>
+      <span class="lbl">宽</span><input type="number" id="searchW" value="8" step="0.5">
+      <span class="lbl">高</span><input type="number" id="searchH" value="8" step="0.5">
+      <span class="lbl">间距</span><input type="number" id="searchSpacing" value="2" step="0.5">
+      <button class="btn" style="padding:3px 10px;" onclick="searchByForm()">从当前位置搜索</button>
+    </div>
+    <div class="quick-cmds">
+      <span class="quick-btn" onclick="quickCmd('搜索区域')">用选区搜索</span>
+      <span class="quick-btn" onclick="quickCmd('前进两米')">前进</span>
+      <span class="quick-btn" onclick="quickCmd('后退一米')">后退</span>
+      <span class="quick-btn" onclick="quickCmd('左转90度')">左转</span>
+      <span class="quick-btn" onclick="quickCmd('右转90度')">右转</span>
+      <span class="quick-btn" onclick="quickCmd('停下来')">停止</span>
+      <span class="quick-btn" onclick="quickCmd('返回起点')">返回</span>
+    </div>
   </div>
-  <div class="divider"></div>
-  <div class="ctrl-group move-pad">
-    <div></div>
-    <button class="btn move-btn" onmousedown="move(0.5,0,0)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0.5,0,0)" ontouchend="stopMove()">↑</button>
-    <div></div>
-    <button class="btn move-btn" onmousedown="move(0,0,0.5)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0,0,0.5)" ontouchend="stopMove()">↺</button>
-    <button class="btn move-btn" onmousedown="move(-0.5,0,0)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(-0.5,0,0)" ontouchend="stopMove()">↓</button>
-    <button class="btn move-btn" onmousedown="move(0,0,-0.5)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0,0,-0.5)" ontouchend="stopMove()">↻</button>
+  <div class="action-row">
+    <div class="ctrl-group">
+      <button class="btn primary" onclick="connect()">连接并站立</button>
+      <button class="btn" onclick="stand()">站立</button>
+      <button class="btn" onclick="sit()">坐下</button>
+      <button class="btn danger" onclick="eStop()">急停</button>
+    </div>
+    <div class="divider"></div>
+    <button class="btn" onclick="openFoxglove()" title="另开 Foxglove 看 nav2 原生数据">Foxglove</button>
+    <div class="move-pad">
+      <button class="btn move-btn" id="kQ" title="Q 左平移" onmousedown="move(0,0.3,0)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0,0.3,0)" ontouchend="stopMove()">←平</button>
+      <button class="btn move-btn" id="kW" title="W/↑ 前进" onmousedown="move(0.4,0,0)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0.4,0,0)" ontouchend="stopMove()">↑</button>
+      <button class="btn move-btn" id="kE" title="E 右平移" onmousedown="move(0,-0.3,0)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0,-0.3,0)" ontouchend="stopMove()">平→</button>
+      <button class="btn move-btn" id="kA" title="A/← 左转" onmousedown="move(0,0,0.5)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0,0,0.5)" ontouchend="stopMove()">↺</button>
+      <button class="btn move-btn" id="kS" title="S/↓ 后退" onmousedown="move(-0.4,0,0)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(-0.4,0,0)" ontouchend="stopMove()">↓</button>
+      <button class="btn move-btn" id="kD" title="D/→ 右转" onmousedown="move(0,0,-0.5)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0,0,-0.5)" ontouchend="stopMove()">↻</button>
+    </div>
   </div>
+  <div class="key-hint">键盘: <b>W/↑</b>前进 <b>S/↓</b>后退 <b>A/←</b>左转 <b>D/→</b>右转 <b>Q</b>左平移 <b>E</b>右平移 <b>1</b>站立 <b>2</b>坐下 <b>空格</b>急停 · (输入框聚焦时不响应)</div>
 </div>
 
+<script src="/map.js"></script>
 <script>
 let ws, connected = false, frameCount = 0, lastFpsTime = Date.now(), _moveInterval = null;
+let latestDetections = [];
+let map = null;
 
-function move(vx,vy,vyaw) {
-  clearInterval(_moveInterval);
-  fetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, {method:'POST'});
-  _moveInterval = setInterval(() => {
-    fetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, {method:'POST'});
-  }, 200);
-}
-function stopMove() {
-  clearInterval(_moveInterval);
-  _moveInterval = null;
-  fetch('/api/stop', {method:'POST'});
-}
-
-function connect() {
-  fetch('/api/connect', {method:'POST'}).then(r=>r.json()).then(d => {
-    if (d.ok) { connected = true; updateConn(true); addLog(d.msg); }
+// ---- 地图初始化 ----
+function initMap() {
+  map = new Go2WMap(document.getElementById('mapCanvas'), {
+    onSelectRegion: (region) => {
+      // 拖框选区后, 同步到表单 + 提示
+      document.getElementById('searchW').value = region.w.toFixed(1);
+      document.getElementById('searchH').value = region.h.toFixed(1);
+      console.log('[选区]', region);
+    }
   });
+  map.start();
 }
-function stand() { fetch('/api/stand', {method:'POST'}); }
-function sit() { fetch('/api/sit', {method:'POST'}); }
-function stop() { clearInterval(_moveInterval); _moveInterval = null; fetch('/api/e_stop', {method:'POST'}); }
+function clearRegion() { if (map) map.clearRegion(); }
+function clearTrail() { if (map) { map.slam.trail = []; } }
 
+// ---- 运动控制 ----
+// 速度档位 (偏稳, 后期可调): 前进0.4 后退0.4 转向0.5 平移0.3
+const SPEED = { fwd: 0.4, turn: 0.5, strafe: 0.3 };
+let pressedKeys = new Set();   // 当前按下的控制键
+// _moveInterval 已在顶部 (line 206) 声明, 这里不重复声明
+
+// 按当前 pressedKeys 合成速度并发送 (键盘控制专用)
+function sendMoveFromKeys() {
+  let vx = 0, vy = 0, vyaw = 0;
+  if (pressedKeys.has('w') || pressedKeys.has('arrowup'))    vx  += SPEED.fwd;
+  if (pressedKeys.has('s') || pressedKeys.has('arrowdown'))  vx  -= SPEED.fwd;
+  if (pressedKeys.has('a') || pressedKeys.has('arrowleft'))  vyaw += SPEED.turn;
+  if (pressedKeys.has('d') || pressedKeys.has('arrowright')) vyaw -= SPEED.turn;
+  if (pressedKeys.has('q')) vy  += SPEED.strafe;
+  if (pressedKeys.has('e')) vy  -= SPEED.strafe;
+  // 多键组合直接发合成速度; 全松开则停
+  if (vx === 0 && vy === 0 && vyaw === 0) stopMove();
+  else fetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, { method: 'POST' }).catch(() => {});
+}
+
+// 按钮拖拽控制 (onmousedown 持续, onmouseup/leave 停)
+function move(vx, vy, vyaw) {
+  clearInterval(_moveInterval);
+  fetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, { method: 'POST' });
+  // RosRobotBridge 每次写stdin即时生效, 但保留低频续发以防丢包 (NX看门狗1s兜底)
+  _moveInterval = setInterval(() => fetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, { method: 'POST' }), 300);
+}
+function stopMove() { clearInterval(_moveInterval); _moveInterval = null; fetch('/api/stop', { method: 'POST' }); }
+function connect() { fetch('/api/connect', { method: 'POST' }).then(r => r.json()).then(d => { if (d.ok) { connected = true; updateDogStatus(true); } }); }
+function stand() { fetch('/api/stand', { method: 'POST' }); }
+function sit() { fetch('/api/sit', { method: 'POST' }); }
+function eStop() { clearInterval(_moveInterval); _moveInterval = null; pressedKeys.clear(); resetKeyHighlight(); fetch('/api/e_stop', { method: 'POST' }); }
+
+// ---- 键盘控制 ----
+const KEY_MAP = {
+  'w':'kW','arrowup':'kW', 's':'kS','arrowdown':'kS',
+  'a':'kA','arrowleft':'kA', 'd':'kD','arrowright':'kD',
+  'q':'kQ', 'e':'kE'
+};
+function isTyping() {
+  const a = document.activeElement;
+  return a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA');
+}
+function highlightKey(btnId, on) {
+  const el = document.getElementById(btnId);
+  if (el) el.style.background = on ? '#4caf50' : '';
+  if (el) el.style.color = on ? '#fff' : '';
+}
+function resetKeyHighlight() {
+  ['kW','kS','kA','kD','kQ','kE'].forEach(id => highlightKey(id, false));
+}
+document.addEventListener('keydown', (e) => {
+  if (isTyping()) return;            // 输入框内打字不触发
+  const k = e.key.toLowerCase();
+  if (k in KEY_MAP) {
+    e.preventDefault();
+    pressedKeys.add(k);
+    highlightKey(KEY_MAP[k], true);
+    sendMoveFromKeys();
+  } else if (k === ' ' || k === 'spacebar') {
+    e.preventDefault(); eStop();     // 空格急停
+  } else if (k === '1' || k === 'pageup') { stand(); }
+  else if (k === '2' || k === 'pagedown') { sit(); }
+});
+document.addEventListener('keyup', (e) => {
+  if (isTyping()) return;
+  const k = e.key.toLowerCase();
+  if (k in KEY_MAP) {
+    pressedKeys.delete(k);
+    // 同组键(如w和arrowup)都松开才取消高亮
+    const grp = KEY_MAP[k];
+    const stillDown = Object.keys(KEY_MAP).some(kk => KEY_MAP[kk] === grp && pressedKeys.has(kk));
+    if (!stillDown) highlightKey(grp, false);
+    sendMoveFromKeys();
+  }
+});
+
+// ---- 指令 ----
 function sendCmd() {
   const input = document.getElementById('cmdInput');
   const text = input.value.trim();
   if (!text) return;
   input.value = '';
-  addChat('user', text);
-  fetch('/api/command', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
+  fetch('/api/command', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
 }
-function quickCmd(text) {
-  document.getElementById('cmdInput').value = text;
-  sendCmd();
+function quickCmd(text) { document.getElementById('cmdInput').value = text; sendCmd(); }
+
+// 表单搜索: 从狗当前位置起, 按输入的宽高搜索
+function searchByForm() {
+  const w = parseFloat(document.getElementById('searchW').value) || 8;
+  const h = parseFloat(document.getElementById('searchH').value) || 8;
+  const sp = parseFloat(document.getElementById('searchSpacing').value) || 2;
+  fetch(`/api/search?width=${w}&height=${h}&spacing=${sp}`, { method: 'POST' })
+    .then(r => r.json()).then(d => { if (d.ok) { document.getElementById('taskCount').textContent = '搜索已启动'; } });
 }
 
-function updateConn(on) {
-  const dot = document.getElementById('connDot');
-  const txt = document.getElementById('connText');
+function openFoxglove() {
+  fetch('/api/foxglove').then(r => r.json()).then(d => {
+    if (d.url) window.open(d.url, '_blank');
+    else alert('Foxglove bridge 未启动');
+  }).catch(() => alert('Foxglove bridge 未启动'));
+}
+
+// ---- 状态更新 ----
+function updateDogStatus(on) {
+  const dot = document.getElementById('dogDot');
   dot.className = 'status-dot ' + (on ? 'on' : 'off');
-  txt.textContent = on ? '已连接' : '未连接';
+}
+function updateDogState(state) {
+  // state: STOPPED/MOVING/STANDING/SITTING/SEATED/EMERGENCY/UNKNOWN
+  const el = document.getElementById('dogStateLabel');
+  if (!el) return;
+  const colors = { STOPPED:'#4caf50', MOVING:'#ff9800', STANDING:'#2196f3',
+                   SITTING:'#ff9800', SEATED:'#888', EMERGENCY:'#f44336', UNKNOWN:'#666' };
+  el.textContent = state || '--';
+  el.style.color = colors[state] || '#888';
+  // 急停时狗状态点变红闪烁
+  const dot = document.getElementById('dogDot');
+  if (state === 'EMERGENCY') dot.className = 'status-dot warn';
+  else if (state && state !== 'UNKNOWN') dot.className = 'status-dot on';
+}
+function updateSlamStatus(source) {
+  const dot = document.getElementById('slamDot');
+  const el = document.getElementById('mapSource');
+  if (source && source !== 'none') { dot.className = 'status-dot on'; el.textContent = 'SLAM: ' + source; }
+  else { dot.className = 'status-dot off'; el.textContent = 'SLAM: 未连接'; }
 }
 
 function updateTasks(data) {
@@ -244,135 +355,101 @@ function updateTasks(data) {
   const countEl = document.getElementById('taskCount');
   const active = data.active;
   const pending = data.pending || [];
-
   let html = '';
-  if (active) {
-    html += taskHTML(active);
-  }
-  for (const t of pending) {
-    html += taskHTML(t);
-  }
+  if (active) html += taskHTML(active);
+  for (const t of pending) html += taskHTML(t);
   if (!html) html = '<div class="task-empty">暂无任务</div>';
   el.innerHTML = html;
   countEl.textContent = `${pending.length} 待执行`;
 }
-
 function taskHTML(t) {
-  const icons = {navigate:'→',search_area:'◎',follow:'◎',move:'→',stop:'■',return_home:'↩',observe:'◎',wait:'◎'};
-  const typeNames = {navigate:'导航',search_area:'区域搜索',follow:'跟踪',move:'移动',stop:'停止',return_home:'返回',observe:'观察',wait:'等待'};
-  return `<div class="task-item">
-    <div class="task-icon ${t.status}">${icons[t.type]||'?'}</div>
-    <div class="task-info">
-      <div class="task-type">${typeNames[t.type]||t.type}</div>
-      <div class="task-params">${JSON.stringify(t.params).slice(0,50)}</div>
-    </div>
-    <span class="task-status ${t.status}">${t.status}</span>
-  </div>`;
+  const icons = { navigate: '→', search_area: '◎', follow: '◎', move: '→', stop: '■', return_home: '↩', observe: '◎', wait: '◎' };
+  const typeNames = { navigate: '导航', search_area: '区域搜索', follow: '跟踪', move: '移动', stop: '停止', return_home: '返回', observe: '观察', wait: '等待' };
+  return `<div class="task-item"><div class="task-icon ${t.status}">${icons[t.type] || '?'}</div><div class="task-info"><div class="task-type">${typeNames[t.type] || t.type}</div><div class="task-params">${JSON.stringify(t.params).slice(0, 48)}</div></div><span class="task-status ${t.status}">${t.status}</span></div>`;
+}
+function updateDetList(dets) {
+  const el = document.getElementById('detList');
+  if (!dets || !dets.length) { el.innerHTML = '<div class="det-empty">无检测</div>'; return; }
+  el.innerHTML = dets.map(d => `<div class="det-item"><span>${d.class}</span><span>${Math.round(d.confidence * 100)}%</span></div>`).join('');
 }
 
-function addChat(role, text) {
-  const el = document.getElementById('chatBox');
-  const time = new Date().toLocaleTimeString();
-  const cls = role === 'user' ? 'chat-user' : 'chat-bot';
-  const label = role === 'user' ? '你' : 'Go2W';
-  el.innerHTML += `<div class="chat-msg"><div class="${cls}"><b>${label}:</b> ${text}</div><div class="chat-time">${time}</div></div>`;
-  el.scrollTop = el.scrollHeight;
-}
-
-function addLog(msg) {
-  console.log('[Go2W]', msg);
-}
-
-// WebSocket
+// ---- WebSocket ----
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const wsUrl = `${proto}://${location.hostname}:8001`;
-  console.log('[WS] connecting to', wsUrl);
   ws = new WebSocket(wsUrl);
-  ws.onopen = () => { console.log('[WS] connected'); document.getElementById('noVideo').textContent = '视频加载中...'; };
-  ws.onerror = (e) => { console.error('[WS] error', e); };
   ws.onmessage = (e) => {
     try {
       const data = JSON.parse(e.data);
       if (data.type === 'frame') {
         const img = document.getElementById('videoImg');
-        const noVid = document.getElementById('noVideo');
         img.src = 'data:image/jpeg;base64,' + data.data;
         img.style.display = 'block';
-        noVid.style.display = 'none';
-        document.getElementById('detBadge').textContent = data.detections + ' 目标';
+        document.getElementById('noVideo').style.display = 'none';
+        document.getElementById('detBadge').textContent = (data.detections || 0) + ' 目标';
         frameCount++;
+      } else if (data.type === 'slam') {
+        if (map) map.update(data.data);
+        updateSlamStatus(data.data.slam_source);
+        const d = data.data;
+        document.getElementById('poseInfo').textContent = `位姿: x=${d.x.toFixed(2)} y=${d.y.toFixed(2)} yaw=${(d.yaw * 180 / Math.PI).toFixed(0)}°`;
       } else if (data.type === 'status') {
-        if (data.imu_yaw !== undefined) {
-          document.getElementById('imuInfo').textContent = `IMU yaw: ${data.imu_yaw.toFixed(2)} rad (${(data.imu_yaw * 180 / Math.PI).toFixed(1)}°)`;
-        }
         if (data.tasks) updateTasks(data.tasks);
+        if (data.connected !== undefined) { connected = data.connected; updateDogStatus(connected); }
+        if (data.dog_state) updateDogState(data.dog_state);
+        if (data.det_list) updateDetList(data.det_list);
       } else if (data.type === 'tasks') {
         updateTasks(data.data);
       } else if (data.type === 'vlm') {
-        const d = data.data;
-        if (d.response) addChat('bot', d.response);
+        if (data.data.response) console.log('[VLM]', data.data.response);
+      } else if (data.type === 'search') {
+        // 搜索发现目标 → 在地图标记 (detMarks 已在 slam 里)
+        if (data.data && data.data.found) console.log('[搜索发现]', data.data.found);
       }
-    } catch (err) { console.error('[WS] parse error', err); }
+    } catch (err) { console.error('[WS] parse', err); }
   };
-  ws.onclose = () => {
-    console.log('[WS] closed, reconnecting...');
-    clearInterval(_moveInterval); _moveInterval = null;  // 断线时停止运动
-    setTimeout(connectWS, 2000);
-  };
+  ws.onclose = () => { clearInterval(_moveInterval); _moveInterval = null; setTimeout(connectWS, 2000); };
 }
-// 页面加载时先发停止, 防止重连后残留运动
-fetch('/api/stop', {method:'POST'});
-connectWS();
 
-// FPS 计算
+// ---- 启动 ----
+initMap();
+connectWS();
+fetch('/api/stop', { method: 'POST' }); // 加载即停止, 防重连残留运动
+
+// FPS
 setInterval(() => {
   const now = Date.now();
-  const fps = Math.round(frameCount / ((now - lastFpsTime) / 1000));
-  document.getElementById('fpsBadge').textContent = fps + ' FPS';
-  frameCount = 0;
-  lastFpsTime = now;
+  document.getElementById('fpsBadge').textContent = Math.round(frameCount / ((now - lastFpsTime) / 1000)) + ' FPS';
+  frameCount = 0; lastFpsTime = now;
 }, 1000);
 
 // 状态轮询
 setInterval(() => {
-  fetch('/api/status').then(r=>r.json()).then(d => {
-    connected = d.connected;
-    updateConn(connected);
-    if (d.imu_yaw !== undefined) {
-      document.getElementById('imuInfo').textContent = `IMU yaw: ${d.imu_yaw.toFixed(2)} rad (${(d.imu_yaw*180/Math.PI).toFixed(1)}°)`;
-    }
-  }).catch(()=>{});
+  fetch('/api/status').then(r => r.json()).then(d => {
+    if (d.connected !== undefined) { connected = d.connected; updateDogStatus(connected); }
+    if (d.tasks) updateTasks(d.tasks);
+  }).catch(() => {});
 }, 3000);
 
 // 键盘控制
 const keyState = {};
 document.addEventListener('keydown', (e) => {
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.target.tagName === 'INPUT') return;
   if (keyState[e.key]) return;
   keyState[e.key] = true;
-
-  switch(e.key) {
-    case 'ArrowUp':    move(0.5, 0, 0); break;
-    case 'ArrowDown':  move(-0.5, 0, 0); break;
-    case 'ArrowLeft':  move(0, 0, 0.5); break;
+  switch (e.key) {
+    case 'ArrowUp': move(0.4, 0, 0); break;
+    case 'ArrowDown': move(-0.4, 0, 0); break;
+    case 'ArrowLeft': move(0, 0, 0.5); break;
     case 'ArrowRight': move(0, 0, -0.5); break;
   }
 });
-
 document.addEventListener('keyup', (e) => {
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.target.tagName === 'INPUT') return;
   keyState[e.key] = false;
-
-  const anyDown = Object.values(keyState).some(v => v);
-  if (!anyDown) stopMove();
+  if (!Object.values(keyState).some(v => v)) stopMove();
 });
-
-// 页面失焦时自动停止
-window.addEventListener('blur', () => {
-  Object.keys(keyState).forEach(k => keyState[k] = false);
-  stopMove();
-});
+window.addEventListener('blur', () => { Object.keys(keyState).forEach(k => keyState[k] = false); stopMove(); });
 </script>
 </body>
 </html>

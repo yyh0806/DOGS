@@ -1,0 +1,18 @@
+# 运行时生成的状态文件 (ros_to_json 实时写, 不进版本库)
+web/dog_state.json
+web/dog_state.json.tmp
+
+# 日志
+log/
+*.log
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 构建产物
+build/
+install/
+
+# 模型文件 (太大, 单独管理)
+*.pt
