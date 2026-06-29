@@ -77,8 +77,9 @@ class NxMotionNode(Node):
         self._sport = SportClient(enableLease=True)
         self._sport.SetTimeout(10.0)
         self._sport.Init()
-        # go2 包 SDK 缺 SwitchGait (版本不完整), 这里手动注册 API 1011。
-        # Go2W 轮式狗移动前必须 SwitchGait 切轮式步态, 否则 Move 触发足式迈步→摔倒。
+        # ⚠️ 历史遗留: 手动注册 SwitchGait API 1011。实测 SwitchGait(1)=trot 会让
+        # Go2W 摔倒 (见 docs/TECH_DECISIONS.md 第一节), 已停止调用。此注册保留待清理,
+        # 不影响当前移动控制 (移动逻辑已对齐 panel.py, 待实车验证)。
         self._SWITCHGAIT_API_ID = 1011
         self._sport._RegistApi(self._SWITCHGAIT_API_ID, 0)
         time.sleep(2)  # 等 lease 激活
@@ -167,6 +168,8 @@ class NxMotionNode(Node):
                     # 且每0.5s补一次StopMove清除运动控制器内部残留目标速度。
                     # Go2W ai-w 轮式模式: 仅Move(0,0,0)无法停轮子(实测轮子仍
                     # 以~1rad/s转), 必须StopMove()才能真正刹住。
+                    # ⚠️ 与 SDK_CAPABILITIES.md"StopMove对Go2W无效"冲突, 待 LowState 轮速
+                    # 实测裁决(见 TECH_DECISIONS §一 实车 TODO)。
                     now = time.time()
                     if now - last_zero_move > 0.5:
                         self._sport.StopMove()
@@ -180,8 +183,8 @@ class NxMotionNode(Node):
                 time.sleep(0.5)
 
     def _switch_gait(self, gait_type):
-        """切步态。go2 包 SDK 无 SwitchGait 方法, 直接用 API 1011 调用。
-        Go2W 轮式: gait_type 见官方示例 (go2w示例用1, as2示例用0)。"""
+        """⚠️ 已禁用(当前无调用方)。SwitchGait(1)=trot 实测让 Go2W 摔倒,
+        见 docs/TECH_DECISIONS.md 第一节。保留仅供后续研究轮式步态切换参考, 勿盲调。"""
         import json as _json
         p = {"data": gait_type}
         code, _ = self._sport._Call(self._SWITCHGAIT_API_ID, _json.dumps(p))
@@ -194,13 +197,14 @@ class NxMotionNode(Node):
             with self._lock:
                 self._state = STANDING
                 self._vx = self._vy = self._vyaw = 0.0
-            self.get_logger().info("STANDING: StandUp → StopMove")
-            # Go2W 轮式狗安全站立: 只用 StandUp + StopMove。
-            # 注意: SwitchGait(1)=trot 会触发轮子狂转(危险!), BalanceStand 触发轮子后滑。
-            # 这两个都暂时不用。移动控制的轮式步态切换需进一步研究官方文档确认正确参数。
-            # 当前状态: 站立/坐下能用, 移动待解决。
+            self.get_logger().info("STANDING: StandUp → BalanceStand → Move(0,0,0)")
+            # 站立序列对齐 web/panel.py:RobotConnection._do_stand (SDK_CAPABILITIES 实测能动版)。
+            # 关键: BalanceStand 让狗进入主动平衡态, 轮子才接受 Move 速度指令; 早期版本误删
+            # 此步(误判"后滑危险"), 导致 Move 返回 code=0 但轮子不转。后滑是 BalanceStand
+            # 进入瞬间轮子调平衡的副作用, 紧接 Move(0,0,0) 可压住。
+            # ⚠️ 待实车验证(硬件装完后): vx=0.1 短按, 手放 Damp 急停。
             self._sport.StandUp(); time.sleep(2)
-            self._sport.StopMove(); time.sleep(0.3)
+            self._sport.BalanceStand(); time.sleep(0.5)
             self._sport.Move(0, 0, 0)
             with self._lock:
                 self._state = STOPPED

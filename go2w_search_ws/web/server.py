@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+❌ DEPRECATED — 不要在此文件上开发新功能。
+本文件是 web/panel.py 的前身(老单体后端), 已被 panel.py 取代, 不在运行链路中。
+保留仅供历史参考。新代码请用 web/panel.py。详见 docs/PROJECT_STRUCTURE.md。
+
 Go2W 搜索系统 Web 后端 (纯 Python 版)
 ======================================
 用 websockets + http.server 替代 FastAPI/uvicorn，

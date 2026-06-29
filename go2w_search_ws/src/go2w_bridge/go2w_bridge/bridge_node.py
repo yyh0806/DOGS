@@ -1,4 +1,8 @@
-"""Go2W Bridge Node - ROS2 与 Go2W SDK 之间的桥接节点。
+"""❌ DEPRECATED — 不要在此文件上开发新功能。
+老的单体桥(PC 直连狗), 已被 NX 中心化架构取代(nx_motion_node + nx_sensor_node)。
+不在运行链路中, 保留仅供历史参考。详见 docs/PROJECT_STRUCTURE.md。
+
+Go2W Bridge Node - ROS2 与 Go2W SDK 之间的桥接节点。
 
 职责:
 1. 从 Go2W SDK DDS 获取 IMU/LiDAR/视频数据，发布标准 ROS2 话题

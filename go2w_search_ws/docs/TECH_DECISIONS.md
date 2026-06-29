@@ -4,6 +4,18 @@
 
 ## 一、阶段 0 移动控制：根因与突破方向
 
+> 🔧 **2026-06-29 根因定位（推翻下方"业界未解难题"结论）**：
+> 真因 = `nx_motion_node._do_stand` **误删了 `BalanceStand`**。对比 `web/panel.py:RobotConnection._do_stand`
+> （`SDK_CAPABILITIES.md` 实测能动）的站立序列 `StandUp → BalanceStand → Move(0,0,0)`，
+> nx_motion_node 此前只有 `StandUp → StopMove → Move(0,0,0)`。缺 BalanceStand → 狗停在 idle 态 →
+> Move 返回 code=0 但轮子不转（精确匹配下方实测症状）。
+> **已修复**：`nx_motion_node._do_stand` 加回 BalanceStand，对齐 panel.py。**待实车验证**（硬件装完后 `vx=0.1` 短按）。
+> 下方旧排查记录保留作过程留档，其中"业界未解难题"结论已过时。
+>
+> **实车 TODO**：① `vx=0.1` 短按测 BalanceStand 后能否移动；② STOPPED 态 `StopMove` 三方矛盾裁决
+> （`nx_motion_node` 注释说必需 / `SDK_CAPABILITIES` 说无效 / `panel.py` 不用）——用 LowState `motor_state`
+> 轮速实测哪种真能刹住，二选一统一 `nx_motion_node` 与 `panel.py`。
+
 ### 已排除的根因（实测）
 - ❌ 不是 SDK 缺 Move_Wheel（1.0.1 版本 Go2W 就用 Move，无 Move_Wheel）
 - ❌ 不是缺 enableLease（nx_motion_node 第73行已 enableLease=True）
@@ -36,7 +48,7 @@ StandUp 让狗处于 idle/balance 态，直接 Move 可能不触发轮式运动�
 - `sportmodestate` 话题**无数据**（运动服务状态不可读）
 - 外部无权威解决方案（unitree_rl_lab #122 Go2W 不动，无人解答）
 
-**结论**：Go2W 轮式狗驱动轮子需要某种未知的模式激活，SDK 的 Move/StandUp/SwitchJoystick 都不触发。这是业界未解难题，非我们代码 bug。
+**结论**（⚠️ 已过时，见文首根因定位）：Go2W 轮式狗驱动轮子需要某种未知的模式激活，SDK 的 Move/StandUp/SwitchJoystick 都不触发。这是业界未解难题，非我们代码 bug。
 
 ## 二、阶段 2 建图：FAST_LIO + MID360 部署方案
 

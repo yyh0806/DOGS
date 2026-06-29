@@ -1,4 +1,8 @@
-"""Go2W Sport Client - 封装 unitree_sdk2py 的运动控制接口。
+"""❌ DEPRECATED — 不要在此文件上开发新功能。
+随 bridge_node.py 一同废弃(bridge_node 用), 已被 nx_motion_node 内联的 SportClient 取代。
+不在运行链路中, 保留仅供历史参考。详见 docs/PROJECT_STRUCTURE.md。
+
+Go2W Sport Client - 封装 unitree_sdk2py 的运动控制接口。
 
 该模块封装了 Go2W 机器狗的高层运动控制 API，
 包括: 站立、坐下、速度控制、移动到目标点、步态切换、运动模式切换。

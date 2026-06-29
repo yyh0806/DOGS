@@ -114,8 +114,8 @@
 | Web 前端（键盘+按钮） | ✅ | web/panel.py, static/panel.html |
 | 狗站立/坐下/急停 | ✅ | nx_motion_node._do_stand/_do_sit/_do_estop |
 | 乱跑防护 | ✅ | go2w-motion.service (崩溃自启) |
-| 后滑修复 | ✅ | _do_stand 去掉 BalanceStand |
-| **狗移动（前进后退转向）** | ❌ 待解决 | Go2W 轮式需正确步态切换参数 |
+| 后滑(旧"修复"实为bug根因) | ⚠️已纠正 | _do_stand **加回** BalanceStand (对齐 panel.py, 见 TECH_DECISIONS §一) |
+| **狗移动（前进后退转向）** | ⏳ 待实车 | _do_stand 加 BalanceStand 后逻辑对齐 panel.py, 待硬件装完验证 |
 | 地图/雷达显示 | ⚠️ 部分 | nx_sensor_node 数据流（需确认在跑） |
 | YOLO 检测 | ✅ | ai/detector.py（视频画框） |
 | VLM 指令解析 | ⚠️ 降级 | ai/vlm.py 加载失败，用关键词匹配兜底 |

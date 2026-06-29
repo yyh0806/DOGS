@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# ⚠️ 已退役 (阶段A: web 通信层上移 NX)。保留作 PC fallback / 历史参考, 勿再使用。
+# 阶段A 起, PC 端改用: bash web/start_pc_browser.sh  (web 服务由 NX 的 go2w-web.service 提供)
+# 本脚本在 PC 起 go2w_humble 容器 + ros_to_json 桥 + panel.py, 这条链路已被 NX 本机 web 替代。
+# ====================================================================
 # Go2W 真链路一键启动 (笔记本侧)
 #
 # 前置条件:
