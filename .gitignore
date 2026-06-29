@@ -20,3 +20,4 @@ deps/
 # mock 模式真检出 person, spec-stage-b §8.1/C4.4)。10KB 小图, 必须入库,
 # 否则 git clone/pull 的部署路径 (非 deploy_nx_ai.sh) 会缺该文件。
 !go2w_search_ws/web/static/mock_person.png
+.omc/
