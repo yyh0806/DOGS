@@ -1,0 +1,28 @@
+[Unit]
+Description=Go2W NX Web Server (阶段A: HTTP:8000 + WS:8001, 内嵌 rclpy 订阅/发布本机话题)
+# 控狗服务先起 (web 发的 /cmd_vel /cmd_pose 才有消费者)
+After=go2w-motion.service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=nx
+# 关键环境: CycloneDDS库 + ROS2 humble (与 go2w-motion.service 一致)
+Environment=LD_LIBRARY_PATH=/home/nx/CycloneDDS/lib
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=ROS_DOMAIN_ID=0
+# 前端访问用的公开 IP (可选, 仅影响 /api/foxglove 返回的 URL)
+Environment=GO2W_PUBLIC_IP=192.168.43.41
+Environment=HOME=/home/nx
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec python3 -u /home/nx/go2w_ws/web/nx_web_server.py'
+WorkingDirectory=/home/nx/go2w_ws
+# 崩溃自动重启 (web 服务必须高可用, 否则前端失联)
+Restart=always
+RestartSec=2
+# 正常停止: SIGINT 触发 main finally (rclpy.shutdown + destroy_node, 不调 Damp)
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
