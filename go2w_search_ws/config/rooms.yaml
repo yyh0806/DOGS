@@ -1,0 +1,62 @@
+# Go2W 房间级搜索地图 (阶段E, 静态 YAML, 人工标定)
+# ============================================================================
+# 坐标系: map (与 Nav2 的全局坐标系一致, 通常是 FAST_LIO/map_server 的 map frame)
+# yaw: 弧度 (ROS REP-103, 正=左转), 与 Nav2 PoseStamped.orientation 四元数等价转换
+# search_area.origin_*: map 绝对坐标 (不是相对 nav_pose), 直接喂 planner.plan_lawnmower
+#
+# ⚠️ 坐标为占位值, 部署时必须人工标定替换! 标定流程见 docs/room_calibration.md:
+#    1. 建 Nav2 地图完成 (FAST_LIO + map_server)
+#    2. 遥控狗站到房间入口, ros2 topic echo /odom 记录 x/y/yaw (yaw 取 quaternion→euler)
+#    3. 把值填进对应 room.nav_pose
+#    4. 估算房间搜索矩形 (走到房间对角顶点, 记录 x/y), 填进 search_area.{width,height,origin_*}
+#    5. curl -X POST '/api/reload_rooms' 热加载 (无需重启 nx_web_server)
+#    6. curl -X POST '/api/search_room?room=客厅' 验证狗真走到客厅
+# ============================================================================
+
+frame_id: map                  # 所有 pose 的坐标系 (发给 Nav2 的 goal.header.frame_id 用此值)
+version: "1.0"                 # schema 版本, RoomMap.load 时校验
+default_search_spacing: 2.5    # 默认搜索行间距 (米), 房间级可被 room.search_area.spacing 覆盖
+default_search_pattern: lawnmower  # 默认覆盖模式, 可被 room.search_area.pattern 覆盖
+
+rooms:
+  # 客厅: 大房间, 全类别检测 (target_classes 为空 = 检测所有)
+  - name: 客厅
+    aliases: ["living room", "living", "起居室"]
+    nav_pose:
+      x: 2.5                   # map 坐标系 X (米), 占位值
+      y: 1.8                   # map 坐标系 Y (米), 占位值
+      yaw: 0.0                 # 到达时朝向 (弧度, 正=左转)
+    search_area:
+      width: 5.0               # 矩形宽 (米, X 方向)
+      height: 4.0              # 矩形高 (米, Y 方向)
+      origin_x: 1.0            # 矩形左下角 X (map 绝对坐标, 不是相对 nav_pose)
+      origin_y: 0.5            # 矩形左下角 Y
+      spacing: 1.5             # 行间距 (覆盖 default_search_spacing)
+      pattern: lawnmower       # 覆盖模式 (覆盖 default_search_pattern)
+    target_classes: []         # 搜索目标类别过滤 (空=检测所有)
+
+  # 卧室: 中等房间, 只检测 person (target_classes 限定)
+  - name: 卧室
+    aliases: ["bedroom", "睡房"]
+    nav_pose: {x: -1.2, y: 3.4, yaw: 1.5708}   # yaw=π/2 (90°, 朝左)
+    search_area:
+      width: 4.0
+      height: 3.5
+      origin_x: -3.0
+      origin_y: 2.0
+      spacing: 1.2
+      pattern: lawnmower
+    target_classes: ["person"]   # 只记录 person 检测
+
+  # 厨房: 小房间, 全类别检测
+  - name: 厨房
+    aliases: ["kitchen"]
+    nav_pose: {x: 4.0, y: -2.0, yaw: -1.5708}  # yaw=-π/2 (-90°, 朝右)
+    search_area:
+      width: 3.0
+      height: 3.0
+      origin_x: 3.0
+      origin_y: -3.5
+      spacing: 1.0
+      pattern: spiral          # 小房间用螺旋覆盖 (覆盖 default_search_pattern)
+    target_classes: []
