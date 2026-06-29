@@ -1,0 +1,23 @@
+[Unit]
+Description=Go2W NX Sensor Node (读狗 IMU/雷达 → /imu /scan /odom, 只读不控狗)
+After=go2w-motion.service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=nx
+Environment=LD_LIBRARY_PATH=/home/nx/CycloneDDS/lib
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/nx/go2w_ws/fastdds_udp.xml
+Environment=HOME=/home/nx
+Environment=DOG_INTERFACE=enxc8a362616c4c
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec python3 -u /home/nx/go2w_ws/nx_sensor_node.py'
+WorkingDirectory=/home/nx/go2w_ws
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

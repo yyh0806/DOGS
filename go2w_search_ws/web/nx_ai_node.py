@@ -22,6 +22,13 @@
   - VLM 不在 HTTP handler 线程同步推理 (submit_parse 入队异步处理)
   - ChannelFactory 本进程只 Init 一次 (spec 决策 4, 与 nx_sensor_node 进程隔离)
   - 不入库 engine/onnx (gitignore)
+
+== round-3 解耦: 视频流与 YOLO 解耦 (NX 可能无 ultralytics/torch) ==
+  - 无 ultralytics (或 GO2W_AI_NO_DETECT=1) → detector=None, 视频流照常推 type=frame
+    (detections=0, slam.data.detections=[]), 不崩、不退化为"AI 完全关闭"。
+  - 检测调用统一走 _run_detector(frame) 抽象方法, 为后续 locateanything 开放词汇
+    定位预留可替换接口 (同签名替换本方法, 视频流路径不动)。
+  - VLM 同样 graceful: 无 transformers → vlm=None → TaskManager 走 _fallback_parse。
 """
 
 import base64
@@ -65,6 +72,49 @@ def set_ws_broadcast(fn):
 _CAMERA_HFOV_DEG = float(os.environ.get("GO2W_CAMERA_HFOV", "70"))
 # YOLO 无深度, 检测目标固定假设距离 (米) (spec §11: 不做精确深度定位)
 _DETECT_ASSUME_DIST_M = float(os.environ.get("GO2W_DETECT_DIST", "3.0"))
+
+# ============================================================================
+# 检测器解耦 (round-3): 视频流不再依赖 ultralytics/torch
+# ----------------------------------------------------------------------------
+# NX 上可能没装 ultralytics/torch (用户不走 YOLO, 后续换 locateanything 开放
+# 词汇定位)。要求: 即使无 ultralytics, nx_ai_node 仍取帧 + 推 type=frame 视频流
+# (detections 空), 让前端显示第一视角。
+#
+# 两个开关 (均只影响检测, 不影响视频流):
+#   1. GO2W_AI_NO_DETECT=1 → 显式禁检测 (即使装了 ultralytics 也不 YOLO, 纯视频流)
+#   2. ultralytics/torch 缺失 → 自动禁检测 (detector=None, 记 warning, 不崩)
+# 任一触发 → self._detector=None → _run_detector 返回 [] → 视频流照常。
+# ============================================================================
+# 显式禁检测开关 (round-3 需求 3)
+_DETECT_DISABLED_BY_ENV = str(os.environ.get("GO2W_AI_NO_DETECT", "")).strip() in ("1", "true", "True", "yes")
+
+# ultralytics 是否可导入 (NX 可能没装; 探测一次, 记 warning, 不崩)
+# 注意: 这里只探测 ultralytics 本身, 不在顶层 import ai.detector (保持 ai.detector
+# 懒加载, 避免本模块 import 时触发 ai.config 等链路)。ai.detector 内部在
+# Detector.__init__ 才 import ultralytics, 所以探测 ultralytics 等价于探测检测可行性。
+def _probe_ultralytics():
+    """探测 ultralytics 是否可导入 (NX 可能没装)。返回 bool。
+    只调用一次 (模块加载时), 结果缓存到 _ULTRALYTICS_AVAILABLE。
+    缺失不是错误: 后续走纯视频流路径 (detector=None, detections 空)。
+    """
+    try:
+        import importlib
+        importlib.import_module("ultralytics")  # 不保留引用, 仅探测
+        return True
+    except Exception as e:
+        # 不崩: 记 warning (不是 error), 视频流仍工作, 仅 detections 空
+        logger.warning(f"[AI] ultralytics 不可导入 ({type(e).__name__}), YOLO 检测将禁用 "
+                       f"(视频流不受影响, detections 为空; GO2W_AI_NO_DETECT 或换 locateanything)")
+        return False
+
+_ULTRALYTICS_AVAILABLE = _probe_ultralytics()
+
+# 最终是否允许 YOLO 检测: 环境没禁 + ultralytics 在
+_DETECT_ALLOWED = (not _DETECT_DISABLED_BY_ENV) and _ULTRALYTICS_AVAILABLE
+if _DETECT_DISABLED_BY_ENV:
+    logger.info("[AI] GO2W_AI_NO_DETECT=1 → 显式禁检测 (纯视频流模式, detections 恒空)")
+elif not _ULTRALYTICS_AVAILABLE:
+    logger.warning("[AI] 检测禁用 (无 ultralytics) → 纯视频流模式 (type=frame 照推, detections=0)")
 
 
 # ============================================================================
@@ -205,6 +255,11 @@ class NxAiEngine:
     def start(self):
         """启动视频/YOLO 线程 + VLM 工作线程 + 显存监控 (spec §5)。
         关键: 启动时不 import torch/ultralytics (懒加载, 启动秒级, §11 反模式)。
+
+        round-3: 即使无 ultralytics/torch, start() 仍正常创建并启动 3 线程
+        (video/vlm/mem)。视频线程 _init_detector 见无 ultralytics → detector=None,
+        仍取帧推 type=frame (detections 空); VLM 线程见无 transformers → 走 fallback。
+        即: 缺重依赖时 start() 不抛、视频流不断, 满足 NX 纯视频流部署。
         """
         self._running = True
         t1 = threading.Thread(target=self._video_yolo_loop, name="nx_ai_video", daemon=True)
@@ -272,14 +327,29 @@ class NxAiEngine:
     def _init_detector(self):
         """懒初始化 YOLO (降级链 engine>onnx>pt, spec §4.2)。
         Detector.__init__ 已支持 .engine/.onnx/.pt 任意格式 + warm-up (detector.py:28-30)。
+
+        round-3 解耦: 若 _DETECT_ALLOWED=False (GO2W_AI_NO_DETECT=1 或无 ultralytics),
+        直接 detector=None 返回, 不尝试加载任何模型 → 视频流不受影响。
         """
         if self._detector_inited:
             return
         self._detector_inited = True
+
+        # round-3: 检测被禁 (环境禁 / 无 ultralytics) → 纯视频流模式
+        # 不崩、不报错 (warning 已在模块加载时记), 视频线程照常取帧推流。
+        if not _DETECT_ALLOWED:
+            self._detector = None
+            if _DETECT_DISABLED_BY_ENV:
+                logger.info("[AI] _init_detector: GO2W_AI_NO_DETECT=1, 跳过 YOLO (纯视频流)")
+            else:
+                logger.info("[AI] _init_detector: 无 ultralytics, 跳过 YOLO (纯视频流)")
+            return
+
         try:
             from ai.detector import Detector
         except Exception as e:
-            logger.error(f"[AI] 导入 ai.detector 失败 ({e}), YOLO 检测禁用")
+            # ai.detector 顶层 import ai.config, 一般不会失败; 若失败也不崩
+            logger.error(f"[AI] 导入 ai.detector 失败 ({e}), YOLO 检测禁用 (视频流照常)")
             self._detector = None
             return
 
@@ -304,6 +374,41 @@ class NxAiEngine:
                 logger.warning(f"[AI] YOLO 加载异常 {path}: {e}, 尝试下一个候选")
         logger.error("[AI] 所有 YOLO 模型加载失败, 检测降级为禁用 (帧原样推送, slam.detections=[])")
         self._detector = None
+
+    # ------------------------------------------------------------------
+    # 检测器抽象 (round-3: 为 locateanything 预留可替换接口)
+    # ------------------------------------------------------------------
+    def _run_detector(self, frame):
+        """统一检测入口 (round-3 检测器抽象)。
+
+        把 YOLO 调用集中到这单一方法, _video_yolo_loop 只调它, 不直接碰 self._detector。
+        当前实现: 调 self._detector.detect(frame) (YOLO/ultralytics)。
+
+        契约: 输入 BGR ndarray 帧, 返回 list[dict{class,confidence,bbox}] (可能空)。
+        - detector=None (无 ultralytics / GO2W_AI_NO_DETECT=1 / 模型加载失败) → 返回 []
+        - 异常 → 记 warning + 返回 [] (绝不抛, 保证视频流不断)
+
+        === 后续 locateanything 接入说明 (重要) ===
+        locateanything (开放词汇定位) 上线时, 只需替换本方法体:
+            def _run_detector(self, frame):
+                # 例: return self._locate_anything.detect(frame, vocab=self._detect_vocab)
+                ...
+        签名不变 (frame → list[dict{class,confidence,bbox}]), 视频流路径 (_video_yolo_loop /
+        get_frame_jpeg / get_detections_world) 完全不动。bbox 坐标系约定: 像素 xyxy 在
+        _detect_frame_w (输入帧宽) 系下, get_detections_world 据此归一化方位角。
+        """
+        if frame is None:
+            return []
+        det = self._detector
+        if det is None:
+            # 纯视频流模式 (round-3): 不调任何检测器, detections 空
+            return []
+        try:
+            dets = det.detect(frame)
+            return dets if dets else []
+        except Exception as e:
+            logger.warning(f"[AI] 检测异常 ({type(det).__name__}): {e} (本帧 detections 空, 视频流继续)")
+            return []
 
     def _get_frame(self):
         """取一帧 BGR ndarray (VideoClient.GetImageSample 或 mock, spec §7.1)。
@@ -331,12 +436,15 @@ class NxAiEngine:
             return None
 
     def _video_yolo_loop(self):
-        """视频+YOLO 主循环 (线程4, spec §5)。
+        """视频+检测 主循环 (线程4, spec §5)。
         - 懒初始化 (首次循环 _init_video + _init_detector)
         - 取帧 (~8fps, GetImageSample 200-500ms, SDK_CAPABILITIES §1.1)
-        - YOLO detect + annotate
+        - 检测经 _run_detector 抽象 (detector=None 时返回 [], 帧原样, 视频流不断)
         - 缓存 _latest_frame (720p resize 后) + _latest_dets (Lock 保护)
         - 取帧连续 10 次失败 → 切 mock (spec 边界表)
+
+        round-3: detector=None (无 ultralytics / GO2W_AI_NO_DETECT=1) 时本循环
+        仍正常取帧 + resize + 缓存 + 推 type=frame, 只是 detections 空。
         """
         self._init_video()
         self._init_detector()
@@ -360,24 +468,25 @@ class NxAiEngine:
                     continue
                 self._video_fail_streak = 0
 
-                # YOLO 检测 + 画框 (detector=None 时跳过, 帧原样, spec 边界表)
-                dets = []
+                # 检测 + 画框 (经 _run_detector 抽象, round-3 解耦)
+                # detector=None (无 ultralytics / GO2W_AI_NO_DETECT=1) 时 _run_detector 返回 [],
+                # 帧原样推送, 视频流不断 (spec 边界表 + round-3 纯视频流模式)。
                 # MEDIUM-5: 记录检测发生时刻的输入帧宽 (bbox 坐标系)。
                 # 检测在原始帧 (可能 1080p=1920宽) 上做, 随后 resize 到 720p;
                 # 必须用此刻的宽度归一化 bbox, 不能用 resize 后的 _latest_frame.shape[1]。
                 detect_frame_w = frame.shape[1]
-                if self._detector is not None:
+                dets = self._run_detector(frame)
+                if dets:
                     try:
-                        dets = self._detector.detect(frame)
-                        if dets:
+                        # 画框 (detector=None 时 dets 必空, 不会进这里; 保守起见仍 try)
+                        if self._detector is not None:
                             frame = self._detector.annotate(frame, dets)
-                            # 抽样日志 (M4.2): 每 30 帧或目标数变化时打印
-                            if self._frame_count % 30 == 0:
-                                det_str = ", ".join(f"{d['class']} {d['confidence']:.2f}" for d in dets[:5])
-                                logger.info(f"[AI] detect: {det_str}")
+                        # 抽样日志 (M4.2): 每 30 帧打印
+                        if self._frame_count % 30 == 0:
+                            det_str = ", ".join(f"{d['class']} {d['confidence']:.2f}" for d in dets[:5])
+                            logger.info(f"[AI] detect: {det_str}")
                     except Exception as e:
-                        logger.warning(f"[AI] YOLO detect 异常: {e}")
-                        dets = []
+                        logger.warning(f"[AI] annotate 异常: {e}")
 
                 # resize 到 720p (决策 3: 1080p→720p 省带宽)
                 try:
@@ -412,6 +521,11 @@ class NxAiEngine:
         """懒初始化 VLMEngine (首次 parse 时, 决策 2 约束 4)。
         失败 (OOM/路径错) → self._vlm=None 且 **不**置 _vlm_inited=True,
         允许 _vlm_worker 节流重试 (HIGH-1: 模型就位后能自愈, 不永久 fallback)。
+
+        round-3 graceful: NX 上没装 transformers 时, VLMEngine 构造会抛
+        (ai.vlm 内部懒 import transformers), 落入下面 except → _vlm=None。
+        TaskManager 走 _fallback_parse (阶段A 行为, 已支持), 不崩、不退出。
+        即: VLM 不可用时指令解析降级为关键词 fallback, 不影响视频流与检测。
         """
         if self._vlm_inited:
             return
