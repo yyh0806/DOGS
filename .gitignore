@@ -15,3 +15,8 @@ deps/
 *.engine
 *.onnx
 .env
+
+# HIGH-3 例外: mock_person.png 是阶段B mock 视频必需资源 (COCO 人物裁图, 让 YOLO 在
+# mock 模式真检出 person, spec-stage-b §8.1/C4.4)。10KB 小图, 必须入库,
+# 否则 git clone/pull 的部署路径 (非 deploy_nx_ai.sh) 会缺该文件。
+!go2w_search_ws/web/static/mock_person.png
