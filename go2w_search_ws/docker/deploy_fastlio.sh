@@ -51,20 +51,21 @@ fi
 # ---- 2. livox_ros_driver2 ----
 echo ""
 echo "[2/3] livox_ros_driver2..."
-if [ ! -d ~/ws_livox ]; then
+if [ ! -d ~/ws_livox/install/livox_ros_driver2 ]; then
     mkdir -p ~/ws_livox/src && cd ~/ws_livox/src
-    git clone https://github.com/Livox-SDK/livox_ros_driver2.git
+    if [ ! -d livox_ros_driver2 ]; then
+        git clone https://github.com/Livox-SDK/livox_ros_driver2.git
+    fi
     cd livox_ros_driver2
-    # 官方要求: package.xml format 2→3
-    sed -i 's/format="2"/format="3"/' package.xml
-    echo "  ⚠️ 请确认 src/MID360_config.json 里的 broadcast_code (印在雷达机身)"
-    echo "  ⚠️ 请确认 host_ip 是NX连雷达网卡的IP (默认192.168.1.50)"
-    cd ~/ws_livox
-    colcon build --symlink-install --packages-select livox_ros_driver2 \
-        --cmake-args -DCMAKE_BUILD_TYPE=Release
+    # ⚠️ livox_ros_driver2 用官方build.sh (ROS1/ROS2共用代码, 不能直接colcon build)
+    # package_ROS2.xml 是ROS2的package.xml, build.sh会处理
+    source /opt/ros/humble/setup.bash
+    ./build.sh humble
     echo "✅ livox_ros_driver2 已编译"
+    echo "  ⚠️ 请确认 MID360_config.json 里的 broadcast_code (印在雷达机身, 15位)"
+    echo "  ⚠️ 请确认 host_ip 是NX连雷达网卡的IP"
 else
-    echo "✅ ws_livox 已存在, 跳过"
+    echo "✅ livox_ros_driver2 已编译, 跳过"
 fi
 
 # ---- 3. FAST_LIO_ROS2 ----
