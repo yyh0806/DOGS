@@ -9,7 +9,7 @@
 > （`SDK_CAPABILITIES.md` 实测能动）的站立序列 `StandUp → BalanceStand → Move(0,0,0)`，
 > nx_motion_node 此前只有 `StandUp → StopMove → Move(0,0,0)`。缺 BalanceStand → 狗停在 idle 态 →
 > Move 返回 code=0 但轮子不转（精确匹配下方实测症状）。
-> **已修复**：`nx_motion_node._do_stand` 加回 BalanceStand，对齐 panel.py。**待实车验证**（硬件装完后 `vx=0.1` 短按）。
+> **已修复并实车验证**：`nx_motion_node._do_stand` 加回 BalanceStand，对齐 panel.py。✅ **2026-06-29 实车验证通过**——NX 部署最新版（commit 32258d1）+ fastdds 禁 SHM 强制 UDP（修 systemd 间通信）+ websockets 10.4 + PC 代理 bypass 后，PC 前端键盘控制狗能正常轮式移动，"Move code=0 但轮子不转"彻底解决。
 > 下方旧排查记录保留作过程留档，其中"业界未解难题"结论已过时。
 >
 > **实车 TODO**：① `vx=0.1` 短按测 BalanceStand 后能否移动；② STOPPED 态 `StopMove` 三方矛盾裁决
