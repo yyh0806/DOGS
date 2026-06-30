@@ -20,11 +20,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'bridge_node = go2w_bridge.bridge_node:main',
-            'sport_client = go2w_bridge.sport_client:main',
             'nx_sensor_node = go2w_bridge.nx_sensor_node:main',
             'nx_motion_node = go2w_bridge.nx_motion_node:main',
-            'nx_panel_bridge = go2w_bridge.nx_panel_bridge:main',
         ],
     },
 )

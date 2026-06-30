@@ -12,9 +12,18 @@ User=nx
 Environment=LD_LIBRARY_PATH=/home/nx/CycloneDDS/lib
 Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 Environment=ROS_DOMAIN_ID=0
+# 狗主控网卡: NxAiEngine.VideoClient 的 ChannelFactory 绑定用 (与 motion/sensor 一致,
+# 否则 reboot 后网卡名不对时 VideoClient 取不到帧 → 视频退回 mock).
+# 部署时 deploy_nx_web.sh 的 sed 会替换成实测网卡名.
+Environment=DOG_INTERFACE=enxc8a362616c4c
 # 前端访问用的公开 IP (可选, 仅影响 /api/foxglove 返回的 URL)
 Environment=GO2W_PUBLIC_IP=192.168.43.41
 Environment=HOME=/home/nx
+# reboot 时序坑根治: USB 网卡(enxc8a362616c4c)晚于 network-online.target 枚举,
+# ChannelFactory 是进程级单例不重试 → 网卡没就绪时 VideoClient Init 失败 → 视频退回 mock.
+# 等 60s 网卡就绪再启动; 超时 exit 1 触发 Restart=always 重试
+# (单次等 60s, 天然避开默认 start-limit 10s/5次, 狗没插线时持续重试不放弃).
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do ip link show enxc8a362616c4c >/dev/null 2>&1 && exit 0; sleep 1; done; echo "[wait-iface] enxc8a362616c4c 60s 未就绪, 等 Restart 重试" >&2; exit 1'
 ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec python3 -u /home/nx/go2w_ws/web/nx_web_server.py'
 WorkingDirectory=/home/nx/go2w_ws
 # 崩溃自动重启 (web 服务必须高可用, 否则前端失联)

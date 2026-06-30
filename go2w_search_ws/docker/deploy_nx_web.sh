@@ -57,14 +57,41 @@ echo "✅ web 代码 + static 已拷贝 (nx_web_server.py, mock_dog_state_publis
 # ---- 3. 安装 go2w-web systemd 服务 ----
 echo ""
 echo "[3/3] 安装 go2w-web systemd 服务..."
-scp -q "$WS_DIR/docker/go2w-web.service" "$NX_USER@$NX_HOST:/tmp/go2w-web.service"
+
+# 3a. 探测连狗的 USB 网卡 (与 deploy_nx.sh 一致; 让 ExecStartPre + DOG_INTERFACE
+#     适配实测网卡名, 否则换 NX 时 web service 的 ExecStartPre 永远等不到网卡 → 卡死).
+#     注意: 这里不 ping 狗主控 (web 部署时狗可能没开机), 只要有 192.168.123.x 的网卡即可.
+DOG_IFACE=$(ssh "$NX_USER@$NX_HOST" 'bash -s' <<'REMOTE'
+for iface in $(ls /sys/class/net/ | grep -E "^enx|^enP|^enp"); do
+  ip=$(ip -br addr show "$iface" 2>/dev/null | awk '{print $3}' | grep -oE "192.168.123.[0-9]+")
+  if [ -n "$ip" ]; then echo "$iface"; exit 0; fi
+done
+for iface in $(ls /sys/class/net/); do
+  ip=$(ip -br addr show "$iface" 2>/dev/null | awk '{print $3}' | grep -oE "192.168.123.[0-9]+")
+  if [ -n "$ip" ]; then echo "$iface"; exit 0; fi
+done
+echo ""
+REMOTE
+)
+if [ -z "$DOG_IFACE" ]; then
+  echo "⚠️  未找到 192.168.123.x 网卡, 用模板默认 enxc8a362616c4c (ExecStartPre 会持续等网卡)"
+  DOG_IFACE="enxc8a362616c4c"
+else
+  echo "✅ 连狗网卡: $DOG_IFACE"
+fi
+
+# 3b. 用实测网卡名生成 service (替换 ExecStartPre + DOG_INTERFACE 里的 enxc8a362616c4c)
+TMP_SERVICE=$(mktemp)
+sed "s|enxc8a362616c4c|$DOG_IFACE|g" "$WS_DIR/docker/go2w-web.service" > "$TMP_SERVICE"
+scp -q "$TMP_SERVICE" "$NX_USER@$NX_HOST:/tmp/go2w-web.service"
+rm -f "$TMP_SERVICE"
 ssh "$NX_USER@$NX_HOST" "echo '$NX_USER' | sudo -S bash -c '
   cp /tmp/go2w-web.service /etc/systemd/system/go2w-web.service &&
   systemctl daemon-reload &&
   systemctl enable go2w-web.service &&
   systemctl restart go2w-web.service
 ' 2>&1 | tail -1"
-echo "✅ 服务已安装并启动 (enabled + active)"
+echo "✅ 服务已安装并启动 (enabled + active, 网卡=$DOG_IFACE)"
 
 # ---- 验证 ----
 echo ""
