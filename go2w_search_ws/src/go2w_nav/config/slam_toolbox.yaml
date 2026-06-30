@@ -1,25 +1,65 @@
-# SLAM Toolbox 在线异步模式配置
-# 适用于 Go2W mid-360 LiDAR 实时建图
+# SLAM Toolbox 2D 配置 —— 阶段F 降级建图路径 (slam_toolbox 替代未就绪的 FAST_LIO)
+#
+# 路线 (spec-slam.md 决策 1-7):
+#   nx_sensor /scan (狗自带 LiDAR 投影, 2D, base_link 系) → slam_toolbox
+#     → /map (OccupancyGrid) + map→odom TF
+#   nx_sensor 继续发 /odom + odom→base_link TF (阶段A 红线, 不动)
+#
+# 双模式共用 (mapping + localization, 由 launch arg mode 切换 executable):
+#   mapping      → async_slam_toolbox_node      (从头建图, /map 实时生长)
+#   localization → localization_slam_toolbox_node (载入 .posegraph+.data, scan-matching 定位)
+# localization 专属参数 (map_file_name / map_start_pose) 由 launch 按 mode 注入,
+# 不写死本 yaml, 避免 mapping 模式误载入地图。
+#
+# 详见 docs/slam_runbook.md + gan-harness/spec-slam.md。
 
 slam_toolbox:
   ros__parameters:
-    # 基本设置
-    odom_frame: odom
-    map_frame: map
-    base_frame: base_link
-    scan_topic: /scan
+    # ============================================================
+    # Frame 架构 (决策 3, 与 nx_sensor_node.py 实测一致)
+    # ============================================================
+    odom_frame: odom        # nx_sensor /odom frame + odom→base_link TF (nx_sensor_node.py:201,213)
+    map_frame: map          # Nav2 global_costmap.global_frame + 阶段E goal frame
+    base_frame: base_link   # nx_sensor /scan frame_id (nx_sensor_node.py:228)
+                           # ⚠️ 不是 laser_frame: nx_sensor 投影时假设激光与本体零偏移,
+                           #   /scan 直接在 base_link 系, 无需 base_link→laser static_transform。
+    scan_topic: /scan       # nx_sensor 发的 topic 名 (nx_sensor_node.py:107)
+
+    # ============================================================
+    # ⚠️ 头号风险 (决策 4): QoS 匹配 nx_sensor 发布端
+    # ============================================================
+    # nx_sensor /scan 用默认 RELIABLE QoS (nx_sensor_node.py:107, 第104行注释明确
+    # "QoS 用默认 RELIABLE")。
+    # slam_toolbox 默认 use_sensor_data_qos=true (即 rclcpp::SensorDataQoS() = BEST_EFFORT)。
+    # RELIABLE 发布端 vs BEST_EFFORT 订阅端 = QoS 不兼容 → slam_toolbox 静默收不到 scan,
+    # /map 一直空, 无任何报错。这是本阶段头号坑。
+    # 修复: 显式设 false, 切回默认 RELIABLE, 匹配 nx_sensor 发布端。
+    # ⚠️ 反直觉: 大多数 slam_toolbox 示例用 true (因为多数 LiDAR 驱动发 BEST_EFFORT);
+    #   但 nx_sensor 发 RELIABLE, 这里必须 false。
+    use_sensor_data_qos: false
+
     use_scan_matching: true
     use_scan_barycenter: true
 
-    # 运动阈值
-    minimum_travel_distance: 0.3
-    minimum_travel_heading: 0.3
+    # ============================================================
+    # 运动阈值 (推狗走室内合理)
+    # ============================================================
+    minimum_travel_distance: 0.3   # 每 0.3m 加一个节点
+    minimum_travel_heading: 0.3    # 每 ≈17° (0.3 rad) 加一个节点
 
-    # 扫描缓冲
+    # ============================================================
+    # 扫描缓冲 + 范围
+    # ============================================================
     scan_buffer_size: 10
     scan_buffer_maximum_scan_distance: 10.0
+    # 对齐 nx_sensor /scan range_max=10.0 (nx_sensor_node.py:235)。
+    # (休眠值 8.0 是 MID360 遗留值; nx_sensor 投影的 /scan 能到 10m, 设 8.0 浪费 2m 数据)
+    max_laser_range: 10.0
+    minimum_score: 0.0
 
-    # 匹配参数
+    # ============================================================
+    # 匹配 / loop closing (休眠值合理, 保留)
+    # ============================================================
     link_match_minimum_response_fine: 0.1
     link_scan_maximum_distance: 1.5
     loop_search_maximum_distance: 3.0
@@ -28,10 +68,6 @@ slam_toolbox:
     loop_match_maximum_variance_coarse: 3.0
     loop_match_minimum_response_coarse: 0.35
     loop_match_minimum_response_fine: 0.45
-
-    # LiDAR 范围
-    max_laser_range: 8.0
-    minimum_score: 0.0
 
     # 搜索空间
     correlation_search_space_dimension: 0.5
@@ -53,19 +89,31 @@ slam_toolbox:
     minimum_distance_penalty: 0.5
     use_response_expansion: true
 
-    # 地图更新
-    map_update_interval: 2.0
-    resolution: 0.05
+    # ============================================================
+    # 地图更新 (与 Nav2 costmap 对齐)
+    # ============================================================
+    map_update_interval: 2.0        # 0.5Hz /map 发布, Nav2 global_costmap update 1Hz 够消化
+    resolution: 0.05                # 与 Nav2 costmap resolution 0.05 对齐 (nav2_params_slim.yaml)
     minimum_time_interval: 0.5
-    transform_timeout: 0.2
-    tf_buffer_duration: 30.0
+    transform_timeout: 0.2          # 与 Nav2 transform_tolerance 一致
+    tf_buffer_duration: 30.0        # scan-matching 要历史 scan, 长 buffer
     stack_size_to_use: 40000000
     enable_interactive_mode: false
 
-    # 求解器
+    # ============================================================
+    # 求解器 (Ceres, 保留休眠值)
+    # ============================================================
     solver_plugin: solver_plugins::CeresSolver
     ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
     ceres_preconditioner: SCHUR_JACOBI
     ceres_trust_strategy: LEVENBERG_MARQUARDT
     ceres_dogleg_type: TRADITIONAL_DOGLEG
     ceres_loss_function: None
+
+    # ============================================================
+    # localization 模式专属 (由 slam.launch.py 按 mode:=localization 注入,
+    # mapping 模式不写, 避免误载入地图):
+    #   map_file_name: /path/to/data  (无扩展名, .posegraph + .data 由 slam_toolbox 自带序列化)
+    #   map_start_pose: [0.0, 0.0, 0.0]   (建图起始位姿 = map 原点 identity)
+    #   mode: localization (由 localization_slam_toolbox_node executable 决定, yaml 可不显式写)
+    # ============================================================
