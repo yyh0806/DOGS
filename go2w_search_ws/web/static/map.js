@@ -12,7 +12,7 @@
  *   { x, y, yaw,           // 狗当前位姿 (世界坐标, 米/弧度)
  *     trail: [[x,y],...],   // 已走轨迹
  *     map: [[x,y],...],     // 障碍栅格点
- *     scan: [[x,y],...],    // 本帧激光扫描点 (机体系)
+ *     scan: [[x,y],...],    // 本帧激光扫描点 (世界坐标)
  *     detections: [{x,y,class}],  // 检测目标位置
  *     waypoints: [{x,y}],   // 规划航点
  *     currentWP: int }
@@ -26,10 +26,11 @@ class Go2WMap {
     // 地图状态
     this.slam = {
       robotX: 0, robotY: 0, robotYaw: 0,
-      trail: [], mapPoints: [], scanPoints: [],
+      trail: [], mapPoints: [], lidarMapPoints: [], scanPoints: [],
       detMarks: [], waypoints: [], currentWP: -1,
       slamSource: '',
     };
+    this._lidarCells = new Map();
     // 用户选区 (世界坐标), 由 panel.html 设置 (表单输入时也同步显示)
     this.searchRegion = null; // {x, y, w, h}
 
@@ -55,11 +56,43 @@ class Go2WMap {
     if (data.map) this.slam.mapPoints = data.map;
     if (data.scan) this.slam.scanPoints = data.scan;
     if (data.slam_source !== undefined) this.slam.slamSource = data.slam_source;
+    this._tf = null;
   }
 
   /** 设置/清除搜索区域 (世界坐标 {x,y,w,h}); 表单输入也调这个同步显示 */
-  setRegion(region) { this.searchRegion = region; }
-  clearRegion() { this.searchRegion = null; }
+  setRegion(region) { this.searchRegion = region; this._tf = null; }
+  clearRegion() { this.searchRegion = null; this._tf = null; }
+
+  /** 接收 MID360 局部点 (x前/y左, 米), 转成世界坐标并累积到左侧障碍栅格。 */
+  addLocalObstaclePoints(points) {
+    if (!Array.isArray(points) || !points.length) return;
+    const cosY = Math.cos(this.slam.robotYaw);
+    const sinY = Math.sin(this.slam.robotYaw);
+    for (const pt of points) {
+      if (!Array.isArray(pt) || pt.length < 2) continue;
+      const lx = Number(pt[0]);
+      const ly = Number(pt[1]);
+      if (!Number.isFinite(lx) || !Number.isFinite(ly)) continue;
+      const wx = cosY * lx - sinY * ly + this.slam.robotX;
+      const wy = sinY * lx + cosY * ly + this.slam.robotY;
+      this._addLidarObstacleCell(wx, wy);
+    }
+    this.slam.lidarMapPoints = Array.from(this._lidarCells.values());
+    this._tf = null;
+  }
+
+  _addLidarObstacleCell(wx, wy) {
+    const qx = Math.round(wx * 10) / 10;
+    const qy = Math.round(wy * 10) / 10;
+    const x = Object.is(qx, -0) ? 0 : qx;
+    const y = Object.is(qy, -0) ? 0 : qy;
+    const key = `${x.toFixed(1)},${y.toFixed(1)}`;
+    if (this._lidarCells.has(key)) this._lidarCells.delete(key);
+    this._lidarCells.set(key, [x, y]);
+    while (this._lidarCells.size > 5000) {
+      this._lidarCells.delete(this._lidarCells.keys().next().value);
+    }
+  }
 
   start() {
     this._running = true;
@@ -95,6 +128,8 @@ class Go2WMap {
       allY.push(this.searchRegion.y, this.searchRegion.y + this.searchRegion.h);
     }
     for (const p of s.mapPoints) { allX.push(p[0]); allY.push(p[1]); }
+    for (const p of s.lidarMapPoints) { allX.push(p[0]); allY.push(p[1]); }
+    for (const p of s.scanPoints) { allX.push(p[0]); allY.push(p[1]); }
     for (const t of s.trail) { allX.push(t[0]); allY.push(t[1]); }
     for (const wp of s.waypoints) { allX.push(wp.x); allY.push(wp.y); }
     for (const d of s.detMarks) { allX.push(d.x); allY.push(d.y); }
@@ -179,27 +214,23 @@ class Go2WMap {
     for (let gy = gMin; gy <= gMax; gy++) if (gy !== 0) ctx.fillText(gy + 'm', toX(0) + 2, toY(gy) - 2);
 
     // 1. 障碍栅格点
-    if (s.mapPoints.length) {
+    const obstaclePoints = s.mapPoints.concat(s.lidarMapPoints);
+    if (obstaclePoints.length) {
       ctx.fillStyle = 'rgba(255,145,0,0.7)';
-      for (const p of s.mapPoints) ctx.fillRect(toX(p[0]) - 1, toY(p[1]) - 1, 2, 2);
+      for (const p of obstaclePoints) ctx.fillRect(toX(p[0]) - 1, toY(p[1]) - 1, 2, 2);
     }
     // 2. 实时扫描
     const rx = toX(s.robotX), ry = toY(s.robotY);
     if (s.scanPoints.length) {
-      const cosY = Math.cos(s.robotYaw), sinY = Math.sin(s.robotYaw);
       ctx.strokeStyle = 'rgba(0,230,118,0.12)'; ctx.lineWidth = 0.5;
       ctx.beginPath();
       for (const pt of s.scanPoints) {
-        const wx = cosY * pt[0] - sinY * pt[1] + s.robotX;
-        const wy = sinY * pt[0] + cosY * pt[1] + s.robotY;
-        ctx.moveTo(rx, ry); ctx.lineTo(toX(wx), toY(wy));
+        ctx.moveTo(rx, ry); ctx.lineTo(toX(pt[0]), toY(pt[1]));
       }
       ctx.stroke();
       ctx.fillStyle = 'rgba(0,255,136,0.8)';
       for (const pt of s.scanPoints) {
-        const wx = cosY * pt[0] - sinY * pt[1] + s.robotX;
-        const wy = sinY * pt[0] + cosY * pt[1] + s.robotY;
-        ctx.beginPath(); ctx.arc(toX(wx), toY(wy), 2, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(toX(pt[0]), toY(pt[1]), 2, 0, Math.PI * 2); ctx.fill();
       }
     }
     // 3. 搜索区域框 (用户选区) + 拖动中的虚框

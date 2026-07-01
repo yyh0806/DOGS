@@ -1,0 +1,19 @@
+[Unit]
+Description=Livox MID360 雷达网络配置 (host IP 192.168.1.200/32 + 主机路由到雷达)
+Documentation=https://github.com/Livox-SDK/livox_ros_driver2
+# 网卡名 enx207bd2edf780 = USB-网口转换器 MAC(20:7b:d2:ed:f7:80) 决定,
+# 换转换器要改这里。也可改成按 MAC 匹配(udev) 但当前硬编码够用。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 等 USB-网口转换器枚举到位 (插拔后最多等 30s)
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do [ -e /sys/class/net/enx207bd2edf780 ] && exit 0; sleep 1; done; exit 0'
+# 关键: /32 不抢 WiFi 的 192.168.1.0/24 路由 (配 /24 会断 SSH, 见 memory mid360-livox-online)
+ExecStart=/bin/bash -c 'ip link set enx207bd2edf780 up; ip addr add 192.168.1.200/32 dev enx207bd2edf780 2>/dev/null || true; ip route add 192.168.1.160/32 dev enx207bd2edf780 metric 50 2>/dev/null || true'
+ExecStop=/bin/bash -c 'ip route del 192.168.1.160/32 dev enx207bd2edf780 2>/dev/null || true; ip addr del 192.168.1.200/32 dev enx207bd2edf780 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target

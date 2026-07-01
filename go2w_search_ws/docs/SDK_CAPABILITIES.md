@@ -227,35 +227,39 @@ ch.SetReader(handler=on_lidar)
 
 ---
 
-## 四、当前系统架构
+## 四、当前系统架构（NX 中心化 — 2026-07-01 重画）
+
+> 早期版本画的是**已删除**的 PC 后端 `web/server.py`（FastAPI + 笔记本:8000），已按现架构重画。
+> 第一/二/七节的数据接口、SDK 动作、DDS topic 清单**仍为实测有效资产**，未变。
 
 ```
-浏览器 (http://<笔记本IP>:8000)
-  ├── 第一视角画面（摄像头 + YOLO 检测框）
-  ├── SLAM 建图（LiDAR 障碍物栅格 + IMU 航向 + 轨迹）
-  └── 搜索 / 停止 按钮
-       │
-       │ WebSocket + REST API
+PC 浏览器 (瘦客户端, http://<NX_IP>:8000)
+  ├── 狗原生摄像头 (5.9fps SDK 上限) + YOLO 检测框
+  ├── C13 云台双流 (可见光 + 红外 RTSP)  ★新
+  ├── Livox MID360 雷达鸟瞰              ★新
+  ├── SLAM 障碍栅格地图 + 轨迹 + IMU 航向
+  └── 搜索 / 定位(locate_anything) / 急停
+       │ HTTP:8000 + WebSocket:8001 (低频状态/指令)
        ▼
-FastAPI 后端 (web/server.py)
-  ├── RobotSDK
-  │     ├── SportClient       → 运动控制（站立、移动、停止）
-  │     ├── VideoClient       → 摄像头 1920x1080
-  │     ├── IMU Subscriber    → rt/lowstate, 500Hz, 提供精确 yaw
-  │     ├── LiDAR Subscriber  → rt/utlidar/cloud, 15Hz, 点云 → 障碍物栅格
-  │     ├── VisualOdometer    → ORB 特征（备用，保留）
-  │     └── 轮式里程计         → IMU yaw + 速度积分推算位置
-  ├── Detector (YOLOv8n)      → 目标检测（当前加载失败，待修复）
-  ├── LidarMap                 → PointCloud2 解析 → 200×200 栅格 (0.1m/格)
-  └── SearchMission            → 割草机路径规划 + 定时导航
-       │
-       │ DDS (CycloneDDS, enp65s0)
+载荷 NX (Orin NX 16GB, ROS2 Humble — 跑所有重活, 本机闭环)
+  nx_web_server.py (主程序: HTTP+WS+rclpy, 组件注入式)
+  ├── nx_ai_node     VideoClient 1920x1080 + YOLO/VLM/LocateAnything
+  ├── nx_gimbal_node C13 RTSP 双流 (gst 硬解/ffmpeg)  ★新
+  ├── nx_lidar_node  /livox/lidar → 鸟瞰 png           ★新
+  ├── nx_slam_map    障碍栅格累积                      ★新
+  ├── nx_sensor_node 狗 IMU/雷达/轮速 → /imu /scan /odom + TF
+  ├── nx_motion_node 持 lease 控狗 (看门狗, systemd 自启)
+  ├── slam_toolbox 2D / nav2_slim
+  └── [可选] FAST_LIO 3D (MID360 自带 IMU, 200Hz)
+       │ unitree_sdk2py (CycloneDDS, USB 网卡 enxc8a362616c4c)
        ▼
-Go2W 机器狗 (192.168.123.161)
-  ├── 摄像头 (1920x1080)
-  ├── IMU (500Hz, rpy/quat/gyro/accel)
-  ├── LiDAR (15Hz, ~3800点/帧)
-  └── 运动控制 (Move/BalanceStand)
+Go2W 主控 (192.168.123.161, 宇树出厂系统, 只收 SDK 指令)
+  ├── 摄像头 (1920x1080, GetImageSample)
+  ├── IMU (rt/lowstate, 500Hz)
+  ├── 内置 LiDAR (rt/utlidar/cloud, 15Hz, ~3800点/帧)
+  └── 运动控制 (BalanceStand/Move)
+外设: Skydroid C13 云台 (192.168.144.108, vis:554 + ir:555)
+      Livox MID360 (192.168.1.160, /livox/lidar 10Hz)
 ```
 
 ---

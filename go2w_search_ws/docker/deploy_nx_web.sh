@@ -49,14 +49,35 @@ echo ""
 echo "[2/3] 拷贝 nx_web 代码到 NX:~/$NX_USER/go2w_ws/ ..."
 ssh "$NX_USER@$NX_HOST" "mkdir -p ~/go2w_ws/web ~/go2w_ws/web/static"
 scp -q "$WS_DIR/web/nx_web_server.py"            "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+scp -q "$WS_DIR/web/nx_gimbal_node.py"           "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+scp -q "$WS_DIR/web/nx_lidar_node.py"            "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+scp -q "$WS_DIR/web/nx_slam_map.py"              "$NX_USER@$NX_HOST:~/go2w_ws/web/"
 scp -q "$WS_DIR/web/mock_dog_state_publisher.py" "$NX_USER@$NX_HOST:~/go2w_ws/web/"
 scp -q "$WS_DIR/web/static/panel.html"           "$NX_USER@$NX_HOST:~/go2w_ws/web/static/"
 scp -q "$WS_DIR/web/static/map.js"               "$NX_USER@$NX_HOST:~/go2w_ws/web/static/"
-echo "✅ web 代码 + static 已拷贝 (nx_web_server.py, mock_dog_state_publisher.py, panel.html, map.js)"
+echo "✅ web 代码 + static 已拷贝 (nx_web_server.py, nx_gimbal_node.py, nx_lidar_node.py, nx_slam_map.py, mock, panel.html, map.js)"
 
 # ---- 3. 安装 go2w-web systemd 服务 ----
 echo ""
 echo "[3/3] 安装 go2w-web systemd 服务..."
+
+# 可选: MID360 驱动服务。网络 service 只配 192.168.1.200/32 + 路由, driver service 才真正发布 /livox/lidar。
+if ssh "$NX_USER@$NX_HOST" "test -f ~/ws_livox/install/setup.bash"; then
+  echo "检测到 ~/ws_livox/install/setup.bash, 安装 Livox MID360 systemd 服务..."
+  scp -q "$WS_DIR/docker/livox-mid360-net.service"    "$NX_USER@$NX_HOST:/tmp/livox-mid360-net.service"
+  scp -q "$WS_DIR/docker/livox-mid360-driver.service" "$NX_USER@$NX_HOST:/tmp/livox-mid360-driver.service"
+  ssh "$NX_USER@$NX_HOST" "echo '$NX_USER' | sudo -S bash -c '
+    cp /tmp/livox-mid360-net.service /etc/systemd/system/livox-mid360-net.service &&
+    cp /tmp/livox-mid360-driver.service /etc/systemd/system/livox-mid360-driver.service &&
+    systemctl daemon-reload &&
+    systemctl enable livox-mid360-net.service livox-mid360-driver.service &&
+    systemctl restart livox-mid360-net.service &&
+    systemctl restart livox-mid360-driver.service
+  ' 2>&1 | tail -1"
+  echo "✅ Livox MID360 网络 + 驱动服务已安装并启动"
+else
+  echo "⚠️  未检测到 ~/ws_livox/install/setup.bash, 跳过 Livox driver service 安装"
+fi
 
 # 3a. 探测连狗的 USB 网卡 (与 deploy_nx.sh 一致; 让 ExecStartPre + DOG_INTERFACE
 #     适配实测网卡名, 否则换 NX 时 web service 的 ExecStartPre 永远等不到网卡 → 卡死).

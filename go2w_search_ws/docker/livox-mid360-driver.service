@@ -1,0 +1,24 @@
+[Unit]
+Description=Livox MID360 ROS2 Driver (/livox/lidar + /livox/imu)
+Documentation=https://github.com/Livox-SDK/livox_ros_driver2
+Requires=livox-mid360-net.service
+After=livox-mid360-net.service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=nx
+Environment=HOME=/home/nx
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=ROS_DOMAIN_ID=0
+WorkingDirectory=/home/nx/ws_livox
+ExecStartPre=/bin/bash -c 'test -f /home/nx/ws_livox/install/setup.bash'
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/nx/ws_livox/install/setup.bash && exec ros2 launch livox_ros_driver2 msg_MID360_launch.py'
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -29,13 +29,19 @@ import asyncio
 import json
 import math
 import os
+import sys
 import threading
 import time
 import traceback
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+_WEB_DIR = Path(__file__).resolve().parent
+_WS_DIR = _WEB_DIR.parent
+if str(_WS_DIR) not in sys.path:
+    sys.path.insert(0, str(_WS_DIR))
 
 # ---- ROS2 (NX 本机, Humble) ----
 import rclpy
@@ -45,6 +51,8 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import String
+
+from nx_slam_map import ObstacleGridAccumulator
 
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -94,23 +102,79 @@ except Exception as _e:
 
 
 # ============================================================================
+# C13 云台 RTSP 双流桥接 (独立组件, 懒加载 cv2; 不动 AI/VideoClient 路径)
+# GimbalRtspBridge 拉 C13 可见光+红外 RTSP → WS type=gimbal。
+# GIMBAL_OK=False (cv2 缺失/C13_ENABLE=0) 时跳过, 主服务不受影响。
+# ============================================================================
+GIMBAL_OK = False
+GimbalRtspBridge = None
+try:
+    from nx_gimbal_node import GimbalRtspBridge, is_enabled as _gimbal_enabled
+    GIMBAL_OK = _gimbal_enabled()
+    logger.info(f"C13 双流桥接: {'可用' if GIMBAL_OK else '未启用 (C13_ENABLE=0 或 cv2 缺失)'}")
+except Exception as _e:
+    logger.warning(f"C13 双流桥接不可用 (前端无云台画面, 主服务不受影响): {_e}")
+
+
+# ============================================================================
+# Livox MID360 雷达点云 2D 鸟瞰展示 (独立组件, 订阅 /livox/lidar → type=lidar)
+# 需 go2w-web.service source ~/ws_livox/install/setup.bash (livox_ros_driver2.msg)。
+# ============================================================================
+LIDAR_OK = False
+LidarBridge = None
+try:
+    from nx_lidar_node import LidarBridge, _LIDAR_OK as _lidar_ok
+    LIDAR_OK = bool(_lidar_ok)
+    logger.info(f"雷达点云展示: {'可用' if LIDAR_OK else '未启用 (livox.msg 缺失, 需 source ws_livox)'}")
+except Exception as _e:
+    logger.warning(f"雷达点云展示不可用 (前端无雷达画面, 主服务不受影响): {_e}")
+
+
+# ============================================================================
 # WS 广播 (照抄 panel.py:92-105)
 # ============================================================================
 WS_CLIENTS = set()
 WS_LOOP = None
+_WS_PENDING = 0
+_WS_PENDING_LOCK = threading.Lock()
+_WS_MAX_PENDING = max(1, int(os.environ.get("GO2W_WS_MAX_PENDING", "3")))
+_WS_SEND_TIMEOUT = max(0.02, float(os.environ.get("GO2W_WS_SEND_TIMEOUT", "1.0")))  # H4 fix: 0.2→1.0 (本地/局域网, 避免瞬时抖动误踢健康连接)
+# C1 fix: NxRobotBridge.move 执行层 guard — 前进时前方 /scan 障碍 < 此阈值→强制 vx=0 (防自主跟踪撞墙)
+_FRONT_CLEARANCE_M = float(os.environ.get("GO2W_FRONT_CLEARANCE", "0.5"))
 
 
-def ws_broadcast(data):
+def ws_broadcast(data, force=False):
+    global _WS_PENDING
     if WS_LOOP and WS_CLIENTS:
+        if not force:
+            with _WS_PENDING_LOCK:
+                if _WS_PENDING >= _WS_MAX_PENDING:
+                    return
+                _WS_PENDING += 1
         msg = json.dumps(data, ensure_ascii=False)
-        asyncio.run_coroutine_threadsafe(_async_broadcast(msg), WS_LOOP)
+        fut = asyncio.run_coroutine_threadsafe(_async_broadcast(msg), WS_LOOP)
+
+        def _done(_):
+            global _WS_PENDING
+            if not force:
+                with _WS_PENDING_LOCK:
+                    _WS_PENDING = max(0, _WS_PENDING - 1)
+
+        fut.add_done_callback(_done)
+
+
+async def _send_ws(ws, msg):
+    try:
+        await asyncio.wait_for(ws.send(msg), timeout=_WS_SEND_TIMEOUT)
+        return None
+    except Exception:
+        return ws
 
 
 async def _async_broadcast(msg):
-    for ws in list(WS_CLIENTS):
-        try:
-            await ws.send(msg)
-        except Exception:
+    stale = await asyncio.gather(*[_send_ws(ws, msg) for ws in list(WS_CLIENTS)])
+    for ws in stale:
+        if ws is not None:
             WS_CLIENTS.discard(ws)
 
 
@@ -346,6 +410,7 @@ class NxRobotBridge:
         # 阶段B: NxAiEngine 注入 (main 里 robot._ai_engine = ai_engine),
         # 让 get_frame() 能委托取最新缓存帧 (供 TaskManager._execute_search 检测)。
         self._ai_engine = None
+        self._gimbal_bridge = None
 
     @property
     def connected(self):
@@ -378,11 +443,41 @@ class NxRobotBridge:
             }
 
     # ---- 动作: 转发到 NxWebNode 的 rclpy publisher ----
-    def move(self, vx, vy, vyaw):
+    def front_clearance(self, half_fov_deg=30.0):
+        """机体前方 ±half_fov_deg 最近障碍距离(m)。无 /scan 返回大值(视为畅通, 不卡跟踪)。
+        LaserScan: angle_min=-pi, 索引 i→angle=-pi+i*2pi/n, 前方 angle=0→i=n/2 (nx_sensor /scan)。"""
+        with self._node._lock:
+            ranges = list(self._node._scan_ranges)
+        if not ranges:
+            return 999.0
+        n = len(ranges)
+        center = n / 2.0
+        span = int(round(math.radians(half_fov_deg) / (2.0 * math.pi / n)))
+        lo = max(0, int(center - span)); hi = min(n, int(center + span + 1))
+        valid = [r for r in ranges[lo:hi] if 0.05 < r < 10.0]
+        return min(valid) if valid else 999.0
+
+    def move(self, vx, vy, vyaw, manual=False):
+        # C1 fix (2026-07-01, critic 收敛): guard 仅对自主路径(manual=False)生效 —
+        # tracker/TaskManager 调 move 不传 manual → 受 connected+前方障碍保护;
+        # 操作员 /api/move 传 manual=True → 透传(可顶近障碍/过门框, 全权控制)。
+        # 不破阶段B tracker 红线(tracker 调 move 无参自动走 guard), 且不误伤手动控制。
+        vx = float(vx); vy = float(vy); vyaw = float(vyaw)
+        if not manual:
+            if not self.connected:
+                return
+            if vx > 0.0:
+                try:
+                    front = self.front_clearance(30.0)
+                except Exception:
+                    front = 999.0
+                if front < _FRONT_CLEARANCE_M:
+                    logger.info(f"[move] 自主前进前方障碍 {front:.2f}m<{_FRONT_CLEARANCE_M}m, 暂停(仅转向/侧移)")
+                    vx = 0.0
         with self._lock:
-            self._vx = float(vx)
-            self._vy = float(vy)
-            self._vyaw = float(vyaw)
+            self._vx = vx
+            self._vy = vy
+            self._vyaw = vyaw
         self._node.publish_cmd_vel(vx, vy, vyaw)
 
     def stop_move(self):
@@ -399,12 +494,23 @@ class NxRobotBridge:
     def e_stop(self):
         self._node.publish_cmd_pose('estop')
 
+    def stop(self):
+        """Compatibility for ai.tracker.TargetTracker.stop()."""
+        self.stop_move()
+
     # ---- 阶段B 新增: get_frame 委托给 NxAiEngine (spec §7.2.3) ----
     def get_frame(self):
         """阶段B: 返回最新缓存帧 (带 YOLO 框, 720p BGR), 供 TaskManager._execute_search 检测。
         帧来自 NxAiEngine._video_yolo_loop 的缓存 (Lock 保护), 不调 GetImageSample (不阻塞)。
         无 AI 引擎/无缓存帧 → None (TaskManager 跳过检测, 与 panel.py:581 一致)。
         """
+        if self._gimbal_bridge is not None:
+            try:
+                f = self._gimbal_bridge.get_vis_frame()
+                if f is not None:
+                    return f
+            except Exception:
+                pass
         if self._ai_engine is None:
             return None
         try:
@@ -447,6 +553,13 @@ class TaskManager:
         self._search_targets = []
         # 阶段A 不跑 AI: vlm/detector 传 None, tracker 不创建
         self._tracker = None
+        if self.vlm is not None:
+            try:
+                from ai.tracker import TargetTracker
+                self._tracker = TargetTracker(self.vlm, self.robot, detector=self.detector)
+                logger.info("TargetTracker 已启用 (VLM/LocateAnything follow backend)")
+            except Exception as e:
+                logger.warning(f"TargetTracker 初始化失败, follow 将不可用: {e}")
         # 阶段E: 房间级搜索编排注入 (spec §7.2.2); None 时 search_room 任务标 failed
         self.room_orchestrator = room_orchestrator
 
@@ -594,9 +707,9 @@ class TaskManager:
     @staticmethod
     def _fallback_parse(text):
         r = {"understanding": text, "tasks": [], "response": ""}
-        if "跟着" in text or "跟随" in text:
+        if "跟着" in text or "跟随" in text or "跟上" in text:
             target = ""
-            for kw in ["跟着", "跟随"]:
+            for kw in ["跟着", "跟随", "跟上"]:
                 if kw in text:
                     target = text[text.index(kw) + len(kw):].strip().rstrip("。，！？")
             r["tasks"] = [{"type": "follow", "priority": 8, "params": {"target": target}}]
@@ -856,7 +969,7 @@ def create_server(host, port, static_dir):
                 vx = float(q.get('vx', ['0'])[0])
                 vy = float(q.get('vy', ['0'])[0])
                 vyaw = float(q.get('vyaw', ['0'])[0])
-                robot.move(vx, vy, vyaw)
+                robot.move(vx, vy, vyaw, manual=True)  # /api/move = 操作员手动, bypass 自主 guard (C1 critic 收敛)
                 self._json({"ok": True})
             elif p.path == '/api/command':
                 text = q.get('text', [''])[0] or body
@@ -868,6 +981,32 @@ def create_server(host, port, static_dir):
                 if text:
                     task_mgr.process_command(text)
                 self._json({"ok": True, "text": text})
+            elif p.path == '/api/locate':
+                target = q.get('target', [''])[0] or q.get('text', [''])[0] or body
+                if body:
+                    try:
+                        jb = json.loads(body)
+                        if isinstance(jb, dict):
+                            target = jb.get('target') or jb.get('text') or target
+                    except Exception:
+                        pass
+                target = (target or "").strip()
+                if not target:
+                    self._json({"ok": False, "msg": "缺少 target/text 参数"})
+                    return
+                if robot is None or getattr(robot, "_ai_engine", None) is None:
+                    self._json({"ok": False, "msg": "AI 引擎未启用"})
+                    return
+                frame = robot.get_frame()
+                if frame is None:
+                    self._json({"ok": False, "msg": "当前没有可用视频帧"})
+                    return
+                result = robot._ai_engine.locate_target(frame, target)
+                payload = dict(result)
+                payload["target"] = target
+                payload["status"] = result.get("description") or ("found" if result.get("found") else "no detections")
+                ws_broadcast({"type": "locate", "data": payload}, force=True)
+                self._json({"ok": bool(result.get("found")), "target": target, "result": result})
             elif p.path == '/api/search':
                 # 表单/地图选区搜索: width,height,spacing,origin_x,origin_y,pattern
                 w = float(q.get('width', ['8'])[0])
@@ -934,7 +1073,7 @@ def create_server(host, port, static_dir):
         def log_message(self, *a):
             pass
 
-    return HTTPServer((host, port), H)
+    return ThreadingHTTPServer((host, port), H)  # H5 fix: 每请求独立线程, /api/locate 长 subprocess 不再阻塞 /api/stop 急停
 
 
 # ============================================================================
@@ -967,6 +1106,10 @@ def run_ws(host, port):
 #   - 不发 frame (阶段A 不直连狗 VideoClient, 前端 type==='frame' 自然显示"等待视频")
 # ============================================================================
 _trail = []
+_obstacle_grid = ObstacleGridAccumulator(
+    resolution=float(os.environ.get("GO2W_MAP_RESOLUTION", "0.1")),
+    max_points=int(os.environ.get("GO2W_MAP_MAX_POINTS", "50000")),  # M3 fix: 5000→50000 (0.1m 栅格 20m×20m=40000 cell, LRU 太小会让墙点被淘汰)
+)
 
 
 def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager: TaskManager, ai_engine=None):
@@ -992,10 +1135,9 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
             # type=frame 格式严格对齐 panel.py:847-849 / panel.html:384-389:
             #   detections = 整数计数 (C1.4), 不是数组! 像素 bbox 已画在 jpeg 里。
             if ai_engine is not None:
-                fr = ai_engine.get_frame_jpeg()
-                if fr is not None:
-                    b64, det_count = fr
-                    ws_broadcast({"type": "frame", "data": b64, "detections": int(det_count)})
+                det_count = ai_engine.get_frame_detection_count()
+                if det_count is not None:
+                    ws_broadcast({"type": "frame", "detections": int(det_count)})
 
             # ---- trail 累积 (每 0.1m 一个点, 上限 2000) ----
             if not _trail:
@@ -1022,6 +1164,7 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
                                          round(sin_y * lx + cos_y * ly + y, 2)])
                         if len(scan_pts) >= 200:
                             break
+            map_pts = _obstacle_grid.update(scan_pts) if scan_pts else _obstacle_grid.points()
 
             # ---- SLAM 推送 (字段名严格匹配 map.js update()) ----
             # 阶段B: slam.data.detections 是数组 [{x,y,class}] (C1.5, map.js:52),
@@ -1035,7 +1178,7 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
                     "y": round(y, 2),
                     "yaw": round(yaw, 2),
                     "trail": _trail,
-                    "map": [],
+                    "map": map_pts,
                     "scan": scan_pts,
                     "detections": det_world,
                     "waypoints": [],
@@ -1044,14 +1187,16 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
                 }})
 
             # ---- status 推送 (字段名匹配 panel.html:396-400) ----
+            det_list = ai_engine.get_detection_list() if ai_engine is not None and hasattr(ai_engine, "get_detection_list") else []
             ws_broadcast({"type": "status",
                           "imu_yaw": round(yaw, 3),
                           "stats": {"imu_count": imu_count,
-                                    "robot_mode": 0,
-                                    "robot_velocity": [dog_vx, dog_vy, dog_vyaw],
-                                    "connected": connected},
+                                     "robot_mode": 0,
+                                     "robot_velocity": [dog_vx, dog_vy, dog_vyaw],
+                                     "connected": connected},
                           "dog_state": dog_state,
-                          "tasks": task_manager.get_state() if task_manager else {}})
+                          "tasks": task_manager.get_state() if task_manager else {},
+                          "det_list": det_list})
 
             time.sleep(0.15)
         except Exception as e:
@@ -1095,6 +1240,29 @@ def main():
             detector_proxy = None
 
     task_mgr = TaskManager(robot, vlm_engine=vlm_proxy, detector=detector_proxy)
+
+    # C13 云台双流桥接 (独立 daemon 线程拉 vis+ir RTSP → type=gimbal 推前端)
+    gimbal_bridge = None
+    if GIMBAL_OK and GimbalRtspBridge is not None:
+        try:
+            gimbal_bridge = GimbalRtspBridge(ws_broadcast)
+            gimbal_bridge.start()
+            robot._gimbal_bridge = gimbal_bridge
+            logger.info("C13 云台双流桥接已启动")
+        except Exception as e:
+            logger.error(f"C13 双流桥接启动失败 (前端无云台画面, 主服务不受影响): {e}")
+            gimbal_bridge = None
+
+    # Livox MID360 雷达点云展示 (订阅 /livox/lidar → type=lidar 推前端鸟瞰 png)
+    lidar_bridge = None
+    if LIDAR_OK and LidarBridge is not None:
+        try:
+            lidar_bridge = LidarBridge(ws_broadcast)
+            lidar_bridge.start(node)
+            logger.info("雷达点云展示桥接已启动")
+        except Exception as e:
+            logger.error(f"雷达点云展示启动失败 (主服务不受影响): {e}")
+            lidar_bridge = None
 
     # 阶段E (spec §7.2.5): 创建 RoomSearchOrchestrator + 注入 TaskManager
     room_orchestrator = None
@@ -1142,6 +1310,16 @@ def main():
         try:
             if ai_engine is not None:
                 ai_engine.stop()  # 阶段B: 停 3 daemon 线程 + unload VLM
+        except Exception:
+            pass
+        try:
+            if gimbal_bridge is not None:
+                gimbal_bridge.stop()
+        except Exception:
+            pass
+        try:
+            if lidar_bridge is not None:
+                lidar_bridge.stop()
         except Exception:
             pass
         # 阶段E: 取消进行中的 Nav2 goal (spec §11 进程退出清理)

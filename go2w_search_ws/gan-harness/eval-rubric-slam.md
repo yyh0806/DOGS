@@ -51,7 +51,7 @@
 | 1 | `slam_toolbox.yaml` 含 `use_sensor_data_qos: false` | **C** | grep 有此参数，且值=false | `grep "use_sensor_data_qos" src/go2w_nav/config/slam_toolbox.yaml`；**缺失或=true = Critical FAIL**（QoS 不匹配静默失败，slam_toolbox 收不到 nx_sensor 的 RELIABLE /scan） |
 | 2 | `slam_toolbox.yaml` `scan_topic: /scan` | C | = `/scan`（nx_sensor 发的 topic 名） | grep；**禁止** /base_scan /laser_scan 等别名 |
 | 3 | `nav2_params_slim.yaml` obstacle_layer scan 段含 `reliability: reliable` | H | local_costmap + global_costmap 的 obstacle_layer scan 段都有 `reliability: reliable`（匹配 nx_sensor RELIABLE 发布） | `grep -A2 "reliability" src/go2w_nav/config/nav2_params_slim.yaml`（应 2 处）；若 Nav2 Humble obstacle_layer 不支持 reliability 参数，Generator 需书面说明替代方案（如改 nx_sensor 发 BEST_EFFORT，但这违反阶段A 红线，需 Planner 批准） |
-| 4 | nx_sensor_node.py 未改 | **C** | `git diff src/go2w_bridge/go2w_bridge/nx_sensor_node.py` 为空 | `git diff --name-only HEAD \| grep nx_sensor_node` 应无输出；**改动 = Critical FAIL**（阶段A 红线 + /scan 来源） |
+| 4 | nx_sensor_node.py 仅允许 wheel odom 破线 | **C** | `git diff` 仅含 wheel odom 改动(motor_state[12-15] 轮速积分 → /odom xy + linear.x), 不改 /scan /imu /tf 逻辑 | **2026-07-01 授权破线**(解 P0 odom 缺口, 见 PROJECT_STRUCTURE 五节 + docs/wheel_odom_calibration.md); `git diff HEAD -- nx_sensor_node.py` 应只动 wheel_radius 参数(L64)/_odom v 字段(L89)/_on_imu wheel_dq(L133)/_publish_odom_imu 轮速积分段(L186-197), **/scan 发布(L107/235) + /imu + TF 逻辑不动 = 仍 Critical** |
 | 5 | `slam_toolbox.yaml` `max_laser_range: 10.0` | M | = 10.0（对齐 nx_sensor /scan range_max=10.0，nx_sensor_node.py:235） | grep；8.0 不致错（MID360 遗留值）但浪费数据，应改 10.0 |
 
 ### 2.2 frame/TF 一致性（6 项，权重 0.25）
@@ -197,7 +197,7 @@ git diff --name-only HEAD
 |---|---|---|
 | 1 | **slam use_sensor_data_qos = false** | **头号风险**：nx_sensor /scan 发 RELIABLE，slam_toolbox 默认 BEST_EFFORT 不匹配静默失败 |
 | 2 | slam scan_topic = /scan | nx_sensor 发的 topic 名 |
-| 4 | **不改 nx_sensor_node.py** | **阶段A 红线 + /scan 来源** |
+| 4 | **nx_sensor 仅 wheel odom 破线** | 2026-07-01 授权(解 P0 odom 缺口), /scan /imu /tf 不动 |
 | 6 | slam base_frame = base_link | nx_sensor /scan frame_id（非 laser_frame） |
 | 7 | slam odom_frame = odom | nx_sensor /odom frame |
 | 8 | slam map_frame = map | Nav2 + 阶段E 一致 |
@@ -223,7 +223,7 @@ git diff --name-only HEAD
 ## Critical 项 (C): [N/15 PASS]
 - [PASS/FAIL] #1 slam use_sensor_data_qos=false: ...
 - [PASS/FAIL] #2 slam scan_topic=/scan: ...
-- [PASS/FAIL] #4 nx_sensor_node.py 未改: ...
+- [PASS/FAIL] #4 nx_sensor_node.py 仅 wheel odom 破线(2026-07-01 授权, /scan /imu /tf 不动): ...
 - [PASS/FAIL] #6 slam base_frame=base_link: ...
 - [PASS/FAIL] #7 slam odom_frame=odom: ...
 - [PASS/FAIL] #8 slam map_frame=map: ...

@@ -40,9 +40,13 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
 
 /* 视频 */
 .video-section { flex: 0 0 auto; }
-.video-wrap { background: #000; position: relative; width: 100%; height: 200px; display: flex; align-items: center; justify-content: center; }
+.video-wrap { background: #000; position: relative; width: 100%; height: 200px; display: flex; align-items: center; justify-content: center; overflow: hidden; }
 .video-wrap img { max-width: 100%; max-height: 100%; object-fit: contain; }
-.video-overlay { position: absolute; top: 6px; left: 6px; display: flex; gap: 6px; }
+.video-overlay { position: absolute; top: 6px; left: 6px; display: flex; gap: 6px; z-index: 3; }
+.locate-overlay { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+.locate-box { position: absolute; border: 2px solid #00e5ff; border-radius: 2px; box-shadow: 0 0 0 1px rgba(0,0,0,0.65), 0 0 16px rgba(0,229,255,0.45); }
+.locate-box-label { position: absolute; left: -2px; top: -23px; max-width: 220px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; background: rgba(0,0,0,0.82); color: #e0f7fa; border: 1px solid rgba(0,229,255,0.7); border-radius: 3px; padding: 2px 6px; font-size: 11px; line-height: 16px; }
+.locate-note { position: absolute; left: 8px; right: 8px; bottom: 8px; background: rgba(0,0,0,0.78); color: #ffd54f; border: 1px solid rgba(255,213,79,0.45); border-radius: 4px; padding: 5px 7px; font-size: 11px; line-height: 16px; }
 .badge { background: rgba(0,0,0,0.7); padding: 2px 7px; border-radius: 3px; font-size: 10px; }
 .badge.green { color: #4caf50; } .badge.orange { color: #ff9800; }
 .no-video { color: #555; font-size: 12px; }
@@ -85,6 +89,10 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
 .search-form { display: flex; gap: 6px; margin-top: 6px; align-items: center; font-size: 11px; flex-wrap: wrap; }
 .search-form input { width: 42px; padding: 3px 5px; background: #1a1a1a; border: 1px solid #333; border-radius: 3px; color: #fff; font-size: 11px; text-align: center; }
 .search-form .lbl { color: #666; }
+.locate-form { display: flex; gap: 6px; margin-top: 6px; align-items: center; font-size: 11px; flex-wrap: wrap; }
+.locate-form input { width: min(240px, 58vw); padding: 3px 6px; background: #1a1a1a; border: 1px solid #333; border-radius: 3px; color: #fff; font-size: 11px; outline: none; }
+.locate-form input:focus { border-color: #1565c0; }
+.locate-form .lbl { color: #666; }
 
 /* 动作按钮栏 */
 .action-row { padding: 8px 14px; display: flex; align-items: center; gap: 10px; }
@@ -137,16 +145,33 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
   <!-- 右栏: 视频+检测 / 任务 -->
   <div class="right-pane">
     <div class="section video-section">
-      <div class="section-header">相机 <span id="videoMeta">--</span></div>
-      <div class="video-wrap">
+      <div class="section-header">云台 C13 (可见光+红外) <span id="videoMeta">--</span></div>
+      <div class="video-wrap" id="visVideoWrap">
         <div class="video-overlay">
+          <span class="badge green">可见光</span>
           <span class="badge green" id="fpsBadge">-- FPS</span>
           <span class="badge orange" id="detBadge">0 目标</span>
         </div>
         <span class="no-video" id="noVideo">等待视频...</span>
         <img id="videoImg" style="display:none" />
+        <div class="locate-overlay" id="locateOverlay"></div>
+      </div>
+      <div class="video-wrap" style="height:130px;border-top:1px solid #2a2a2a;">
+        <div class="video-overlay">
+          <span class="badge" style="color:#ff5722;">红外</span>
+        </div>
+        <span class="no-video" id="noIrVideo">等待红外...</span>
+        <img id="irImg" style="display:none" />
       </div>
       <div class="det-list" id="detList"><div class="det-empty">无检测</div></div>
+    </div>
+
+    <div class="section" style="flex:0 0 auto;">
+      <div class="section-header">雷达 MID360 鸟瞰 <span id="lidarMeta" style="font-weight:400;color:#555;">--</span></div>
+      <div style="background:#000;padding:4px;display:flex;justify-content:center;">
+        <img id="lidarImg" style="max-width:100%;max-height:220px;display:none;" />
+        <span class="no-video" id="noLidar">等待雷达...</span>
+      </div>
     </div>
 
     <div class="section task-section">
@@ -169,6 +194,11 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
       <span class="lbl">高</span><input type="number" id="searchH" value="8" step="0.5">
       <span class="lbl">间距</span><input type="number" id="searchSpacing" value="2" step="0.5">
       <button class="btn" style="padding:3px 10px;" onclick="searchByForm()">从当前位置搜索</button>
+    </div>
+    <div class="locate-form">
+      <span class="lbl">目标定位</span>
+      <input id="locateInput" value="所有可见物体" onkeydown="if(event.key==='Enter')locateTarget()" />
+      <button class="btn" style="padding:3px 10px;" onclick="locateTarget()">定位</button>
     </div>
     <div class="quick-cmds">
       <span class="quick-btn" onclick="quickCmd('搜索区域')">用选区搜索</span>
@@ -205,6 +235,7 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
 <script>
 let ws, connected = false, frameCount = 0, lastFpsTime = Date.now(), _moveInterval = null;
 let latestDetections = [];
+let latestLocateResult = null;
 let map = null;
 
 // ---- 地图初始化 ----
@@ -318,6 +349,30 @@ function searchByForm() {
     .then(r => r.json()).then(d => { if (d.ok) { document.getElementById('taskCount').textContent = '搜索已启动'; } });
 }
 
+function locateTarget() {
+  const input = document.getElementById('locateInput');
+  const target = (input.value || '').trim();
+  if (!target) return;
+  const meta = document.getElementById('videoMeta');
+  if (meta) meta.textContent = `定位中: ${target}`;
+  fetch(`/api/locate?target=${encodeURIComponent(target)}`, { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      const result = d.result || {};
+      result.target = d.target || result.target || target;
+      if (Array.isArray(result.detections)) updateDetList(result.detections);
+      renderLocateOverlay(result);
+      if (meta) {
+        const status = result.description || result.status || d.msg || (result.found ? 'found' : 'no detections');
+        meta.textContent = result.found ? `定位: ${d.target || target}` : `定位未命中: ${status}`;
+      }
+    })
+    .catch(() => {
+      showLocateNote('LocateAnything: 请求未完成');
+      if (meta) meta.textContent = '定位失败: 请求未完成';
+    });
+}
+
 function openFoxglove() {
   fetch('/api/foxglove').then(r => r.json()).then(d => {
     if (d.url) window.open(d.url, '_blank');
@@ -373,6 +428,141 @@ function updateDetList(dets) {
   el.innerHTML = dets.map(d => `<div class="det-item"><span>${d.class}</span><span>${Math.round(d.confidence * 100)}%</span></div>`).join('');
 }
 
+function collectLocateBoxes(result) {
+  if (!result) return [];
+  const dets = Array.isArray(result.detections) ? result.detections : [];
+  const boxes = dets
+    .filter(d => Array.isArray(d.bbox) && d.bbox.length >= 4)
+    .map(d => ({
+      bbox: d.bbox,
+      label: d.class || d.label || result.target || 'object',
+      labelZh: d.label_zh || result.label_zh || '',
+      confidence: d.confidence || result.confidence || 0,
+      frameWidth: d.frame_width || result.frame_width,
+      frameHeight: d.frame_height || result.frame_height,
+    }));
+  if (boxes.length) return boxes;
+  if (Array.isArray(result.bbox) && result.bbox.length >= 4) {
+    return [{
+      bbox: result.bbox,
+      label: result.label || result.target || 'object',
+      labelZh: result.label_zh || '',
+      confidence: result.confidence || 0,
+      frameWidth: result.frame_width,
+      frameHeight: result.frame_height,
+    }];
+  }
+  return [];
+}
+
+function clampBox(bbox, frameW, frameH) {
+  const [rawX1, rawY1, rawX2, rawY2] = bbox.map(Number);
+  const x1 = Math.max(0, Math.min(frameW, rawX1));
+  const y1 = Math.max(0, Math.min(frameH, rawY1));
+  const x2 = Math.max(0, Math.min(frameW, rawX2));
+  const y2 = Math.max(0, Math.min(frameH, rawY2));
+  return [Math.min(x1, x2), Math.min(y1, y2), Math.max(x1, x2), Math.max(y1, y2)];
+}
+
+function displayLocateLabel(boxData, index, total) {
+  const rawZh = (boxData.labelZh || boxData.label_zh || '').trim();
+  const raw = String(boxData.label || boxData.class || 'object').trim();
+  const key = raw.toLowerCase();
+  const zhMap = {
+    object: '物体',
+    objects: '物体',
+    person: '人',
+    people: '人',
+    'person wearing white clothes': '白衣人',
+    'person wearing black clothes': '黑衣人',
+    'person wearing blue clothes': '蓝衣人',
+    'person wearing red clothes': '红衣人',
+    chair: '椅子',
+    table: '桌子',
+    desk: '桌子',
+    door: '门',
+    window: '窗户',
+    car: '车',
+    vehicle: '车',
+    backpack: '背包',
+    bag: '包',
+    box: '箱子',
+    bottle: '瓶子',
+    cup: '杯子',
+    screen: '屏幕',
+  };
+  const label = rawZh || zhMap[key] || raw || '物体';
+  return total > 1 && label === '物体' ? `物体 ${index + 1}` : label;
+}
+
+function showLocateNote(text) {
+  const overlay = document.getElementById('locateOverlay');
+  if (!overlay) return;
+  overlay.innerHTML = '';
+  const note = document.createElement('div');
+  note.className = 'locate-note';
+  note.textContent = text;
+  overlay.appendChild(note);
+}
+
+function renderLocateOverlay(result) {
+  latestLocateResult = result || null;
+  const overlay = document.getElementById('locateOverlay');
+  if (!overlay) return;
+  overlay.innerHTML = '';
+  if (!result) return;
+
+  const boxes = collectLocateBoxes(result);
+  if (!result.found || !boxes.length) {
+    const target = result.target ? `: ${result.target}` : '';
+    const status = result.description || result.status || 'no detections';
+    showLocateNote(`LocateAnything${target} - ${status}`);
+    return;
+  }
+
+  const img = document.getElementById('videoImg');
+  const wrap = overlay.parentElement;
+  if (!img || !wrap) {
+    showLocateNote('LocateAnything: 缺少可见光画面，无法画框');
+    return;
+  }
+
+  const imgRect = img.getBoundingClientRect();
+  const wrapRect = wrap.getBoundingClientRect();
+  if (imgRect.width <= 0 || imgRect.height <= 0) {
+    showLocateNote('LocateAnything: 等待视频帧');
+    return;
+  }
+
+  let drawn = 0;
+  boxes.forEach((boxData, index) => {
+    const frameW = Number(boxData.frameWidth) || 0;
+    const frameH = Number(boxData.frameHeight) || 0;
+    if (frameW <= 0 || frameH <= 0) return;
+    const [x1, y1, x2, y2] = clampBox(boxData.bbox, frameW, frameH);
+    if (x2 <= x1 || y2 <= y1) return;
+    const left = imgRect.left - wrapRect.left + (x1 / frameW) * imgRect.width;
+    const top = imgRect.top - wrapRect.top + (y1 / frameH) * imgRect.height;
+    const width = Math.max(2, ((x2 - x1) / frameW) * imgRect.width);
+    const height = Math.max(2, ((y2 - y1) / frameH) * imgRect.height);
+    const box = document.createElement('div');
+    box.className = 'locate-box';
+    box.style.left = `${left}px`;
+    box.style.top = `${top}px`;
+    box.style.width = `${width}px`;
+    box.style.height = `${height}px`;
+
+    const label = document.createElement('div');
+    label.className = 'locate-box-label';
+    const conf = boxData.confidence ? ` ${Math.round(boxData.confidence * 100)}%` : '';
+    label.textContent = `${displayLocateLabel(boxData, index, boxes.length)}${conf}`;
+    box.appendChild(label);
+    overlay.appendChild(box);
+    drawn++;
+  });
+  if (!drawn) showLocateNote('LocateAnything: 缺少图像尺寸，无法画框');
+}
+
 // ---- WebSocket ----
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -381,11 +571,34 @@ function connectWS() {
   ws.onmessage = (e) => {
     try {
       const data = JSON.parse(e.data);
-      if (data.type === 'frame') {
-        const img = document.getElementById('videoImg');
-        img.src = 'data:image/jpeg;base64,' + data.data;
-        img.style.display = 'block';
-        document.getElementById('noVideo').style.display = 'none';
+      if (data.type === 'lidar') {
+        const li = document.getElementById('lidarImg');
+        li.src = 'data:image/png;base64,' + data.data;
+        li.style.display = 'block';
+        document.getElementById('noLidar').style.display = 'none';
+        if (map && data.points) map.addLocalObstaclePoints(data.points);
+        const meta = document.getElementById('lidarMeta');
+        if (meta && data.points) meta.textContent = data.points.length + ' pts';
+      } else if (data.type === 'gimbal') {
+        // C13 云台双流 (可见光+红外合并推送)
+        if (data.vis) {
+          const img = document.getElementById('videoImg');
+          img.src = 'data:image/jpeg;base64,' + data.vis;
+          img.style.display = 'block';
+          document.getElementById('noVideo').style.display = 'none';
+          frameCount++;
+          if (latestLocateResult) requestAnimationFrame(() => renderLocateOverlay(latestLocateResult));
+        }
+        if (data.ir) {
+          const ir = document.getElementById('irImg');
+          ir.src = 'data:image/jpeg;base64,' + data.ir;
+          ir.style.display = 'block';
+          document.getElementById('noIrVideo').style.display = 'none';
+        }
+      } else if (data.type === 'frame') {
+        // 狗相机/YOLO 帧; videoImg 已由 type=gimbal.vis (云台可见光) 占用,
+        // 狗没上电时 nx_ai 会切 mock 发灰底帧, 覆盖云台画面会闪烁 →
+        // frame 只更新检测计数, 不写 videoImg (云台为主视频源)
         document.getElementById('detBadge').textContent = (data.detections || 0) + ' 目标';
         frameCount++;
       } else if (data.type === 'slam') {
@@ -402,6 +615,15 @@ function connectWS() {
         updateTasks(data.data);
       } else if (data.type === 'vlm') {
         if (data.data.response) console.log('[VLM]', data.data.response);
+      } else if (data.type === 'locate') {
+        if (data.data && data.data.detections) updateDetList(data.data.detections);
+        if (data.data) renderLocateOverlay(data.data);
+        const meta = document.getElementById('videoMeta');
+        if (meta && data.data) {
+          meta.textContent = data.data.found
+            ? `定位: ${data.data.target || ''}`
+            : `定位未命中: ${data.data.status || '--'}`;
+        }
       } else if (data.type === 'search') {
         // 搜索发现目标 → 在地图标记 (detMarks 已在 slam 里)
         if (data.data && data.data.found) console.log('[搜索发现]', data.data.found);
@@ -450,6 +672,7 @@ document.addEventListener('keyup', (e) => {
   if (!Object.values(keyState).some(v => v)) stopMove();
 });
 window.addEventListener('blur', () => { Object.keys(keyState).forEach(k => keyState[k] = false); stopMove(); });
+window.addEventListener('resize', () => { if (latestLocateResult) renderLocateOverlay(latestLocateResult); });
 </script>
 </body>
 </html>

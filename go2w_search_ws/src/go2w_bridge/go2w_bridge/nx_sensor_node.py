@@ -61,6 +61,7 @@ class NxSensorNode(Node):
         self.declare_parameter('publish_scan', True)
         self.declare_parameter('odom_rate', 50.0)
         self.declare_parameter('scan_rate', 10.0)
+        self.declare_parameter('wheel_radius', 0.065)  # Go2W 轮径(m), wheel odom 用, 建图后标定
 
         if not SDK_OK:
             self.get_logger().error(f"unitree_sdk2py 不可用: {_SDK_ERR}")
@@ -86,8 +87,10 @@ class NxSensorNode(Node):
         self._lidar_count = 0
 
         # 死推算里程计状态
-        self._odom = {'x': 0.0, 'y': 0.0, 'yaw': 0.0, 'last_t': 0.0}
+        # wheel odom 状态 (轮速积分 xy, yaw 用 IMU)
+        self._odom = {'x': 0.0, 'y': 0.0, 'yaw': 0.0, 'last_t': 0.0, 'v': 0.0}
         self._yaw_offset = None  # 启动时把 yaw 归零 (让初始朝向=0)
+        self._wheel_radius = self.get_parameter('wheel_radius').get_parameter_value().double_value
 
         # 订阅狗的 DDS 话题
         try:
@@ -127,6 +130,10 @@ class NxSensorNode(Node):
                 self._imu['quat'] = [float(x) for x in msg.imu_state.quaternion]
                 self._imu['count'] += 1
                 self._imu['t'] = time.time()
+                # wheel odom: 存 4 轮角速度 (Go2W motor_state[12-15] = 轮子电机, dq=rad/s)
+                ms = msg.motor_state
+                if len(ms) >= 16:
+                    self._imu['wheel_dq'] = [float(ms[i].dq) for i in (12, 13, 14, 15)]
         except Exception:
             pass
 
@@ -176,13 +183,18 @@ class NxSensorNode(Node):
             self.get_logger().info(f"IMU yaw 归零: 原始 {yaw:.3f} → 0")
         yaw_zero = yaw - self._yaw_offset
 
-        # 死推算: 没有真里程计时, 用 IMU gyro+z 估角速度, 暂不估平移 (留 FAST_LIO)
-        # 这里 odom 主要给前端看 yaw 变化 + TF, xy 留 0 (阶段B接真里程计后填充)
+        # wheel odom (成熟技术: 轮速积分): 4轮平均角速度 × 轮径 = 线速度, 沿 IMU yaw 积分得 xy。
+        # yaw 用 IMU(准确无漂移), xy 用轮速(室内硬地无打滑, 够 slam 用)。原 xy 占位0 已废弃。
         now_s = time.time()
-        if self._odom['last_t'] == 0.0:
-            self._odom['last_t'] = now_s
+        dt = now_s - self._odom['last_t'] if self._odom['last_t'] > 0 else 0.0
         self._odom['last_t'] = now_s
         self._odom['yaw'] = yaw_zero
+        wheel_dq = self._imu.get('wheel_dq') or [0.0, 0.0, 0.0, 0.0]
+        v = sum(wheel_dq) / 4.0 * self._wheel_radius  # 线速度 m/s (4轮同向, 平均即前进速度)
+        if 0 < dt < 1.0:  # 过滤首帧/大间隔(回调断流), 避免积分跳变
+            self._odom['x'] += v * math.cos(yaw_zero) * dt
+            self._odom['y'] += v * math.sin(yaw_zero) * dt
+        self._odom['v'] = v
 
         # 发布 IMU
         imu_msg = Imu()
@@ -205,6 +217,7 @@ class NxSensorNode(Node):
         cy, sy = math.cos(yaw_zero * 0.5), math.sin(yaw_zero * 0.5)
         odom.pose.pose.orientation.z = sy; odom.pose.pose.orientation.w = cy
         odom.twist.twist.angular.z = gyro[2]
+        odom.twist.twist.linear.x = self._odom['v']  # wheel odom 线速度 (供 nav2/cmd_vel 反馈)
         self._odom_pub.publish(odom)
 
         # TF: odom → base_link

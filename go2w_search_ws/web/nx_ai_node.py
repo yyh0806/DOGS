@@ -87,6 +87,7 @@ _DETECT_ASSUME_DIST_M = float(os.environ.get("GO2W_DETECT_DIST", "3.0"))
 # ============================================================================
 # 显式禁检测开关 (round-3 需求 3)
 _DETECT_DISABLED_BY_ENV = str(os.environ.get("GO2W_AI_NO_DETECT", "")).strip() in ("1", "true", "True", "yes")
+_AI_VIDEO_ENABLED = str(os.environ.get("GO2W_AI_VIDEO_ENABLE", "0")).strip() in ("1", "true", "True", "yes", "on")
 
 # ultralytics 是否可导入 (NX 可能没装; 探测一次, 记 warning, 不崩)
 # 注意: 这里只探测 ultralytics 本身, 不在顶层 import ai.detector (保持 ai.detector
@@ -213,6 +214,7 @@ class NxAiEngine:
 
     def __init__(self):
         self._lock = threading.Lock()
+        self._locate_lock = threading.Lock()  # M5 fix: 串行化 locate_target (subprocess fork 3B 模型 ~2GB, 并发 OOM)
         # 视频源 (spec 决策 4: ChannelFactory 单例 + VideoClient)
         self._video = None              # unitree VideoClient (懒初始化)
         self._factory = None            # ChannelFactory 单例 (本进程)
@@ -243,6 +245,13 @@ class NxAiEngine:
         self._vlm_last_use = 0.0
         self._vlm_idle_timeout = float(os.environ.get("GO2W_VLM_IDLE", "60"))
         self._vlm_loading = False       # load 进行中 (H3.2 loading 状态)
+        # LocateAnything (开放词汇定位; 低频按需, 不进 8fps YOLO 主循环)
+        self._locate = None
+        self._locate_inited = False
+        self._latest_locate_dets = []
+        self._latest_locate_frame_w = 1280
+        self._latest_locate_target = ""
+        self._latest_locate_status = "unloaded"
         # 控制
         self._running = False
         self._threads = []
@@ -262,12 +271,21 @@ class NxAiEngine:
         即: 缺重依赖时 start() 不抛、视频流不断, 满足 NX 纯视频流部署。
         """
         self._running = True
-        t1 = threading.Thread(target=self._video_yolo_loop, name="nx_ai_video", daemon=True)
         t2 = threading.Thread(target=self._vlm_worker, name="nx_ai_vlm", daemon=True)
         t3 = threading.Thread(target=self._mem_monitor, name="nx_ai_mem", daemon=True)
-        t1.start(); t2.start(); t3.start()
-        self._threads = [t1, t2, t3]
-        logger.info("[AI] NxAiEngine 启动 (3 daemon 线程: video/vlm/mem)")
+        threads = []
+        if _AI_VIDEO_ENABLED:
+            t1 = threading.Thread(target=self._video_yolo_loop, name="nx_ai_video", daemon=True)
+            t1.start()
+            threads.append(t1)
+        else:
+            logger.warning("[AI] dog camera video loop disabled (GO2W_AI_VIDEO_ENABLE=0) — "
+                           "无狗原生视频帧; locate/follow 仅在 C13 云台启用时有帧, 否则 /api/locate 返回'无可用帧'")
+        t2.start(); t3.start()
+        threads.extend([t2, t3])
+        self._threads = threads
+        logger.info(f"[AI] NxAiEngine 启动 ({len(threads)} daemon 线程: "
+                    f"{'video/' if _AI_VIDEO_ENABLED else ''}vlm/mem)")
 
     def stop(self):
         self._running = False
@@ -408,7 +426,159 @@ class NxAiEngine:
             return dets if dets else []
         except Exception as e:
             logger.warning(f"[AI] 检测异常 ({type(det).__name__}): {e} (本帧 detections 空, 视频流继续)")
-            return []
+        return []
+
+    # ------------------------------------------------------------------
+    # LocateAnything 按需定位 (低频 grounding, 给 /api/locate 和 follow 用)
+    # ------------------------------------------------------------------
+    def _init_locate_anything(self):
+        """Lazy-load the locate-anything.cpp CLI adapter.
+
+        This only checks the binary/model paths. The 3B model itself is loaded
+        by the external CLI process when a locate request arrives.
+        """
+        if self._locate_inited:
+            return
+        self._locate_inited = True
+        backend = os.environ.get("GO2W_LOCATE_BACKEND", "cpp").strip().lower()
+        if backend in ("0", "off", "false", "none", "no"):
+            self._latest_locate_status = "disabled"
+            logger.info("[LocateAnything] disabled by GO2W_LOCATE_BACKEND")
+            return
+        try:
+            from ai.locate_anything import LocateAnythingCli
+            locate = LocateAnythingCli()
+            self._locate = locate
+            self._latest_locate_status = "ready" if locate.available else "missing_model_or_binary"
+            logger.info(f"[LocateAnything] backend=cpp status={self._latest_locate_status} "
+                        f"bin={locate.binary} model={locate.model}")
+        except Exception as e:
+            self._locate = None
+            self._latest_locate_status = f"error: {e}"
+            logger.warning(f"[LocateAnything] init failed: {e}")
+
+    def locate_target(self, frame, target):
+        """Locate a natural-language target in one frame.
+
+        Returns the same result shape as ai.vlm.VLMEngine.locate, with an extra
+        `detections` list for page/status rendering.
+        """
+        if frame is None:
+            return {"found": False, "bbox": None, "cx": 0, "cy": 0,
+                    "label": "", "confidence": 0.0, "detections": [],
+                    "description": "empty frame"}
+        self._init_locate_anything()
+        # M5 fix: 串行化 locate (subprocess fork 3B 模型 ~2GB, 并发 OOM); /api/locate + tracker 两路调用
+        with self._locate_lock:
+            result = None
+            if self._locate is not None and getattr(self._locate, "available", False):
+                result = self._locate.locate(frame, target)
+            elif self._vlm is not None and getattr(self._vlm, "loaded", False):
+                result = self._vlm.locate(frame, target)
+                if "detections" not in result and result.get("found") and result.get("bbox"):
+                    result["detections"] = [{
+                        "class": result.get("description", target),
+                        "confidence": 1.0,
+                        "bbox": result.get("bbox"),
+                        "source": "vlm",
+                    }]
+            else:
+                result = {"found": False, "bbox": None, "cx": 0, "cy": 0,
+                          "label": "", "confidence": 0.0, "detections": [],
+                          "description": self._latest_locate_status or "locate unavailable"}
+
+        try:
+            frame_w = int(frame.shape[1])
+            frame_h = int(frame.shape[0])
+        except Exception:
+            frame_w, frame_h = 1280, 720
+        dets = result.get("detections") or []
+        if result.get("found") and result.get("bbox") and not dets:
+            dets = [{
+                "class": result.get("label") or result.get("description") or target,
+                "label_zh": result.get("label_zh") or result.get("label") or result.get("description") or target,
+                "confidence": result.get("confidence", 1.0),
+                "bbox": result.get("bbox"),
+                "source": "locate_anything",
+            }]
+        dets = [
+            {
+                **d,
+                "frame_width": int(d.get("frame_width") or frame_w),
+                "frame_height": int(d.get("frame_height") or frame_h),
+            }
+            for d in dets
+            if isinstance(d, dict)
+        ]
+        result["frame_width"] = frame_w
+        result["frame_height"] = frame_h
+        result["detections"] = dets
+
+        with self._lock:
+            self._latest_locate_target = target
+            self._latest_locate_dets = dets
+            self._latest_locate_frame_w = frame_w
+            if result.get("found"):
+                self._latest_locate_status = "found"
+            elif self._latest_locate_status == "ready":
+                self._latest_locate_status = "not_found"
+
+        if result.get("found") and result.get("bbox"):
+            x1, y1, x2, y2 = [float(v) for v in result["bbox"][:4]]
+            result["cx"] = (x1 + x2) / 2.0 / max(1.0, float(frame_w))
+            result["cy"] = (y1 + y2) / 2.0 / max(1.0, float(frame_h))
+        else:
+            result.setdefault("cx", 0)
+            result.setdefault("cy", 0)
+
+        self._safe_broadcast({"type": "locate", "data": {
+            "target": target,
+            "status": result.get("description") or self._latest_locate_status,
+            "found": bool(result.get("found")),
+            "bbox": result.get("bbox"),
+            "label": result.get("label", ""),
+            "label_zh": result.get("label_zh", ""),
+            "confidence": result.get("confidence", 0.0),
+            "cx": result.get("cx", 0),
+            "cy": result.get("cy", 0),
+            "frame_width": frame_w,
+            "frame_height": frame_h,
+            "detections": dets,
+            "description": result.get("description", ""),
+        }})
+        return result
+
+    def track_target(self, frame, target, img_w=640, img_h=480):
+        """Locate target and convert its bbox into follow vx/vyaw.
+
+        C1 fix (2026-07-01): vx 永远 >= 0 (禁后退 — 轮足狗后退看不到目标且易撞身后);
+        用 bbox 宽度比(不受物体高度影响)替代面积比(贴地小物体面积小会被误判 ratio<0.3 持续前冲撞墙)。
+        执行层 guard(connected/前方障碍) 在 NxRobotBridge.move, 覆盖所有调用者。"""
+        loc = self.locate_target(frame, target)
+        if not loc.get("found"):
+            return {**loc, "vx": 0.0, "vyaw": 0.0}
+        bbox = loc.get("bbox")
+        cx = float(loc.get("cx", 0.5))
+        offset_x = cx - 0.5
+        vyaw = max(-1.0, min(1.0, -offset_x * 2.0))
+        vx = 0.0
+        if bbox and len(bbox) >= 4:
+            x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+            # C1: 宽度比(高度无关), 贴地物体(背包/箱子)也能正确判距
+            width_ratio = max(0.0, x2 - x1) / max(1.0, float(img_w))
+            if width_ratio < 0.15:        # 目标窄(远) → 前进靠近
+                vx = 0.2
+            elif width_ratio < 0.3:       # 中等距离 → 慢速
+                vx = 0.1
+            elif width_ratio > 0.5:       # 目标宽(近) → 停下只转向, 不后退
+                vx = 0.0
+        return {**loc, "vx": vx, "vyaw": vyaw}
+
+    def get_detection_list(self):
+        """Return detections for the page-side detection list."""
+        with self._lock:
+            dets = list(self._latest_dets) + list(self._latest_locate_dets)
+        return dets[:8]
 
     def _get_frame(self):
         """取一帧 BGR ndarray (VideoClient.GetImageSample 或 mock, spec §7.1)。
@@ -748,9 +918,9 @@ class NxAiEngine:
     def _fallback_parse(text):
         """关键词 fallback (panel.py:520-545 同款, M2.2)。"""
         r = {"understanding": text, "tasks": [], "response": ""}
-        if "跟着" in text or "跟随" in text:
+        if "跟着" in text or "跟随" in text or "跟上" in text:
             target = ""
-            for kw in ["跟着", "跟随"]:
+            for kw in ["跟着", "跟随", "跟上"]:
                 if kw in text:
                     target = text[text.index(kw) + len(kw):].strip().rstrip("。，！？")
             r["tasks"] = [{"type": "follow", "priority": 8, "params": {"target": target}}]
@@ -813,6 +983,15 @@ class NxAiEngine:
             logger.debug(f"[AI] get_frame_jpeg 异常: {e}")
             return None
 
+    def get_frame_detection_count(self):
+        """Return the latest detection count without JPEG encoding."""
+        with self._lock:
+            frame = self._latest_frame
+            dets = self._latest_dets
+        if frame is None:
+            return None
+        return len(dets)
+
     def get_detections_world(self, robot_x, robot_y, robot_yaw):
         """broadcast_loop 调用: 返回 slam.data.detections 格式 [{x,y,class}] (C1.5 数组!)。
         bbox 中心 x 归一化 → 方位角 (假设 FOV=70°), 距离假设 3m (spec §6.2 简化)。
@@ -823,13 +1002,15 @@ class NxAiEngine:
         不用 resize 后的 _latest_frame.shape[1] (720p=1280), 否则方位系统偏左。
         """
         with self._lock:
-            dets = list(self._latest_dets)
-            fw = self._detect_frame_w if self._detect_frame_w > 0 else 1280
+            dets = [(d, self._detect_frame_w if self._detect_frame_w > 0 else 1280)
+                    for d in self._latest_dets]
+            dets.extend((d, self._latest_locate_frame_w if self._latest_locate_frame_w > 0 else 1280)
+                        for d in self._latest_locate_dets)
         if not dets:
             return []
         half_fov = math.radians(_CAMERA_HFOV_DEG / 2.0)
         out = []
-        for d in dets:
+        for d, fw in dets:
             try:
                 bbox = d.get("bbox", [0, 0, fw, 0])
                 if not bbox or len(bbox) < 4:
@@ -950,6 +1131,20 @@ class NxAiVlmProxy:
             return json.dumps(result, ensure_ascii=False)
         except Exception:
             return '{"tasks":[],"response":"' + str(result.get("response", "")) + '"}'
+
+    def locate(self, image, target_description):
+        """TargetTracker-compatible locate() using LocateAnything first."""
+        if hasattr(self._ai, "locate_target"):
+            return self._ai.locate_target(image, target_description)
+        return {"found": False, "bbox": None, "cx": 0, "cy": 0,
+                "description": "locate unavailable"}
+
+    def track_target(self, image, target_description, img_w=640, img_h=480):
+        """TargetTracker-compatible track_target() using LocateAnything first."""
+        if hasattr(self._ai, "track_target"):
+            return self._ai.track_target(image, target_description, img_w=img_w, img_h=img_h)
+        return {"found": False, "bbox": None, "cx": 0, "cy": 0,
+                "vx": 0.0, "vyaw": 0.0, "description": "track unavailable"}
 
 
 class NxAiDetectorProxy:

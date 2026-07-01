@@ -49,6 +49,7 @@ scp -q "$WS_DIR/web/static/mock_person.png" "$NX_USER@$NX_HOST:$REMOTE_DIR/web/s
 scp -q "$WS_DIR/ai/config.py"               "$NX_USER@$NX_HOST:$REMOTE_DIR/ai/"
 scp -q "$WS_DIR/ai/detector.py"             "$NX_USER@$NX_HOST:$REMOTE_DIR/ai/"
 scp -q "$WS_DIR/ai/vlm.py"                  "$NX_USER@$NX_HOST:$REMOTE_DIR/ai/"
+scp -q "$WS_DIR/ai/locate_anything.py"      "$NX_USER@$NX_HOST:$REMOTE_DIR/ai/"
 scp -q "$WS_DIR/ai/tracker.py"              "$NX_USER@$NX_HOST:$REMOTE_DIR/ai/" 2>/dev/null || true
 scp -q "$WS_DIR/ai/__init__.py"             "$NX_USER@$NX_HOST:$REMOTE_DIR/ai/" 2>/dev/null || true
 echo "OK: nx_ai_node.py + verify_nx_ai.sh + mock_person.png + ai/ 已拷贝"
@@ -80,4 +81,7 @@ echo "    GO2W_VLM_IDLE=60        VLM 空闲卸载超时 (秒)"
 echo "    DOG_INTERFACE=enxc8a362616c4c  狗网卡"
 echo "    GO2W_YOLO_ENGINE=models/yolov8n.engine  TensorRT engine 路径"
 echo "    GO2W_VLM_MODEL_NX=/home/nx/models/Qwen/Qwen2___5-VL-3B-Instruct  VLM 路径"
+echo "    GO2W_LOCATE_BIN=/home/nx/locate-anything.cpp/build/locate-anything-cli  LocateAnything CLI"
+echo "    GO2W_LOCATE_MODEL=/home/nx/models/locate-anything-q8_0.gguf  LocateAnything GGUF"
+echo "    GO2W_LOCATE_TIMEOUT=120  LocateAnything inference timeout"
 echo "================================================"
