@@ -4,6 +4,10 @@ import math
 from collections.abc import Iterable
 
 
+_GRID_RATIO_TOLERANCE = 1e-9
+_MAX_GRID_CANDIDATES = 100_000
+
+
 class ActiveSearchPlanner:
     def __init__(self, spacing: float = 1.0, obstacle_clearance: float = 0.5):
         self.spacing = self._finite_positive_value(spacing, "spacing")
@@ -13,17 +17,16 @@ class ActiveSearchPlanner:
 
     def generate_candidates(self, room_area: dict, robot_pose: tuple[float, float, float], obstacles) -> list[dict]:
         origin_x, origin_y, width, height = self._validate_room_area(room_area)
-        max_x = origin_x + width
-        max_y = origin_y + height
-        center_x = origin_x + width / 2.0
-        center_y = origin_y + height / 2.0
+        x_steps, max_x, center_x = self._grid_axis(origin_x, width, "origin_x", "width")
+        y_steps, max_y, center_y = self._grid_axis(origin_y, height, "origin_y", "height")
+        self._validate_grid_size(x_steps, y_steps)
         obstacle_points = list(self._obstacle_points(obstacles))
 
         candidates = []
-        x = origin_x
-        while x <= max_x + 1e-9:
-            y = origin_y
-            while y <= max_y + 1e-9:
+        for x_index in range(x_steps):
+            x = self._grid_coordinate(origin_x, width, x_index, x_steps)
+            for y_index in range(y_steps):
+                y = self._grid_coordinate(origin_y, height, y_index, y_steps)
                 rounded_x = round(x, 2)
                 rounded_y = round(y, 2)
                 key = (rounded_x, rounded_y)
@@ -47,8 +50,6 @@ class ActiveSearchPlanner:
                             "repeated_observation_penalty": 1.0 if key in self._visited else 0.0,
                         }
                     )
-                y += self.spacing
-            x += self.spacing
 
         return candidates
 
@@ -177,6 +178,51 @@ class ActiveSearchPlanner:
         if not math.isfinite(number):
             raise ValueError(f"{name} must be a finite number")
         return number
+
+    def _grid_axis(
+        self,
+        origin: float,
+        extent: float,
+        origin_field: str,
+        extent_field: str,
+    ) -> tuple[int, float, float]:
+        max_value = origin + extent
+        center_value = origin + extent / 2.0
+        if not (
+            math.isfinite(max_value)
+            and math.isfinite(center_value)
+            and origin < center_value < max_value
+        ):
+            raise ValueError(
+                f"room_area.{origin_field}/{extent_field} is too large or unsafe for grid generation"
+            )
+
+        ratio = extent / self.spacing
+        if not math.isfinite(ratio) or ratio > _MAX_GRID_CANDIDATES:
+            raise ValueError(f"room_area.{extent_field} is too large for grid generation")
+
+        steps_after_origin = math.floor(ratio + _GRID_RATIO_TOLERANCE)
+        step_count = int(steps_after_origin) + 1
+        if step_count > 1 and origin + self.spacing <= origin:
+            raise ValueError(
+                f"room_area.{origin_field}/{extent_field} is too large or unsafe for grid generation"
+            )
+        return step_count, max_value, center_value
+
+    def _validate_grid_size(self, x_steps: int, y_steps: int) -> None:
+        if x_steps * y_steps > _MAX_GRID_CANDIDATES:
+            raise ValueError("room_area grid is too large for grid generation")
+
+    def _grid_coordinate(self, origin: float, extent: float, index: int, step_count: int) -> float:
+        offset = index * self.spacing
+        if index == step_count - 1 and math.isclose(
+            offset,
+            extent,
+            rel_tol=0.0,
+            abs_tol=abs(self.spacing) * _GRID_RATIO_TOLERANCE,
+        ):
+            offset = extent
+        return origin + offset
 
     def _information_gain(self, x: float, y: float, min_x: float, min_y: float, max_x: float, max_y: float) -> float:
         distance_to_edge = min(x - min_x, max_x - x, y - min_y, max_y - y)

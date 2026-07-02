@@ -63,6 +63,14 @@ def test_rejects_invalid_room_geometry(room_area):
         planner.generate_candidates(room_area, robot_pose=(0.0, 0.0, 0.0), obstacles=[])
 
 
+def test_rejects_room_geometry_too_large_for_grid_generation():
+    planner = ActiveSearchPlanner(spacing=1.0)
+    room_area = {"origin_x": 1e308, "origin_y": 0.0, "width": 1.0, "height": 1.0}
+
+    with pytest.raises(ValueError, match="too large|unsafe|grid"):
+        planner.generate_candidates(room_area, robot_pose=(0.0, 0.0, 0.0), obstacles=[])
+
+
 def test_malformed_obstacles_are_ignored_without_crashing():
     planner = ActiveSearchPlanner(spacing=1.0, obstacle_clearance=0.6)
     room_area = {"origin_x": 0.0, "origin_y": 0.0, "width": 2.0, "height": 2.0}
