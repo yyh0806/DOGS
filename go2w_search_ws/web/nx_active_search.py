@@ -6,20 +6,13 @@ from collections.abc import Iterable
 
 class ActiveSearchPlanner:
     def __init__(self, spacing: float = 1.0, obstacle_clearance: float = 0.5):
-        self.spacing = float(spacing)
-        self.obstacle_clearance = float(obstacle_clearance)
-        if self.spacing <= 0.0:
-            raise ValueError("spacing must be positive")
-        if self.obstacle_clearance < 0.0:
-            raise ValueError("obstacle_clearance must be non-negative")
+        self.spacing = self._finite_positive_value(spacing, "spacing")
+        self.obstacle_clearance = self._finite_positive_value(obstacle_clearance, "obstacle_clearance")
         self._blocked = set()
         self._visited = set()
 
     def generate_candidates(self, room_area: dict, robot_pose: tuple[float, float, float], obstacles) -> list[dict]:
-        origin_x = float(room_area["origin_x"])
-        origin_y = float(room_area["origin_y"])
-        width = float(room_area["width"])
-        height = float(room_area["height"])
+        origin_x, origin_y, width, height = self._validate_room_area(room_area)
         max_x = origin_x + width
         max_y = origin_y + height
         center_x = origin_x + width / 2.0
@@ -106,13 +99,84 @@ class ActiveSearchPlanner:
         return min(math.hypot(point_x - x, point_y - y) for point_x, point_y in obstacles)
 
     def _obstacle_points(self, obstacles) -> Iterable[tuple[float, float]]:
-        for obstacle in obstacles or []:
-            if isinstance(obstacle, dict):
-                if "x" in obstacle and "y" in obstacle:
-                    yield (float(obstacle["x"]), float(obstacle["y"]))
-                continue
-            if len(obstacle) >= 2:
-                yield (float(obstacle[0]), float(obstacle[1]))
+        if obstacles is None:
+            return
+        if isinstance(obstacles, dict):
+            point = self._normalize_obstacle_point(obstacles)
+            if point is not None:
+                yield point
+            return
+        if isinstance(obstacles, (str, bytes)):
+            return
+        try:
+            iterator = iter(obstacles)
+        except TypeError:
+            return
+
+        for obstacle in iterator:
+            point = self._normalize_obstacle_point(obstacle)
+            if point is not None:
+                yield point
+
+    def _normalize_obstacle_point(self, obstacle) -> tuple[float, float] | None:
+        if isinstance(obstacle, dict):
+            if "x" not in obstacle or "y" not in obstacle:
+                return None
+            return self._finite_point_or_none(obstacle["x"], obstacle["y"])
+        if isinstance(obstacle, (str, bytes)):
+            return None
+        try:
+            return self._finite_point_or_none(obstacle[0], obstacle[1])
+        except (TypeError, IndexError, KeyError):
+            return None
+
+    def _finite_point_or_none(self, x_value, y_value) -> tuple[float, float] | None:
+        try:
+            x = float(x_value)
+            y = float(y_value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(x) or not math.isfinite(y):
+            return None
+        return (x, y)
+
+    def _validate_room_area(self, room_area: dict) -> tuple[float, float, float, float]:
+        if not isinstance(room_area, dict):
+            raise ValueError("room_area must be a mapping with origin_x, origin_y, width, and height")
+
+        origin_x = self._finite_room_area_value(room_area, "origin_x")
+        origin_y = self._finite_room_area_value(room_area, "origin_y")
+        width = self._finite_room_area_value(room_area, "width")
+        height = self._finite_room_area_value(room_area, "height")
+        if width <= 0.0:
+            raise ValueError("room_area.width must be a finite positive value")
+        if height <= 0.0:
+            raise ValueError("room_area.height must be a finite positive value")
+        return origin_x, origin_y, width, height
+
+    def _finite_room_area_value(self, room_area: dict, field: str) -> float:
+        if field not in room_area:
+            raise ValueError(f"room_area.{field} is required")
+        value = self._finite_number(room_area[field], f"room_area.{field}")
+        return value
+
+    def _finite_positive_value(self, value, name: str) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a finite positive value") from exc
+        if not math.isfinite(number) or number <= 0.0:
+            raise ValueError(f"{name} must be a finite positive value")
+        return number
+
+    def _finite_number(self, value, name: str) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a finite number") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{name} must be a finite number")
+        return number
 
     def _information_gain(self, x: float, y: float, min_x: float, min_y: float, max_x: float, max_y: float) -> float:
         distance_to_edge = min(x - min_x, max_x - x, y - min_y, max_y - y)

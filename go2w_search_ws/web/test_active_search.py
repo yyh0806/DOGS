@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 WEB_DIR = Path(__file__).resolve().parent
 if str(WEB_DIR) not in sys.path:
     sys.path.insert(0, str(WEB_DIR))
@@ -29,6 +31,62 @@ def test_generates_candidates_inside_room_only():
         "obstacle_risk_cost",
         "repeated_observation_penalty",
     }.issubset(candidates[0])
+
+
+@pytest.mark.parametrize("spacing", [0.0, -1.0, float("inf"), float("nan")])
+def test_rejects_invalid_spacing(spacing):
+    with pytest.raises(ValueError, match="spacing must be a finite positive value"):
+        ActiveSearchPlanner(spacing=spacing)
+
+
+@pytest.mark.parametrize("obstacle_clearance", [0.0, -0.1, float("inf"), float("nan")])
+def test_rejects_invalid_obstacle_clearance(obstacle_clearance):
+    with pytest.raises(ValueError, match="obstacle_clearance must be a finite positive value"):
+        ActiveSearchPlanner(obstacle_clearance=obstacle_clearance)
+
+
+@pytest.mark.parametrize(
+    "room_area",
+    [
+        {"origin_x": float("inf"), "origin_y": 0.0, "width": 2.0, "height": 2.0},
+        {"origin_x": 0.0, "origin_y": float("nan"), "width": 2.0, "height": 2.0},
+        {"origin_x": 0.0, "origin_y": 0.0, "width": 0.0, "height": 2.0},
+        {"origin_x": 0.0, "origin_y": 0.0, "width": -1.0, "height": 2.0},
+        {"origin_x": 0.0, "origin_y": 0.0, "width": float("inf"), "height": 2.0},
+        {"origin_x": 0.0, "origin_y": 0.0, "width": 2.0, "height": float("nan")},
+    ],
+)
+def test_rejects_invalid_room_geometry(room_area):
+    planner = ActiveSearchPlanner()
+
+    with pytest.raises(ValueError, match="room_area"):
+        planner.generate_candidates(room_area, robot_pose=(0.0, 0.0, 0.0), obstacles=[])
+
+
+def test_malformed_obstacles_are_ignored_without_crashing():
+    planner = ActiveSearchPlanner(spacing=1.0, obstacle_clearance=0.6)
+    room_area = {"origin_x": 0.0, "origin_y": 0.0, "width": 2.0, "height": 2.0}
+
+    candidates = planner.generate_candidates(
+        room_area,
+        robot_pose=(0.0, 0.0, 0.0),
+        obstacles=[None, 7, "bad", {"x": 1.0}, [1.0], object()],
+    )
+
+    assert candidates
+
+
+def test_non_finite_obstacles_do_not_disable_valid_obstacle_filtering():
+    planner = ActiveSearchPlanner(spacing=1.0, obstacle_clearance=0.6)
+    room_area = {"origin_x": 0.0, "origin_y": 0.0, "width": 2.0, "height": 2.0}
+
+    candidates = planner.generate_candidates(
+        room_area,
+        robot_pose=(0.0, 0.0, 0.0),
+        obstacles=[[float("nan"), 0.0], [float("inf"), 1.0], [1.0, 1.0]],
+    )
+
+    assert (1.0, 1.0) not in {(c["x"], c["y"]) for c in candidates}
 
 
 def test_filters_candidates_near_obstacle():
