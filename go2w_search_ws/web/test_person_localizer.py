@@ -65,22 +65,32 @@ def test_bad_bbox_returns_bearing_only_without_map_position():
     assert result["world_y"] is None
 
 
-def test_right_side_bbox_rotates_with_robot_yaw_and_uses_matching_scan_index():
+def test_right_side_bbox_uses_negative_scan_angle_and_rotates_with_robot_yaw():
     det = {"class": "person", "confidence": 0.8, "bbox": [960, 100, 1060, 500]}
     frame = DetectionFrame(width=1280, height=720, camera_hfov_rad=math.radians(70.0))
     scan = LaserScanSnapshot(angle_min=-math.pi, angle_increment=math.pi / 180.0, ranges=[0.0] * 360)
-    scan.ranges[200] = 3.0
+    scan.ranges[160] = 3.0
 
-    result = localize_person_detection(det, frame, scan, robot_x=0.0, robot_y=0.0, robot_yaw=math.pi / 2)
+    result_forward = localize_person_detection(det, frame, scan, robot_x=0.0, robot_y=0.0, robot_yaw=0.0)
 
-    expected_base = math.radians(20.234375)
+    expected_base = math.radians(-20.234375)
+    assert result_forward["position_quality"] == "range_lidar"
+    assert result_forward["bearing_base"] == pytest.approx(expected_base)
+    assert result_forward["bearing_map"] == pytest.approx(expected_base)
+    assert result_forward["range_m"] == pytest.approx(3.0)
+    assert result_forward["world_x"] == pytest.approx(3.0 * math.cos(expected_base))
+    assert result_forward["world_y"] == pytest.approx(3.0 * math.sin(expected_base))
+    assert result_forward["world_y"] < 0.0
+
+    result_rotated = localize_person_detection(det, frame, scan, robot_x=0.0, robot_y=0.0, robot_yaw=math.pi / 2)
+
     expected_map = math.pi / 2 + expected_base
-    assert result["position_quality"] == "range_lidar"
-    assert result["bearing_base"] == pytest.approx(expected_base)
-    assert result["bearing_map"] == pytest.approx(expected_map)
-    assert result["range_m"] == pytest.approx(3.0)
-    assert result["world_x"] == pytest.approx(3.0 * math.cos(expected_map))
-    assert result["world_y"] == pytest.approx(3.0 * math.sin(expected_map))
+    assert result_rotated["position_quality"] == "range_lidar"
+    assert result_rotated["bearing_base"] == pytest.approx(expected_base)
+    assert result_rotated["bearing_map"] == pytest.approx(expected_map)
+    assert result_rotated["range_m"] == pytest.approx(3.0)
+    assert result_rotated["world_x"] == pytest.approx(3.0 * math.cos(expected_map))
+    assert result_rotated["world_y"] == pytest.approx(3.0 * math.sin(expected_map))
 
 
 def test_range_at_bearing_uses_median_valid_ranges_and_wraparound_angle_diff():
@@ -95,3 +105,69 @@ def test_range_at_bearing_uses_median_valid_ranges_and_wraparound_angle_diff():
     result = range_at_bearing(scan, math.radians(-180.0), window_rad=math.radians(10.0))
 
     assert result == pytest.approx(2.0)
+
+
+def test_range_at_bearing_rejects_malformed_scan_metadata():
+    valid_scan = LaserScanSnapshot(
+        angle_min=0.0,
+        angle_increment=math.pi / 180.0,
+        ranges=[2.0],
+        range_min=0.1,
+        range_max=10.0,
+    )
+    cases = [
+        (LaserScanSnapshot(angle_min=float("nan"), angle_increment=math.pi / 180.0, ranges=[2.0]), 0.0, 0.1),
+        (LaserScanSnapshot(angle_min="bad", angle_increment=math.pi / 180.0, ranges=[2.0]), 0.0, 0.1),
+        (LaserScanSnapshot(angle_min=0.0, angle_increment=float("nan"), ranges=[2.0]), 0.0, 0.1),
+        (LaserScanSnapshot(angle_min=0.0, angle_increment=0.0, ranges=[2.0]), 0.0, 0.1),
+        (LaserScanSnapshot(angle_min=0.0, angle_increment=-0.1, ranges=[2.0]), 0.0, 0.1),
+        (LaserScanSnapshot(angle_min=0.0, angle_increment=math.pi / 180.0, ranges=[2.0], range_min=0.0), 0.0, 0.1),
+        (LaserScanSnapshot(angle_min=0.0, angle_increment=math.pi / 180.0, ranges=[2.0], range_min=float("nan")), 0.0, 0.1),
+        (LaserScanSnapshot(angle_min=0.0, angle_increment=math.pi / 180.0, ranges=[2.0], range_max=float("inf")), 0.0, 0.1),
+        (LaserScanSnapshot(angle_min=0.0, angle_increment=math.pi / 180.0, ranges=[2.0], range_min=5.0, range_max=1.0), 0.0, 0.1),
+        (valid_scan, float("nan"), 0.1),
+        (valid_scan, "bad", 0.1),
+        (valid_scan, 0.0, float("nan")),
+        (valid_scan, 0.0, 0.0),
+        (valid_scan, 0.0, -0.1),
+        (valid_scan, 0.0, "bad"),
+    ]
+
+    for scan, bearing, window in cases:
+        assert range_at_bearing(scan, bearing, window_rad=window) is None
+
+
+def test_localize_person_detection_rejects_malformed_frame_and_bbox_values():
+    scan = LaserScanSnapshot(angle_min=-math.pi, angle_increment=math.pi / 180.0, ranges=[0.0] * 360)
+    scan.ranges[180] = 2.5
+    valid_frame = DetectionFrame(width=1280, height=720, camera_hfov_rad=math.radians(70.0))
+    valid_bbox = [590, 100, 690, 500]
+    cases = [
+        (DetectionFrame(width="bad", height=720, camera_hfov_rad=math.radians(70.0)), valid_bbox),
+        (DetectionFrame(width=float("nan"), height=720, camera_hfov_rad=math.radians(70.0)), valid_bbox),
+        (DetectionFrame(width=1280, height="bad", camera_hfov_rad=math.radians(70.0)), valid_bbox),
+        (DetectionFrame(width=1280, height=float("nan"), camera_hfov_rad=math.radians(70.0)), valid_bbox),
+        (DetectionFrame(width=1280, height=720, camera_hfov_rad="bad"), valid_bbox),
+        (DetectionFrame(width=1280, height=720, camera_hfov_rad=float("nan")), valid_bbox),
+        (valid_frame, [590, 100, float("nan"), 500]),
+        (valid_frame, [590, 100, 690, float("inf")]),
+        (valid_frame, [590, "bad", 690, 500]),
+    ]
+
+    for frame, bbox in cases:
+        result = localize_person_detection(
+            {"class": "person", "confidence": 0.9, "bbox": bbox},
+            frame,
+            scan,
+            robot_x=1.0,
+            robot_y=2.0,
+            robot_yaw=0.0,
+        )
+
+        assert result["position_quality"] == "bearing_only"
+        assert result["range_source"] == "unresolved"
+        assert result["bearing_base"] is None
+        assert result["bearing_map"] is None
+        assert result["range_m"] is None
+        assert result["world_x"] is None
+        assert result["world_y"] is None
