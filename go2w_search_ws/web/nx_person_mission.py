@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -12,11 +13,16 @@ from typing import Any
 import numpy as np
 
 
+_ARTIFACT_METADATA_KEYS = {"bbox", "frame_width", "frame_height", "raw_url", "photo_url", "crop_url"}
+_SAFE_SLUG_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
 class PersonMissionStore:
     """Track person observations for one room-search mission."""
 
     def __init__(self, mission_id: str, static_root: str | Path | None = None, merge_distance_m: float = 0.7):
         self.mission_id = str(mission_id)
+        self.mission_slug = _safe_mission_slug(self.mission_id)
         self.static_root = Path(static_root) if static_root is not None else Path(__file__).resolve().parent / "static"
         self.merge_distance_m = float(merge_distance_m)
         self._markers: list[dict[str, Any]] = []
@@ -54,6 +60,8 @@ class PersonMissionStore:
         obs_y = _to_float(obs.get("world_y"))
         if obs_x is None or obs_y is None:
             return None
+        nearest_marker = None
+        nearest_distance = None
         for marker in self._markers:
             if marker.get("position_quality") != "range_lidar":
                 continue
@@ -61,9 +69,11 @@ class PersonMissionStore:
             marker_y = _to_float(marker.get("world_y"))
             if marker_x is None or marker_y is None:
                 continue
-            if math.hypot(obs_x - marker_x, obs_y - marker_y) <= self.merge_distance_m:
-                return marker
-        return None
+            distance = math.hypot(obs_x - marker_x, obs_y - marker_y)
+            if distance <= self.merge_distance_m and (nearest_distance is None or distance < nearest_distance):
+                nearest_marker = marker
+                nearest_distance = distance
+        return nearest_marker
 
     def _new_marker(self, obs: dict) -> dict[str, Any]:
         marker_id = f"person_{self._next_id:03d}"
@@ -74,18 +84,17 @@ class PersonMissionStore:
 
     def _merge_marker(self, marker: dict[str, Any], obs: dict) -> None:
         marker["observation_count"] = int(marker.get("observation_count", 1)) + 1
-        marker["last_observed_at"] = _to_float(obs.get("timestamp"), default=time.time())
+        last_observed_at = _to_float(obs.get("timestamp"), default=time.time())
 
         current_confidence = _to_float(marker.get("confidence"), default=0.0)
         new_confidence = _to_float(obs.get("confidence"), default=0.0)
         if new_confidence >= current_confidence:
             marker_id = marker["id"]
-            observation_count = marker["observation_count"]
-            marker.clear()
-            marker.update(_marker_from_observation(marker_id, obs))
-            marker["observation_count"] = observation_count
+            updates = _merge_updates_from_observation(marker_id, obs)
+            marker.update(updates)
         else:
             marker["confidence"] = current_confidence
+        marker["last_observed_at"] = last_observed_at
 
     def _save_artifacts(self, marker: dict[str, Any], obs: dict, frame) -> None:
         frame_array = _normalize_frame(frame)
@@ -93,7 +102,7 @@ class PersonMissionStore:
         bbox = _clamp_bbox(obs.get("bbox") or marker.get("bbox"), width, height)
 
         marker_id = marker["id"]
-        mission_dir = self.static_root / "missions" / self.mission_id
+        mission_dir = self._mission_artifact_dir()
         mission_dir.mkdir(parents=True, exist_ok=True)
 
         raw_path = mission_dir / f"{marker_id}_raw.jpg"
@@ -114,12 +123,21 @@ class PersonMissionStore:
             "bbox": list(bbox),
             "frame_width": width,
             "frame_height": height,
-            "raw_url": f"/missions/{self.mission_id}/{marker_id}_raw.jpg",
-            "photo_url": f"/missions/{self.mission_id}/{marker_id}_annotated.jpg",
-            "crop_url": f"/missions/{self.mission_id}/{marker_id}_crop.jpg",
+            "raw_url": f"/missions/{self.mission_slug}/{marker_id}_raw.jpg",
+            "photo_url": f"/missions/{self.mission_slug}/{marker_id}_annotated.jpg",
+            "crop_url": f"/missions/{self.mission_slug}/{marker_id}_crop.jpg",
         })
         with json_path.open("w", encoding="utf-8") as fh:
             json.dump(_json_safe(marker), fh, ensure_ascii=False, indent=2, sort_keys=True)
+
+    def _mission_artifact_dir(self) -> Path:
+        missions_root = (self.static_root / "missions").resolve()
+        mission_dir = (missions_root / self.mission_slug).resolve()
+        try:
+            mission_dir.relative_to(missions_root)
+        except ValueError as exc:
+            raise ValueError("mission artifact directory escapes static missions root") from exc
+        return mission_dir
 
 
 def _marker_from_observation(marker_id: str, obs: dict) -> dict[str, Any]:
@@ -138,6 +156,22 @@ def _marker_from_observation(marker_id: str, obs: dict) -> dict[str, Any]:
         marker["world_y"] = world_y
         marker["y"] = world_y
     return marker
+
+
+def _merge_updates_from_observation(marker_id: str, obs: dict) -> dict[str, Any]:
+    updates = _marker_from_observation(marker_id, obs)
+    for default_key in ("class", "confidence", "timestamp"):
+        if default_key not in obs:
+            updates.pop(default_key, None)
+    for artifact_key in _ARTIFACT_METADATA_KEYS:
+        updates.pop(artifact_key, None)
+    return updates
+
+
+def _safe_mission_slug(mission_id: str) -> str:
+    basename = str(mission_id or "mission").replace("\\", "/").rstrip("/").split("/")[-1]
+    slug = _SAFE_SLUG_RE.sub("-", basename).strip(".-_")
+    return slug or "mission"
 
 
 def _to_float(value, default=None):
@@ -163,10 +197,12 @@ def _clamp_bbox(bbox, width: int, height: int) -> tuple[int, int, int, int]:
     if not bbox or len(bbox) < 4:
         return 0, 0, int(width), int(height)
     x1, y1, x2, y2 = (_to_float(v, default=0.0) for v in bbox[:4])
-    left = max(0, min(int(round(x1)), int(width)))
-    top = max(0, min(int(round(y1)), int(height)))
-    right = max(0, min(int(round(x2)), int(width)))
-    bottom = max(0, min(int(round(y2)), int(height)))
+    left_value, right_value = sorted((x1, x2))
+    top_value, bottom_value = sorted((y1, y2))
+    left = max(0, min(int(round(left_value)), int(width)))
+    top = max(0, min(int(round(top_value)), int(height)))
+    right = max(0, min(int(round(right_value)), int(width)))
+    bottom = max(0, min(int(round(bottom_value)), int(height)))
     if right <= left or bottom <= top:
         return 0, 0, int(width), int(height)
     return left, top, right, bottom
