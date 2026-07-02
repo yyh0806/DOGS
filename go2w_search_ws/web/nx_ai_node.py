@@ -992,6 +992,37 @@ class NxAiEngine:
             return None
         return len(dets)
 
+    def get_person_detection_snapshot(self):
+        """Return the latest YOLO person detections with a copied frame."""
+        with self._lock:
+            if self._latest_frame is None:
+                return {
+                    "frame": None,
+                    "frame_width": 0,
+                    "frame_height": 0,
+                    "detections": [],
+                }
+            frame = self._latest_frame.copy()
+            height, width = frame.shape[:2]
+            detections = []
+            for det in self._latest_dets:
+                if det.get("class") != "person":
+                    continue
+                copied = dict(det)
+                bbox = copied.get("bbox")
+                if isinstance(bbox, list):
+                    copied["bbox"] = list(bbox)
+                copied["frame_width"] = int(width)
+                copied["frame_height"] = int(height)
+                copied["source"] = "yolo"
+                detections.append(copied)
+        return {
+            "frame": frame,
+            "frame_width": int(width),
+            "frame_height": int(height),
+            "detections": detections,
+        }
+
     def get_detections_world(self, robot_x, robot_y, robot_yaw):
         """broadcast_loop 调用: 返回 slam.data.detections 格式 [{x,y,class}] (C1.5 数组!)。
         bbox 中心 x 归一化 → 方位角 (假设 FOV=70°), 距离假设 3m (spec §6.2 简化)。

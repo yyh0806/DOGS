@@ -319,6 +319,10 @@ class NxWebNode(Node):
         self._imu_count = 0
         self._scan_count = 0
         self._scan_ranges = []           # 原始 ranges (机体系)
+        self._scan_angle_min = 0.0
+        self._scan_angle_increment = 0.0
+        self._scan_range_min = 0.0
+        self._scan_range_max = 0.0
         self._odom_x = 0.0
         self._odom_y = 0.0
         self._odom_count = 0
@@ -355,7 +359,11 @@ class NxWebNode(Node):
 
     def _on_scan(self, msg: LaserScan):
         with self._lock:
-            self._scan_ranges = [round(float(r), 2) for r in msg.ranges]
+            self._scan_ranges = [round(float(r), 3) for r in msg.ranges]
+            self._scan_angle_min = float(msg.angle_min)
+            self._scan_angle_increment = float(msg.angle_increment)
+            self._scan_range_min = float(msg.range_min)
+            self._scan_range_max = float(msg.range_max)
             self._scan_count += 1
 
     def _on_odom(self, msg: Odometry):
@@ -405,6 +413,17 @@ class NxWebNode(Node):
                     "robot_mode": 0,
                     "robot_velocity": [self._dog_vx, self._dog_vy, self._dog_vyaw],
                 },
+            }
+
+    def get_scan_snapshot(self):
+        with self._lock:
+            return {
+                "angle_min": self._scan_angle_min,
+                "angle_increment": self._scan_angle_increment,
+                "range_min": self._scan_range_min,
+                "range_max": self._scan_range_max,
+                "ranges": list(self._scan_ranges),
+                "count": self._scan_count,
             }
 
 
