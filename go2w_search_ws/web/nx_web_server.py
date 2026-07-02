@@ -683,6 +683,8 @@ class TaskManager:
                 return None
             lock = getattr(node_obj, "_lock", threading.Lock())
             with lock:
+                if int(getattr(node_obj, "_odom_count", 0)) <= 0:
+                    return None
                 return float(getattr(node_obj, "_odom_x")), float(getattr(node_obj, "_odom_y"))
         except Exception:
             return None
