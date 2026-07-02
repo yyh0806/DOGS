@@ -102,6 +102,22 @@ except Exception as _e:
 
 
 # ============================================================================
+# Product command parser (deterministic offline path; falls back to VLM/fallback)
+# ============================================================================
+PRODUCT_COMMAND_OK = False
+_PRODUCT_COMMAND_ERR = ""
+parse_product_command = None
+resolve_current_room = None
+try:
+    from nx_product_command import parse_product_command, resolve_current_room
+    PRODUCT_COMMAND_OK = True
+    logger.info("Product room person command parser available (nx_product_command)")
+except Exception as _e:
+    _PRODUCT_COMMAND_ERR = str(_e)
+    logger.warning(f"Product command parser unavailable, using existing parse path: {_e}")
+
+
+# ============================================================================
 # C13 云台 RTSP 双流桥接 (独立组件, 懒加载 cv2; 不动 AI/VideoClient 路径)
 # GimbalRtspBridge 拉 C13 可见光+红外 RTSP → WS type=gimbal。
 # GIMBAL_OK=False (cv2 缺失/C13_ENABLE=0) 时跳过, 主服务不受影响。
@@ -606,8 +622,10 @@ class TaskManager:
 
     def _process_command_bg(self, text):
         try:
-            result = self._vlm_parse_command(text) if (self.vlm and getattr(self.vlm, 'loaded', False)) \
-                else self._fallback_parse(text)
+            result = self._parse_product_command(text)
+            if result is None:
+                result = self._vlm_parse_command(text) if (self.vlm and getattr(self.vlm, 'loaded', False)) \
+                    else self._fallback_parse(text)
             response = result.get("response", "")
             tasks = result.get("tasks", [])
             logger.info(f"指令解析: '{text}' → response='{response}' tasks={len(tasks)}")
@@ -617,6 +635,68 @@ class TaskManager:
         except Exception as e:
             logger.error(f"指令处理失败: {e}")
             traceback.print_exc()
+
+    def _parse_product_command(self, text):
+        if parse_product_command is None:
+            return None
+        try:
+            result = parse_product_command(text)
+        except Exception as e:
+            logger.warning(f"Product command parser failed, using existing parse path: {e}")
+            return None
+        if result is not None:
+            self._resolve_product_current_room(result)
+        return result
+
+    def _resolve_product_current_room(self, result):
+        if resolve_current_room is None:
+            return
+        tasks = result.get("tasks", []) if isinstance(result, dict) else []
+        needs_current_room = any(
+            isinstance(t, dict)
+            and isinstance(t.get("params"), dict)
+            and t["params"].get("room") == "__current__"
+            for t in tasks
+        )
+        if not needs_current_room:
+            return
+        pose = self._latest_robot_map_pose()
+        rooms = self._room_details_for_resolution()
+        if pose is None or not rooms:
+            return
+        try:
+            room_name = resolve_current_room(pose[0], pose[1], rooms)
+        except Exception as e:
+            logger.warning(f"Current-room resolution failed; keeping __current__: {e}")
+            return
+        if not room_name:
+            return
+        for task in tasks:
+            params = task.get("params") if isinstance(task, dict) else None
+            if isinstance(params, dict) and params.get("room") == "__current__":
+                params["room"] = room_name
+
+    def _latest_robot_map_pose(self):
+        try:
+            node_obj = getattr(self.robot, "_node", None)
+            if node_obj is None:
+                return None
+            lock = getattr(node_obj, "_lock", threading.Lock())
+            with lock:
+                return float(getattr(node_obj, "_odom_x")), float(getattr(node_obj, "_odom_y"))
+        except Exception:
+            return None
+
+    def _room_details_for_resolution(self):
+        orch_obj = self.room_orchestrator or getattr(TaskManager, "_global_room_orchestrator", None)
+        if orch_obj is None:
+            return []
+        try:
+            rooms = orch_obj.list_rooms_detail()
+        except Exception as e:
+            logger.warning(f"Room detail read failed; keeping __current__: {e}")
+            return []
+        return rooms if isinstance(rooms, list) else []
 
     def _vlm_parse_command(self, text):
         # 阶段B: 真接 VLM (vlm 是 NxAiVlmProxy 时, chat 同步阻塞后台线程等队列结果)。
