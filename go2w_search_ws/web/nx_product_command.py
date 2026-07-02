@@ -20,6 +20,12 @@ _CURRENT_ROOM_TERMS = (
     "本屋",
 )
 
+_NEGATION_TERMS = (
+    "别",
+    "不要",
+    "不用",
+)
+
 _SEARCH_TERMS = (
     "搜索",
     "搜寻",
@@ -29,13 +35,12 @@ _SEARCH_TERMS = (
     "找",
 )
 
-_PERSON_TERMS = (
+_EXPLICIT_PERSON_TERMS = (
     "所有人",
     "全部人",
     "全部人员",
     "所有人员",
     "人员",
-    "人",
 )
 
 _MARK_TERMS = (
@@ -95,6 +100,21 @@ _NON_ROOM_CANDIDATES = (
 )
 
 _TRAILING_ROOM_WORDS_RE = re.compile(r"(里|里面|内|中|的)$")
+_GO_TERMS_RE = r"(?:去|到)"
+_ROOM_SUFFIX_RE = r"(?:里|里面|内|中)?"
+_ROOM_PERSON_SEPARATOR_RE = r"(?:里|里面|内|中|的)?"
+_REQUIRED_ROOM_PERSON_SEPARATOR_RE = r"(?:里|里面|内|中|的)"
+_SEARCH_TERMS_RE = r"(?:搜索|搜寻|寻找|查找|搜|找)"
+_PERSON_TARGET_RE = r"(?:所有人员|全部人员|所有人|全部人|人员|人)"
+_PERSON_TARGET_FOLLOW_RE = r"(?=$|一下$|一遍$|吧$|吗$|并?(?:标注|标记|标出来|标出|圈出))"
+
+
+def _terms_re(terms: tuple[str, ...]) -> str:
+    return "|".join(re.escape(term) for term in sorted(terms, key=len, reverse=True))
+
+
+_CURRENT_ROOM_TERMS_RE = f"(?:{_terms_re(_CURRENT_ROOM_TERMS)})"
+_KNOWN_ROOM_TERMS_RE = f"(?:{_terms_re(_KNOWN_ROOM_TERMS)})"
 
 
 def parse_product_command(text: str) -> dict | None:
@@ -106,17 +126,11 @@ def parse_product_command(text: str) -> dict | None:
     normalized = _normalize_text(text)
     if not normalized:
         return None
-
-    has_search_intent = _contains_any(normalized, _SEARCH_TERMS)
-    has_person_intent = _contains_any(normalized, _PERSON_TERMS)
-    has_mark_intent = _contains_any(normalized, _MARK_TERMS)
-    has_current_room_intent = _contains_any(normalized, _CURRENT_ROOM_TERMS)
-
-    if has_current_room_intent and has_person_intent and (has_search_intent or has_mark_intent):
-        return _command_result(_CURRENT_ROOM)
-
-    if not has_search_intent or not has_person_intent:
+    if _contains_any(normalized, _NEGATION_TERMS):
         return None
+
+    if _is_current_room_person_search(normalized):
+        return _command_result(_CURRENT_ROOM)
 
     named_room = _extract_named_room(normalized)
     if named_room:
@@ -132,10 +146,9 @@ def resolve_current_room(robot_x: float, robot_y: float, rooms: list[dict]) -> s
     If none contains it, return the room with the nearest usable nav_pose.
     Malformed room entries are ignored.
     """
-    try:
-        x = float(robot_x)
-        y = float(robot_y)
-    except (TypeError, ValueError):
+    x = _finite_float(robot_x)
+    y = _finite_float(robot_y)
+    if x is None or y is None:
         return None
 
     nearest_name = None
@@ -188,14 +201,29 @@ def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
     return any(term in text for term in terms)
 
 
-def _extract_named_room(text: str) -> str | None:
-    for room in sorted(_KNOWN_ROOM_TERMS, key=len, reverse=True):
-        if room in text:
-            return room
+def _is_current_room_person_search(text: str) -> bool:
+    if not _contains_any(text, _CURRENT_ROOM_TERMS):
+        return False
+    if not (_contains_any(text, _SEARCH_TERMS) or _contains_any(text, _MARK_TERMS)):
+        return False
+    if _contains_any(text, _EXPLICIT_PERSON_TERMS):
+        return True
+    return bool(re.search(
+        rf"{_CURRENT_ROOM_TERMS_RE}{_ROOM_PERSON_SEPARATOR_RE}人{_PERSON_TARGET_FOLLOW_RE}",
+        text,
+    ))
 
+
+def _extract_named_room(text: str) -> str | None:
     patterns = (
-        r"(?:去|到)(?P<room>[\u4e00-\u9fffA-Za-z0-9_-]{1,12})(?:里|里面|内|中)?(?:找|寻找|搜索|搜寻|查找)(?:所有人|全部人|所有人员|全部人员|人员|人)",
-        r"(?:搜索|搜寻|查找|寻找|搜|找)(?P<room>[\u4e00-\u9fffA-Za-z0-9_-]{1,12})(?:的)?(?:所有人|全部人|所有人员|全部人员|人员|人)",
+        rf"{_GO_TERMS_RE}(?P<room>{_KNOWN_ROOM_TERMS_RE}){_ROOM_SUFFIX_RE}"
+        rf"{_SEARCH_TERMS_RE}{_PERSON_TARGET_RE}{_PERSON_TARGET_FOLLOW_RE}",
+        rf"{_SEARCH_TERMS_RE}(?P<room>{_KNOWN_ROOM_TERMS_RE})"
+        rf"{_ROOM_PERSON_SEPARATOR_RE}{_PERSON_TARGET_RE}{_PERSON_TARGET_FOLLOW_RE}",
+        rf"{_GO_TERMS_RE}(?P<room>[\u4e00-\u9fffA-Za-z0-9_-]{{1,12}}){_ROOM_SUFFIX_RE}"
+        rf"{_SEARCH_TERMS_RE}{_PERSON_TARGET_RE}{_PERSON_TARGET_FOLLOW_RE}",
+        rf"{_SEARCH_TERMS_RE}(?P<room>[\u4e00-\u9fffA-Za-z0-9_-]{{1,12}})"
+        rf"{_REQUIRED_ROOM_PERSON_SEPARATOR_RE}{_PERSON_TARGET_RE}{_PERSON_TARGET_FOLLOW_RE}",
     )
     for pattern in patterns:
         match = re.search(pattern, text)
@@ -222,12 +250,11 @@ def _clean_room_name(room: str) -> str | None:
 def _point_in_search_area(x: float, y: float, search_area) -> bool:
     if not isinstance(search_area, dict):
         return False
-    try:
-        origin_x = float(search_area["origin_x"])
-        origin_y = float(search_area["origin_y"])
-        width = float(search_area["width"])
-        height = float(search_area["height"])
-    except (KeyError, TypeError, ValueError):
+    origin_x = _finite_float(search_area.get("origin_x"))
+    origin_y = _finite_float(search_area.get("origin_y"))
+    width = _finite_float(search_area.get("width"))
+    height = _finite_float(search_area.get("height"))
+    if origin_x is None or origin_y is None or width is None or height is None:
         return False
     if width <= 0.0 or height <= 0.0:
         return False
@@ -237,9 +264,18 @@ def _point_in_search_area(x: float, y: float, search_area) -> bool:
 def _nav_pose_distance(x: float, y: float, nav_pose) -> float | None:
     if not isinstance(nav_pose, dict):
         return None
-    try:
-        nav_x = float(nav_pose["x"])
-        nav_y = float(nav_pose["y"])
-    except (KeyError, TypeError, ValueError):
+    nav_x = _finite_float(nav_pose.get("x"))
+    nav_y = _finite_float(nav_pose.get("y"))
+    if nav_x is None or nav_y is None:
         return None
     return math.hypot(x - nav_x, y - nav_y)
+
+
+def _finite_float(value) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed

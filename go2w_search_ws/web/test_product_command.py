@@ -4,6 +4,8 @@ import threading
 import types
 from pathlib import Path
 
+import pytest
+
 WEB_DIR = Path(__file__).resolve().parent
 if str(WEB_DIR) not in sys.path:
     sys.path.insert(0, str(WEB_DIR))
@@ -70,6 +72,16 @@ def test_non_room_people_command_returns_none():
     assert parse_product_command("找前面的人") is None
 
 
+@pytest.mark.parametrize("command", [
+    "找客厅的机器人",
+    "去客厅找无人机",
+    "客厅有人，找一下钥匙",
+    "别找客厅的人",
+])
+def test_non_product_room_commands_return_none(command):
+    assert parse_product_command(command) is None
+
+
 def test_resolve_current_room_by_containing_area():
     rooms = [
         {
@@ -116,6 +128,64 @@ def test_resolve_current_room_returns_none_when_no_room_has_usable_geometry():
     ]
 
     assert resolve_current_room(0.0, 0.0, rooms) is None
+
+
+def test_resolve_current_room_returns_none_for_non_finite_robot_pose():
+    rooms = [
+        {
+            "name": "客厅",
+            "nav_pose": {"x": 0.0, "y": 0.0, "yaw": 0.0},
+            "search_area": {"origin_x": -1.0, "origin_y": -1.0, "width": 2.0, "height": 2.0},
+        },
+    ]
+
+    assert resolve_current_room(float("nan"), 0.0, rooms) is None
+
+
+def test_resolve_current_room_ignores_non_finite_nav_pose():
+    rooms = [
+        {
+            "name": "客厅",
+            "nav_pose": {"x": float("inf"), "y": 0.0, "yaw": 0.0},
+        },
+        {
+            "name": "卧室",
+            "nav_pose": {"x": 5.0, "y": 0.0, "yaw": 0.0},
+        },
+    ]
+
+    assert resolve_current_room(4.0, 0.0, rooms) == "卧室"
+
+
+def test_resolve_current_room_returns_none_when_nav_pose_is_non_finite():
+    rooms = [
+        {
+            "name": "客厅",
+            "nav_pose": {"x": float("inf"), "y": 0.0, "yaw": 0.0},
+        },
+    ]
+
+    assert resolve_current_room(4.0, 0.0, rooms) is None
+
+
+def test_resolve_current_room_ignores_non_finite_search_area():
+    rooms = [
+        {
+            "name": "客厅",
+            "search_area": {
+                "origin_x": float("nan"),
+                "origin_y": -1.0,
+                "width": 10.0,
+                "height": 10.0,
+            },
+        },
+        {
+            "name": "卧室",
+            "search_area": {"origin_x": 3.0, "origin_y": -1.0, "width": 3.0, "height": 3.0},
+        },
+    ]
+
+    assert resolve_current_room(4.0, 0.0, rooms) == "卧室"
 
 
 def test_latest_robot_map_pose_requires_received_odom(monkeypatch):
