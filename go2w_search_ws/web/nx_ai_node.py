@@ -234,6 +234,7 @@ class NxAiEngine:
         # 720p(1280宽) 存 _latest_frame。get_detections_world 必须用 _detect_frame_w 归一化,
         # 否则 cx_norm 系统偏小 → slam 检测标记系统偏左。
         self._detect_frame_w = 1280
+        self._detect_frame_h = 720
         # VLM (spec 决策 2: 懒加载 + 单工作线程 + 空闲超时 unload)
         self._vlm = None                # ai.vlm.VLMEngine (懒初始化)
         self._vlm_inited = False
@@ -645,6 +646,7 @@ class NxAiEngine:
                 # 检测在原始帧 (可能 1080p=1920宽) 上做, 随后 resize 到 720p;
                 # 必须用此刻的宽度归一化 bbox, 不能用 resize 后的 _latest_frame.shape[1]。
                 detect_frame_w = frame.shape[1]
+                detect_frame_h = frame.shape[0]
                 dets = self._run_detector(frame)
                 if dets:
                     try:
@@ -675,6 +677,7 @@ class NxAiEngine:
                     # MEDIUM-5: 与 _latest_dets 同帧写入检测时的帧宽 (bbox 坐标系),
                     # get_detections_world 读它归一化, 不被 resize 后的 720p 宽度污染。
                     self._detect_frame_w = detect_frame_w
+                    self._detect_frame_h = detect_frame_h
                     self._frame_count += 1
             except Exception as e:
                 logger.warning(f"[AI] video_yolo_loop 异常: {e}")
@@ -1004,14 +1007,36 @@ class NxAiEngine:
                 }
             frame = self._latest_frame.copy()
             height, width = frame.shape[:2]
+            detect_frame_w = getattr(self, "_detect_frame_w", width)
+            detect_frame_h = getattr(self, "_detect_frame_h", height)
             detections = []
             for det in self._latest_dets:
                 if det.get("class") != "person":
                     continue
                 copied = dict(det)
                 bbox = copied.get("bbox")
-                if isinstance(bbox, list):
-                    copied["bbox"] = list(bbox)
+                if isinstance(bbox, (list, tuple)):
+                    scaled_bbox = list(bbox)
+                    if len(scaled_bbox) >= 4:
+                        src_w = copied.get("frame_width") or detect_frame_w
+                        src_h = copied.get("frame_height") or detect_frame_h
+                        try:
+                            src_w = float(src_w)
+                            if src_w > 0 and src_w != width:
+                                x_scale = float(width) / src_w
+                                scaled_bbox[0] = float(scaled_bbox[0]) * x_scale
+                                scaled_bbox[2] = float(scaled_bbox[2]) * x_scale
+                        except (TypeError, ValueError):
+                            pass
+                        try:
+                            src_h = float(src_h)
+                            if src_h > 0 and src_h != height:
+                                y_scale = float(height) / src_h
+                                scaled_bbox[1] = float(scaled_bbox[1]) * y_scale
+                                scaled_bbox[3] = float(scaled_bbox[3]) * y_scale
+                        except (TypeError, ValueError):
+                            pass
+                    copied["bbox"] = scaled_bbox
                 copied["frame_width"] = int(width)
                 copied["frame_height"] = int(height)
                 copied["source"] = "yolo"
