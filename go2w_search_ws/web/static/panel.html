@@ -418,14 +418,45 @@ function updateTasks(data) {
   countEl.textContent = `${pending.length} 待执行`;
 }
 function taskHTML(t) {
-  const icons = { navigate: '→', search_area: '◎', follow: '◎', move: '→', stop: '■', return_home: '↩', observe: '◎', wait: '◎' };
-  const typeNames = { navigate: '导航', search_area: '区域搜索', follow: '跟踪', move: '移动', stop: '停止', return_home: '返回', observe: '观察', wait: '等待' };
+  const icons = { navigate: '→', search_area: '◎', search_room: '⌂', follow: '◎', move: '→', stop: '■', return_home: '↩', observe: '◎', wait: '◎' };
+  const typeNames = { navigate: '导航', search_area: '区域搜索', search_room: '房间搜索', follow: '跟踪', move: '移动', stop: '停止', return_home: '返回', observe: '观察', wait: '等待' };
   return `<div class="task-item"><div class="task-icon ${t.status}">${icons[t.type] || '?'}</div><div class="task-info"><div class="task-type">${typeNames[t.type] || t.type}</div><div class="task-params">${JSON.stringify(t.params).slice(0, 48)}</div></div><span class="task-status ${t.status}">${t.status}</span></div>`;
 }
 function updateDetList(dets) {
   const el = document.getElementById('detList');
-  if (!dets || !dets.length) { el.innerHTML = '<div class="det-empty">无检测</div>'; return; }
-  el.innerHTML = dets.map(d => `<div class="det-item"><span>${d.class}</span><span>${Math.round(d.confidence * 100)}%</span></div>`).join('');
+  if (!el) return;
+  const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+  const personNumber = (d, fallback) => {
+    const rawId = d.person_id ?? d.id ?? '';
+    const match = String(rawId).match(/(\d+)$/);
+    return match ? String(Number(match[1])) : String(fallback + 1);
+  };
+  const displayLabel = (d, index) => {
+    const raw = String(d.label_zh || d.label || d.class || d.name || d.type || '').trim();
+    const key = String(d.class || d.label || d.type || '').toLowerCase();
+    const isPerson = d.person_id !== undefined || key === 'person' || key === 'people' || key === 'person_marker';
+    if (isPerson) return `人${personNumber(d, index)}`;
+    return raw || '目标';
+  };
+  const displayMeta = (d) => {
+    const conf = Number(d.confidence ?? d.score ?? d.probability);
+    if (Number.isFinite(conf)) return `${Math.round(conf * 100)}%`;
+    if (d.position_quality) return d.position_quality;
+    if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) return `${Number(d.x).toFixed(1)}, ${Number(d.y).toFixed(1)}`;
+    return '';
+  };
+  const safePhotoUrl = (d) => {
+    const url = d.photo_url || d.crop_url || d.raw_url || '';
+    return /^\s*javascript:/i.test(url) ? '' : url;
+  };
+  if (!Array.isArray(dets) || !dets.length) { el.innerHTML = '<div class="det-empty">无检测</div>'; return; }
+  el.innerHTML = dets.map((d, index) => {
+    const photoUrl = safePhotoUrl(d);
+    const photo = photoUrl ? ` <a href="${escapeHtml(photoUrl)}" target="_blank" rel="noopener">照片</a>` : '';
+    return `<div class="det-item"><span>${escapeHtml(displayLabel(d, index))}${photo}</span><span>${escapeHtml(displayMeta(d))}</span></div>`;
+  }).join('');
 }
 
 function collectLocateBoxes(result) {
@@ -627,6 +658,18 @@ function connectWS() {
       } else if (data.type === 'search') {
         // 搜索发现目标 → 在地图标记 (detMarks 已在 slam 里)
         if (data.data && data.data.found) console.log('[搜索发现]', data.data.found);
+      } else if (data.type === 'person_markers') {
+        const markers = data.data && Array.isArray(data.data.markers) ? data.data.markers : [];
+        if (map) map.update({ person_markers: markers });
+        updateDetList(markers);
+      } else if (data.type === 'search_room') {
+        console.log('[房间搜索]', data.data || {});
+      } else if (data.type === 'mission_report') {
+        const report = data.data || {};
+        const detections = Array.isArray(report.detections) ? report.detections : [];
+        if (map) map.update({ person_markers: detections });
+        updateDetList(detections);
+        console.log('[任务报告]', report);
       }
     } catch (err) { console.error('[WS] parse', err); }
   };
