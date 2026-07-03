@@ -72,13 +72,15 @@ _rclpy = None
 _NavigateToPose = None
 _ReentrantCallbackGroup = None
 _ActionClient = None
+_OccupancyGrid = None  # nav_msgs/OccupancyGrid (frontier 探索订阅 /map_frontier 用)
 
 
 def _import_ros():
-    """懒导入 rclpy + nav2 action 类型。返回 True/False。
+    """懒导入 rclpy + nav2 action 类型 + nav_msgs/geometry_msgs。返回 True/False。
     NX 部署: True; Windows 开发机: False (静态检查/纯逻辑测试用 mock 替代)。
     """
     global _rclpy, _NavigateToPose, _ReentrantCallbackGroup, _ActionClient
+    global _OccupancyGrid
     if _rclpy is not None:
         return True
     try:
@@ -86,14 +88,225 @@ def _import_ros():
         from rclpy.action import ActionClient as _AC
         from rclpy.callback_groups import ReentrantCallbackGroup as _RCG
         from nav2_msgs.action import NavigateToPose as _NTP
+        from nav_msgs.msg import OccupancyGrid as _OG
         _rclpy = _r
         _ActionClient = _AC
         _ReentrantCallbackGroup = _RCG
         _NavigateToPose = _NTP
+        _OccupancyGrid = _OG
         return True
     except Exception as e:
         logger.debug(f"rclpy/nav2 不可导入 (NX 部署外正常): {e}")
         return False
+
+
+# ============================================================================
+# Frontier 检测器 (plan 2026-07-03 §3.3.2 / §6)
+# 用户已选方法 (c) cost-distance 加权; 评分公式为 LEARNING-MODE 红线
+# ============================================================================
+def _find_frontier_clusters(map_msg, robot_pose, visited,
+                            min_cluster_size=3, revisit_radius=1.0):
+    """从 OccupancyGrid 提取 frontier 簇列表 (脚手架, 不含评分)。
+
+    解析 map_msg → 检测边界 cell (自由 cell 8 邻域含未知) → BFS 8 连通聚簇
+    → 过滤小簇 / 已访簇 → 返回每个簇的 center/size/distance。
+
+    Args:
+        map_msg: nav_msgs/OccupancyGrid 或测试 mock (SimpleNamespace, 属性访问)。
+            容错读 info.resolution/width/height/origin.position.x/y;
+            data 是 list[int], row-major (idx = row*width + col);
+            cell 三态: -1 未知 / 0 自由 / 100 占据 (1..99 当占据, 边界判定只看 -1 和 0)。
+        robot_pose: tuple (x, y, yaw) in map frame (m, rad)。取 x,y 算簇距离。
+        visited: list[dict] 已访 frontier 中心 [{"x":, "y":}]。
+        min_cluster_size: int, 小于此 cell 数的簇视为噪点丢弃。
+        revisit_radius: float (m), 簇中心到任一 visited 点距离小于此值则跳过 (防重访)。
+
+    Returns:
+        list[dict], 每个 dict:
+          {"center_cell": (row, col), "center_world": (x_m, y_m),
+           "size": int (簇 cell 数), "distance": float (簇中心到机器人距离, 米)}
+        无簇返回 []。
+    """
+    # ---- 1. 容错解析 map_msg ----
+    if map_msg is None:
+        return []
+    info = getattr(map_msg, "info", None)
+    if info is None:
+        return []
+    resolution = float(getattr(info, "resolution", 0.0) or 0.0)
+    width = int(getattr(info, "width", 0) or 0)
+    height = int(getattr(info, "height", 0) or 0)
+    if resolution <= 0.0 or width <= 0 or height <= 0:
+        return []
+    origin = getattr(info, "origin", None)
+    if origin is not None:
+        pos = getattr(origin, "position", None)
+        if pos is not None:
+            origin_x = float(getattr(pos, "x", 0.0) or 0.0)
+            origin_y = float(getattr(pos, "y", 0.0) or 0.0)
+        else:
+            origin_x, origin_y = 0.0, 0.0
+    else:
+        origin_x, origin_y = 0.0, 0.0
+    data = getattr(map_msg, "data", None)
+    if not data:
+        return []
+    # 统一成 list[int]
+    if not isinstance(data, list):
+        try:
+            data = list(data)
+        except Exception:
+            return []
+
+    robot_x = float(robot_pose[0]) if robot_pose else 0.0
+    robot_y = float(robot_pose[1]) if len(robot_pose) > 1 else 0.0
+
+    def cell_value(r, c):
+        """越界返回 None (不视作未知); 否则返回 data 值。"""
+        if r < 0 or r >= height or c < 0 or c >= width:
+            return None
+        return data[r * width + c]
+
+    # ---- 2. 边界 cell 检测: 自由 cell 且 8 邻域至少一个未知 ----
+    UNKNOWN, FREE = -1, 0
+    frontier_cells = []
+    # 8 邻域偏移 (dr, dc)
+    neighbors8 = [(-1, -1), (-1, 0), (-1, 1),
+                  (0, -1),          (0, 1),
+                  (1, -1),  (1, 0),  (1, 1)]
+    for row in range(height):
+        row_base = row * width
+        for col in range(width):
+            if data[row_base + col] != FREE:
+                continue
+            for dr, dc in neighbors8:
+                v = cell_value(row + dr, col + dc)
+                if v == UNKNOWN:
+                    frontier_cells.append((row, col))
+                    break  # 一个未知邻居即可
+
+    if not frontier_cells:
+        return []
+
+    # ---- 3. connected-components 聚簇 (BFS, 8 连通) ----
+    frontier_set = set(frontier_cells)
+    visited_cells = set()
+    clusters_raw = []
+    for seed in frontier_cells:
+        if seed in visited_cells:
+            continue
+        # BFS
+        queue = [seed]
+        visited_cells.add(seed)
+        component = [seed]
+        head = 0
+        while head < len(queue):
+            r, c = queue[head]
+            head += 1
+            for dr, dc in neighbors8:
+                nb = (r + dr, c + dc)
+                if nb in frontier_set and nb not in visited_cells:
+                    visited_cells.add(nb)
+                    queue.append(nb)
+                    component.append(nb)
+        if len(component) >= min_cluster_size:
+            clusters_raw.append(component)
+
+    if not clusters_raw:
+        return []
+
+    # ---- 4. 簇中心 + world 坐标 + 距离 + visited 过滤 ----
+    out = []
+    for comp in clusters_raw:
+        n = len(comp)
+        mean_row = sum(r for r, _ in comp) / n
+        mean_col = sum(c for _, c in comp) / n
+        center_row = int(round(mean_row))
+        center_col = int(round(mean_col))
+        cx_world = origin_x + center_col * resolution
+        cy_world = origin_y + center_row * resolution
+
+        # visited 过滤: 簇中心到任一 visited 点 < revisit_radius 则跳过
+        too_close = False
+        if visited:
+            for vp in visited:
+                vx = float(vp.get("x", 0.0)) if isinstance(vp, dict) else 0.0
+                vy = float(vp.get("y", 0.0)) if isinstance(vp, dict) else 0.0
+                if math.hypot(cx_world - vx, cy_world - vy) < revisit_radius:
+                    too_close = True
+                    break
+        if too_close:
+            continue
+
+        distance = math.hypot(cx_world - robot_x, cy_world - robot_y)
+        out.append({
+            "center_cell": (center_row, center_col),
+            "center_world": (cx_world, cy_world),
+            "size": n,
+            "distance": distance,
+        })
+    return out
+
+
+def select_next_frontier(map_msg, robot_pose, visited,
+                         min_cluster_size=3, revisit_radius=1.0):
+    """从 occupancy grid 选下一个 frontier 目标点。
+
+    已实现 cost-distance 加权 (方法 c, 默认 α=1.0, 环境变量 GO2W_FRONTIER_ALPHA 可覆盖):
+    平衡探索收益 (簇 size) 与行走代价 (distance)。
+    frontier 簇列表由 `_find_frontier_clusters` 提供 (脚手架已实现): 每个簇含
+      - center_cell (row, col), center_world (x_m, y_m)
+      - size (簇 cell 数, 探索收益代理)
+      - distance (簇中心到机器人欧氏距离, 米)
+    visited 过滤 / 小簇过滤 / 8 连通 BFS 聚簇均在脚手架内完成。
+
+    Args:
+        map_msg: nav_msgs/OccupancyGrid (slam_toolbox 发的 /map 或 /map_frontier)
+            - data[] 是 row-major int8[], -1=未知 / 0=自由 / 100=占据
+            - info.resolution (m/cell), info.width, info.height, info.origin (Pose)
+        robot_pose: tuple (x, y, yaw) in map frame (m, rad)
+        visited: list[dict] 已访 frontier 中心 [{"x":, "y":}]
+        min_cluster_size: int, 小簇过滤阈值 (默认 3)。
+        revisit_radius: float (m), 重访过滤半径 (默认 1.0)。
+
+    Returns:
+        dict {"x": float, "y": float, "yaw": float, "size": int, "score": float}
+        代表下一个 Nav2 goal (map frame), 或 None 表示无可用 frontier。
+
+    # 三种 valid frontier 选择方法 (已实现 c):
+    #   (a) 最近邻 frontier: 遍历 grid 找未知/自由边界 cell, 选欧氏距离最近的簇中心。
+    #   (b) 信息增益最大化: 按 frontier 簇大小 (cell 数) 评分, 选最大簇。
+    #   (c) cost-distance 加权: score = size / (1 + distance * alpha), 平衡探索收益与行走代价。
+    #
+    # 实现说明: 默认走 (c), α=1.0 (GO2W_FRONTIER_ALPHA 可覆盖)。score = size/(1+distance*α)。
+    """
+    # ---- 脚手架: 找簇 (已实现) ----
+    clusters = _find_frontier_clusters(map_msg, robot_pose, visited,
+                                       min_cluster_size, revisit_radius)
+    if not clusters:
+        return None
+
+    # ===== cost-distance 评分 (默认实现: alpha=1.0, 经典公式, yaw 指向簇中心) =====
+    # score = size / (1 + distance * alpha) — 平衡探索收益与行走代价
+    # alpha 可由调用方/环境变量调参 (大→保守就近, 小→贪心探索); 默认 1.0
+    robot_x, robot_y, _ = robot_pose
+    try:
+        alpha = float(os.environ.get("GO2W_FRONTIER_ALPHA", "1.0"))
+    except (TypeError, ValueError):
+        logger.warning("GO2W_FRONTIER_ALPHA 非法, 回退到默认 1.0")
+        alpha = 1.0
+    if not math.isfinite(alpha) or alpha <= 0.0:
+        logger.warning(f"GO2W_FRONTIER_ALPHA={alpha} 必须 > 0, 回退到 1.0")
+        alpha = 1.0
+
+    def _score(c):
+        return c["size"] / (1.0 + c["distance"] * alpha)
+
+    best = max(clusters, key=_score)
+    bx, by = best["center_world"]
+    yaw = math.atan2(by - robot_y, bx - robot_x)
+    return {"x": bx, "y": by, "yaw": yaw,
+            "size": best["size"], "score": _score(best)}
 
 
 # ============================================================================
@@ -686,6 +899,12 @@ class RoomSearchOrchestrator:
             self._current_wp_idx = 0
             self._current_targets_found = 0
 
+        # ---- frontier 探索: 无预建图模式, 绕过 RoomMap/SELECT_ROOM ----
+        # plan 2026-07-03 §3.3.3: 分发前移到 run() 入口, 不进 SELECT_ROOM/RoomMap 路径
+        if params.get("search_strategy") == "frontier_explore":
+            self._run_frontier_explore(task, mission_id, start_time, params)
+            return
+
         detections_log: List[dict] = []   # 累积所有检测 (含 robot 位姿 + 时间戳)
         found_list: List[str] = []         # 去重标签 (复用阶段B type=search 格式)
 
@@ -1029,6 +1248,250 @@ class RoomSearchOrchestrator:
         self._finalize_report(task, mission_id, room, total_wp=max_views,
                               visited=visited, detections_log=markers,
                               start_time=start_time)
+
+    def _make_sentry_room(self, name: str = "__frontier__") -> Room:
+        """构造最小哨兵 Room 供 frontier 探索 _finalize_report 用 (无真实 rooms.yaml 房间)。
+        build_mission_report 已有 room is not None 守卫, search_area 放空 dict 对前端无意义。
+        绕过 Room.__init__ (它强校验 search_area.width 等必填字段, frontier 无意义),
+        直接设最小属性: build_mission_report 只读 room.name / room.search_area。
+        """
+        room = Room.__new__(Room)
+        room.name = name
+        room.aliases = []
+        room.nav_pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
+        room.search_area = {}
+        room.target_classes = []
+        return room
+
+    def _run_frontier_explore(self, task, mission_id: str, start_time: float,
+                              params: dict) -> None:
+        """无预建图 frontier 探索搜人状态机 (plan 2026-07-03 §3.3.4)。
+
+        状态流: INIT_SLAM → (FRONTIER_DETECT → NAVIGATING → DETECT)* → REPORT
+        复用 _phase/_fail/_check_cancel/_finalize_report/_observe_people_at_viewpoint/
+        _broadcast_person_markers/_get_live_robot_pose/_laser_scan_snapshot/Nav2ActionClient。
+        不依赖 RoomMap / rooms.yaml; room 名固定 "__frontier__" (哨兵 Room)。
+        与 _run_product_person_search 同构, 便于前端复用 ws type=search_room 渲染。
+        """
+        # ---- 前置检查 ----
+        if not self._product_search_available():
+            self._fail("frontier_unavailable", room="__frontier__")
+            task.status = "failed"
+            task.result = {"reason": "frontier_unavailable"}
+            return
+        if _OccupancyGrid is None:
+            # 跨平台: Windows 开发机无 nav_msgs, NX 部署应 _import_ros 已成
+            self._fail("frontier_unavailable", room="__frontier__",
+                       msg="OccupancyGrid type not loaded (rclpy/nav_msgs missing)")
+            task.status = "failed"
+            task.result = {"reason": "frontier_unavailable"}
+            return
+
+        get_snapshot = getattr(self._ai, "get_person_detection_snapshot", None)
+        if self._ai is None or not callable(get_snapshot):
+            self._fail("no_yolo", room="__frontier__")
+            task.status = "failed"
+            task.result = {"reason": "no_yolo"}
+            return
+
+        if self._param_explicitly_false(params.get("use_lidar_person_range")):
+            self._fail("lidar_required", room="__frontier__")
+            task.status = "failed"
+            task.result = {"reason": "lidar_required"}
+            return
+
+        if self._laser_scan_snapshot() is None:
+            self._fail("no_scan", room="__frontier__")
+            task.status = "failed"
+            task.result = {"reason": "no_scan"}
+            return
+
+        target_classes = list(params.get("target_classes", []) or [])
+        if "person" not in target_classes:
+            target_classes = ["person"]
+
+        with self._lock:
+            self._current_room_name = "__frontier__"
+            self._person_markers = []
+
+        # ---- INIT_SLAM: 等 /map_frontier 首帧 ----
+        self._phase("INIT_SLAM", progress=0.0, room="__frontier__")
+        if self._check_cancel("INIT_SLAM", "__frontier__"):
+            task.status = "failed"
+            task.result = {"reason": "cancelled"}
+            return
+
+        map_received = threading.Event()
+        latest_map_box = [None]  # [0] = latest OccupancyGrid msg (回调写, 主循环读)
+        map_lock = threading.Lock()
+        sub_handle = None
+
+        def _on_map_frontier(msg):
+            with map_lock:
+                latest_map_box[0] = msg
+            map_received.set()
+
+        try:
+            # 创建订阅 (NxWebNode 上挂; 主 spin 线程驱动回调)
+            sub_handle = self._node.create_subscription(
+                _OccupancyGrid, "/map_frontier", _on_map_frontier, 10)
+
+            # 等首帧 (超时 10s → no_map)
+            if not map_received.wait(timeout=10.0):
+                self._fail("no_map", room="__frontier__",
+                           msg="timeout waiting for /map_frontier first frame")
+                task.status = "failed"
+                task.result = {"reason": "no_map"}
+                return
+
+            # ensure Nav2 + wait_for_server
+            nav = self._ensure_nav()
+            if nav is None or not nav.wait_for_server(timeout=2.0):
+                self._fail("no_nav", room="__frontier__")
+                task.status = "failed"
+                task.result = {"reason": "no_nav"}
+                return
+
+            sentry_room = self._make_sentry_room("__frontier__")
+
+            # ---- 循环: frontier 驱动 Nav2 走 → 每停留点 DETECT ----
+            max_frontiers = self._positive_int(params.get("max_frontiers"), 15)
+            max_time = self._positive_float(params.get("max_time"), 300.0)
+            with self._lock:
+                self._current_total_wp = max_frontiers
+
+            store = PersonMissionStore(mission_id, static_root=self._static_root)
+            visited: List[dict] = []
+            require_photos = bool(params.get("require_photos", False))
+
+            for iteration in range(max_frontiers):
+                with self._lock:
+                    self._current_wp_idx = iteration
+
+                # cancel 检查
+                if self._check_cancel("FRONTIER_DETECT", "__frontier__"):
+                    task.status = "failed"
+                    task.result = {"reason": "cancelled"}
+                    return
+
+                # 读最新 map 缓存
+                with map_lock:
+                    map_msg = latest_map_box[0]
+                if map_msg is None:
+                    break  # 无 map (不应发生, 首帧已收), 安全退出
+
+                robot_pose = self._get_live_robot_pose()
+                if robot_pose is None:
+                    self._fail("no_pose", room="__frontier__",
+                               stage=f"frontier_{iteration}",
+                               msg="live robot pose required for frontier explore")
+                    task.status = "failed"
+                    task.result = {"reason": "no_pose"}
+                    return
+
+                target = select_next_frontier(map_msg, robot_pose, visited)
+                if target is None:
+                    break  # 无可用 frontier, 正常结束
+
+                # FRONTIER_DETECT phase
+                progress = float(iteration) / float(max(1, max_frontiers))
+                self._phase("FRONTIER_DETECT", progress=progress,
+                            room="__frontier__", current_wp=iteration,
+                            total_wp=max_frontiers,
+                            waypoint=(target["x"], target["y"]))
+
+                # NAVIGATING: 发 Nav2 goal
+                self._phase("NAVIGATING", progress=progress,
+                            room="__frontier__", current_wp=iteration,
+                            total_wp=max_frontiers)
+                if self._check_cancel("NAVIGATING", "__frontier__"):
+                    task.status = "failed"
+                    task.result = {"reason": "cancelled"}
+                    return
+
+                result = nav.send_goal_and_wait(
+                    target["x"], target["y"], target.get("yaw", 0.0),
+                    frame_id="map")
+                if not result.get("ok"):
+                    reason = self._nav_failure_reason(result)
+                    if reason in ("no_nav", "cancelled"):
+                        self._fail(reason, room="__frontier__",
+                                   status=result.get("status"),
+                                   stage=f"frontier_{iteration}")
+                        task.status = "failed"
+                        task.result = {"reason": reason, "raw": result}
+                        return
+                    # 其余 (aborted/timeout/wp_nav_err) 标 visited 并 continue
+                    visited.append({"x": target["x"], "y": target["y"]})
+                    self._phase("FRONTIER_DETECT", progress=progress,
+                                room="__frontier__", current_wp=iteration,
+                                total_wp=max_frontiers,
+                                warning=f"frontier {iteration} skipped ({reason})")
+                    continue
+
+                visited.append({"x": target["x"], "y": target["y"]})
+
+                # DETECT: 到达后调 _observe_people_at_viewpoint
+                self._phase("DETECT",
+                            progress=float(iteration + 1) / float(max(1, max_frontiers)),
+                            room="__frontier__", current_wp=iteration,
+                            total_wp=max_frontiers)
+                if self._check_cancel("DETECT", "__frontier__"):
+                    task.status = "failed"
+                    task.result = {"reason": "cancelled"}
+                    return
+
+                observe_pose = self._get_live_robot_pose()
+                if observe_pose is None:
+                    self._fail("no_pose", room="__frontier__",
+                               stage=f"frontier_{iteration}",
+                               msg="live robot pose required for person map coordinates")
+                    task.status = "failed"
+                    task.result = {"reason": "no_pose"}
+                    return
+
+                observed = self._observe_people_at_viewpoint(
+                    store, "__frontier__", iteration, observe_pose,
+                    target_classes, require_photos=require_photos,
+                    use_lidar=True)
+                if observed is None:
+                    self._fail("no_scan", room="__frontier__",
+                               stage=f"frontier_{iteration}")
+                    task.status = "failed"
+                    task.result = {"reason": "no_scan"}
+                    return
+                if isinstance(observed, dict) and observed.get("reason"):
+                    reason = str(observed.get("reason"))
+                    self._fail(reason, room="__frontier__",
+                               stage=f"frontier_{iteration}",
+                               detections=observed.get("detections"))
+                    task.status = "failed"
+                    task.result = observed
+                    return
+
+                self._broadcast_person_markers(mission_id, store.markers())
+
+                # 时间检查 (max_time 双保险)
+                if (time.time() - start_time) > max_time:
+                    logger.info(
+                        f"[{mission_id}] frontier 探索达 max_time={max_time}s, 停止迭代")
+                    break
+
+            # ---- REPORT ----
+            markers = store.markers()
+            self._broadcast_person_markers(mission_id, markers)
+            self._phase("REPORT", progress=1.0, room="__frontier__",
+                        targets_found=len(markers))
+            self._finalize_report(task, mission_id, sentry_room,
+                                  total_wp=max_frontiers, visited=len(visited),
+                                  detections_log=markers, start_time=start_time)
+        finally:
+            # 清理订阅 (防重复 frontier 任务累积订阅泄漏)
+            if sub_handle is not None:
+                try:
+                    self._node.destroy_subscription(sub_handle)
+                except Exception as e:
+                    logger.debug(f"destroy_subscription 异常 (可忽略): {e}")
 
     def _product_search_available(self) -> bool:
         return all((
