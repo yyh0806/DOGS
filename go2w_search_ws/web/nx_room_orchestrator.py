@@ -865,6 +865,18 @@ class RoomSearchOrchestrator:
         if "person" not in target_classes:
             target_classes = ["person"]
 
+        if self._param_explicitly_false(params.get("use_lidar_person_range")):
+            self._fail("lidar_required", room=room.name)
+            task.status = "failed"
+            task.result = {"reason": "lidar_required"}
+            return
+
+        if self._laser_scan_snapshot() is None:
+            self._fail("no_scan", room=room.name)
+            task.status = "failed"
+            task.result = {"reason": "no_scan"}
+            return
+
         with self._lock:
             self._current_room_name = room.name
             self._person_markers = []
@@ -918,7 +930,7 @@ class RoomSearchOrchestrator:
         store = PersonMissionStore(mission_id, static_root=self._static_root)
         visited = 0
         require_photos = bool(params.get("require_photos", False))
-        use_lidar = bool(params.get("use_lidar_person_range", True))
+        last_viewpoint_failure = None
 
         for view_idx in range(max_views):
             with self._lock:
@@ -951,7 +963,8 @@ class RoomSearchOrchestrator:
                 frame_id=room_map.frame_id)
             if not result.get("ok"):
                 reason = self._nav_failure_reason(result)
-                if reason == "no_nav":
+                last_viewpoint_failure = reason
+                if reason in ("no_nav", "cancelled"):
                     self._fail(reason, room=room.name, status=result.get("status"),
                                stage=f"viewpoint_{view_idx}")
                     task.status = "failed"
@@ -968,10 +981,22 @@ class RoomSearchOrchestrator:
             observe_pose = self._get_robot_pose(fallback=candidate)
             self._phase("DETECT", progress=float(view_idx + 1) / float(max(1, max_views)),
                         room=room.name, current_wp=view_idx, total_wp=max_views)
-            self._observe_people_at_viewpoint(
+            observed = self._observe_people_at_viewpoint(
                 store, room.name, view_idx, observe_pose, target_classes,
-                require_photos=require_photos, use_lidar=use_lidar)
+                require_photos=require_photos, use_lidar=True)
+            if observed is None:
+                self._fail("no_scan", room=room.name, stage=f"viewpoint_{view_idx}")
+                task.status = "failed"
+                task.result = {"reason": "no_scan"}
+                return
             self._broadcast_person_markers(mission_id, store.markers())
+
+        if visited == 0:
+            reason = "no_viewpoint_reached"
+            self._fail(reason, room=room.name, last_nav_failure=last_viewpoint_failure)
+            task.status = "failed"
+            task.result = {"reason": reason, "last_nav_failure": last_viewpoint_failure}
+            return
 
         markers = store.markers()
         self._broadcast_person_markers(mission_id, markers)
@@ -1009,7 +1034,7 @@ class RoomSearchOrchestrator:
 
         scan = self._laser_scan_snapshot()
         if scan is None:
-            return 0
+            return None
 
         frame = snapshot.get("frame")
         frame_width, frame_height = self._snapshot_frame_size(snapshot, frame)
@@ -1066,12 +1091,28 @@ class RoomSearchOrchestrator:
             ranges = list(data.get("ranges") or [])
             if not ranges:
                 return None
+            angle_increment = float(data.get("angle_increment", 0.0))
+            range_min = float(data.get("range_min", 0.15))
+            range_max = float(data.get("range_max", 10.0))
+            if angle_increment <= 0.0 or range_min <= 0.0 or range_max <= range_min:
+                return None
+            has_valid_range = False
+            for raw_range in ranges:
+                try:
+                    range_m = float(raw_range)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(range_m) and range_min <= range_m <= range_max:
+                    has_valid_range = True
+                    break
+            if not has_valid_range:
+                return None
             return LaserScanSnapshot(
                 angle_min=float(data.get("angle_min", 0.0)),
-                angle_increment=float(data.get("angle_increment", 0.0)),
+                angle_increment=angle_increment,
                 ranges=ranges,
-                range_min=float(data.get("range_min", 0.15)),
-                range_max=float(data.get("range_max", 10.0)),
+                range_min=range_min,
+                range_max=range_max,
             )
         except Exception as e:
             logger.warning(f"get_scan_snapshot failed: {e}")
@@ -1150,7 +1191,23 @@ class RoomSearchOrchestrator:
 
     def _nav_failure_reason(self, result: dict) -> str:
         reason = (result or {}).get("reason", "nav_aborted")
-        return "no_nav" if reason == "no_server" else reason
+        if reason == "no_server":
+            return "no_nav"
+        if reason in ("cancelled", "canceled"):
+            return "cancelled"
+        return reason
+
+    def _param_explicitly_false(self, value) -> bool:
+        if value is False:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() in ("false", "0", "no", "off")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                return float(value) == 0.0
+            except (TypeError, ValueError):
+                return False
+        return False
 
     def _positive_int(self, value, default: int) -> int:
         try:
