@@ -1168,9 +1168,22 @@ def create_server(host, port, static_dir):
                             target_classes = list(jb.get('target_classes'))
                     except Exception:
                         pass
-                task_mgr.add_list([Task("search_room",
-                                         {"room": room, "target_classes": target_classes}, 5)])
-                self._json({"ok": True, "msg": f"搜索房间 '{room}' 已入队"})
+                # search_strategy 透传 (frontier_explore / next_best_view);
+                # 不传则 task_params 与原代码一致, 走 RoomSearchOrchestrator 默认路径
+                search_strategy = q.get('search_strategy', [''])[0]
+                if not search_strategy and body:
+                    try:
+                        jb = json.loads(body)
+                        if isinstance(jb, dict):
+                            search_strategy = jb.get('search_strategy', '') or ''
+                    except Exception:
+                        pass
+                task_params = {"room": room, "target_classes": target_classes}
+                if search_strategy:
+                    task_params["search_strategy"] = search_strategy
+                task_mgr.add_list([Task("search_room", task_params, 5)])
+                self._json({"ok": True, "msg": f"搜索房间 '{room}' 已入队"
+                            + (f" (strategy={search_strategy})" if search_strategy else "")})
             else:
                 self.send_error(404)
 
