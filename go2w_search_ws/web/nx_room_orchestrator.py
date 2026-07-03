@@ -42,6 +42,28 @@ from typing import Optional, List, Dict
 
 logger = logging.getLogger("go2w.room_orch")
 
+try:
+    from nx_active_search import ActiveSearchPlanner
+except Exception:
+    ActiveSearchPlanner = None
+
+try:
+    from nx_person_localizer import DetectionFrame, LaserScanSnapshot, localize_person_detection
+except Exception:
+    DetectionFrame = None
+    LaserScanSnapshot = None
+    localize_person_detection = None
+
+try:
+    from nx_person_mission import PersonMissionStore
+except Exception:
+    PersonMissionStore = None
+
+try:
+    from nx_product_command import resolve_current_room
+except Exception:
+    resolve_current_room = None
+
 # web/ 目录 (与 nx_web_server.py 同目录, 复用其内联的 plan_lawnmower/plan_spiral)
 _WEB_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -530,6 +552,8 @@ class RoomSearchOrchestrator:
         self._current_total_wp: int = 0
         self._current_wp_idx: int = 0
         self._current_targets_found: int = 0
+        self._person_markers: List[dict] = []
+        self._static_root = os.path.join(_WEB_DIR, "static")
         self._cancelled = False
 
     # ---- 房间地图加载 ----
@@ -675,6 +699,25 @@ class RoomSearchOrchestrator:
             task.status = "failed"
             task.result = {"reason": self._room_map_err or "no_room_map"}
             return
+        if room_query == "__current__":
+            resolved = None
+            if resolve_current_room is not None:
+                robot_x, robot_y, _ = self._get_robot_pose()
+                try:
+                    resolved = resolve_current_room(
+                        robot_x, robot_y, room_map.list_rooms_detail())
+                except Exception as e:
+                    logger.warning(f"resolve_current_room failed: {e}")
+                    resolved = None
+            if resolved is None:
+                self._fail("no_room", room=room_query,
+                           msg="unable to resolve current room from robot pose")
+                task.status = "failed"
+                task.result = {"reason": "no_room", "query": room_query}
+                return
+            room_query = resolved
+            with self._lock:
+                self._current_room_name = room_query
         room = room_map.find(room_query)
         if room is None:
             self._fail("no_room", room=room_query)
@@ -688,6 +731,11 @@ class RoomSearchOrchestrator:
 
         # 决定 target_classes: room 优先, 任务级次之, 空则全记
         target_classes = room.target_classes if room.target_classes else task_target_classes
+        if params.get("search_strategy") == "next_best_view":
+            self._run_product_person_search(
+                task, mission_id, start_time, room_map, room,
+                target_classes, params)
+            return
 
         # ---- 2. NAVIGATE (发房间入口 goal) ----
         self._phase("NAVIGATE", progress=0.0, room=room.name)
@@ -796,6 +844,329 @@ class RoomSearchOrchestrator:
         self._finalize_report(task, mission_id, room, total_wp=total_wp,
                               visited=visited, detections_log=detections_log,
                               start_time=start_time)
+
+    def _run_product_person_search(self, task, mission_id: str, start_time: float,
+                                   room_map: RoomMap, room: Room,
+                                   target_classes: List[str], params: dict) -> None:
+        if not self._product_search_available():
+            self._fail("product_search_unavailable", room=room.name)
+            task.status = "failed"
+            task.result = {"reason": "product_search_unavailable"}
+            return
+
+        get_snapshot = getattr(self._ai, "get_person_detection_snapshot", None)
+        if self._ai is None or not callable(get_snapshot):
+            self._fail("no_yolo", room=room.name)
+            task.status = "failed"
+            task.result = {"reason": "no_yolo"}
+            return
+
+        target_classes = list(target_classes or [])
+        if "person" not in target_classes:
+            target_classes = ["person"]
+
+        with self._lock:
+            self._current_room_name = room.name
+            self._person_markers = []
+
+        self._phase("NAVIGATE", progress=0.0, room=room.name)
+        if self._check_cancel("NAVIGATE", room.name):
+            task.status = "failed"
+            task.result = {"reason": "cancelled"}
+            return
+
+        nav = self._ensure_nav()
+        if nav is None or not nav.wait_for_server(timeout=2.0):
+            self._fail("no_nav", room=room.name)
+            task.status = "failed"
+            task.result = {"reason": "no_nav"}
+            return
+
+        self._phase("NAVIGATING", progress=0.0, room=room.name,
+                    distance_remaining=None)
+        entry = nav.send_goal_and_wait(
+            room.nav_pose["x"], room.nav_pose["y"], room.nav_pose["yaw"],
+            frame_id=room_map.frame_id)
+        if not entry.get("ok"):
+            reason = self._nav_failure_reason(entry)
+            self._fail(reason, room=room.name, status=entry.get("status"),
+                       stage="navigate_to_room")
+            task.status = "failed"
+            task.result = {"reason": reason, "raw": entry}
+            return
+        if self._check_cancel("NAVIGATING", room.name):
+            task.status = "failed"
+            task.result = {"reason": "cancelled"}
+            return
+
+        self._phase("ARRIVED", progress=0.0, room=room.name)
+        max_views = self._positive_int(params.get("max_views"), 12)
+        with self._lock:
+            self._current_total_wp = max_views
+
+        try:
+            planner = ActiveSearchPlanner(
+                spacing=self._active_search_spacing(room),
+                obstacle_clearance=self._positive_float(
+                    params.get("obstacle_clearance_m"), 0.5))
+        except Exception as e:
+            self._fail("invalid_search_area", room=room.name, msg=str(e))
+            task.status = "failed"
+            task.result = {"reason": "invalid_search_area", "error": str(e)}
+            return
+
+        store = PersonMissionStore(mission_id, static_root=self._static_root)
+        visited = 0
+        require_photos = bool(params.get("require_photos", False))
+        use_lidar = bool(params.get("use_lidar_person_range", True))
+
+        for view_idx in range(max_views):
+            with self._lock:
+                self._current_wp_idx = view_idx
+            if self._check_cancel("ACTIVE_SEARCH", room.name):
+                task.status = "failed"
+                task.result = {"reason": "cancelled"}
+                return
+
+            robot_pose = self._get_robot_pose(fallback=room.nav_pose)
+            try:
+                candidates = planner.generate_candidates(
+                    room.search_area, robot_pose, self._get_obstacle_points())
+                candidate = planner.select_next_best(candidates, robot_pose)
+            except Exception as e:
+                self._fail("invalid_search_area", room=room.name, msg=str(e))
+                task.status = "failed"
+                task.result = {"reason": "invalid_search_area", "error": str(e)}
+                return
+            if candidate is None:
+                break
+
+            progress = float(view_idx) / float(max(1, max_views))
+            self._phase("NEXT_BEST_VIEW", progress=progress, room=room.name,
+                        current_wp=view_idx, total_wp=max_views,
+                        waypoint=(candidate["x"], candidate["y"]),
+                        score=candidate.get("score"))
+            result = nav.send_goal_and_wait(
+                candidate["x"], candidate["y"], candidate.get("yaw", 0.0),
+                frame_id=room_map.frame_id)
+            if not result.get("ok"):
+                reason = self._nav_failure_reason(result)
+                if reason == "no_nav":
+                    self._fail(reason, room=room.name, status=result.get("status"),
+                               stage=f"viewpoint_{view_idx}")
+                    task.status = "failed"
+                    task.result = {"reason": reason, "raw": result}
+                    return
+                planner.mark_blocked(candidate)
+                self._phase("NEXT_BEST_VIEW", progress=progress, room=room.name,
+                            current_wp=view_idx, total_wp=max_views,
+                            warning=f"viewpoint {view_idx} skipped ({reason})")
+                continue
+
+            visited += 1
+            planner.mark_visited(candidate)
+            observe_pose = self._get_robot_pose(fallback=candidate)
+            self._phase("DETECT", progress=float(view_idx + 1) / float(max(1, max_views)),
+                        room=room.name, current_wp=view_idx, total_wp=max_views)
+            self._observe_people_at_viewpoint(
+                store, room.name, view_idx, observe_pose, target_classes,
+                require_photos=require_photos, use_lidar=use_lidar)
+            self._broadcast_person_markers(mission_id, store.markers())
+
+        markers = store.markers()
+        self._broadcast_person_markers(mission_id, markers)
+        self._phase("REPORT", progress=1.0, room=room.name,
+                    targets_found=len(markers))
+        self._finalize_report(task, mission_id, room, total_wp=max_views,
+                              visited=visited, detections_log=markers,
+                              start_time=start_time)
+
+    def _product_search_available(self) -> bool:
+        return all((
+            ActiveSearchPlanner is not None,
+            DetectionFrame is not None,
+            LaserScanSnapshot is not None,
+            localize_person_detection is not None,
+            PersonMissionStore is not None,
+        ))
+
+    def _observe_people_at_viewpoint(self, store, room_name: str, view_idx: int,
+                                     robot_pose, target_classes: List[str],
+                                     require_photos: bool = True,
+                                     use_lidar: bool = True) -> int:
+        get_snapshot = getattr(self._ai, "get_person_detection_snapshot", None)
+        if not callable(get_snapshot):
+            return 0
+        try:
+            snapshot = get_snapshot() or {}
+        except Exception as e:
+            logger.warning(f"get_person_detection_snapshot failed: {e}")
+            return 0
+
+        detections = snapshot.get("detections") or []
+        if not detections:
+            return 0
+
+        scan = self._laser_scan_snapshot()
+        if scan is None:
+            return 0
+
+        frame = snapshot.get("frame")
+        frame_width, frame_height = self._snapshot_frame_size(snapshot, frame)
+        if frame_width <= 0 or frame_height <= 0:
+            return 0
+
+        frame_info = DetectionFrame(
+            width=frame_width,
+            height=frame_height,
+            camera_hfov_rad=self._camera_hfov_rad(),
+        )
+        robot_x, robot_y, robot_yaw = robot_pose
+        allowed = set(target_classes or ["person"])
+        added = 0
+        for det in detections:
+            if det.get("class") != "person":
+                continue
+            if allowed and "person" not in allowed:
+                continue
+            try:
+                localized = localize_person_detection(
+                    det, frame_info, scan, robot_x, robot_y, robot_yaw)
+            except Exception as e:
+                logger.warning(f"localize_person_detection failed: {e}")
+                continue
+            if use_lidar and localized.get("position_quality") != "range_lidar":
+                continue
+            localized.update({
+                "robot_x": round(float(robot_x), 3),
+                "robot_y": round(float(robot_y), 3),
+                "robot_yaw": round(float(robot_yaw), 3),
+                "room": room_name,
+                "wp_index": int(view_idx),
+                "view_index": int(view_idx),
+                "timestamp": time.time(),
+            })
+            try:
+                store.add_observation(
+                    localized, frame=frame if require_photos else None)
+            except Exception as e:
+                logger.warning(f"person observation storage failed: {e}")
+                continue
+            added += 1
+        return added
+
+    def _laser_scan_snapshot(self):
+        if self._node is None or LaserScanSnapshot is None:
+            return None
+        get_scan = getattr(self._node, "get_scan_snapshot", None)
+        if not callable(get_scan):
+            return None
+        try:
+            data = get_scan() or {}
+            ranges = list(data.get("ranges") or [])
+            if not ranges:
+                return None
+            return LaserScanSnapshot(
+                angle_min=float(data.get("angle_min", 0.0)),
+                angle_increment=float(data.get("angle_increment", 0.0)),
+                ranges=ranges,
+                range_min=float(data.get("range_min", 0.15)),
+                range_max=float(data.get("range_max", 10.0)),
+            )
+        except Exception as e:
+            logger.warning(f"get_scan_snapshot failed: {e}")
+            return None
+
+    def _snapshot_frame_size(self, snapshot: dict, frame) -> tuple:
+        width = self._positive_int(snapshot.get("frame_width"), 0)
+        height = self._positive_int(snapshot.get("frame_height"), 0)
+        if (width <= 0 or height <= 0) and frame is not None:
+            try:
+                shape = getattr(frame, "shape", None)
+                if shape is not None and len(shape) >= 2:
+                    height = int(shape[0])
+                    width = int(shape[1])
+            except Exception:
+                pass
+        return width, height
+
+    def _broadcast_person_markers(self, mission_id: str, markers: List[dict]) -> None:
+        marker_list = list(markers or [])
+        with self._lock:
+            self._person_markers = marker_list
+            self._current_targets_found = len(marker_list)
+        self._safe_broadcast({
+            "type": "person_markers",
+            "data": {
+                "mission_id": mission_id,
+                "markers": marker_list,
+            },
+        })
+
+    def _get_obstacle_points(self) -> List[tuple]:
+        try:
+            if self._node is None:
+                return []
+            with getattr(self._node, "_lock", threading.Lock()):
+                ranges = list(getattr(self._node, "_scan_ranges", []) or [])
+                angle_min = float(getattr(self._node, "_scan_angle_min", 0.0))
+                angle_increment = float(getattr(self._node, "_scan_angle_increment", 0.0))
+                range_min = float(getattr(self._node, "_scan_range_min", 0.15) or 0.15)
+                range_max = float(getattr(self._node, "_scan_range_max", 10.0) or 10.0)
+                robot_x = float(getattr(self._node, "_odom_x", 0.0))
+                robot_y = float(getattr(self._node, "_odom_y", 0.0))
+                robot_yaw = float(getattr(self._node, "_imu_yaw", 0.0))
+            if not ranges or angle_increment <= 0.0:
+                return []
+            stride = max(1, len(ranges) // 720)
+            points = []
+            for index in range(0, len(ranges), stride):
+                try:
+                    range_m = float(ranges[index])
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(range_m) or range_m < range_min or range_m > range_max:
+                    continue
+                angle = robot_yaw + angle_min + index * angle_increment
+                points.append((
+                    robot_x + range_m * math.cos(angle),
+                    robot_y + range_m * math.sin(angle),
+                ))
+            return points
+        except Exception:
+            return []
+
+    def _active_search_spacing(self, room: Room) -> float:
+        return self._positive_float(room.search_area.get("spacing"), 1.0)
+
+    def _camera_hfov_rad(self) -> float:
+        try:
+            hfov_deg = float(os.environ.get("GO2W_CAMERA_HFOV", "70"))
+            if math.isfinite(hfov_deg) and hfov_deg > 0.0:
+                return math.radians(hfov_deg)
+        except (TypeError, ValueError):
+            pass
+        return math.radians(70.0)
+
+    def _nav_failure_reason(self, result: dict) -> str:
+        reason = (result or {}).get("reason", "nav_aborted")
+        return "no_nav" if reason == "no_server" else reason
+
+    def _positive_int(self, value, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = int(default)
+        return parsed if parsed > 0 else int(default)
+
+    def _positive_float(self, value, default: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = float(default)
+        if not math.isfinite(parsed) or parsed <= 0.0:
+            return float(default)
+        return parsed
 
     def _plan_room_waypoints(self, room: Room) -> List[dict]:
         """用 plan_lawnmower/plan_spiral 把房间 search_area 切成航点序列。
