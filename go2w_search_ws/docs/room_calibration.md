@@ -86,3 +86,11 @@
 - [ ] `/api/reload_rooms` 返回 `ok:true`
 - [ ] `/api/search_room?room=客厅` 狗真走到客厅
 - [ ] F12 Console 看到 `type=mission_report` 报告
+
+## Product Person Search Requirement
+
+- Product command: `去搜索这个房间，把所有人标注出来`.
+- The command parser should create a `search_room` task for the active room with `room: "__current__"`, `target_classes: ['person']`, `require_photos: true`, `mark_on_map: true`, `search_strategy: "next_best_view"`, and `use_lidar_person_range: true`.
+- `__current__` resolves at mission start from the calibrated room that contains, or is nearest to, the robot pose. If no calibrated room can be resolved, the product flow should fail clearly instead of launching an unbounded search.
+- Rooms used by this command must have calibrated `search_area` values in `config/rooms.yaml`: `origin_x`, `origin_y`, `width`, `height`, `spacing`, and `pattern`. The `next_best_view` planner should keep coverage goals inside that calibrated area.
+- Person detection is constrained to `target_classes: ['person']`; reported people should use LiDAR-backed localization when range is available and publish map `person_markers` so operators can see every marked person.
