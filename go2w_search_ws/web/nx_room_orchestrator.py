@@ -672,6 +672,7 @@ class RoomSearchOrchestrator:
         """
         params = task.params or {}
         room_query = params.get("room", "")
+        is_product_search = params.get("search_strategy") == "next_best_view"
         # 任务级 target_classes 覆盖 (room.target_classes 优先, 任务级次之)
         task_target_classes = params.get("target_classes", []) or []
 
@@ -702,7 +703,17 @@ class RoomSearchOrchestrator:
         if room_query == "__current__":
             resolved = None
             if resolve_current_room is not None:
-                robot_x, robot_y, _ = self._get_robot_pose()
+                if is_product_search:
+                    live_pose = self._get_live_robot_pose()
+                    if live_pose is None:
+                        self._fail("no_pose", room=room_query,
+                                   msg="live robot pose required to resolve current room")
+                        task.status = "failed"
+                        task.result = {"reason": "no_pose", "query": room_query}
+                        return
+                    robot_x, robot_y, _ = live_pose
+                else:
+                    robot_x, robot_y, _ = self._get_robot_pose()
                 try:
                     resolved = resolve_current_room(
                         robot_x, robot_y, room_map.list_rooms_detail())
@@ -978,7 +989,13 @@ class RoomSearchOrchestrator:
 
             visited += 1
             planner.mark_visited(candidate)
-            observe_pose = self._get_robot_pose(fallback=candidate)
+            observe_pose = self._get_live_robot_pose()
+            if observe_pose is None:
+                self._fail("no_pose", room=room.name, stage=f"viewpoint_{view_idx}",
+                           msg="live robot pose required for person map coordinates")
+                task.status = "failed"
+                task.result = {"reason": "no_pose"}
+                return
             self._phase("DETECT", progress=float(view_idx + 1) / float(max(1, max_views)),
                         room=room.name, current_wp=view_idx, total_wp=max_views)
             observed = self._observe_people_at_viewpoint(
@@ -988,6 +1005,13 @@ class RoomSearchOrchestrator:
                 self._fail("no_scan", room=room.name, stage=f"viewpoint_{view_idx}")
                 task.status = "failed"
                 task.result = {"reason": "no_scan"}
+                return
+            if isinstance(observed, dict) and observed.get("reason"):
+                reason = str(observed.get("reason"))
+                self._fail(reason, room=room.name, stage=f"viewpoint_{view_idx}",
+                           detections=observed.get("detections"))
+                task.status = "failed"
+                task.result = observed
                 return
             self._broadcast_person_markers(mission_id, store.markers())
 
@@ -1049,6 +1073,7 @@ class RoomSearchOrchestrator:
         robot_x, robot_y, robot_yaw = robot_pose
         allowed = set(target_classes or ["person"])
         added = 0
+        no_lidar_context = []
         for det in detections:
             if det.get("class") != "person":
                 continue
@@ -1061,6 +1086,16 @@ class RoomSearchOrchestrator:
                 logger.warning(f"localize_person_detection failed: {e}")
                 continue
             if use_lidar and localized.get("position_quality") != "range_lidar":
+                no_lidar_context.append({
+                    "class": det.get("class"),
+                    "confidence": det.get("confidence"),
+                    "bbox": det.get("bbox"),
+                    "position_quality": localized.get("position_quality"),
+                    "range_source": localized.get("range_source"),
+                    "bearing_base": localized.get("bearing_base"),
+                    "bearing_map": localized.get("bearing_map"),
+                    "range_m": localized.get("range_m"),
+                })
                 continue
             localized.update({
                 "robot_x": round(float(robot_x), 3),
@@ -1078,6 +1113,8 @@ class RoomSearchOrchestrator:
                 logger.warning(f"person observation storage failed: {e}")
                 continue
             added += 1
+        if use_lidar and added == 0 and no_lidar_context:
+            return {"reason": "no_lidar_range", "detections": no_lidar_context}
         return added
 
     def _laser_scan_snapshot(self):
@@ -1090,6 +1127,26 @@ class RoomSearchOrchestrator:
             data = get_scan() or {}
             ranges = list(data.get("ranges") or [])
             if not ranges:
+                return None
+            try:
+                timestamp = float(data.get("timestamp"))
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(timestamp) or timestamp <= 0.0:
+                return None
+            try:
+                age_sec = (
+                    float(data.get("age_sec"))
+                    if data.get("age_sec") is not None
+                    else time.time() - timestamp
+                )
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(age_sec) or age_sec < 0.0:
+                return None
+            max_age_sec = self._positive_float(
+                os.environ.get("GO2W_SCAN_MAX_AGE_SEC"), 2.0)
+            if age_sec > max_age_sec:
                 return None
             angle_increment = float(data.get("angle_increment", 0.0))
             range_min = float(data.get("range_min", 0.15))
@@ -1267,6 +1324,30 @@ class RoomSearchOrchestrator:
         return 0.0, 0.0, 0.0
 
     # ---- 辅助 ----
+    def _get_live_robot_pose(self):
+        try:
+            if self._node is None:
+                return None
+            lock = getattr(self._node, "_lock", None)
+            if lock is not None:
+                with lock:
+                    odom_count = int(getattr(self._node, "_odom_count", 0) or 0)
+                    x = float(getattr(self._node, "_odom_x", 0.0))
+                    y = float(getattr(self._node, "_odom_y", 0.0))
+                    yaw = float(getattr(self._node, "_imu_yaw", 0.0))
+            else:
+                odom_count = int(getattr(self._node, "_odom_count", 0) or 0)
+                x = float(getattr(self._node, "_odom_x", 0.0))
+                y = float(getattr(self._node, "_odom_y", 0.0))
+                yaw = float(getattr(self._node, "_imu_yaw", 0.0))
+            if odom_count <= 0:
+                return None
+            if not all(math.isfinite(value) for value in (x, y, yaw)):
+                return None
+            return x, y, yaw
+        except Exception:
+            return None
+
     def _phase(self, phase: str, **extra) -> None:
         """推送状态机进度: ws_broadcast({"type":"search_room","data":{phase, ...}})。
         spec §5 实现要点 2: 每阶段切换 ws_broadcast。

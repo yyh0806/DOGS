@@ -323,6 +323,7 @@ class NxWebNode(Node):
         self._scan_angle_increment = 0.0
         self._scan_range_min = 0.0
         self._scan_range_max = 0.0
+        self._scan_timestamp = 0.0
         self._odom_x = 0.0
         self._odom_y = 0.0
         self._odom_count = 0
@@ -364,6 +365,7 @@ class NxWebNode(Node):
             self._scan_angle_increment = float(msg.angle_increment)
             self._scan_range_min = float(msg.range_min)
             self._scan_range_max = float(msg.range_max)
+            self._scan_timestamp = time.time()
             self._scan_count += 1
 
     def _on_odom(self, msg: Odometry):
@@ -417,6 +419,8 @@ class NxWebNode(Node):
 
     def get_scan_snapshot(self):
         with self._lock:
+            timestamp = float(getattr(self, "_scan_timestamp", 0.0) or 0.0)
+            age_sec = (time.time() - timestamp) if timestamp > 0.0 else None
             return {
                 "angle_min": self._scan_angle_min,
                 "angle_increment": self._scan_angle_increment,
@@ -424,6 +428,8 @@ class NxWebNode(Node):
                 "range_max": self._scan_range_max,
                 "ranges": list(self._scan_ranges),
                 "count": self._scan_count,
+                "timestamp": timestamp,
+                "age_sec": age_sec,
             }
 
 

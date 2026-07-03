@@ -1,5 +1,7 @@
 import math
 import sys
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +53,14 @@ class FakeAi:
 
 
 class FakeNode:
+    def __init__(self, scan_timestamp=None):
+        self._lock = threading.RLock()
+        self._odom_x = 0.2
+        self._odom_y = 0.2
+        self._imu_yaw = 0.0
+        self._odom_count = 1
+        self._scan_timestamp = time.time() if scan_timestamp is None else scan_timestamp
+
     def get_scan_snapshot(self):
         ranges = [0.0] * 360
         ranges[180] = 2.0
@@ -60,7 +70,30 @@ class FakeNode:
             "angle_increment": math.pi / 180.0,
             "range_min": 0.15,
             "range_max": 10.0,
+            "timestamp": self._scan_timestamp,
         }
+
+
+class NoPoseNode(FakeNode):
+    def __init__(self):
+        super().__init__()
+        self._odom_x = 0.0
+        self._odom_y = 0.0
+        self._imu_yaw = 0.0
+        self._odom_count = 0
+
+
+class StaleScanNode(FakeNode):
+    def __init__(self):
+        super().__init__(scan_timestamp=time.time() - 10.0)
+
+
+class InvalidForwardRangeNode(FakeNode):
+    def get_scan_snapshot(self):
+        snapshot = super().get_scan_snapshot()
+        snapshot["ranges"][90] = 2.0
+        snapshot["ranges"][180] = 0.0
+        return snapshot
 
 
 class MissingScanNode:
@@ -189,3 +222,54 @@ def test_product_search_fails_when_scan_snapshot_missing(tmp_path):
 
     assert task.status == "failed"
     assert task.result["reason"] == "no_scan"
+
+
+def test_product_current_room_fails_no_pose_without_live_odom(tmp_path):
+    events = []
+    nav = FakeNav()
+    orchestrator = make_orchestrator(tmp_path, events, nav, node=NoPoseNode())
+    task = FakeTask()
+    task.params["room"] = "__current__"
+
+    orchestrator.run(task)
+
+    assert task.status == "failed"
+    assert task.result["reason"] == "no_pose"
+    assert nav.calls == []
+
+
+def test_product_search_fails_no_pose_when_observing_without_live_odom(tmp_path):
+    events = []
+    nav = FakeNav()
+    orchestrator = make_orchestrator(tmp_path, events, nav, node=NoPoseNode())
+    task = FakeTask()
+
+    orchestrator.run(task)
+
+    assert task.status == "failed"
+    assert task.result["reason"] == "no_pose"
+
+
+def test_product_search_fails_when_scan_snapshot_stale(tmp_path):
+    events = []
+    nav = FakeNav()
+    orchestrator = make_orchestrator(tmp_path, events, nav, node=StaleScanNode())
+    task = FakeTask()
+
+    orchestrator.run(task)
+
+    assert task.status == "failed"
+    assert task.result["reason"] == "no_scan"
+
+
+def test_product_search_fails_no_lidar_range_when_person_has_no_valid_range(tmp_path):
+    events = []
+    nav = FakeNav()
+    orchestrator = make_orchestrator(tmp_path, events, nav, node=InvalidForwardRangeNode())
+    task = FakeTask()
+
+    orchestrator.run(task)
+
+    assert task.status == "failed"
+    assert task.result["reason"] == "no_lidar_range"
+    assert task.result["detections"][0]["position_quality"] == "bearing_only"

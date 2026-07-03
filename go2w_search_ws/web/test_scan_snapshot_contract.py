@@ -114,12 +114,15 @@ def _new_scan_node(web):
     node._scan_angle_increment = 0.0
     node._scan_range_min = 0.0
     node._scan_range_max = 0.0
+    node._scan_timestamp = 0.0
     return node
 
 
-def test_scan_snapshot_stores_laserscan_metadata_and_copied_ranges(monkeypatch):
+def test_scan_snapshot_stores_laserscan_metadata_timestamp_and_copied_ranges(monkeypatch):
     web = _load_web_server(monkeypatch)
     node = _new_scan_node(web)
+    ticks = iter([100.0, 100.25, 100.5])
+    monkeypatch.setattr(web.time, "time", lambda: next(ticks))
     scan = types.SimpleNamespace(
         ranges=[0.12345, 1.23456, 9.87654],
         angle_min=-1.57,
@@ -131,14 +134,14 @@ def test_scan_snapshot_stores_laserscan_metadata_and_copied_ranges(monkeypatch):
     node._on_scan(scan)
     snapshot = node.get_scan_snapshot()
 
-    assert snapshot == {
-        "angle_min": -1.57,
-        "angle_increment": 0.01,
-        "range_min": 0.2,
-        "range_max": 12.0,
-        "ranges": [0.123, 1.235, 9.877],
-        "count": 1,
-    }
+    assert snapshot["angle_min"] == -1.57
+    assert snapshot["angle_increment"] == 0.01
+    assert snapshot["range_min"] == 0.2
+    assert snapshot["range_max"] == 12.0
+    assert snapshot["ranges"] == [0.123, 1.235, 9.877]
+    assert snapshot["count"] == 1
+    assert snapshot["timestamp"] == 100.0
+    assert snapshot["age_sec"] == 0.25
 
     snapshot["ranges"][0] = 99
 
