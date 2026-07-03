@@ -1,6 +1,7 @@
 import importlib
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 
@@ -195,6 +196,7 @@ def test_latest_robot_map_pose_requires_received_odom(monkeypatch):
         _odom_x=0.0,
         _odom_y=0.0,
         _odom_count=0,
+        _odom_t=0.0,
     )
     manager = nx_web_server.TaskManager.__new__(nx_web_server.TaskManager)
     manager.robot = types.SimpleNamespace(_node=node)
@@ -202,7 +204,37 @@ def test_latest_robot_map_pose_requires_received_odom(monkeypatch):
     assert manager._latest_robot_map_pose() is None
 
     node._odom_count = 1
+    node._odom_t = time.time()
     assert manager._latest_robot_map_pose() == (0.0, 0.0)
+
+
+def test_product_current_room_parser_keeps_current_when_odom_is_stale(monkeypatch):
+    nx_web_server = _import_nx_web_server_with_ros_stubs(monkeypatch)
+    node = types.SimpleNamespace(
+        _lock=threading.Lock(),
+        _odom_x=2.0,
+        _odom_y=1.0,
+        _odom_count=1,
+        _odom_t=time.time() - 10.0,
+    )
+    manager = nx_web_server.TaskManager.__new__(nx_web_server.TaskManager)
+    manager.robot = types.SimpleNamespace(_node=node)
+    manager.room_orchestrator = types.SimpleNamespace(list_rooms_detail=lambda: [
+        {
+            "name": "room-a",
+            "search_area": {
+                "origin_x": 0.0,
+                "origin_y": 0.0,
+                "width": 4.0,
+                "height": 3.0,
+            },
+        },
+    ])
+    result = {"tasks": [_expected_task("__current__")]}
+
+    manager._resolve_product_current_room(result)
+
+    assert result["tasks"][0]["params"]["room"] == "__current__"
 
 
 def _import_nx_web_server_with_ros_stubs(monkeypatch):

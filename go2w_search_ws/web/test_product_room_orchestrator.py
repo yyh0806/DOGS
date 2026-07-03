@@ -59,6 +59,7 @@ class FakeNode:
         self._odom_y = 0.2
         self._imu_yaw = 0.0
         self._odom_count = 1
+        self._odom_t = time.time()
         self._scan_timestamp = time.time() if scan_timestamp is None else scan_timestamp
 
     def get_scan_snapshot(self):
@@ -86,6 +87,12 @@ class NoPoseNode(FakeNode):
 class StaleScanNode(FakeNode):
     def __init__(self):
         super().__init__(scan_timestamp=time.time() - 10.0)
+
+
+class StaleOdomNode(FakeNode):
+    def __init__(self):
+        super().__init__()
+        self._odom_t = time.time() - 10.0
 
 
 class InvalidForwardRangeNode(FakeNode):
@@ -238,10 +245,36 @@ def test_product_current_room_fails_no_pose_without_live_odom(tmp_path):
     assert nav.calls == []
 
 
+def test_product_current_room_fails_no_pose_with_stale_odom(tmp_path):
+    events = []
+    nav = FakeNav()
+    orchestrator = make_orchestrator(tmp_path, events, nav, node=StaleOdomNode())
+    task = FakeTask()
+    task.params["room"] = "__current__"
+
+    orchestrator.run(task)
+
+    assert task.status == "failed"
+    assert task.result["reason"] == "no_pose"
+    assert nav.calls == []
+
+
 def test_product_search_fails_no_pose_when_observing_without_live_odom(tmp_path):
     events = []
     nav = FakeNav()
     orchestrator = make_orchestrator(tmp_path, events, nav, node=NoPoseNode())
+    task = FakeTask()
+
+    orchestrator.run(task)
+
+    assert task.status == "failed"
+    assert task.result["reason"] == "no_pose"
+
+
+def test_product_search_fails_no_pose_when_observing_with_stale_odom(tmp_path):
+    events = []
+    nav = FakeNav()
+    orchestrator = make_orchestrator(tmp_path, events, nav, node=StaleOdomNode())
     task = FakeTask()
 
     orchestrator.run(task)

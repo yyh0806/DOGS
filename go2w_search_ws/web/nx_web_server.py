@@ -327,6 +327,7 @@ class NxWebNode(Node):
         self._odom_x = 0.0
         self._odom_y = 0.0
         self._odom_count = 0
+        self._odom_t = 0.0
         self._last_state_t = 0.0         # 最近一次 /dog_state 时间 (判 connected)
 
         self.get_logger().info(
@@ -372,6 +373,7 @@ class NxWebNode(Node):
         with self._lock:
             self._odom_x = float(msg.pose.pose.position.x)
             self._odom_y = float(msg.pose.pose.position.y)
+            self._odom_t = time.time()
             self._odom_count += 1
 
     # ---- 发布 (HTTP handler 线程调用; rclpy publisher.publish 线程安全) ----
@@ -710,7 +712,23 @@ class TaskManager:
             with lock:
                 if int(getattr(node_obj, "_odom_count", 0)) <= 0:
                     return None
-                return float(getattr(node_obj, "_odom_x")), float(getattr(node_obj, "_odom_y"))
+                odom_t = float(getattr(node_obj, "_odom_t", 0.0) or 0.0)
+                x = float(getattr(node_obj, "_odom_x"))
+                y = float(getattr(node_obj, "_odom_y"))
+            if not all(math.isfinite(value) for value in (x, y, odom_t)):
+                return None
+            if odom_t <= 0.0:
+                return None
+            try:
+                max_age_sec = float(os.environ.get("GO2W_ODOM_MAX_AGE_SEC", "2.0"))
+            except (TypeError, ValueError):
+                max_age_sec = 2.0
+            if not math.isfinite(max_age_sec) or max_age_sec <= 0.0:
+                max_age_sec = 2.0
+            age_sec = time.time() - odom_t
+            if not math.isfinite(age_sec) or age_sec < 0.0 or age_sec > max_age_sec:
+                return None
+            return x, y
         except Exception:
             return None
 

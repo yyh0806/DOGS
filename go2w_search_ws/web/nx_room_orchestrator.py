@@ -1332,17 +1332,26 @@ class RoomSearchOrchestrator:
             if lock is not None:
                 with lock:
                     odom_count = int(getattr(self._node, "_odom_count", 0) or 0)
+                    odom_t = float(getattr(self._node, "_odom_t", 0.0) or 0.0)
                     x = float(getattr(self._node, "_odom_x", 0.0))
                     y = float(getattr(self._node, "_odom_y", 0.0))
                     yaw = float(getattr(self._node, "_imu_yaw", 0.0))
             else:
                 odom_count = int(getattr(self._node, "_odom_count", 0) or 0)
+                odom_t = float(getattr(self._node, "_odom_t", 0.0) or 0.0)
                 x = float(getattr(self._node, "_odom_x", 0.0))
                 y = float(getattr(self._node, "_odom_y", 0.0))
                 yaw = float(getattr(self._node, "_imu_yaw", 0.0))
             if odom_count <= 0:
                 return None
-            if not all(math.isfinite(value) for value in (x, y, yaw)):
+            if not all(math.isfinite(value) for value in (x, y, yaw, odom_t)):
+                return None
+            if odom_t <= 0.0:
+                return None
+            age_sec = time.time() - odom_t
+            max_age_sec = self._positive_float(
+                os.environ.get("GO2W_ODOM_MAX_AGE_SEC"), 2.0)
+            if not math.isfinite(age_sec) or age_sec < 0.0 or age_sec > max_age_sec:
                 return None
             return x, y, yaw
         except Exception:
