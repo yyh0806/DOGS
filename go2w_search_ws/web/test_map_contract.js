@@ -17,8 +17,8 @@ class FakeContext {
   beginPath() {}
   moveTo(x, y) { this.ops.push({ type: 'moveTo', x, y }); }
   lineTo(x, y) { this.ops.push({ type: 'lineTo', x, y }); }
-  stroke() {}
-  fill() {}
+  stroke() { this.ops.push({ type: 'stroke', strokeStyle: this.strokeStyle, lineWidth: this.lineWidth }); }
+  fill() { this.ops.push({ type: 'fill', fillStyle: this.fillStyle, strokeStyle: this.strokeStyle }); }
   arc(x, y, r) { this.ops.push({ type: 'arc', x, y, r }); }
   translate() {}
   rotate() {}
@@ -121,7 +121,43 @@ function testLocalLidarPointsAccumulateIntoObstacleMap() {
   assert(hasPoint, `expected local MID360 point [2,0] to map to world point [5,-3], got ${JSON.stringify(map.slam.lidarMapPoints)}`);
 }
 
+function testPersonMarkersRenderWithLabelsAndQualityStyles() {
+  const { map, ctx } = createMap();
+  map.update({
+    x: 0,
+    y: 0,
+    trail: [[0, 0]],
+    scan: [],
+    map: [],
+    detections: [],
+    person_markers: [
+      { x: 24, y: 0, position_quality: 'range_lidar' },
+      { world_x: -18, world_y: 0, position_quality: 'bearing_only' },
+    ],
+  });
+
+  map._draw();
+
+  const labels = ctx.ops
+    .filter(op => op.type === 'fillText')
+    .map(op => op.text);
+  assert(labels.includes('人1'), `expected person marker label 人1, got ${JSON.stringify(labels)}`);
+  assert(labels.includes('人2'), `expected person marker label 人2, got ${JSON.stringify(labels)}`);
+  assert(map._tf.maxX >= 24, `expected transform maxX to include x/y person marker, got ${map._tf.maxX}`);
+  assert(map._tf.minX <= -18, `expected transform minX to include world_x/world_y person marker, got ${map._tf.minX}`);
+
+  const confirmedFill = ctx.ops.find(op => op.type === 'fill' && op.fillStyle === '#ff1744');
+  const confirmedStroke = ctx.ops.find(op => op.type === 'stroke' && op.strokeStyle === '#ffffff');
+  const bearingFill = ctx.ops.find(op => op.type === 'fill' && op.fillStyle === '#ffc107');
+  const bearingStroke = ctx.ops.find(op => op.type === 'stroke' && op.strokeStyle === '#263238');
+  assert(confirmedFill, `expected confirmed person marker red fill, got ${JSON.stringify(ctx.ops.filter(op => op.type === 'fill'))}`);
+  assert(confirmedStroke, `expected confirmed person marker white stroke, got ${JSON.stringify(ctx.ops.filter(op => op.type === 'stroke'))}`);
+  assert(bearingFill, `expected bearing-only person marker amber fill, got ${JSON.stringify(ctx.ops.filter(op => op.type === 'fill'))}`);
+  assert(bearingStroke, `expected bearing-only person marker dark stroke, got ${JSON.stringify(ctx.ops.filter(op => op.type === 'stroke'))}`);
+}
+
 testWorldScanPointsAreDrawnWithoutSecondTransform();
 testTransformRecomputesAfterSlamUpdate();
 testLocalLidarPointsAccumulateIntoObstacleMap();
+testPersonMarkersRenderWithLabelsAndQualityStyles();
 console.log('map contract tests passed');

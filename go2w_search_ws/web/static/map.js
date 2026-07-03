@@ -28,6 +28,7 @@ class Go2WMap {
       robotX: 0, robotY: 0, robotYaw: 0,
       trail: [], mapPoints: [], lidarMapPoints: [], scanPoints: [],
       detMarks: [], waypoints: [], currentWP: -1,
+      personMarkers: [],
       slamSource: '',
     };
     this._lidarCells = new Map();
@@ -51,6 +52,7 @@ class Go2WMap {
     if (data.yaw !== undefined) this.slam.robotYaw = data.yaw;
     if (data.trail) this.slam.trail = data.trail;
     if (data.detections) this.slam.detMarks = data.detections;
+    if (data.person_markers !== undefined) this.slam.personMarkers = data.person_markers;
     if (data.waypoints && data.waypoints.length) this.slam.waypoints = data.waypoints;
     if (data.currentWP !== undefined) this.slam.currentWP = data.currentWP;
     if (data.map) this.slam.mapPoints = data.map;
@@ -94,6 +96,16 @@ class Go2WMap {
     }
   }
 
+  _personMarkerPosition(marker) {
+    if (!marker) return null;
+    const x = marker.x !== undefined ? marker.x : marker.world_x;
+    const y = marker.y !== undefined ? marker.y : marker.world_y;
+    const nx = Number(x);
+    const ny = Number(y);
+    if (!Number.isFinite(nx) || !Number.isFinite(ny)) return null;
+    return { x: nx, y: ny };
+  }
+
   start() {
     this._running = true;
     const loop = () => {
@@ -133,6 +145,11 @@ class Go2WMap {
     for (const t of s.trail) { allX.push(t[0]); allY.push(t[1]); }
     for (const wp of s.waypoints) { allX.push(wp.x); allY.push(wp.y); }
     for (const d of s.detMarks) { allX.push(d.x); allY.push(d.y); }
+    for (const marker of s.personMarkers) {
+      const pos = this._personMarkerPosition(marker);
+      if (!pos) continue;
+      allX.push(pos.x); allY.push(pos.y);
+    }
 
     const minX = Math.min(...allX), maxX = Math.max(...allX);
     const minY = Math.min(...allY), maxY = Math.max(...allY);
@@ -280,6 +297,20 @@ class Go2WMap {
       ctx.fillStyle = '#ff1744';
       ctx.beginPath(); ctx.moveTo(dx, dy - 8); ctx.lineTo(dx - 6, dy + 5); ctx.lineTo(dx + 6, dy + 5); ctx.closePath(); ctx.fill();
       ctx.fillStyle = '#fff'; ctx.font = '10px sans-serif'; ctx.fillText(det.class, dx + 8, dy + 3);
+    }
+    for (let i = 0; i < s.personMarkers.length; i++) {
+      const marker = s.personMarkers[i];
+      const pos = this._personMarkerPosition(marker);
+      if (!pos) continue;
+      const px = toX(pos.x), py = toY(pos.y);
+      const confirmed = marker.position_quality === 'range_lidar' || marker.position_quality === 'multi_view';
+      ctx.fillStyle = confirmed ? '#ff1744' : '#ffc107';
+      ctx.strokeStyle = confirmed ? '#ffffff' : '#263238';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(px, py, 5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = confirmed ? '#ffffff' : '#263238';
+      ctx.font = '11px sans-serif';
+      ctx.fillText(`人${i + 1}`, px + 7, py - 7);
     }
     // 7. 狗 (箭头)
     ctx.save();
