@@ -53,9 +53,19 @@ scp -q "$WS_DIR/web/nx_gimbal_node.py"           "$NX_USER@$NX_HOST:~/go2w_ws/we
 scp -q "$WS_DIR/web/nx_lidar_node.py"            "$NX_USER@$NX_HOST:~/go2w_ws/web/"
 scp -q "$WS_DIR/web/nx_slam_map.py"              "$NX_USER@$NX_HOST:~/go2w_ws/web/"
 scp -q "$WS_DIR/web/mock_dog_state_publisher.py" "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+# 阶段E: 房间级搜索编排 (nx_web_server.py 运行时动态 import 这些; 缺失 → product/person search
+# 被 try-import 优雅降级跳过, 不报错但功能静默失效。务必随 web 层一起部署)
+scp -q "$WS_DIR/web/nx_room_orchestrator.py"     "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+scp -q "$WS_DIR/web/nx_product_command.py"       "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+scp -q "$WS_DIR/web/nx_active_search.py"         "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+scp -q "$WS_DIR/web/nx_person_mission.py"        "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+scp -q "$WS_DIR/web/nx_person_localizer.py"      "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+# 部署后冒烟测试 (NX 上跑产品/人员搜索 + 契约套件, 不用回 PC 找脚本)
+scp -q "$WS_DIR/web/verify_product_room_person_search.sh" "$NX_USER@$NX_HOST:~/go2w_ws/web/" 2>/dev/null || true
+scp -q "$WS_DIR/web/verify_nx_web.sh"            "$NX_USER@$NX_HOST:~/go2w_ws/web/" 2>/dev/null || true
 scp -q "$WS_DIR/web/static/panel.html"           "$NX_USER@$NX_HOST:~/go2w_ws/web/static/"
 scp -q "$WS_DIR/web/static/map.js"               "$NX_USER@$NX_HOST:~/go2w_ws/web/static/"
-echo "✅ web 代码 + static 已拷贝 (nx_web_server.py, nx_gimbal_node.py, nx_lidar_node.py, nx_slam_map.py, mock, panel.html, map.js)"
+echo "✅ web 代码 + stage-E 编排 + verify 脚本 + static 已拷贝"
 
 # ---- 3. 安装 go2w-web systemd 服务 ----
 echo ""

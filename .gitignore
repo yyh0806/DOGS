@@ -21,3 +21,7 @@ deps/
 # 否则 git clone/pull 的部署路径 (非 deploy_nx_ai.sh) 会缺该文件。
 !go2w_search_ws/web/static/mock_person.png
 .omc/
+
+# 工具缓存 (不在仓库内但常出现在仓库根: locate-anything.cpp 上游克隆 / playwright MCP)
+.cache/
+.playwright-mcp/

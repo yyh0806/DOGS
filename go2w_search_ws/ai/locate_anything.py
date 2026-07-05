@@ -44,6 +44,20 @@ def label_to_zh(label: str) -> str:
         "bottle": "瓶子",
         "cup": "杯子",
         "screen": "屏幕",
+        "monitor": "显示器",
+        "keyboard": "键盘",
+        "phone": "手机",
+        "book": "书",
+        "bowl": "碗",
+        "device": "设备",
+        "equipment": "装备",
+        "tool": "工具",
+        "furniture": "家具",
+        "appliance": "电器",
+        "animal": "动物",
+        "plant": "植物",
+        "dog": "狗",
+        "cat": "猫",
     }
     return mapping.get(key, label or "物体")
 
@@ -66,7 +80,12 @@ def _normalize_target_text(target: str) -> str:
         "objects",
     }
     if text.lower() in all_object_terms:
-        return "object"
+        # M3 fix: "所有可见物体" → 多类别候选 prompt (实测确认: 单 "object" 让模型把整个画面
+        # 当一个 object 返回全图框 [0,0,W,H]; </c> 是 locate-anything 的类别分隔符,
+        # 模型从候选类别里选最匹配的输出 label。COCO 常用类 + 通用词覆盖)
+        return ("person</c>chair</c>table</c>desk</c>bottle</c>cup</c>box</c>bag</c>backpack</c>"
+                "device</c>equipment</c>tool</c>furniture</c>appliance</c>monitor</c>keyboard</c>"
+                "phone</c>book</c>bowl</c>door</c>window</c>car</c>vehicle</c>animal</c>plant</c>dog</c>cat")
     # L1 注意: 长串(含"人"的复合词 + "前面的人")必须在单字"人"之前 — for 按列表顺序
     # 命中, 先替换长串后剩余的孤立"人"才走兜底 person。否定句(如"不要找人")超出关键词法能力。
     replacements = [
