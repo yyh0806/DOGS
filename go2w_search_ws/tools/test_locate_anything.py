@@ -27,13 +27,15 @@ def test_build_prompt_wraps_follow_target_for_open_vocabulary_grounding():
     assert prompt.endswith(".")
 
 
-def test_build_prompt_maps_all_visible_objects_to_generic_object_query():
+def test_build_prompt_maps_all_visible_objects_to_multi_class_query():
     from ai.locate_anything import build_locate_prompt
 
     prompt = build_locate_prompt("所有可见物体")
 
     assert "Locate all the instances" in prompt
-    assert "description: object." in prompt
+    assert "</c>" in prompt  # M3: 多类别候选 (单 "object" 让模型返回全图框 [0,0,W,H])
+    assert "person" in prompt
+    assert "chair" in prompt
 
 
 def test_parse_cli_output_normalizes_label_box_and_confidence():

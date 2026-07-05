@@ -91,10 +91,14 @@ class NxMotionNode(Node):
         self._vx = self._vy = self._vyaw = 0.0
         self._last_cmd_time = 0.0
         self._pose_cmd = None  # 'stand'/'sit'/'estop'
+        self._cmd_vel_count = 0  # 可观测性: 收到的 /cmd_vel 累计(排查 subscription 静默失效)
 
         # ROS2 接口
-        self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
-        self.create_subscription(String, '/cmd_pose', self._on_cmd_pose, 10)
+        # ⚠️ rclpy 坑根治 (2026-07-02 实测): create_subscription 返回的 Subscription 对象
+        # 必须存到 self, 否则 Python GC 周期性回收 → 订阅静默失效 (节点不死、不报错, 但
+        # /cmd_vel 收不到, 表现为"lease 在、进程活, 方向键却控不动狗")。publisher 同理持引用。
+        self._cmd_vel_sub = self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
+        self._cmd_pose_sub = self.create_subscription(String, '/cmd_pose', self._on_cmd_pose, 10)
         self._state_pub = self.create_publisher(String, '/dog_state', 10)
 
         # 启动控制线程 (独立线程, 避免 SDK 调用阻塞 ROS2 executor)
@@ -112,6 +116,7 @@ class NxMotionNode(Node):
 
     # ---- ROS2 回调 ----
     def _on_cmd_vel(self, msg):
+        self._cmd_vel_count += 1  # 可观测性: 累计收到的指令数(_publish_state 带入 /dog_state)
         with self._lock:
             # 坐标系: vx前后 vy左右 vyaw旋转(正=左转)
             # 实测 Go2W SDK Move(x,y,z): z正=左转 (与cmd_vel angular.z约定一致, 无需反转)
@@ -247,6 +252,7 @@ class NxMotionNode(Node):
         msg.data = json.dumps({
             'state': names[state] if state < len(names) else str(state),
             'vx': round(vx, 3), 'vy': round(vy, 3), 'vyaw': round(vyaw, 3),
+            'cmd_vel_n': self._cmd_vel_count,  # 卡在 0 = subscription 又静默失效了
         })
         self._state_pub.publish(msg)
 

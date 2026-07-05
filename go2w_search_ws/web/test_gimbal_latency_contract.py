@@ -109,24 +109,24 @@ def test_large_gimbal_frames_are_downscaled_before_jpeg(monkeypatch):
     frame = gimbal._resize_for_ws(_FakeFrame(), max_width=gimbal._VIS_WIDTH)
 
     assert frame is not None
-    assert sys.modules["cv2"]._resized == [(480, 270)]
+    assert sys.modules["cv2"]._resized == [(640, 360)]  # M3: _VIS_WIDTH 480→640 → resize (640,360)
 
 
 def test_gimbal_defaults_are_low_latency(monkeypatch):
     gimbal = _load_gimbal_module(monkeypatch)
 
-    assert gimbal._FPS == 4
+    assert gimbal._FPS == 12  # M0: 4→12 (fps≥10 goal), 旧 4 断言已 stale
     assert gimbal._JPEG_Q == 38
-    assert gimbal._VIS_WIDTH == 480
+    assert gimbal._VIS_WIDTH == 640  # M3: 480→640 提 locate bbox 精度
     assert gimbal._IR_WIDTH == 256
-    assert gimbal._VIS_HEIGHT == 270
+    assert gimbal._VIS_HEIGHT == 360  # M3: round(640*9/16)=360
     assert gimbal._IR_HEIGHT == 205
 
 
 def test_gimbal_prefers_jetson_gstreamer_hardware_decode():
     text = (WEB_DIR / "nx_gimbal_node.py").read_text(encoding="utf-8")
 
-    assert 'os.environ.get("C13_BACKEND", "auto")' in text
+    assert 'os.environ.get("C13_BACKEND", "ffmpeg")' in text  # M2: auto→ffmpeg (service 环境 GST 被 ws_livox LD_LIBRARY_PATH 污染, FFmpeg 软解稳定)
     assert "nvv4l2decoder enable-max-performance=1" in text
     assert "width={int(self._target_width)},height={int(self._target_height)}" in text
     assert "_GstRtspCapture(url, name, target_width, target_height)" in text

@@ -22,11 +22,11 @@ logger = logging.getLogger("go2w.gimbal")
 
 _VIS_URL = os.environ.get("C13_VIS_URL", "rtsp://192.168.144.108:554/stream=1")
 _IR_URL = os.environ.get("C13_IR_URL", "rtsp://192.168.144.108:555/stream=2")
-_BACKEND = os.environ.get("C13_BACKEND", "auto").strip().lower()
-_FPS = max(1.0, float(os.environ.get("C13_FPS", "4")))
+_BACKEND = os.environ.get("C13_BACKEND", "ffmpeg").strip().lower()
+_FPS = max(1.0, float(os.environ.get("C13_FPS", "12")))
 _JPEG_Q = int(os.environ.get("C13_JPEG_Q", "38"))
 _DROP_GRABS = max(0, int(os.environ.get("C13_DROP_GRABS", "0")))  # M2 fix: 默认 0 (FFmpeg 已 nobuffer+max_delay, grab-drop 反增延迟降帧率; 需要时 export C13_DROP_GRABS=2)
-_VIS_WIDTH = max(1, int(os.environ.get("C13_VIS_WIDTH", "480")))
+_VIS_WIDTH = max(1, int(os.environ.get("C13_VIS_WIDTH", "640")))  # M3: 480→640 提 locate bbox 精度 (grounding 模型低分辨率 bbox 粗略; 带宽代价可接受)
 _IR_WIDTH = max(1, int(os.environ.get("C13_IR_WIDTH", "256")))
 _VIS_HEIGHT = max(1, int(os.environ.get("C13_VIS_HEIGHT", str(round(_VIS_WIDTH * 9 / 16)))))
 _IR_HEIGHT = max(1, int(os.environ.get("C13_IR_HEIGHT", str(round(_IR_WIDTH * 0.8)))))
@@ -238,13 +238,16 @@ class GimbalRtspBridge:
                 continue
             fail = 0
             try:
-                if max_width:
-                    frame = _resize_for_ws(frame, max_width)
-                ok, jpg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_Q])
+                # M4: vis 存原始高清帧 (给 locate/跟随用; 实测 640x360 退化成全屏 person, 1280x720 才能分类);
+                #     ws 广播单独 resize 到 _VIS_WIDTH 省带宽 (前端显示 640 够)。detection.frame_width=1280
+                #     由前端 renderLocateOverlay (x1/frameW)*imgRect.width 自动映射到显示尺寸, 框对齐。
+                if name == "vis":
+                    with self._lock:
+                        self._vis_frame = frame.copy()
+                ws_frame = _resize_for_ws(frame, max_width) if max_width else frame
+                ok, jpg = cv2.imencode('.jpg', ws_frame, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_Q])
                 if ok:
                     with self._lock:
-                        if name == "vis":
-                            self._vis_frame = frame.copy()
                         setattr(self, attr, base64.b64encode(jpg.tobytes()).decode())
             except Exception as e:
                 logger.debug(f"[gimbal] {name} encode 异常: {e}")
@@ -266,7 +269,7 @@ class GimbalRtspBridge:
                 v, i = self._vis_b64, self._ir_b64
             if v or i:
                 try:
-                    self._ws({"type": "gimbal", "vis": v, "ir": i})
+                    self._ws({"type": "gimbal", "vis": v, "ir": i}, force=True)
                 except Exception as e:
                     logger.debug(f"[gimbal] broadcast 异常: {e}")
             elif time.time() > warmup and not warned:
