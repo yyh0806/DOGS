@@ -690,6 +690,14 @@ class TaskManager:
         pose = self._latest_robot_map_pose()
         rooms = self._room_details_for_resolution()
         if pose is None or not rooms:
+            # 无房间图 (RoomMap 未加载 / 无 pose): next_best_view 必失败 (_ensure_room_map 推 FAILED),
+            # 自动降级到 frontier_explore (无预建图探索, 已有测试覆盖) 让狗仍能搜人。
+            # frontier_explore 在 run() 入口分流, 不进 SELECT_ROOM, 忽略 room=__current__。
+            for task in tasks:
+                params = task.get("params") if isinstance(task, dict) else None
+                if isinstance(params, dict) and params.get("room") == "__current__":
+                    params["search_strategy"] = "frontier_explore"
+                    logger.info("无房间图: __current__ 房间搜索自动降级 frontier_explore")
             return
         try:
             room_name = resolve_current_room(pose[0], pose[1], rooms)
@@ -753,6 +761,7 @@ class TaskManager:
 - move: {"vx":前进速度m/s, "vy":侧移, "vyaw":旋转(正=左转), "duration":秒}
 - follow: {"target":"目标"}
 - search_area: {"pattern":"lawnmower", "width":米, "height":米}
+- search_room: {"room":"房间名或__current__(当前房间)", "target_classes":["person"], "require_photos":true, "mark_on_map":true} — 进房间搜索 + 拍照 + 地图标注
 - stop: {}
 - return_home: {}
 
@@ -760,8 +769,11 @@ class TaskManager:
 输入"前进两米然后左转"
 输出: {"tasks":[{"type":"move","priority":8,"params":{"vx":0.5,"duration":4.0}},{"type":"move","priority":7,"params":{"vyaw":0.5,"duration":3.0}}]}
 
-输入"搜索这个房间"
-输出: {"tasks":[{"type":"search_area","priority":5,"params":{"pattern":"lawnmower","width":8,"height":8}}]}
+输入"搜索这个房间标注所有人"
+输出: {"tasks":[{"type":"search_room","priority":8,"params":{"room":"__current__","target_classes":["person"],"require_photos":true,"mark_on_map":true}}]}
+
+输入"去客厅找所有人"
+输出: {"tasks":[{"type":"search_room","priority":8,"params":{"room":"客厅","target_classes":["person"]}}]}
 
 输入"跟着前面的人"
 输出: {"tasks":[{"type":"follow","priority":8,"params":{"target":"前面的人"}}]}

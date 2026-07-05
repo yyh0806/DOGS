@@ -63,6 +63,7 @@ scp -q "$WS_DIR/web/nx_person_localizer.py"      "$NX_USER@$NX_HOST:~/go2w_ws/we
 # 部署后冒烟测试 (NX 上跑产品/人员搜索 + 契约套件, 不用回 PC 找脚本)
 scp -q "$WS_DIR/web/verify_product_room_person_search.sh" "$NX_USER@$NX_HOST:~/go2w_ws/web/" 2>/dev/null || true
 scp -q "$WS_DIR/web/verify_nx_web.sh"            "$NX_USER@$NX_HOST:~/go2w_ws/web/" 2>/dev/null || true
+scp -q "$WS_DIR/web/diagnose_motion.sh"          "$NX_USER@$NX_HOST:~/go2w_ws/web/" 2>/dev/null || true
 scp -q "$WS_DIR/web/static/panel.html"           "$NX_USER@$NX_HOST:~/go2w_ws/web/static/"
 scp -q "$WS_DIR/web/static/map.js"               "$NX_USER@$NX_HOST:~/go2w_ws/web/static/"
 echo "✅ web 代码 + stage-E 编排 + verify 脚本 + static 已拷贝"
