@@ -116,12 +116,16 @@ def _on_ws_message(ws, message: str) -> None:
             speak(f"任务完成，但{room or '房间'}未发现人")
     elif mtype == "search_room":
         phase = payload.get("phase")
+        room = payload.get("room") or ""
         if phase == "FAILED":
             reason = payload.get("reason") or payload.get("msg") or "未知原因"
             speak(f"任务失败：{reason}")
-        elif phase == "ARRIVED":
-            room = payload.get("room") or ""
-            speak(f"已到达{room}" if room else "已到达房间")
+        elif phase == "ARRIVED" and room and room != "__frontier__":
+            # 有图 (next_best_view) 路径才 ARRIVED; 无图路径 (frontier_explore) 不发此 phase
+            speak(f"已到达{room}")
+        elif phase == "INIT_SLAM":
+            # 无图 (frontier_explore) 路径开始: SLAM 建图初始化, 给用户"任务启动"反馈
+            speak("开始探索房间")
     # 其他 type (frame/scan/locate/vlm/partial) 不播报
 
 
