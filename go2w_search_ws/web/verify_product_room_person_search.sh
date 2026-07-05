@@ -82,6 +82,7 @@ product_tests=(
   web/test_ai_snapshot_contract.py
   web/test_scan_snapshot_contract.py
   web/test_product_room_orchestrator.py
+  web/test_voice_search_contract.py
 )
 
 for test_file in "${product_tests[@]}"; do

@@ -186,6 +186,7 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
   <div class="cmd-row">
     <div class="cmd-input-wrap">
       <input class="cmd-input" id="cmdInput" placeholder="输入指令: 搜索前方10x10米找红色背包..." onkeydown="if(event.key==='Enter')sendCmd()" />
+      <button class="btn" id="voiceBtn" title="语音输入 (需 Chrome/Edge + 联网; 识别后回车确认发送)" onclick="toggleVoice()" style="padding:3px 10px;">🎤</button>
       <button class="btn primary" onclick="sendCmd()">发送</button>
     </div>
     <div class="search-form">
@@ -199,6 +200,7 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
       <span class="lbl">目标定位</span>
       <input id="locateInput" value="所有可见物体" onkeydown="if(event.key==='Enter')locateTarget()" />
       <button class="btn" style="padding:3px 10px;" onclick="locateTarget()">定位</button>
+      <button class="btn" id="locateLoopBtn" style="padding:3px 10px;" onclick="toggleLocateLoop()">持续扫描</button>
     </div>
     <div class="quick-cmds">
       <span class="quick-btn" onclick="quickCmd('搜索区域')">用选区搜索</span>
@@ -208,6 +210,7 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
       <span class="quick-btn" onclick="quickCmd('右转90度')">右转</span>
       <span class="quick-btn" onclick="quickCmd('停下来')">停止</span>
       <span class="quick-btn" onclick="quickCmd('返回起点')">返回</span>
+      <span class="quick-btn" style="background:#1976d2;color:#fff;" title="一键测端到端: NLU → search_room task (无需麦克风)" onclick="quickCmd('去搜索这个房间，把所有人标注出来')">🎤 房间搜人</span>
     </div>
   </div>
   <div class="action-row">
@@ -233,9 +236,12 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
 
 <script src="/map.js"></script>
 <script>
-let ws, connected = false, frameCount = 0, lastFpsTime = Date.now(), _moveInterval = null;
+let ws, connected = false, frameCount = 0, lastFpsTime = Date.now(), _moveInterval = null, _locateLoopTimer = null;
 let latestDetections = [];
-let latestLocateResult = null;
+let latestLocateResult = null, latestLocateTs = 0;
+const LOCATE_TTL_MS = 30000;  // locate worker 后台 ~5-21s/帧异步推; TTL 30s 防 worker 挂了残留陈旧框
+const _LOCATE_GENERIC = new Set(['', 'object', 'objects']);  // CLI grounding 无 class 时的泛化占位
+function _isGenericClass(s) { return _LOCATE_GENERIC.has((s || '').toLowerCase()); }
 let map = null;
 
 // ---- 地图初始化 ----
@@ -280,11 +286,11 @@ function move(vx, vy, vyaw) {
   // RosRobotBridge 每次写stdin即时生效, 但保留低频续发以防丢包 (NX看门狗1s兜底)
   _moveInterval = setInterval(() => fetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, { method: 'POST' }), 300);
 }
-function stopMove() { clearInterval(_moveInterval); _moveInterval = null; fetch('/api/stop', { method: 'POST' }); }
+function stopMove() { clearInterval(_moveInterval); _moveInterval = null; if (_locateLoopTimer) { clearTimeout(_locateLoopTimer); _locateLoopTimer = null; } fetch('/api/stop', { method: 'POST' }); }
 function connect() { fetch('/api/connect', { method: 'POST' }).then(r => r.json()).then(d => { if (d.ok) { connected = true; updateDogStatus(true); } }); }
 function stand() { fetch('/api/stand', { method: 'POST' }); }
 function sit() { fetch('/api/sit', { method: 'POST' }); }
-function eStop() { clearInterval(_moveInterval); _moveInterval = null; pressedKeys.clear(); resetKeyHighlight(); fetch('/api/e_stop', { method: 'POST' }); }
+function eStop() { clearInterval(_moveInterval); _moveInterval = null; if (_locateLoopTimer) { clearTimeout(_locateLoopTimer); _locateLoopTimer = null; } pressedKeys.clear(); resetKeyHighlight(); fetch('/api/e_stop', { method: 'POST' }); }
 
 // ---- 键盘控制 ----
 const KEY_MAP = {
@@ -340,6 +346,61 @@ function sendCmd() {
 }
 function quickCmd(text) { document.getElementById('cmdInput').value = text; sendCmd(); }
 
+// ---- 语音输入 (浏览器 Web Speech API: PC 本地识别后发给 NX, 走 /api/command → parse_product_command) ----
+// 对抗性设计:
+//   1. 浏览器不支持 (Firefox 无 webkitSpeechRecognition) → alert + 文本输入降级
+//   2. 非 HTTPS/localhost → Chrome 可能拒绝 (onerror not-allowed 明确提示), 不静默失败
+//   3. STT 误识别 → 不自动发送, 填入 cmdInput 让用户回车确认 (狗的动作需人工放行)
+//   4. 二次点击 → stop 而非重启 (isRecognizing 状态保护)
+//   5. 网络错误 → Web Speech API 走在线服务需联网, onerror network 明确提示
+let _voiceRec = null;
+function toggleVoice() {
+  const btn = document.getElementById('voiceBtn');
+  if (_voiceRec && _voiceRec.isRecognizing) { _voiceRec.stop(); return; }
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    alert('浏览器不支持语音识别 (需 Chrome 或 Edge)。请用文本输入指令, 或点"房间搜人"快捷按钮测端到端。');
+    return;
+  }
+  if (window.location.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(window.location.hostname)) {
+    console.warn('[voice] 非 HTTPS/localhost, Chrome 可能拒绝语音识别。若失败请用文本输入, 或给 NX 部署 HTTPS 反代。');
+  }
+  if (!_voiceRec) {
+    _voiceRec = new SR();
+    _voiceRec.lang = 'zh-CN';
+    _voiceRec.continuous = false;
+    _voiceRec.interimResults = false;
+    _voiceRec.maxAlternatives = 1;
+    _voiceRec.onresult = (e) => {
+      const text = e.results[0][0].transcript;
+      const input = document.getElementById('cmdInput');
+      input.value = text;            // 填入输入框, 不自动发送 (STT 可能误识别)
+      input.focus();
+      console.log('[voice] 识别结果 (回车确认发送):', text);
+    };
+    _voiceRec.onerror = (e) => {
+      const msg = { 'not-allowed': '麦克风权限被拒, 或非安全上下文 (语音识别需 HTTPS 或 localhost)',
+                    'no-speech': '没听到语音, 请重试',
+                    'network': '网络错误 (Web Speech API 需联网)',
+                    'aborted': '已取消' }[e.error] || `语音错误: ${e.error}`;
+      console.error('[voice]', msg);
+      if (e.error !== 'aborted' && e.error !== 'no-speech') alert(msg);
+    };
+    _voiceRec.onend = () => {
+      _voiceRec.isRecognizing = false;
+      btn.textContent = '🎤'; btn.style.background = '';
+    };
+  }
+  try {
+    _voiceRec.isRecognizing = true;
+    _voiceRec.start();
+    btn.textContent = '⏹'; btn.style.background = '#d32f2f';
+  } catch (e) {
+    _voiceRec.isRecognizing = false;
+    console.error('[voice] start failed', e);
+  }
+}
+
 // 表单搜索: 从狗当前位置起, 按输入的宽高搜索
 function searchByForm() {
   const w = parseFloat(document.getElementById('searchW').value) || 8;
@@ -347,6 +408,24 @@ function searchByForm() {
   const sp = parseFloat(document.getElementById('searchSpacing').value) || 2;
   fetch(`/api/search?width=${w}&height=${h}&spacing=${sp}`, { method: 'POST' })
     .then(r => r.json()).then(d => { if (d.ok) { document.getElementById('taskCount').textContent = '搜索已启动'; } });
+}
+
+function toggleLocateLoop() {
+  const btn = document.getElementById('locateLoopBtn');
+  if (_locateLoopTimer) {
+    clearTimeout(_locateLoopTimer); _locateLoopTimer = null;
+    btn.textContent = '持续扫描'; btn.style.background = '';
+    return;
+  }
+  const target = (document.getElementById('locateInput').value || '所有可见物体').trim();
+  btn.textContent = '停止扫描'; btn.style.background = '#d32f2f';
+  const tick = async () => {
+    if (!_locateLoopTimer) return;
+    try { await fetch(`/api/locate?target=${encodeURIComponent(target)}`, { method: 'POST' }); }
+    catch (e) {}
+    if (_locateLoopTimer) _locateLoopTimer = setTimeout(tick, 2000);
+  };
+  _locateLoopTimer = setTimeout(tick, 0);
 }
 
 function locateTarget() {
@@ -472,14 +551,17 @@ function collectLocateBoxes(result) {
   const dets = Array.isArray(result.detections) ? result.detections : [];
   const boxes = dets
     .filter(d => Array.isArray(d.bbox) && d.bbox.length >= 4)
-    .map(d => ({
-      bbox: d.bbox,
-      label: d.class || d.label || result.target || 'object',
-      labelZh: d.label_zh || result.label_zh || '',
-      confidence: d.confidence || result.confidence || 0,
-      frameWidth: d.frame_width || result.frame_width,
-      frameHeight: d.frame_height || result.frame_height,
-    }));
+    .map(d => {
+      const _c = d.class || d.label || '';
+      return {
+        bbox: d.bbox,
+        label: _isGenericClass(_c) ? (result.target || _c || 'object') : _c,  // M3: CLI 泛化占位时 fallback target
+        labelZh: d.label_zh || result.label_zh || '',
+        confidence: d.confidence || result.confidence || 0,
+        frameWidth: d.frame_width || result.frame_width,
+        frameHeight: d.frame_height || result.frame_height,
+      };
+    });
   if (boxes.length) return boxes;
   if (Array.isArray(result.bbox) && result.bbox.length >= 4) {
     return [{
@@ -530,8 +612,9 @@ function displayLocateLabel(boxData, index, total) {
     cup: '杯子',
     screen: '屏幕',
   };
-  const label = rawZh || zhMap[key] || raw || '物体';
-  return total > 1 && label === '物体' ? `物体 ${index + 1}` : label;
+  const _isGenT = (s) => _LOCATE_GENERIC.has((s || '').toLowerCase()) || /所有|全部|可见|东西/.test(s || '');
+  const label = (!_isGenT(rawZh) && rawZh) ? rawZh : (zhMap[key] || (!_isGenT(raw) ? raw : '') || '目标');
+  return total > 1 ? `${label} ${index + 1}` : label;
 }
 
 function showLocateNote(text) {
@@ -546,6 +629,7 @@ function showLocateNote(text) {
 
 function renderLocateOverlay(result) {
   latestLocateResult = result || null;
+  if (result) latestLocateTs = Date.now();  // M3: 刷新 TTL 时间戳
   const overlay = document.getElementById('locateOverlay');
   if (!overlay) return;
   overlay.innerHTML = '';
@@ -593,7 +677,7 @@ function renderLocateOverlay(result) {
 
     const label = document.createElement('div');
     label.className = 'locate-box-label';
-    const conf = boxData.confidence ? ` ${Math.round(boxData.confidence * 100)}%` : '';
+    const conf = (boxData.confidence && boxData.confidence < 0.999) ? ` ${Math.round(boxData.confidence * 100)}%` : '';  // M3: 默认 1.0 (CLI 不给真实 conf) 不显示, 避免 "100%" 误导
     label.textContent = `${displayLocateLabel(boxData, index, boxes.length)}${conf}`;
     box.appendChild(label);
     overlay.appendChild(box);
@@ -626,7 +710,10 @@ function connectWS() {
           img.style.display = 'block';
           document.getElementById('noVideo').style.display = 'none';
           frameCount++;
-          if (latestLocateResult) requestAnimationFrame(() => renderLocateOverlay(latestLocateResult));
+          if (latestLocateResult) {
+            if (Date.now() - latestLocateTs > LOCATE_TTL_MS) { latestLocateResult = null; document.getElementById('locateOverlay').innerHTML = ''; }
+            else requestAnimationFrame(() => renderLocateOverlay(latestLocateResult));
+          }
         }
         if (data.ir) {
           const ir = document.getElementById('irImg');
@@ -655,13 +742,16 @@ function connectWS() {
       } else if (data.type === 'vlm') {
         if (data.data.response) console.log('[VLM]', data.data.response);
       } else if (data.type === 'locate') {
+        latestLocateTs = Date.now();  // 每次 locate 都刷新 ts (worker 活着, 防 TTL 误清)
         if (data.data && data.data.detections) updateDetList(data.data.detections);
-        if (data.data) renderLocateOverlay(data.data);
+        // 有框才重画 (更新 latestLocateResult); 无框保留上次框 (hold last result, 不闪烁)
+        const _hasBox = !!(data.data && (data.data.found || (data.data.detections && data.data.detections.length)));
+        if (_hasBox && data.data) renderLocateOverlay(data.data);
         const meta = document.getElementById('videoMeta');
         if (meta && data.data) {
           meta.textContent = data.data.found
-            ? `定位: ${data.data.target || ''}`
-            : `定位未命中: ${data.data.status || '--'}`;
+            ? `定位: ${data.data.target || ''} (${(data.data.detections || []).length} 框)`
+            : `定位未命中(保留上次框): ${data.data.status || '--'}`;
         }
       } else if (data.type === 'search') {
         // 搜索发现目标 → 在地图标记 (detMarks 已在 slam 里)
@@ -681,7 +771,7 @@ function connectWS() {
       }
     } catch (err) { console.error('[WS] parse', err); }
   };
-  ws.onclose = () => { clearInterval(_moveInterval); _moveInterval = null; setTimeout(connectWS, 2000); };
+  ws.onclose = () => { clearInterval(_moveInterval); _moveInterval = null; if (_locateLoopTimer) { clearTimeout(_locateLoopTimer); _locateLoopTimer = null; } setTimeout(connectWS, 2000); };
 }
 
 // ---- 启动 ----
