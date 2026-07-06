@@ -31,13 +31,16 @@ Environment=GO2W_AI_VIDEO_ENABLE=0
 # C13 双流目标推流帧率 (nx_gimbal_node.py:_FPS 默认 12 → 前端天花板 12-15fps, 人眼卡顿感).
 # 调到 30 对齐 C13 源帧率; 若 NX 软解跟不上 (实测 fpsBadge 仍 <25), 需切 NVDEC 硬解.
 Environment=C13_FPS=30
+# C13 双流解码后端: gst=nvv4l2decoder NVDEC 硬解 (需 start_go2w_web.sh 剥离 ws_livox LD 污染);
+# ffmpeg=软解 (旧默认, 30fps 双流 FIFO 堆积 → 延迟越跑越大). gst 打不开不 fallback, 看 journalctl 确认.
+Environment=C13_BACKEND=gst
 Environment=HOME=/home/nx
 # reboot 时序坑根治: USB 网卡(enxc8a362616c4c)晚于 network-online.target 枚举,
 # ChannelFactory 是进程级单例不重试 → 网卡没就绪时 VideoClient Init 失败 → 视频退回 mock.
 # 等 60s 网卡就绪再启动; 超时 exit 1 触发 Restart=always 重试
 # (单次等 60s, 天然避开默认 start-limit 10s/5次, 狗没插线时持续重试不放弃).
 ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do ip link show enxc8a362616c4c >/dev/null 2>&1 && exit 0; sleep 1; done; echo "[wait-iface] enxc8a362616c4c 60s 未就绪, 等 Restart 重试" >&2; exit 1'
-ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && if test -f /home/nx/ws_livox/install/setup.bash; then source /home/nx/ws_livox/install/setup.bash; fi && exec python3 -u /home/nx/go2w_ws/web/nx_web_server.py'
+ExecStart=/bin/bash /home/nx/go2w_ws/web/start_go2w_web.sh
 WorkingDirectory=/home/nx/go2w_ws
 # 崩溃自动重启 (web 服务必须高可用, 否则前端失联)
 Restart=always

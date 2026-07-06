@@ -38,8 +38,9 @@ echo "================================================"
 # ---- 1. 连通性检查 ----
 echo ""
 echo "[1/3] 检查 NX 连通性..."
-if ! ping -c1 -W2 "$NX_HOST" >/dev/null 2>&1; then
-  echo "❌ NX ($NX_HOST) 不可达, 请确认 NX 开机且连热点"
+# 用 ssh 而非 ping 验真 (跨平台 + 代理坑: Windows ping 不认 -c, Mihomo/Tailscale 让 ping 假超时)
+if ! ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no "$NX_USER@$NX_HOST" 'true' >/dev/null 2>&1; then
+  echo "❌ NX ($NX_HOST) SSH 不通 (ping 假阴性是已知坑, 以 TCP/ssh 为准; 关 Mihomo/Tailscale 试试)"
   exit 1
 fi
 echo "✅ NX 在线"
@@ -48,6 +49,7 @@ echo "✅ NX 在线"
 echo ""
 echo "[2/3] 拷贝 nx_web 代码到 NX:~/$NX_USER/go2w_ws/ ..."
 ssh "$NX_USER@$NX_HOST" "mkdir -p ~/go2w_ws/web ~/go2w_ws/web/static"
+scp -q "$WS_DIR/web/start_go2w_web.sh"           "$NX_USER@$NX_HOST:~/go2w_ws/web/"
 scp -q "$WS_DIR/web/nx_web_server.py"            "$NX_USER@$NX_HOST:~/go2w_ws/web/"
 scp -q "$WS_DIR/web/nx_gimbal_node.py"           "$NX_USER@$NX_HOST:~/go2w_ws/web/"
 scp -q "$WS_DIR/web/nx_lidar_node.py"            "$NX_USER@$NX_HOST:~/go2w_ws/web/"
