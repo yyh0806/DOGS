@@ -23,7 +23,7 @@ def _expected_task(room):
             "target_classes": ["person"],
             "require_photos": True,
             "mark_on_map": True,
-            "search_strategy": "next_best_view",
+            "search_strategy": "frontier_explore",
             "use_lidar_person_range": True,
         },
     }
@@ -33,7 +33,7 @@ def test_parse_current_room_all_people_command():
     result = parse_product_command("去搜索这个房间，把所有人标注出来")
 
     assert result == {
-        "response": "搜索当前房间并标注所有人",
+        "response": "探索并标注所有人",
         "tasks": [_expected_task("__current__")],
     }
 
@@ -42,7 +42,7 @@ def test_parse_current_room_all_people_short_command():
     result = parse_product_command("搜索这个房间所有人")
 
     assert result == {
-        "response": "搜索当前房间并标注所有人",
+        "response": "探索并标注所有人",
         "tasks": [_expected_task("__current__")],
     }
 
@@ -51,7 +51,7 @@ def test_parse_named_room_people_command():
     result = parse_product_command("搜索客厅的人")
 
     assert result == {
-        "response": "搜索当前房间并标注所有人",
+        "response": "探索并标注所有人",
         "tasks": [_expected_task("客厅")],
     }
 
@@ -60,7 +60,7 @@ def test_parse_go_named_room_find_people_command():
     result = parse_product_command("去卧室找人")
 
     assert result == {
-        "response": "搜索当前房间并标注所有人",
+        "response": "探索并标注所有人",
         "tasks": [_expected_task("卧室")],
     }
 

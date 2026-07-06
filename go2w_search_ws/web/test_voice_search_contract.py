@@ -32,7 +32,7 @@ def test_core_command_current_room_all_people():
     assert t["params"]["target_classes"] == ["person"]
     assert t["params"]["require_photos"] is True      # 拍照
     assert t["params"]["mark_on_map"] is True          # 地图标注
-    assert t["params"]["search_strategy"] == "next_best_view"
+    assert t["params"]["search_strategy"] == "frontier_explore"
     assert t["params"]["use_lidar_person_range"] is True
 
 

@@ -76,28 +76,36 @@ _OccupancyGrid = None  # nav_msgs/OccupancyGrid (frontier 探索订阅 /map_fron
 
 
 def _import_ros():
-    """懒导入 rclpy + nav2 action 类型 + nav_msgs/geometry_msgs。返回 True/False。
-    NX 部署: True; Windows 开发机: False (静态检查/纯逻辑测试用 mock 替代)。
+    """懒导入 rclpy + nav_msgs (必需, frontier 探索用) + nav2 action (可选, NAVIGATE 路径用)。
+
+    返回 True if rclpy+nav_msgs 都成 (frontier 可跑); False = 无 ROS 环境 (Windows 开发机)。
+    nav2_msgs 失败不阻塞 frontier (只阻塞 NAVIGATE/next_best_view 路径) — 解耦后
+    无图场景(只走 frontier)在没装 nav2 的 NX 上也能跑。
     """
     global _rclpy, _NavigateToPose, _ReentrantCallbackGroup, _ActionClient
     global _OccupancyGrid
     if _rclpy is not None:
         return True
+    # 必需: rclpy + nav_msgs (frontier 订阅 /map_frontier 用 OccupancyGrid)
     try:
         import rclpy as _r
         from rclpy.action import ActionClient as _AC
         from rclpy.callback_groups import ReentrantCallbackGroup as _RCG
-        from nav2_msgs.action import NavigateToPose as _NTP
         from nav_msgs.msg import OccupancyGrid as _OG
         _rclpy = _r
         _ActionClient = _AC
         _ReentrantCallbackGroup = _RCG
-        _NavigateToPose = _NTP
         _OccupancyGrid = _OG
-        return True
     except Exception as e:
-        logger.debug(f"rclpy/nav2 不可导入 (NX 部署外正常): {e}")
+        logger.debug(f"rclpy/nav_msgs 不可导入 (NX 部署外正常): {e}")
         return False
+    # 可选: nav2_msgs (NAVIGATE/next_best_view 路径用; frontier 不需要, 失败不阻塞)
+    try:
+        from nav2_msgs.action import NavigateToPose as _NTP
+        _NavigateToPose = _NTP
+    except Exception as e:
+        logger.info(f"nav2_msgs 不可导入 (NAVIGATE 路径禁用, frontier 探索仍可用): {e}")
+    return True
 
 
 # ============================================================================
@@ -1274,13 +1282,23 @@ class RoomSearchOrchestrator:
         与 _run_product_person_search 同构, 便于前端复用 ws type=search_room 渲染。
         """
         # ---- 前置检查 ----
+        # frontier 路径不走 _ensure_nav (NAVIGATE), 必须主动调 _import_ros 确保
+        # rclpy + nav_msgs 加载; 否则 _OccupancyGrid 永远是初始 None (即使 NX 上
+        # nav_msgs 可用), frontier_unavailable 误报 "OccupancyGrid type not loaded"。
+        # 仅在 _OccupancyGrid is None 时调用 (测试 stub 后跳过, 避免重复 import)。
+        if _OccupancyGrid is None and not _import_ros():
+            self._fail("frontier_unavailable", room="__frontier__",
+                       msg="rclpy/nav_msgs 不可导入 (NX 部署外正常)")
+            task.status = "failed"
+            task.result = {"reason": "frontier_unavailable"}
+            return
         if not self._product_search_available():
             self._fail("frontier_unavailable", room="__frontier__")
             task.status = "failed"
             task.result = {"reason": "frontier_unavailable"}
             return
         if _OccupancyGrid is None:
-            # 跨平台: Windows 开发机无 nav_msgs, NX 部署应 _import_ros 已成
+            # _import_ros 已调但仍 None (理论不应发生; 防御性兜底)
             self._fail("frontier_unavailable", room="__frontier__",
                        msg="OccupancyGrid type not loaded (rclpy/nav_msgs missing)")
             task.status = "failed"

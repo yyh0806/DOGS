@@ -174,8 +174,10 @@ def resolve_current_room(robot_x: float, robot_y: float, rooms: list[dict]) -> s
 
 
 def _command_result(room: str) -> dict:
+    # 无图场景默认: frontier_explore (边走边建图), 不依赖预建 RoomMap。
+    # room 保留作语义 hint (任务上下文/日志), frontier 路径不用于导航。
     return {
-        "response": "搜索当前房间并标注所有人",
+        "response": "探索并标注所有人",
         "tasks": [{
             "type": "search_room",
             "priority": 8,
@@ -184,7 +186,7 @@ def _command_result(room: str) -> dict:
                 "target_classes": ["person"],
                 "require_photos": True,
                 "mark_on_map": True,
-                "search_strategy": "next_best_view",
+                "search_strategy": "frontier_explore",
                 "use_lidar_person_range": True,
             },
         }],
