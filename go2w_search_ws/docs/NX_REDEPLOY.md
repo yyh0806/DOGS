@@ -84,7 +84,27 @@ ws://<NX_IP>:8001          ← WebSocket (前端自动连)
 ## 5. 语音搜索人员(核心目标场景)
 
 > 目标指令:**"去搜索这个房间，把所有人标注出来"** → 狗自动进房间 → YOLO 检测人 → lidar 定位 → 拍照 + 地图标注。
-> 语音采集在 PC(浏览器 Web Speech API),任务发布给 NX,NX 控狗执行。
+> 语音采集 + STT 在 PC,任务发布给 NX,NX 控狗执行;NX 状态经 WS 推回 PC,TTS 播报。
+
+### 5.0 推荐:PC 端 voice_console.py(绕开 HTTPS 限制)
+
+`tools/voice_console.py` — PC 本地 Vosk 离线 STT,识别文本 POST 到 NX `/api/command`,
+同时连 NX WebSocket 收任务反馈,pyttsx3 离线 TTS 播报("开始探索房间" / "已到达客厅" / "找到 N 人")。
+**不受浏览器 Web Speech API 的 HTTPS 限制**(`http://IP` 也能用),是 NX 直连场景的首选入口。
+
+```bash
+# 一次性准备 (PC 上)
+pip install vosk sounddevice pyttsx3            # requests + websocket-client 已装
+# 下 Vosk 中文模型 (~50MB): https://alphacephei.com/vosk/models → vosk-model-small-cn-0.22
+# 解压到 go2w_search_ws/tools/vosk-model-small-cn-0.22 或设 VOSK_MODEL_PATH
+
+# 跑 (NX 在线时)
+cd go2w_search_ws && python tools/voice_console.py --nx <NX_IP>
+# 说"去搜索这个房间，把所有人标注出来" → 自动发送 → 听 TTS 反馈
+```
+
+可选:`--no-auto-send`(识别不自动发,防 STT 误识别让狗乱跑)/ `--no-tts`(只看文字)。
+依赖缺失时**优雅降级**(pyttsx3 没装→只打印;NX 离线→继续监听;WS 断→2s 重连),STT 主功能不崩。
 
 ### 5.1 PC 端 NLU 验证(不需 NX)
 ```bash
@@ -102,8 +122,11 @@ python -m pytest go2w_search_ws/web/test_voice_search_contract.py -v
 - ⚠️ **浏览器限制**:Web Speech API 需 **Chrome/Edge + 联网**;`http://IP:8000` 可能被 Chrome 拒绝(非安全上下文)。失败时用文本输入或"房间搜人"快捷按钮;正式部署建议给 NX 配 HTTPS 反代。
 
 ### 5.3 端到端验证(NX + 狗接入时)
-1. 浏览器打开 `http://<NX_IP>:8000`,点 **"房间搜人"** 快捷按钮(或 🎤 语音输入后回车)
-2. 面板任务状态应经历:`SELECT_ROOM → NAVIGATE → ARRIVED → SEARCH → DETECT → REPORT`
+1. 浏览器打开 `http://<NX_IP>:8000`(或用 PC voice_console.py),触发"去搜索这个房间，把所有人标注出来"
+2. **状态机取决于有没有预建房间图**:
+   - **有图**(next_best_view 路径):`SELECT_ROOM → NAVIGATE → ARRIVED → SEARCH → DETECT → REPORT`,TTS 播"已到达客厅"
+   - **无图**(frontier_explore 路径,默认/未知地图):`INIT_SLAM → FRONTIER_DETECT → NAVIGATING → DETECT → REPORT`,TTS 播"开始探索房间"
+   - 无图自动降级由 `nx_web_server._resolve_product_current_room` 处理(commit e32ab10)
 3. 地图上应出现 **person marker**(带照片缩略图,`require_photos=True`),坐标由 lidar+相机几何定位
 4. `/dog_state` 的 `cmd_vel_n` 应随狗移动递增(否则 subscription 又被 GC)
 5. 失败排查:`journalctl -u go2w-web -f | grep -E "search_room|mission_report|person_marker|localize"`
@@ -127,7 +150,7 @@ python -m pytest go2w_search_ws/web/test_voice_search_contract.py -v
 
 ---
 
-## 6. 当前已知限制
+## 7. 当前已知限制
 
 - **`/api/locate` 冷启动 ~17s/帧**:常驻 `LocateAnythingServer` 已删除(6.2GB gguf 持续占 VRAM 把 C13 fps 拖垮)。前端"持续扫描"按钮仍可用,代价是每帧 17s。
 - **`_FPS=12`**:gimbal 默认帧率目标,NX Orin 实测能否达标待确认(记忆:VideoClient SDK 上限 5.9fps,WebRTC 才是高帧率路径,待接入)。
@@ -135,7 +158,7 @@ python -m pytest go2w_search_ws/web/test_voice_search_contract.py -v
 
 ---
 
-## 7. 文件清单一览(部署后 NX 应有)
+## 8. 文件清单一览(部署后 NX 应有)
 
 ```
 ~/go2w_ws/
