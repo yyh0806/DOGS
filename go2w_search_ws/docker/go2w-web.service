@@ -24,9 +24,13 @@ Environment=GO2W_LOCATE_MODEL=/home/nx/models/locate-anything-q8_0.gguf
 Environment=GO2W_LOCATE_MODE=hybrid
 Environment=GO2W_LOCATE_THREADS=4
 Environment=GO2W_LOCATE_TIMEOUT=120
+Environment=GO2W_YOLO_MODEL=/home/nx/go2w_ws/models/yolov8x-worldv2.pt
 # Frontend uses the C13 gimbal stream; keep the Unitree dog-camera background
 # video loop off unless YOLO/dog-camera AI is explicitly needed.
 Environment=GO2W_AI_VIDEO_ENABLE=0
+# C13 双流目标推流帧率 (nx_gimbal_node.py:_FPS 默认 12 → 前端天花板 12-15fps, 人眼卡顿感).
+# 调到 30 对齐 C13 源帧率; 若 NX 软解跟不上 (实测 fpsBadge 仍 <25), 需切 NVDEC 硬解.
+Environment=C13_FPS=30
 Environment=HOME=/home/nx
 # reboot 时序坑根治: USB 网卡(enxc8a362616c4c)晚于 network-online.target 枚举,
 # ChannelFactory 是进程级单例不重试 → 网卡没就绪时 VideoClient Init 失败 → 视频退回 mock.

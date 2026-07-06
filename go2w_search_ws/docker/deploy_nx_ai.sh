@@ -32,8 +32,9 @@ echo "================================================"
 # ---- 1. 连通性检查 ----
 echo ""
 echo "[1/3] 检查 NX 连通性..."
-if ! ping -c1 -W2 "$NX_HOST" >/dev/null 2>&1; then
-  echo "FAIL: NX ($NX_HOST) 不可达, 请确认 NX 开机且连热点"
+# 用 ssh 而非 ping 验真 (跨平台 + 代理坑: Windows ping 不认 -c, Mihomo/Tailscale 让 ping 假超时)
+if ! ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no "$NX_USER@$NX_HOST" 'true' >/dev/null 2>&1; then
+  echo "FAIL: NX ($NX_HOST) SSH 不通 (ping 假阴性是已知坑, 以 TCP/ssh 为准)"
   exit 1
 fi
 echo "OK: NX 在线"
