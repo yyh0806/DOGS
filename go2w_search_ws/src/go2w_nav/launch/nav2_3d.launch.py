@@ -47,7 +47,8 @@ EKF 拆分。届时删掉下面 tf_bridge_map / tf_bridge_body 两个节点。
 import os
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, TimerAction
+from launch.actions import DeclareLaunchArgument, TimerAction, IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
@@ -122,13 +123,22 @@ def generate_launch_description():
     #    REP-103 全程一致, 零反转)。**不 remap action 名** (/navigate_to_pose 默认,
     #    阶段E 客户端契约)。**不 remap /Odometry** (yaml 显式 odom_topic: /Odometry, 决策 1)。
     # ----------------------------------------------------------------------
-    nav2 = Node(
-        package='nav2_bringup',
-        executable='navigation_launch',
-        name='nav2_bringup',
-        parameters=[params_file, {'use_sim_time': use_sim_time}],
-        output='screen',
-        # 显式注释: 此处**禁止**加 remappings=[('/cmd_vel', ...)] 反转 (狗乱转 Critical)。
+    # nav2_bringup 的 navigation_launch 是 **launch 文件, 不是 executable**
+    # (/opt/ros/humble/lib/nav2_bringup libexec 目录不存在; 同 nx-online-debug-log 坑4)。
+    # 必须 IncludeLaunchDescription, 不能 Node+executable。
+    # **禁止** /cmd_vel remap (狗乱转 Critical, 决策 5 零反转)。
+    nav2 = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(get_package_share_directory('nav2_bringup'), 'launch', 'navigation_launch.py')
+        ),
+        launch_arguments={
+            'params_file': params_file,
+            'use_sim_time': use_sim_time,
+            # 禁 navigation_launch 自带 lifecycle_manager 的 autostart
+            # (它 node_names 含 waypoint_follower, 在本机 configure FATAL 会 abort 整个 bringup
+            #  并连累 bt_navigator 回退; 由下方 lifecycle_manager_navigation 接管, 已移 waypoint_follower)
+            'autostart': 'false',
+        }.items(),
     )
 
     # ----------------------------------------------------------------------
@@ -150,7 +160,9 @@ def generate_launch_description():
                 'planner_server',
                 'behavior_server',
                 'bt_navigator',
-                'waypoint_follower',
+                # ⚠️ 不含 waypoint_follower (单点 navigate_to_pose 不需要;
+                #   Humble 本机 waypoint_follower configure 报 error-state FATAL
+                #   会 abort 整个 bringup。要 NavigateThroughPoses 再加回 + 修 yaml)
                 # ⚠️ 不含 amcl (决策 3, FAST_LIO 发 map→odom)
                 # ⚠️ 不含 map_server (FAST_LIO 不发 OccupancyGrid)
                 # ⚠️ 不含 slam_toolbox (与 FAST_LIO 互斥, 会抢 map→odom TF)
