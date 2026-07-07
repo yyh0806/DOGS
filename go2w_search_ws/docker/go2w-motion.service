@@ -12,11 +12,12 @@ Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 Environment=ROS_DOMAIN_ID=0
 # 狗主控网卡 + 启动自动站立
 Environment=DOG_INTERFACE=enxc8a362616c4c
-# reboot 时序坑根治: USB 网卡(enxc8a362616c4c)晚于 network-online.target 枚举,
-# ChannelFactory 是进程级单例不重试 → 网卡没就绪时 Init 失败 → 控狗无效/狗不站.
-# 等 60s 网卡就绪再启动; 超时 exit 1 触发 Restart=always 重试
-# (单次等 60s, 天然避开默认 start-limit 10s/5次, 狗没插线时持续重试不放弃).
-ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do ip link show enxc8a362616c4c >/dev/null 2>&1 && exit 0; sleep 1; done; echo "[wait-iface] enxc8a362616c4c 60s 未就绪, 等 Restart 重试" >&2; exit 1'
+# 等连狗网卡"链路 UP 且狗主控 161 可达"再起 motion。原版只查 ip link show (网卡存在),
+# 但狗没上电时 USB 网卡仍枚举、仅链路 DOWN → CycloneDDS participant=None → SportClient
+# 构造访问 None._ref 崩 → Restart=always 每 2s 一循环 (实测 restart counter 998 次)。
+# 现在查 operstate=up + ping 161 通才放行; 60s 不通 exit 1 让 systemd 重启 (每 60s 一周期, 省 30x).
+# 双保险: 即使 ExecStartPre 通过后 motion 进程内 _sdk_init_loop 仍会重试 SDK (代码层兜底).
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do [ "$(cat /sys/class/net/enxc8a362616c4c/operstate 2>/dev/null)" = "up" ] && ping -c 1 -W 1 192.168.123.161 >/dev/null 2>&1 && exit 0; sleep 1; done; echo "[wait-dog] enxc8a362616c4c 链路/狗主控 161 60s 未就绪 (狗没上电?), 进程内 _sdk_init_loop 会兜底重试" >&2; exit 1'
 ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec python3 -u /home/nx/go2w_ws/nx_motion_node.py'
 WorkingDirectory=/home/nx/go2w_ws
 # 崩溃自动重启 (lease持有者绝不能长时间离线, 否则狗主控残留程序接管乱跑)

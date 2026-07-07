@@ -58,34 +58,9 @@ class NxMotionNode(Node):
         self.declare_parameter('stand_on_start', True)
         self.declare_parameter('cmd_timeout', 1.0)   # 看门狗超时
         self.declare_parameter('move_rate', 20.0)     # MOVING发Move频率
-
-        if not SDK_OK:
-            self.get_logger().error(f"unitree_sdk2py 不可用: {_SDK_ERR}")
-            return
-
-        iface = self.get_parameter('dog_interface').get_parameter_value().string_value
         self._cmd_timeout = self.get_parameter('cmd_timeout').get_parameter_value().double_value
-        self.get_logger().info(f"连接狗主控控狗, 网卡={iface} ...")
 
-        # 初始化 SDK
-        self._factory = ChannelFactory()
-        try:
-            self._factory.Init(0, iface)
-        except Exception as e:
-            self.get_logger().warning(f"网卡{iface}失败{e}, 自动"); self._factory.Init(0, None)
-
-        self._sport = SportClient(enableLease=True)
-        self._sport.SetTimeout(10.0)
-        self._sport.Init()
-        # ⚠️ 历史遗留: 手动注册 SwitchGait API 1011。实测 SwitchGait(1)=trot 会让
-        # Go2W 摔倒 (见 docs/TECH_DECISIONS.md 第一节), 已停止调用。此注册保留待清理,
-        # 不影响当前移动控制 (移动逻辑已对齐 panel.py, 待实车验证)。
-        self._SWITCHGAIT_API_ID = 1011
-        self._sport._RegistApi(self._SWITCHGAIT_API_ID, 0)
-        time.sleep(2)  # 等 lease 激活
-        self.get_logger().info("SportClient lease 已激活 (持续持有, 压制残留程序)")
-
-        # 控制状态 (锁保护)
+        # 控制状态 (锁保护) — 提前初始化, 保证 _publish_state 在 SDK 未就绪时也安全
         self._lock = threading.Lock()
         self._state = DISCONNECTED
         self._vx = self._vy = self._vyaw = 0.0
@@ -93,23 +68,90 @@ class NxMotionNode(Node):
         self._pose_cmd = None  # 'stand'/'sit'/'estop'
         self._cmd_vel_count = 0  # 可观测性: 收到的 /cmd_vel 累计(排查 subscription 静默失效)
 
+        # SDK 句柄 — _init_sdk 填充; None 表示狗主控未就绪 (狗没上电/链路 DOWN)
+        self._factory = None
+        self._sport = None
+        self._SWITCHGAIT_API_ID = 1011
+        self._sdk_ready = False
+        self._sdk_retry_sec = 5.0   # 狗没电时 SDK 重试间隔 (比原崩溃循环 2s 省 60% CPU/日志)
+
         # ROS2 接口
-        # ⚠️ rclpy 坑根治 (2026-07-02 实测): create_subscription 返回的 Subscription 对象
-        # 必须存到 self, 否则 Python GC 周期性回收 → 订阅静默失效 (节点不死、不报错, 但
-        # /cmd_vel 收不到, 表现为"lease 在、进程活, 方向键却控不动狗")。publisher 同理持引用。
-        self._cmd_vel_sub = self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
-        self._cmd_pose_sub = self.create_subscription(String, '/cmd_pose', self._on_cmd_pose, 10)
+        # ⚠️ rclpy 坑根治 (2026-07-02): publisher/subscription 必须存 self, 否则 GC 回收静默失效。
+        # subscription 延迟到 SDK 就绪后创建: SDK 没起来时收 /cmd_vel 会误触发状态机但控不了狗。
+        self._cmd_vel_sub = None
+        self._cmd_pose_sub = None
         self._state_pub = self.create_publisher(String, '/dog_state', 10)
 
-        # 启动控制线程 (独立线程, 避免 SDK 调用阻塞 ROS2 executor)
-        threading.Thread(target=self._ctrl_loop, daemon=True).start()
+        # SDK 初始化在后台线程重试 — 狗主控没上电时: 不崩进程、不爆 journal、不 CPU 空转,
+        # 狗上电后 _sdk_init_loop 自动检测到并恢复。原版 SportClient 构造直接访问
+        # CycloneDDS participant._ref, 网卡 DOWN 时 participant=None → AttributeError 崩 →
+        # systemd Restart=always 每 2s 一个循环 (实测 restart counter 998 次)。
+        if not SDK_OK:
+            self.get_logger().error(f"unitree_sdk2py 不可用: {_SDK_ERR}; 节点空转, 控狗功能禁用")
+        else:
+            threading.Thread(target=self._sdk_init_loop, daemon=True).start()
 
-        # 看门狗线程
-        threading.Thread(target=self._watchdog, daemon=True).start()
-
-        # 状态发布
+        # 状态发布始终起 (SDK 未就绪时发 "DISCONNECTED + sdk_ready=false",
+        # web 能区分"motion 在等狗"还是"motion 失联")
         self.create_timer(0.5, self._publish_state)
 
+    # ---- SDK 初始化 (狗主控没上电时不崩, 后台重试到狗上电自动恢复) ----
+    def _init_sdk(self) -> bool:
+        """初始化 unitree SDK (ChannelFactory + SportClient). 成功 True, 失败 False (不抛).
+
+        狗主控没上电时: 连狗网卡链路 DOWN → CycloneDDS domain participant=None →
+        SportClient 构造访问 None._ref 抛 AttributeError. catch 住返回 False,
+        _sdk_init_loop 定期重试, 狗上电自动恢复。
+        """
+        iface = self.get_parameter('dog_interface').get_parameter_value().string_value
+        try:
+            factory = ChannelFactory()
+            try:
+                factory.Init(0, iface)
+            except Exception as e:
+                # 网卡名不对时 fallback 自动检测 (与原逻辑一致)
+                self.get_logger().warning(f"网卡 {iface} Init 失败 {e}, 自动检测")
+                factory.Init(0, None)
+            self._factory = factory
+
+            # 关键检测点: SportClient 构造触发 DDS topic 创建, participant=None 时
+            # 在 cyclonedds/topic.py 访问 None._ref 抛 AttributeError — catch 住即"狗没就绪"。
+            sport = SportClient(enableLease=True)
+            sport.SetTimeout(10.0)
+            sport.Init()
+            # ⚠️ 历史遗留: 手动注册 SwitchGait API 1011。实测 SwitchGait(1)=trot 让 Go2W
+            # 摔倒 (docs/TECH_DECISIONS.md 第一节), 已停用, 注册保留待清理。
+            sport._RegistApi(self._SWITCHGAIT_API_ID, 0)
+            time.sleep(2)  # 等 lease 激活
+            self._sport = sport
+            self.get_logger().info(f"SportClient lease 已激活 (网卡={iface}, 持续持有压制残留程序)")
+            return True
+        except Exception as e:
+            self.get_logger().warning(
+                f"SDK 初始化失败 (狗主控没上电? 网卡 {iface} 链路 DOWN?): "
+                f"{type(e).__name__}: {e}; {self._sdk_retry_sec:.0f}s 后重试")
+            self._sport = None
+            self._factory = None
+            return False
+
+    def _sdk_init_loop(self):
+        """后台线程: 反复重试 SDK 初始化直到成功 (狗上电自动恢复). 独立线程, sleep 不阻塞 executor."""
+        while not self._sdk_ready and rclpy.ok():
+            if self._init_sdk():
+                self._on_sdk_ready()
+            else:
+                time.sleep(self._sdk_retry_sec)
+
+    def _on_sdk_ready(self):
+        """SDK 就绪后: 创建 /cmd_vel /cmd_pose 订阅 + 启动控制/看门狗线程 + 自动站立."""
+        self._sdk_ready = True
+        self.get_logger().info("SDK 就绪, 启用 /cmd_vel /cmd_pose 订阅 + 控制/看门狗线程")
+        self._cmd_vel_sub = self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
+        self._cmd_pose_sub = self.create_subscription(String, '/cmd_pose', self._on_cmd_pose, 10)
+        # 启动控制线程 (独立线程, 避免 SDK 调用阻塞 ROS2 executor)
+        threading.Thread(target=self._ctrl_loop, daemon=True).start()
+        # 看门狗线程
+        threading.Thread(target=self._watchdog, daemon=True).start()
         # 自动站立
         if self.get_parameter('stand_on_start').get_parameter_value().bool_value:
             with self._lock: self._pose_cmd = 'stand'
@@ -251,18 +293,23 @@ class NxMotionNode(Node):
         msg = String()
         msg.data = json.dumps({
             'state': names[state] if state < len(names) else str(state),
+            'sdk_ready': self._sdk_ready,  # False = 狗没上电/SDK 未就绪, motion 在等 (web 可显"等待狗")
             'vx': round(vx, 3), 'vy': round(vy, 3), 'vyaw': round(vyaw, 3),
             'cmd_vel_n': self._cmd_vel_count,  # 卡在 0 = subscription 又静默失效了
         })
         self._state_pub.publish(msg)
 
     def destroy_node(self):
-        try:
-            self._sport.Move(0, 0, 0); time.sleep(0.05)
-            self._sport.StopMove(); time.sleep(0.2)
-            self._sport.Damp()
-            self.get_logger().info("退出: 已趴下释放")
-        except Exception: pass
+        # SDK 未就绪时 self._sport=None, 跳过趴下 (没句柄也没必要)
+        if self._sport is not None:
+            try:
+                self._sport.Move(0, 0, 0); time.sleep(0.05)
+                self._sport.StopMove(); time.sleep(0.2)
+                self._sport.Damp()
+                self.get_logger().info("退出: 已趴下释放")
+            except Exception: pass
+        else:
+            self.get_logger().info("退出: SDK 未就绪, 无需趴下")
         super().destroy_node()
 
 
