@@ -209,12 +209,10 @@ global_costmap:
       resolution: 0.05
       track_unknown_space: true
       # 全局规划用 2D 投影足够; 不加 voxel_layer (3D 体素是 local 双保险的事)。
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
-      static_layer:
-        plugin: "nav2_costmap_2d::StaticLayer"
-        # FAST_LIO 不发 OccupancyGrid, 此层订阅 /map 无数据, 仅无害空层;
-        # costmap 靠 obstacle_layer 实时累积。未来加 map_server 时此层自动生效。
-        map_subscribe_transient_local: true
+      plugins: ["obstacle_layer", "inflation_layer"]
+      # static_layer 删 (2026-07-07 实测): FastLIO 不发 OccupancyGrid, static_layer 订阅 /map
+      # 无数据 → global_costmap 不初始化 → "Robot out of bounds" → planner 失败狗不动
+      # (原注释"无害空层"误判). 改纯 obstacle_layer 实时累积 /scan. 未来加 map_server 再加回.
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true

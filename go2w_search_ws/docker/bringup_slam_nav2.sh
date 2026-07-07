@@ -255,8 +255,19 @@ main() {
   fi
   wait_hz /Odometry "$ODOM_MIN_HZ" 60
 
-  # 4. FastLIO TF 检查 (camera_init→body 由 FastLIO 发; map→base_link 经 TF 桥, 在 step5 Nav2 起后才连成)
+  # 4. FastLIO TF 检查 (camera_init→body 由 FastLIO 发)
   wait_tf camera_init body 30
+
+  # 4.5 map→odom fuser (C1 根治, 独立脚本 — go2w_bridge 非 colcon 包, 用 python3 直接跑, 跟 nx_sensor/motion 同模式)
+  if systemctl is-active --quiet map-odom-fuser 2>/dev/null; then
+    ok "map-odom-fuser 已运行, 跳过启动"
+  else
+    log "启动 map_odom_fuser (C1 根治, transient unit=map-odom-fuser)..."
+    start_transient map-odom-fuser \
+      "source /opt/ros/humble/setup.bash && source $FASTLIO_WS/install/setup.bash && python3 $HOME/go2w_ws/map_odom_fuser.py" \
+      "$HOME/go2w_ws"
+  fi
+  wait_tf map odom 30 || die "map→odom 未发 (fuser 未就绪? 查 /livox/lidar + /Odometry 数据)"
 
   # 5. Nav2 3D (已起则跳过)
   if systemctl is-active --quiet nav2-3d 2>/dev/null; then

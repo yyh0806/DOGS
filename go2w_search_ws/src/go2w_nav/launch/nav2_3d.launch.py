@@ -97,25 +97,12 @@ def generate_launch_description():
     )
 
     # ----------------------------------------------------------------------
-    # 2. map→odom fuser (根治 C1, 替代原两个 static_transform_publisher)
-    #    见顶部注释. go2w_bridge 包, entry_point map_odom_fuser.
-    #    必须与 p2l 同期起 (T=0), nav2 stack T=2s 给它时间发 map→odom.
+    # 2. map→odom fuser — 不在本 launch 起 (go2w_bridge 非 colcon 包, 无 entry_point;
+    #    NX 上 nx_sensor/motion_node 都是扁平 .py + python3 直接跑, 不走 colcon install).
+    #    由 bringup_slam_nav2.sh step 3.5 用 systemd-run + python3 起独立脚本
+    #    /home/nx/go2w_ws/map_odom_fuser.py (等 fastlio /Odometry 后, nav2 之前).
+    #    根治 C1 TF 拓扑 (base_link 双 parent). 见 bringup 脚本.
     # ----------------------------------------------------------------------
-    map_odom_fuser = Node(
-        package='go2w_bridge',
-        executable='map_odom_fuser',
-        name='map_odom_fuser',
-        parameters=[{
-            'world_frame': 'map',
-            'fastlio_world': 'camera_init',
-            'fastlio_body': 'body',
-            'odom_frame': 'odom',
-            'base_frame': 'base_link',
-            'publish_hz': 20.0,
-            'use_sim_time': use_sim_time,
-        }],
-        output='screen',
-    )
 
     # ----------------------------------------------------------------------
     # 3. Nav2 全栈 (navigation_launch, 默认不启 amcl/map_server, 符合决策 3)
@@ -189,6 +176,5 @@ def generate_launch_description():
         DeclareLaunchArgument('params_file', default_value=default_params),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         p2l,
-        map_odom_fuser,
         nav2_stack,
     ])

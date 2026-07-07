@@ -126,12 +126,15 @@ class MapOdomFuser(Node):
                 f"TF lookup 未就绪: {e}", throttle_duration_sec=5.0)
             return
 
-        # critic 二轮 M1: 用 FastLIO 测量时间戳 (cb.header.stamp), 不用 now(). 防 FastLIO 卡顿时
-        # fuser 持续发新戳旧行为 (costmap 以为新鲜实际旧, 狗用过时世界模型导航). cb 过旧则 skip + warn.
+        # 时间戳策略 (实测调整, 推翻 critic M1 的 cb.header.stamp 建议):
+        # FastLIO TF 时间戳是 lidar sensor time, 比 wall clock 旧 ~1.5s (传感器固有延迟).
+        # 若用 cb.header.stamp 发 map→odom, costmap 查 @now extrapolation (超 transform_tolerance).
+        # 改用 now() (wall clock) 让 costmap @now 命中; map→odom 是 SLAM 慢变化, lidar 延迟内容差
+        # 可接受. cb 过旧 >5s 才 skip (只防 FastLIO 真卡死, 不误杀 lidar 延迟).
         cb_age = self.get_clock().now() - Time.from_msg(cb.header.stamp)
-        if cb_age.nanoseconds > 5e8:  # 0.5s
+        if cb_age.nanoseconds > 5e9:  # 5s
             self.get_logger().warning(
-                f"camera_init→body 过旧 {cb_age.nanoseconds / 1e9:.2f}s, FastLIO 卡顿? skip 本帧",
+                f"camera_init→body 过旧 {cb_age.nanoseconds / 1e9:.2f}s, FastLIO 真卡顿? skip",
                 throttle_duration_sec=5.0)
             return
         # T_map_base = T_camera_init_body (假设 map==camera_init, body==base_link)
@@ -142,7 +145,7 @@ class MapOdomFuser(Node):
 
         tx, ty, tz, qx, qy, qz, qw = _mat_to_tf(T_map_odom)
         msg = TransformStamped()
-        msg.header.stamp = cb.header.stamp  # FastLIO 测量时间 (非 now, 防过时数据蒙混)
+        msg.header.stamp = self.get_clock().now().to_msg()  # wall clock (costmap @now 命中)
         msg.header.frame_id = self._world   # map
         msg.child_frame_id = self._odom     # odom
         msg.transform.translation.x = tx
