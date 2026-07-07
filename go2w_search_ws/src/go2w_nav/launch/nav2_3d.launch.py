@@ -4,7 +4,7 @@
   MID360 点云 → pointcloud_to_laserscan → /scan → costmap ObstacleLayer (主)
   + local_costmap VoxelLayer 直接吃 PointCloud2 (辅, 双保险)
   + FAST_LIO 定位 (camera_init→body TF + /Odometry, 阶段C 提供)
-  + TF 桥临时 static_transform (map↔camera_init, body↔base_link)
+  + map→odom fuser (go2w_bridge, 根治 C1 base_link 双 parent 拓扑硬伤)
   + Nav2 全栈 (navigation_launch + lifecycle_manager_navigation)
 
 ================================================================================
@@ -18,17 +18,17 @@
   4. nx_web_server (阶段A/B/E)                → Nav2 action client 在此进程内
 
 ================================================================================
-TF 桥临时方案 (阶段C 就绪后删)
+map→odom fuser (根治 critic C1 TF 拓扑硬伤, 2026-07-07 GAN-Flow)
 ================================================================================
-FAST_LIO 发 camera_init→body; Nav2 要 map→odom→base_link。临时用两个
-static_transform_publisher 做 identity 桥接 (map==camera_init, body==base_link)。
-**阶段C FAST_LIO 装好后**, 应配置 FAST_LIO 直接发 map→odom (改 FAST_LIO 的 frame
-名参数 camera_init→map / body→odom, 再单独发 odom→base_link), 或用 robot_localization
-EKF 拆分。届时删掉下面 tf_bridge_map / tf_bridge_body 两个节点。
+原临时方案两个 static_transform_publisher (map→camera_init, body→base_link) identity
+桥 → base_link 双 parent (body + nx_sensor 的 odom) → costmap two-trees (拓扑必然,
+非偶发). 根治: map_odom_fuser 节点 (go2w_bridge) 订阅 camera_init→body (FastLIO) +
+odom→base_link (nx_sensor 死推算), 算 map→odom = T(camera_init→body) × inv(T(odom→base_link))
+发布. TF 树变单链: map ─(fuser 20Hz)─▶ odom ─(nx_sensor 50Hz)─▶ base_link.
 
-前提假设 (顶部注释, 阶段C 装好后需复核):
-  - 雷达装在狗中心 (body==base_link, 零偏移); 若装在头部需填真实偏移。
-  - FAST_LIO 全局原点 = map 原点 (建图起始点 == map==camera_init)。
+前提假设:
+  - 雷达装在狗中心 (body==base_link, 零偏移); 若装在头部需在 fuser 加 offset.
+  - map == camera_init (建图起始原点, FastLIO 全局原点 = map 原点).
 
 ================================================================================
 关键红线 (rubric Critical 项, 改本文件务必保住)
@@ -97,23 +97,24 @@ def generate_launch_description():
     )
 
     # ----------------------------------------------------------------------
-    # 2. TF 桥 (临时方案, 见顶部注释, 阶段C 就绪后删)
-    #    identity static_transform: map==camera_init, body==base_link
-    #    让 FAST_LIO 发的 camera_init→body 等价于 map→base_link 链路。
+    # 2. map→odom fuser (根治 C1, 替代原两个 static_transform_publisher)
+    #    见顶部注释. go2w_bridge 包, entry_point map_odom_fuser.
+    #    必须与 p2l 同期起 (T=0), nav2 stack T=2s 给它时间发 map→odom.
     # ----------------------------------------------------------------------
-    tf_bridge_map = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='tf_map_to_camera_init',
-        arguments=['0', '0', '0', '0', '0', '0', 'map', 'camera_init'],
-        parameters=[{'use_sim_time': use_sim_time}],
-    )
-    tf_bridge_body = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='tf_body_to_base',
-        arguments=['0', '0', '0', '0', '0', '0', 'body', 'base_link'],
-        parameters=[{'use_sim_time': use_sim_time}],
+    map_odom_fuser = Node(
+        package='go2w_bridge',
+        executable='map_odom_fuser',
+        name='map_odom_fuser',
+        parameters=[{
+            'world_frame': 'map',
+            'fastlio_world': 'camera_init',
+            'fastlio_body': 'body',
+            'odom_frame': 'odom',
+            'base_frame': 'base_link',
+            'publish_hz': 20.0,
+            'use_sim_time': use_sim_time,
+        }],
+        output='screen',
     )
 
     # ----------------------------------------------------------------------
@@ -172,13 +173,15 @@ def generate_launch_description():
     )
 
     # ----------------------------------------------------------------------
-    # 启动编排:
-    #   T=0s: p2l + TF 桥 (先起, 让 TF 链 + /scan 就绪)
-    #   T=2s: Nav2 stack + lifecycle_manager (等 TF 就绪, 否则启动时 lookup
-    #         map→base_link 失败报错)
+    # 启动编排 (critic 二轮 High: 原 T=2s 不够 FastLIO 5-10s 就绪, fuser 静默 return
+    #           不发 map→odom → nav2 activate 时 two-trees 重现. 改 T=8s 给 fuser 等
+    #           FastLIO+nx_sensor TF 就绪 + 首次发布 map→odom 的时间):
+    #   T=0s: p2l + map_odom_fuser (fuser lookup 失败时 throttle return, 等就绪后发 map→odom)
+    #   T=8s: Nav2 stack + lifecycle_manager (等 fuser map→odom 就绪, 否则 bt_navigator
+    #         activate 时 lookup map→base_link 失败 → C1 two-trees 重现)
     # ----------------------------------------------------------------------
     nav2_stack = TimerAction(
-        period=2.0,
+        period=8.0,
         actions=[nav2, lifecycle_manager],
     )
 
@@ -186,7 +189,6 @@ def generate_launch_description():
         DeclareLaunchArgument('params_file', default_value=default_params),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         p2l,
-        tf_bridge_map,
-        tf_bridge_body,
+        map_odom_fuser,
         nav2_stack,
     ])

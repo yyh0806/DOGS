@@ -22,6 +22,7 @@ setup(
         'console_scripts': [
             'nx_sensor_node = go2w_bridge.nx_sensor_node:main',
             'nx_motion_node = go2w_bridge.nx_motion_node:main',
+            'map_odom_fuser = go2w_bridge.map_odom_fuser:main',
         ],
     },
 )
