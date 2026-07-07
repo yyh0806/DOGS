@@ -208,6 +208,12 @@ global_costmap:
       footprint: "[ [0.30, 0.20], [0.30, -0.20], [-0.25, -0.20], [-0.25, 0.20] ]"
       resolution: 0.05
       track_unknown_space: true
+      # rolling_window (2026-07-07 实测必加): 无 static map (FastLIO 不发 OccupancyGrid),
+      # 固定 costmap 狗 y<0 时 'Robot out of bounds' → planner 失败 goal ABORTED.
+      # rolling 跟狗动 (狗始终在 costmap 中心), 10×10m 覆盖室内. 代价: 全局规划只看局部 10m.
+      rolling_window: true
+      width: 10
+      height: 10
       # 全局规划用 2D 投影足够; 不加 voxel_layer (3D 体素是 local 双保险的事)。
       plugins: ["obstacle_layer", "inflation_layer"]
       # static_layer 删 (2026-07-07 实测): FastLIO 不发 OccupancyGrid, static_layer 订阅 /map
