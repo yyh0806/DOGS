@@ -1,0 +1,8 @@
+# PC-side offline voice command console
+# Install with: python -m pip install -r requirements-voice.txt
+
+requests
+sounddevice
+vosk
+pyttsx3
+websocket-client

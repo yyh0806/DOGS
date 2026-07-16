@@ -28,7 +28,7 @@
     (detections=0, slam.data.detections=[]), 不崩、不退化为"AI 完全关闭"。
   - 检测调用统一走 _run_detector(frame) 抽象方法, 为后续 locateanything 开放词汇
     定位预留可替换接口 (同签名替换本方法, 视频流路径不动)。
-  - VLM 同样 graceful: 无 transformers → vlm=None → TaskManager 走 _fallback_parse。
+  - VLM 同样 graceful: 无 transformers → 返回可见解析错误和空任务，不生成运动指令。
 """
 
 import base64
@@ -41,6 +41,13 @@ import threading
 import time
 
 import numpy as np
+
+from nx_camera_calibration import resolve_camera_calibration
+
+from nx_mission_schema import (
+    MissionValidationError,
+    canonicalize_search_tasks,
+)
 
 logger = logging.getLogger("go2w.nx_ai")
 
@@ -68,10 +75,12 @@ def set_ws_broadcast(fn):
         _WS_BROADCAST_FN = fn
         logger.debug("[AI] ws_broadcast 已注入")
 
-# 相机水平 FOV (度), 用于 bbox 中心 x 归一化 → 方位角 (spec §6.2 简化策略)
-_CAMERA_HFOV_DEG = float(os.environ.get("GO2W_CAMERA_HFOV", "70"))
-# YOLO 无深度, 检测目标固定假设距离 (米) (spec §11: 不做精确深度定位)
-_DETECT_ASSUME_DIST_M = float(os.environ.get("GO2W_DETECT_DIST", "3.0"))
+# C13 可见光标注基线。任务编排器与前端世界坐标投影共用同一解析逻辑，
+# 防止同一 bbox 在两条路径上得到不同方位角。
+_CAMERA_CALIBRATION = resolve_camera_calibration("c13_vis")
+_CAMERA_HFOV_DEG = _CAMERA_CALIBRATION["hfov_deg"]
+_CAMERA_YAW_OFFSET_DEG = _CAMERA_CALIBRATION["effective_yaw_offset_deg"]
+_DETECTION_SNAPSHOT_MAX = max(64, int(os.environ.get("GO2W_DETECTION_SNAPSHOT_MAX", "256")))
 
 # ============================================================================
 # 检测器解耦 (round-3): 视频流不再依赖 ultralytics/torch
@@ -88,6 +97,32 @@ _DETECT_ASSUME_DIST_M = float(os.environ.get("GO2W_DETECT_DIST", "3.0"))
 # 显式禁检测开关 (round-3 需求 3)
 _DETECT_DISABLED_BY_ENV = str(os.environ.get("GO2W_AI_NO_DETECT", "")).strip() in ("1", "true", "True", "yes")
 _AI_VIDEO_ENABLED = str(os.environ.get("GO2W_AI_VIDEO_ENABLE", "0")).strip() in ("1", "true", "True", "yes", "on")
+_AI_EXTERNAL_VIDEO_ENABLED = str(os.environ.get("GO2W_AI_EXTERNAL_VIDEO_ENABLE", "1")).strip() in ("1", "true", "True", "yes", "on")
+
+
+def _dog_interface_ready(iface, sys_class_net="/sys/class/net"):
+    """Return True when the configured dog-camera DDS interface is usable."""
+    if not iface:
+        return True
+    iface_dir = os.path.join(sys_class_net, str(iface))
+    if not os.path.isdir(iface_dir):
+        return False
+    try:
+        with open(os.path.join(iface_dir, "operstate"), "r", encoding="utf-8") as f:
+            operstate = f.read().strip().lower()
+    except Exception:
+        operstate = ""
+    if operstate and operstate not in ("up", "unknown"):
+        return False
+    carrier_path = os.path.join(iface_dir, "carrier")
+    if os.path.exists(carrier_path):
+        try:
+            with open(carrier_path, "r", encoding="utf-8") as f:
+                if f.read().strip() == "0":
+                    return False
+        except Exception:
+            return False
+    return True
 
 # ultralytics 是否可导入 (NX 可能没装; 探测一次, 记 warning, 不崩)
 # 注意: 这里只探测 ultralytics 本身, 不在顶层 import ai.detector (保持 ai.detector
@@ -225,6 +260,8 @@ class NxAiEngine:
         # YOLO
         self._detector = None           # ai.detector.Detector (懒初始化)
         self._detector_inited = False
+        self._detection_targets = None  # mission-scoped detector vocabulary
+        self._last_detector_target_classes = None
         # 缓存 (视频/YOLO 线程写, broadcast_loop 读)
         self._latest_frame = None       # numpy BGR (带检测框, 720p)
         self._latest_dets = []          # [{class, confidence, bbox}]
@@ -235,6 +272,21 @@ class NxAiEngine:
         # 否则 cx_norm 系统偏小 → slam 检测标记系统偏左。
         self._detect_frame_w = 1280
         self._detect_frame_h = 720
+        self._latest_detection_source = ""
+        self._latest_detection_overlay = []
+        self._latest_detection_overlays = {}
+        self._detection_source_order = []
+        self._latest_source_frame_jpegs = {}
+        self._latest_source_frame_meta = {}
+        self._detection_seq = 0
+        self._detection_snapshots = {}
+        self._detection_snapshot_order = []
+        self._external_frames = {}
+        self._external_seq_by_source = {}
+        self._processed_external_seq_by_source = {}
+        self._external_source_order = []
+        self._external_rr_index = 0
+        self._detection_input_rr_index = 0
         # VLM (spec 决策 2: 懒加载 + 单工作线程 + 空闲超时 unload)
         self._vlm = None                # ai.vlm.VLMEngine (懒初始化)
         self._vlm_inited = False
@@ -268,7 +320,7 @@ class NxAiEngine:
 
         round-3: 即使无 ultralytics/torch, start() 仍正常创建并启动 3 线程
         (video/vlm/mem)。视频线程 _init_detector 见无 ultralytics → detector=None,
-        仍取帧推 type=frame (detections 空); VLM 线程见无 transformers → 走 fallback。
+        仍取帧推 type=frame (detections 空); VLM 线程见无 transformers → 返回空任务。
         即: 缺重依赖时 start() 不抛、视频流不断, 满足 NX 纯视频流部署。
         """
         self._running = True
@@ -279,6 +331,11 @@ class NxAiEngine:
             t1 = threading.Thread(target=self._video_yolo_loop, name="nx_ai_video", daemon=True)
             t1.start()
             threads.append(t1)
+        elif _AI_EXTERNAL_VIDEO_ENABLED:
+            t1 = threading.Thread(target=self._video_yolo_loop, name="nx_ai_c13_video", daemon=True)
+            t1.start()
+            threads.append(t1)
+            logger.info("[AI] C13 external video detection loop enabled (dog camera loop remains off)")
         else:
             logger.warning("[AI] dog camera video loop disabled (GO2W_AI_VIDEO_ENABLE=0) — "
                            "无狗原生视频帧; locate/follow 仅在 C13 云台启用时有帧, 否则 /api/locate 返回'无可用帧'")
@@ -286,7 +343,7 @@ class NxAiEngine:
         threads.extend([t2, t3])
         self._threads = threads
         logger.info(f"[AI] NxAiEngine 启动 ({len(threads)} daemon 线程: "
-                    f"{'video/' if _AI_VIDEO_ENABLED else ''}vlm/mem)")
+                    f"{'video/' if (_AI_VIDEO_ENABLED or _AI_EXTERNAL_VIDEO_ENABLED) else ''}vlm/mem)")
 
     def stop(self):
         self._running = False
@@ -313,6 +370,14 @@ class NxAiEngine:
             self._mock_frame_gen = MockFrameGenerator()
             return
 
+        # 决策 4: 网卡 enxc8a362616c4c (与 nx_sensor_node:57 / nx_motion_node:56 一致)
+        iface = os.environ.get("DOG_INTERFACE", "enxc8a362616c4c")
+        if not _dog_interface_ready(iface):
+            logger.warning(f"[AI] dog interface not ready (DOG_INTERFACE={iface}), 视频源切 mock")
+            self._mock_mode = True
+            self._mock_frame_gen = MockFrameGenerator()
+            return
+
         try:
             from unitree_sdk2py.core.channel import ChannelFactory
             from unitree_sdk2py.go2.video.video_client import VideoClient
@@ -322,8 +387,6 @@ class NxAiEngine:
             self._mock_frame_gen = MockFrameGenerator()
             return
 
-        # 决策 4: 网卡 enxc8a362616c4c (与 nx_sensor_node:57 / nx_motion_node:56 一致)
-        iface = os.environ.get("DOG_INTERFACE", "enxc8a362616c4c")
         try:
             self._factory = ChannelFactory()
             try:
@@ -397,6 +460,30 @@ class NxAiEngine:
     # ------------------------------------------------------------------
     # 检测器抽象 (round-3: 为 locateanything 预留可替换接口)
     # ------------------------------------------------------------------
+    def set_detection_targets(self, target_classes=None):
+        """Atomically replace the mission detector vocabulary.
+
+        Returns the previous value so callers can restore it in ``finally``.
+        ``None`` restores normal detector behavior (YOLO all classes;
+        YOLO-World's configured defaults).
+        """
+        normalized = None
+        if target_classes is not None:
+            normalized = []
+            for target in target_classes:
+                value = str(target or "").strip()
+                if value and value not in normalized:
+                    normalized.append(value)
+            if not normalized:
+                normalized = None
+        with self._lock:
+            previous = (
+                None if self._detection_targets is None
+                else list(self._detection_targets)
+            )
+            self._detection_targets = normalized
+        return previous
+
     def _run_detector(self, frame):
         """统一检测入口 (round-3 检测器抽象)。
 
@@ -418,12 +505,23 @@ class NxAiEngine:
         """
         if frame is None:
             return []
+        with self._lock:
+            target_classes = (
+                None if self._detection_targets is None
+                else list(self._detection_targets)
+            )
+            # The video loop copies this metadata immediately after inference
+            # and stores it with the frame.  This prevents a just-switched
+            # mission from consuming a frame inferred for the old vocabulary.
+            self._last_detector_target_classes = (
+                None if target_classes is None else list(target_classes)
+            )
         det = self._detector
         if det is None:
             # 纯视频流模式 (round-3): 不调任何检测器, detections 空
             return []
         try:
-            dets = det.detect(frame)
+            dets = det.detect(frame, target_classes=target_classes)
             return dets if dets else []
         except Exception as e:
             logger.warning(f"[AI] 检测异常 ({type(det).__name__}): {e} (本帧 detections 空, 视频流继续)")
@@ -502,11 +600,13 @@ class NxAiEngine:
                 "bbox": result.get("bbox"),
                 "source": "locate_anything",
             }]
+        detected_at = time.time()
         dets = [
             {
                 **d,
                 "frame_width": int(d.get("frame_width") or frame_w),
                 "frame_height": int(d.get("frame_height") or frame_h),
+                "ts": detected_at,
             }
             for d in dets
             if isinstance(d, dict)
@@ -578,8 +678,271 @@ class NxAiEngine:
     def get_detection_list(self):
         """Return detections for the page-side detection list."""
         with self._lock:
-            dets = list(self._latest_dets) + list(self._latest_locate_dets)
+            dets = []
+            for source in self._detection_source_order:
+                dets.extend(dict(d) for d in self._latest_detection_overlays.get(source, []))
+            if not dets:
+                dets = [dict(d) for d in (self._latest_detection_overlay or self._latest_dets)]
+            dets.extend(dict(d) for d in self._latest_locate_dets)
         return dets[:8]
+
+    def submit_external_frame(self, frame, source="c13_vis"):
+        """Queue the latest non-dog camera frame for the YOLO loop.
+
+        The broadcast loop calls this with C13 and other camera frames. The YOLO
+        thread consumes the newest frame per source, so slow inference drops
+        stale frames instead of blocking video streaming.
+        """
+        if frame is None:
+            return 0
+        try:
+            copied = frame.copy()
+        except Exception:
+            copied = frame
+        source = source or "external"
+        with self._lock:
+            seq = self._external_seq_by_source.get(source, 0) + 1
+            self._external_seq_by_source[source] = seq
+            self._external_frames[source] = copied
+            if source not in self._external_source_order:
+                self._external_source_order.append(source)
+            return seq
+
+    def _take_external_frame(self):
+        with self._lock:
+            sources = list(self._external_source_order)
+            if not sources:
+                return None
+            start = self._external_rr_index % len(sources)
+            selected = None
+            for offset in range(len(sources)):
+                idx = (start + offset) % len(sources)
+                source = sources[idx]
+                seq = self._external_seq_by_source.get(source, 0)
+                processed = self._processed_external_seq_by_source.get(source, 0)
+                frame = self._external_frames.get(source)
+                if frame is None or seq == processed:
+                    continue
+                self._processed_external_seq_by_source[source] = seq
+                self._external_rr_index = (idx + 1) % len(sources)
+                selected = (frame, source)
+                break
+            if selected is None:
+                return None
+            frame, source = selected
+        try:
+            frame = frame.copy()
+        except Exception:
+            pass
+        return frame, source
+
+    @staticmethod
+    def _clean_bbox(bbox, frame_w, frame_h):
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            return None
+        try:
+            x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+        except (TypeError, ValueError):
+            return None
+        frame_w = max(1.0, float(frame_w))
+        frame_h = max(1.0, float(frame_h))
+        x1 = max(0.0, min(frame_w, x1))
+        y1 = max(0.0, min(frame_h, y1))
+        x2 = max(0.0, min(frame_w, x2))
+        y2 = max(0.0, min(frame_h, y2))
+        x1, x2 = min(x1, x2), max(x1, x2)
+        y1, y2 = min(y1, y2), max(y1, y2)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return [x1, y1, x2, y2]
+
+    @staticmethod
+    def _encode_jpeg(frame, quality=68):
+        if frame is None:
+            return None
+        try:
+            import cv2
+            ok, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
+            return jpeg.tobytes() if ok else None
+        except Exception as e:
+            logger.debug(f"[AI] jpeg encode failed: {e}")
+            return None
+
+    def _cache_detection_result(self, raw_frame, display_frame, dets, source,
+                                detect_frame_w=None, detect_frame_h=None,
+                                target_classes=None):
+        """Store the latest detection frame, overlay payload, and JPEG snapshots."""
+        if raw_frame is None:
+            return
+        if display_frame is None:
+            display_frame = raw_frame
+        try:
+            raw_h, raw_w = raw_frame.shape[:2]
+        except Exception:
+            raw_h, raw_w = 720, 1280
+        detect_frame_w = int(detect_frame_w or raw_w or 1280)
+        detect_frame_h = int(detect_frame_h or raw_h or 720)
+        source = source or "video"
+        now = time.time()
+
+        frame_bytes = self._encode_jpeg(display_frame, quality=68)
+        normalized = []
+        snapshots = {}
+
+        with self._lock:
+            self._detection_seq += 1
+            seq = self._detection_seq
+
+        for idx, det in enumerate((dets or [])[:16]):
+            if not isinstance(det, dict):
+                continue
+            bbox = self._clean_bbox(det.get("bbox"), detect_frame_w, detect_frame_h)
+            if bbox is None:
+                continue
+            x1, y1, x2, y2 = bbox
+            ix1 = max(0, min(raw_w - 1, int(math.floor(x1))))
+            iy1 = max(0, min(raw_h - 1, int(math.floor(y1))))
+            ix2 = max(ix1 + 1, min(raw_w, int(math.ceil(x2))))
+            iy2 = max(iy1 + 1, min(raw_h, int(math.ceil(y2))))
+            crop = raw_frame[iy1:iy2, ix1:ix2]
+            crop_bytes = self._encode_jpeg(crop, quality=72) or frame_bytes
+            snapshot_id = f"{source}-{seq}-{idx}"
+            if crop_bytes or frame_bytes:
+                snapshots[snapshot_id] = {
+                    "crop": crop_bytes or frame_bytes,
+                    "frame": frame_bytes or crop_bytes,
+                    "ts": now,
+                }
+            confidence = det.get("confidence", det.get("score", det.get("probability", 0.0)))
+            try:
+                confidence = float(confidence)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            obs = {
+                "id": snapshot_id,
+                "snapshot_id": snapshot_id,
+                "source": source,
+                "class": det.get("class", det.get("label", det.get("name", "?"))),
+                "label": det.get("label", det.get("class", det.get("name", "?"))),
+                "confidence": confidence,
+                "bbox": bbox,
+                "frame_width": detect_frame_w,
+                "frame_height": detect_frame_h,
+                "ts": now,
+            }
+            if det.get("label_zh"):
+                obs["label_zh"] = det.get("label_zh")
+            if snapshot_id in snapshots:
+                obs["crop_url"] = f"/api/detection_snapshot?id={snapshot_id}&kind=crop"
+                obs["frame_url"] = f"/api/detection_snapshot?id={snapshot_id}&kind=frame"
+            normalized.append(obs)
+
+        with self._lock:
+            self._latest_frame = display_frame
+            self._latest_dets = normalized
+            self._latest_detection_overlay = normalized
+            self._latest_detection_source = source
+            self._latest_detection_overlays[source] = normalized
+            if source not in self._detection_source_order:
+                self._detection_source_order.append(source)
+            if frame_bytes:
+                self._latest_source_frame_jpegs[source] = frame_bytes
+            self._latest_source_frame_meta[source] = {
+                "frame_width": detect_frame_w,
+                "frame_height": detect_frame_h,
+                "ts": now,
+                "target_classes": (
+                    None if target_classes is None else list(target_classes)
+                ),
+            }
+            self._detect_frame_w = detect_frame_w
+            self._detect_frame_h = detect_frame_h
+            self._frame_count += 1
+            for snapshot_id, payload in snapshots.items():
+                self._detection_snapshots[snapshot_id] = payload
+                self._detection_snapshot_order.append(snapshot_id)
+            while len(self._detection_snapshot_order) > _DETECTION_SNAPSHOT_MAX:
+                old_id = self._detection_snapshot_order.pop(0)
+                self._detection_snapshots.pop(old_id, None)
+
+    @staticmethod
+    def _detection_stream_payload(source, dets, frame_meta=None):
+        dets = [dict(d) for d in dets]
+        frame_w = 0
+        frame_h = 0
+        if dets:
+            try:
+                frame_w = int(dets[0].get("frame_width") or 0)
+                frame_h = int(dets[0].get("frame_height") or 0)
+            except Exception:
+                frame_w, frame_h = 0, 0
+        elif frame_meta:
+            try:
+                frame_w = int(frame_meta.get("frame_width") or 0)
+                frame_h = int(frame_meta.get("frame_height") or 0)
+            except Exception:
+                frame_w, frame_h = 0, 0
+        return {
+            "source": source,
+            "frame_width": frame_w,
+            "frame_height": frame_h,
+            "count": len(dets),
+            "detections": dets,
+        }
+
+    def get_detection_overlay(self):
+        with self._lock:
+            dets = [dict(d) for d in self._latest_detection_overlay]
+            return {
+                "source": self._latest_detection_source,
+                "frame_width": int(self._detect_frame_w or 0),
+                "frame_height": int(self._detect_frame_h or 0),
+                "count": len(dets),
+                "detections": dets,
+            }
+
+    def get_detection_overlays(self):
+        with self._lock:
+            streams = []
+            flat = []
+            for source in self._detection_source_order:
+                dets = [dict(d) for d in self._latest_detection_overlays.get(source, [])]
+                streams.append(self._detection_stream_payload(
+                    source,
+                    dets,
+                    self._latest_source_frame_meta.get(source),
+                ))
+                flat.extend(dets)
+            if not streams and self._latest_detection_overlay:
+                dets = [dict(d) for d in self._latest_detection_overlay]
+                streams.append(self._detection_stream_payload(
+                    self._latest_detection_source,
+                    dets,
+                    self._latest_source_frame_meta.get(self._latest_detection_source),
+                ))
+                flat.extend(dets)
+            return {
+                "source": self._latest_detection_source,
+                "count": len(flat),
+                "detections": flat,
+                "streams": streams,
+            }
+
+    def get_video_frame_jpeg(self, source):
+        if not source:
+            return None
+        with self._lock:
+            return self._latest_source_frame_jpegs.get(str(source))
+
+    def get_detection_snapshot_jpeg(self, snapshot_id, kind="crop"):
+        if not snapshot_id:
+            return None
+        key = "frame" if kind == "frame" else "crop"
+        with self._lock:
+            payload = self._detection_snapshots.get(str(snapshot_id))
+            if not payload:
+                return None
+            return payload.get(key) or payload.get("crop") or payload.get("frame")
 
     def _get_frame(self):
         """取一帧 BGR ndarray (VideoClient.GetImageSample 或 mock, spec §7.1)。
@@ -606,6 +969,33 @@ class NxAiEngine:
             logger.debug(f"[AI] GetImageSample 失败: {e}")
             return None
 
+    def _get_next_detection_frame(self, min_interval):
+        source_kinds = ["external"]
+        if _AI_VIDEO_ENABLED:
+            source_kinds.append("dog")
+        if not source_kinds:
+            time.sleep(min_interval)
+            return None
+
+        start = self._detection_input_rr_index % len(source_kinds)
+        for offset in range(len(source_kinds)):
+            idx = (start + offset) % len(source_kinds)
+            kind = source_kinds[idx]
+            if kind == "external":
+                external = self._take_external_frame()
+                if external is not None:
+                    self._detection_input_rr_index = (idx + 1) % len(source_kinds)
+                    return external
+            elif kind == "dog":
+                frame = self._get_frame()
+                if frame is not None:
+                    self._detection_input_rr_index = (idx + 1) % len(source_kinds)
+                    source = "mock" if self._mock_mode else "dog"
+                    return frame, source
+
+        time.sleep(min_interval)
+        return None
+
     def _video_yolo_loop(self):
         """视频+检测 主循环 (线程4, spec §5)。
         - 懒初始化 (首次循环 _init_video + _init_detector)
@@ -617,7 +1007,8 @@ class NxAiEngine:
         round-3: detector=None (无 ultralytics / GO2W_AI_NO_DETECT=1) 时本循环
         仍正常取帧 + resize + 缓存 + 推 type=frame, 只是 detections 空。
         """
-        self._init_video()
+        if _AI_VIDEO_ENABLED:
+            self._init_video()
         self._init_detector()
 
         # 目标 8fps 节流 (对齐取帧频率, 决策 3)
@@ -627,7 +1018,10 @@ class NxAiEngine:
         while self._running:
             t0 = time.time()
             try:
-                frame = self._get_frame()
+                frame_source = self._get_next_detection_frame(min_interval)
+                if frame_source is None:
+                    continue
+                frame, source = frame_source
                 if frame is None:
                     self._video_fail_streak += 1
                     # 连续 10 次失败 → 切 mock (spec 边界表, H2.5)
@@ -645,9 +1039,15 @@ class NxAiEngine:
                 # MEDIUM-5: 记录检测发生时刻的输入帧宽 (bbox 坐标系)。
                 # 检测在原始帧 (可能 1080p=1920宽) 上做, 随后 resize 到 720p;
                 # 必须用此刻的宽度归一化 bbox, 不能用 resize 后的 _latest_frame.shape[1]。
+                raw_frame = frame.copy()
                 detect_frame_w = frame.shape[1]
                 detect_frame_h = frame.shape[0]
                 dets = self._run_detector(frame)
+                with self._lock:
+                    inference_target_classes = (
+                        None if self._last_detector_target_classes is None
+                        else list(self._last_detector_target_classes)
+                    )
                 if dets:
                     try:
                         # 画框 (detector=None 时 dets 必空, 不会进这里; 保守起见仍 try)
@@ -679,6 +1079,15 @@ class NxAiEngine:
                     self._detect_frame_w = detect_frame_w
                     self._detect_frame_h = detect_frame_h
                     self._frame_count += 1
+                self._cache_detection_result(
+                    raw_frame,
+                    frame,
+                    dets,
+                    source,
+                    detect_frame_w,
+                    detect_frame_h,
+                    target_classes=inference_target_classes,
+                )
             except Exception as e:
                 logger.warning(f"[AI] video_yolo_loop 异常: {e}")
 
@@ -693,12 +1102,11 @@ class NxAiEngine:
     def _init_vlm(self):
         """懒初始化 VLMEngine (首次 parse 时, 决策 2 约束 4)。
         失败 (OOM/路径错) → self._vlm=None 且 **不**置 _vlm_inited=True,
-        允许 _vlm_worker 节流重试 (HIGH-1: 模型就位后能自愈, 不永久 fallback)。
+        允许 _vlm_worker 节流重试 (HIGH-1: 模型就位后能自愈)。
 
         round-3 graceful: NX 上没装 transformers 时, VLMEngine 构造会抛
         (ai.vlm 内部懒 import transformers), 落入下面 except → _vlm=None。
-        TaskManager 走 _fallback_parse (阶段A 行为, 已支持), 不崩、不退出。
-        即: VLM 不可用时指令解析降级为关键词 fallback, 不影响视频流与检测。
+        VLM 不可用时返回带 parse_error 的空任务，不崩、不退出，也不影响视频流与检测。
         """
         if self._vlm_inited:
             return
@@ -716,7 +1124,7 @@ class NxAiEngine:
             # 构造成功才标记完成 (HIGH-1: 失败留重试机会)
             self._vlm_inited = True
         except Exception as e:
-            logger.error(f"[AI] 导入/构造 VLMEngine 失败 ({e}), VLM 不可用 (走 fallback, "
+            logger.error(f"[AI] 导入/构造 VLMEngine 失败 ({e}), VLM 不可用 ("
                          f"{self._vlm_init_retry_interval:.0f}s 后可重试)")
             self._vlm = None
             # 注意: 不置 _vlm_inited=True, 允许节流重试
@@ -740,7 +1148,7 @@ class NxAiEngine:
         - unload 后新请求 → 重新 load (H3.4)
         """
         while self._running:
-            # 本轮待处理的 result_box (MEDIUM-1: 异常时据此回写 fallback 并 set done)
+            # 本轮待处理的 result_box (异常时据此回写空任务并 set done)
             pending_box = None
             try:
                 # HIGH-1 自愈: 若上次构造失败 (_vlm is None 且 _vlm_inited 仍 False),
@@ -794,23 +1202,22 @@ class NxAiEngine:
                             logger.error(f"[VLM] load 失败, {memory_summary()}")
                         except Exception:
                             logger.error("[VLM] load 失败 (无显存摘要)")
-                        # fallback (H3.3)
-                        fallback = self._fallback_parse(text)
+                        failure = self._parse_failure("vlm_load_failed", text=text)
                         self._safe_broadcast({"type": "vlm", "data": {
-                            "text": text, "response": fallback["response"] + "(fallback)",
-                            "tasks": fallback["tasks"], "fallback": True}})
-                        result_box["response"] = fallback
+                            "text": text, "response": failure["response"],
+                            "tasks": [], "parse_error": failure["parse_error"]}})
+                        result_box["response"] = failure
                         result_box["done"].set()
                         continue
                     logger.info(f"[VLM] 就绪 (load 用时 {time.time()-t0:.1f}s)")
 
                 if self._vlm is None or not getattr(self._vlm, "loaded", False):
-                    # VLM 不可用 (导入失败/load 失败), fallback
-                    fallback = self._fallback_parse(text)
+                    # VLM 不可用时必须失败关闭，不能合成任何运动任务。
+                    failure = self._parse_failure("vlm_unavailable", text=text)
                     self._safe_broadcast({"type": "vlm", "data": {
-                        "text": text, "response": fallback["response"] + "(fallback)",
-                        "tasks": fallback["tasks"], "fallback": True}})
-                    result_box["response"] = fallback
+                        "text": text, "response": failure["response"],
+                        "tasks": [], "parse_error": failure["parse_error"]}})
+                    result_box["response"] = failure
                     result_box["done"].set()
                     continue
 
@@ -824,16 +1231,19 @@ class NxAiEngine:
                 result_box["done"].set()
             except Exception as e:
                 logger.error(f"[AI] vlm_worker 异常: {e}")
-                # MEDIUM-1: 若已取到本轮请求的 result_box, 回写 fallback 并 set done,
+                # 若已取到本轮请求的 result_box，回写空任务并 set done，
                 # 否则调用线程 (NxAiVlmProxy.chat) 会 wait(120) 卡满超时。
                 if pending_box is not None and not pending_box["done"].is_set():
                     try:
-                        fb = self._fallback_parse(pending_box.get("text", ""))
+                        failure = self._parse_failure(
+                            "vlm_worker_error",
+                            text=pending_box.get("text", ""),
+                        )
                         self._safe_broadcast({"type": "vlm", "data": {
                             "text": pending_box.get("text", ""),
-                            "response": fb["response"] + "(worker异常)",
-                            "tasks": fb["tasks"], "fallback": True}})
-                        pending_box["response"] = fb
+                            "response": failure["response"],
+                            "tasks": [], "parse_error": failure["parse_error"]}})
+                        pending_box["response"] = failure
                         pending_box["done"].set()
                     except Exception as e2:
                         logger.error(f"[AI] vlm_worker 异常回写也失败: {e2}")
@@ -859,35 +1269,49 @@ class NxAiEngine:
         else:
             logger.debug(f"[AI] broadcast 跳过 (ws_broadcast 未注入; 无 nx_web_server/rclpy?)")
 
-    # panel.py:472-518 同款 sys_prompt + JSON 解析 (M2.1/M2.2)
-    _SYS_PROMPT = """你是机器狗指令解析器。把用户中文指令转成JSON任务列表。
+    _SYS_PROMPT = """你是机器狗搜索任务解析器。只把用户的搜索指令转换成一个 JSON 任务。
 
-任务类型和参数:
-- move: {"vx":前进速度m/s, "vy":侧移, "vyaw":旋转(正=左转), "duration":秒}
-- follow: {"target":"目标"}
-- search_area: {"pattern":"lawnmower", "width":米, "height":米}
-- stop: {}
-- return_home: {}
+唯一允许的任务类型和参数:
+- search_room: {"room":"房间名或__current__(当前房间)", "target_classes":["英文视觉类别"], "require_photos":true, "mark_on_map":true}
+
+target_classes 必须是非空的英文视觉类别数组，例如 person、dining table、chair。
+无法确定房间、目标类别或搜索意图时输出 {"tasks":[]}。
 
 示例:
-输入"前进两米然后左转"
-输出: {"tasks":[{"type":"move","priority":8,"params":{"vx":0.5,"duration":4.0}},{"type":"move","priority":7,"params":{"vyaw":0.5,"duration":3.0}}]}
+输入"搜索这个房间，把椅子标注出来"
+输出: {"tasks":[{"type":"search_room","priority":8,"params":{"room":"__current__","target_classes":["chair"],"require_photos":true,"mark_on_map":true}}]}
 
-输入"搜索这个房间"
-输出: {"tasks":[{"type":"search_area","priority":5,"params":{"pattern":"lawnmower","width":8,"height":8}}]}
+输入"去客厅搜索所有人并标在地图上"
+输出: {"tasks":[{"type":"search_room","priority":8,"params":{"room":"客厅","target_classes":["person"],"require_photos":true,"mark_on_map":true}}]}
 
-输入"跟着前面的人"
-输出: {"tasks":[{"type":"follow","priority":8,"params":{"target":"前面的人"}}]}
+只输出 JSON，不要解释，不要 markdown 代码块。"""
 
-输入"后退"
-输出: {"tasks":[{"type":"move","priority":6,"params":{"vx":-0.5,"duration":2.0}}]}
+    @staticmethod
+    def _parse_failure(reason, *, text=""):
+        """Return a user-visible, fail-closed command result."""
+        return {
+            "understanding": str(text or ""),
+            "response": "搜索任务解析失败",
+            "tasks": [],
+            "parse_error": str(reason or "invalid_vlm_mission"),
+        }
 
-只输出JSON, 不要解释, 不要markdown代码块。注意: 后退要用vx负数, 不是vyaw!"""
+    @staticmethod
+    def _validate_vlm_search_result(data):
+        """Validate one VLM result into the canonical search mission schema."""
+        try:
+            if not isinstance(data, dict):
+                raise MissionValidationError("VLM result must be an object")
+            return {
+                "response": str(data.get("response") or "已解析搜索任务"),
+                "tasks": canonicalize_search_tasks(data.get("tasks")),
+            }
+        except (MissionValidationError, TypeError, ValueError, OverflowError) as exc:
+            logger.warning("VLM 搜索任务校验失败: %s", exc)
+            return NxAiEngine._parse_failure("invalid_vlm_mission")
 
     def _vlm_parse_command(self, text):
-        """VLM 真解析 (panel.py:472-518 等价实现)。
-        返回 {response, tasks}; VLM 失败 → _fallback_parse。
-        """
+        """Parse and validate exactly one canonical search-room mission."""
         try:
             response = self._vlm.chat([
                 {"role": "system", "content": self._SYS_PROMPT},
@@ -908,51 +1332,13 @@ class NxAiEngine:
                             depth -= 1
                             if depth == 0: end = i + 1; break
                     data = json.loads(clean[start:end])
-                    if "tasks" in data:
-                        data.setdefault("response", "已解析")
-                        return data
+                    return self._validate_vlm_search_result(data)
             except Exception as e:
                 logger.warning(f"VLM JSON 解析失败: {e}")
         except Exception as e:
             logger.error(f"VLM chat 失败: {e}")
-        return self._fallback_parse(text)
-
-    @staticmethod
-    def _fallback_parse(text):
-        """关键词 fallback (panel.py:520-545 同款, M2.2)。"""
-        r = {"understanding": text, "tasks": [], "response": ""}
-        if "跟着" in text or "跟随" in text or "跟上" in text:
-            target = ""
-            for kw in ["跟着", "跟随", "跟上"]:
-                if kw in text:
-                    target = text[text.index(kw) + len(kw):].strip().rstrip("。，！？")
-            r["tasks"] = [{"type": "follow", "priority": 8, "params": {"target": target}}]
-            r["response"] = f"跟踪{target}"
-        elif "搜索" in text or "找" in text:
-            r["tasks"] = [{"type": "search_area", "priority": 5,
-                           "params": {"pattern": "lawnmower", "width": 10, "height": 10}}]
-            r["response"] = "开始搜索"
-        elif "停" in text:
-            r["tasks"] = [{"type": "stop", "priority": 10, "params": {}}]
-            r["response"] = "已停止"
-        elif "回来" in text or "返回" in text:
-            r["tasks"] = [{"type": "return_home", "priority": 7, "params": {}}]
-            r["response"] = "返回"
-        elif "前进" in text or "向前" in text:
-            r["tasks"] = [{"type": "move", "priority": 6, "params": {"vx": 0.5, "duration": 2.0}}]
-            r["response"] = "前进"
-        elif "后退" in text or "向后" in text:
-            r["tasks"] = [{"type": "move", "priority": 6, "params": {"vx": -0.5, "duration": 2.0}}]
-            r["response"] = "后退"
-        elif "左转" in text:
-            r["tasks"] = [{"type": "move", "priority": 6, "params": {"vyaw": 0.5, "duration": 2.0}}]
-            r["response"] = "左转"
-        elif "右转" in text:
-            r["tasks"] = [{"type": "move", "priority": 6, "params": {"vyaw": -0.5, "duration": 2.0}}]
-            r["response"] = "右转"
-        else:
-            r["response"] = f"收到: {text}"
-        return r
+            return self._parse_failure("vlm_unavailable", text=text)
+        return self._parse_failure("invalid_vlm_mission", text=text)
 
     # ------------------------------------------------------------------
     # broadcast_loop 读取接口 (spec §7.1)
@@ -990,28 +1376,65 @@ class NxAiEngine:
         """Return the latest detection count without JPEG encoding."""
         with self._lock:
             frame = self._latest_frame
-            dets = self._latest_dets
+            if self._latest_detection_overlays:
+                count = sum(len(self._latest_detection_overlays.get(source, []))
+                            for source in self._detection_source_order)
+            else:
+                count = len(self._latest_dets)
         if frame is None:
             return None
-        return len(dets)
+        return count
 
     def get_person_detection_snapshot(self):
         """Return the latest YOLO person detections with a copied frame."""
+        return self.get_detection_snapshot(["person"])
+
+    def get_detection_snapshot(self, target_classes=None):
+        """Return a copied frame with detections filtered to requested classes."""
+        normalized_targets = []
+        for target in target_classes or []:
+            value = str(target or "").strip()
+            if value and value not in normalized_targets:
+                normalized_targets.append(value)
+        allowed = set(normalized_targets)
         with self._lock:
+            source = str(self._latest_detection_source or "")
+            frame_meta = dict(self._latest_source_frame_meta.get(source) or {})
+            vocabulary_tracked = "target_classes" in frame_meta
+            inference_target_classes = frame_meta.get("target_classes")
+            if inference_target_classes is not None:
+                inference_target_classes = [
+                    str(value) for value in inference_target_classes]
+            target_vocabulary_ready = (
+                not normalized_targets
+                or not vocabulary_tracked
+                or inference_target_classes == normalized_targets
+            )
+            try:
+                captured_at = float(frame_meta.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                captured_at = 0.0
+            if not target_vocabulary_ready:
+                captured_at = 0.0
             if self._latest_frame is None:
                 return {
                     "frame": None,
                     "frame_width": 0,
                     "frame_height": 0,
+                    "source": source,
+                    "timestamp": captured_at,
                     "detections": [],
+                    "target_classes": normalized_targets,
+                    "inference_target_classes": inference_target_classes,
+                    "target_vocabulary_ready": target_vocabulary_ready,
                 }
             frame = self._latest_frame.copy()
             height, width = frame.shape[:2]
             detect_frame_w = getattr(self, "_detect_frame_w", width)
             detect_frame_h = getattr(self, "_detect_frame_h", height)
             detections = []
-            for det in self._latest_dets:
-                if det.get("class") != "person":
+            for det in self._latest_dets if target_vocabulary_ready else []:
+                if allowed and det.get("class") not in allowed:
                     continue
                 copied = dict(det)
                 bbox = copied.get("bbox")
@@ -1045,46 +1468,240 @@ class NxAiEngine:
             "frame": frame,
             "frame_width": int(width),
             "frame_height": int(height),
+            "source": source,
+            "timestamp": captured_at,
             "detections": detections,
+            "target_classes": normalized_targets,
+            "inference_target_classes": inference_target_classes,
+            "target_vocabulary_ready": target_vocabulary_ready,
         }
 
-    def get_detections_world(self, robot_x, robot_y, robot_yaw):
+    def get_person_detection_health(self, max_age_sec=None):
+        """Return lightweight detector/frame health without copying image data."""
+        try:
+            max_age_sec = float(
+                max_age_sec if max_age_sec is not None
+                else os.environ.get("GO2W_DETECTION_MAX_AGE_SEC", "2.0"))
+        except (TypeError, ValueError):
+            max_age_sec = 2.0
+        if not math.isfinite(max_age_sec) or max_age_sec <= 0.0:
+            max_age_sec = 2.0
+
+        with self._lock:
+            running = bool(self._running)
+            detector_initialized = bool(self._detector_inited)
+            detector = self._detector
+            detector_ready = detector is not None
+            detector_open_vocabulary = bool(
+                getattr(detector, "is_world", False))
+            detector_model = str(
+                getattr(detector, "_model_path", "") or "")
+            source = str(self._latest_detection_source or "")
+            frame_meta = dict(self._latest_source_frame_meta.get(source) or {})
+            frame = self._latest_frame
+            detections = list(self._latest_dets)
+            if frame is not None:
+                try:
+                    frame_height, frame_width = frame.shape[:2]
+                except Exception:
+                    frame_width = frame_height = 0
+            else:
+                frame_width = frame_height = 0
+            if frame_width <= 0:
+                try:
+                    frame_width = int(frame_meta.get("frame_width") or 0)
+                except (TypeError, ValueError):
+                    frame_width = 0
+            if frame_height <= 0:
+                try:
+                    frame_height = int(frame_meta.get("frame_height") or 0)
+                except (TypeError, ValueError):
+                    frame_height = 0
+            try:
+                captured_at = float(frame_meta.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                captured_at = 0.0
+
+        now = time.time()
+        timestamp_valid = math.isfinite(captured_at) and captured_at > 0.0
+        age_sec = now - captured_at if timestamp_valid else None
+        frame_available = frame is not None and frame_width > 0 and frame_height > 0
+        person_count = sum(
+            1 for detection in detections
+            if isinstance(detection, dict) and detection.get("class") == "person"
+        )
+
+        if not running:
+            reason = "ai_engine_stopped"
+        elif not detector_ready:
+            reason = "detector_not_ready"
+        elif not frame_available:
+            reason = "no_detection_frame"
+        elif not source:
+            reason = "no_detection_source"
+        elif source.strip().lower() == "mock":
+            reason = "mock_detection_source"
+        elif age_sec is None:
+            reason = "invalid_detection_timestamp"
+        elif not math.isfinite(age_sec) or age_sec < -0.5 or age_sec > max_age_sec:
+            reason = "stale_detection_frame"
+        else:
+            reason = "ok"
+
+        return {
+            "healthy": reason == "ok",
+            "reason": reason,
+            "running": running,
+            "detector_initialized": detector_initialized,
+            "detector_ready": detector_ready,
+            "detector_open_vocabulary": detector_open_vocabulary,
+            "detector_model": detector_model,
+            "frame_available": frame_available,
+            "source": source,
+            "timestamp": captured_at,
+            "age_sec": age_sec,
+            "max_age_sec": max_age_sec,
+            "frame_width": int(frame_width),
+            "frame_height": int(frame_height),
+            "detection_count": len(detections),
+            "person_count": person_count,
+        }
+
+    @staticmethod
+    def _range_for_bearing(ranges, bearing):
+        if not ranges:
+            return None
+        try:
+            vals = list(ranges)
+        except Exception:
+            return None
+        n = len(vals)
+        if n <= 0:
+            return None
+        bearing = (float(bearing) + math.pi) % (2.0 * math.pi) - math.pi
+        step = (2.0 * math.pi) / float(n)
+        center = int(round((bearing + math.pi) / step))
+        center = max(0, min(n - 1, center))
+        radius = max(1, int(round(math.radians(4.0) / step)))
+        candidates = []
+        for idx in range(max(0, center - radius), min(n, center + radius + 1)):
+            try:
+                r = float(vals[idx])
+            except (TypeError, ValueError):
+                continue
+            if 0.08 < r < 20.0 and math.isfinite(r):
+                candidates.append(r)
+        return min(candidates) if candidates else None
+
+    @staticmethod
+    def _range_for_livox_points(points, bearing):
+        if not points:
+            return None
+        try:
+            bearing = float(bearing)
+        except (TypeError, ValueError):
+            return None
+        window = math.radians(5.0)
+        candidates = []
+        for pt in points:
+            if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+                continue
+            try:
+                x = float(pt[0])
+                y = float(pt[1])
+            except (TypeError, ValueError):
+                continue
+            dist = math.hypot(x, y)
+            if not (0.08 < dist < 20.0 and math.isfinite(dist)):
+                continue
+            point_bearing = math.atan2(-y, x)  # Livox y is left; bbox positive is image-right.
+            delta = (point_bearing - bearing + math.pi) % (2.0 * math.pi) - math.pi
+            if abs(delta) <= window:
+                candidates.append(dist)
+        return min(candidates) if candidates else None
+
+    def get_detections_world(self, robot_x, robot_y, robot_yaw, ranges=None, lidar_points=None):
         """broadcast_loop 调用: 返回 slam.data.detections 格式 [{x,y,class}] (C1.5 数组!)。
-        bbox 中心 x 归一化 → 方位角 (假设 FOV=70°), 距离假设 3m (spec §6.2 简化)。
-        世界坐标 = robot + 3m×(cos(yaw+ang), sin(yaw+ang))。
+        bbox 中心 x 归一化 → 方位角 (假设 FOV=70°)。只有 LaserScan 或
+        Livox 提供可靠距离时才发布地图坐标；纯单目方位不会伪造固定距离。
         与 type=frame 的整数 detections 相反, slam 这里必须是数组。
 
         MEDIUM-5: 归一化用检测时刻的帧宽 _detect_frame_w (bbox 坐标系),
         不用 resize 后的 _latest_frame.shape[1] (720p=1280), 否则方位系统偏左。
         """
         with self._lock:
-            dets = [(d, self._detect_frame_w if self._detect_frame_w > 0 else 1280)
-                    for d in self._latest_dets]
-            dets.extend((d, self._latest_locate_frame_w if self._latest_locate_frame_w > 0 else 1280)
-                        for d in self._latest_locate_dets)
+            base_dets = []
+            for source in self._detection_source_order:
+                if source == "mock":
+                    continue
+                base_dets.extend(dict(d) for d in self._latest_detection_overlays.get(source, []))
+            if not base_dets:
+                base_dets = list(self._latest_detection_overlay) if self._latest_detection_overlay else list(self._latest_dets)
+            locate_dets = list(self._latest_locate_dets)
+            default_w = self._detect_frame_w if self._detect_frame_w > 0 else 1280
+            locate_w = self._latest_locate_frame_w if self._latest_locate_frame_w > 0 else default_w
+        dets = []
+        for d in base_dets:
+            if isinstance(d, dict):
+                if d.get("source") == "mock":
+                    continue
+                dets.append((dict(d), int(d.get("frame_width") or default_w)))
+        for d in locate_dets:
+            if isinstance(d, dict):
+                dets.append((dict(d), int(d.get("frame_width") or locate_w)))
         if not dets:
             return []
+        try:
+            max_detection_age = float(
+                os.environ.get("GO2W_DETECTION_MAX_AGE_SEC", "2.0"))
+        except (TypeError, ValueError):
+            max_detection_age = 2.0
+        if (not math.isfinite(max_detection_age)
+                or max_detection_age <= 0.0):
+            max_detection_age = 2.0
+        now = time.time()
         half_fov = math.radians(_CAMERA_HFOV_DEG / 2.0)
+        yaw_offset = math.radians(_CAMERA_YAW_OFFSET_DEG)
         out = []
         for d, fw in dets:
             try:
+                captured_at = float(d.get("ts"))
+                frame_age = now - captured_at
+                if (not math.isfinite(captured_at) or captured_at <= 0.0
+                        or not math.isfinite(frame_age) or frame_age < -0.5
+                        or frame_age > max_detection_age):
+                    continue
                 bbox = d.get("bbox", [0, 0, fw, 0])
                 if not bbox or len(bbox) < 4:
                     continue
-                x1, y1, x2, y2 = bbox[:4]
+                x1, _y1, x2, _y2 = bbox[:4]
                 cx_px = (float(x1) + float(x2)) / 2.0
-                # 归一化中心 x (0=画面左, 0.5=中, 1=右) → 方位角 (相对狗朝向)
                 cx_norm = cx_px / float(fw) if fw > 0 else 0.5
-                angle = (cx_norm - 0.5) * 2.0 * half_fov  # rad, 正=右
-                # 世界坐标 (spec §6.2): robot + dist×(cos(yaw+ang), sin(yaw+ang))
-                # 注: 图像右 = 机器人右; 机器人朝向 yaw (世界系); 右转 = yaw - angle
-                # 这里用 yaw + angle (angle 正=右) 对齐 map.js 习惯, 后续 LiDAR 融合再校准
-                wx = robot_x + _DETECT_ASSUME_DIST_M * math.cos(robot_yaw + angle)
-                wy = robot_y + _DETECT_ASSUME_DIST_M * math.sin(robot_yaw + angle)
+                angle = (cx_norm - 0.5) * 2.0 * half_fov + yaw_offset
+                lidar_range = self._range_for_bearing(ranges, angle)
+                range_source = "lidar" if lidar_range is not None else None
+                if lidar_range is None:
+                    lidar_range = self._range_for_livox_points(lidar_points, angle)
+                    if lidar_range is not None:
+                        range_source = "livox"
+                # A monocular bbox has bearing but no trustworthy map range.
+                # Never publish a fabricated fixed-distance marker: mission
+                # localization will keep it unresolved and retry another view.
+                if lidar_range is None:
+                    continue
+                dist = lidar_range
+                wx = robot_x + dist * math.cos(robot_yaw + angle)
+                wy = robot_y + dist * math.sin(robot_yaw + angle)
                 out.append({
                     "x": round(wx, 2),
                     "y": round(wy, 2),
                     "class": d.get("class", "?"),
+                    "confidence": d.get("confidence", 0.0),
+                    "source": d.get("source", "yolo"),
+                    "range": round(float(dist), 2),
+                    "range_source": range_source,
+                    "snapshot_id": d.get("snapshot_id") or d.get("id"),
+                    "crop_url": d.get("crop_url", ""),
                 })
             except Exception:
                 continue
@@ -1167,20 +1784,16 @@ class NxAiVlmProxy:
         result_box = self._ai.submit_parse(text)
         # 同步等结果 (调用方已是后台线程, 阻塞 OK); 设上限防 worker 卡死
         if not result_box["done"].wait(timeout=120.0):
-            # HIGH-2: 超时分支必须返回合法 JSON (含 tasks/response),
-            # 用 _fallback_parse 保证 TaskManager._vlm_parse_command 能正常解析,
-            # 不能返回裸 "(超时)" 字符串 (会让 JSON 解析抛异常落 fallback, 路径混乱)。
-            # 同时 set done: worker 若迟到完成也不应再写已过期的 result_box。
-            logger.warning(f"[VLM] proxy 等结果超时 (120s), 走 fallback")
-            fb = self._ai._fallback_parse(text)
+            # 超时必须返回合法的失败关闭 JSON；迟到结果不得再被消费。
+            logger.warning("[VLM] proxy 等结果超时 (120s)")
+            failure = self._ai._parse_failure("vlm_timeout", text=text)
             result_box["done"].set()
-            return json.dumps(fb, ensure_ascii=False)
+            return json.dumps(failure, ensure_ascii=False)
         result = result_box.get("response")
         if result is None:
-            # 无结果 (worker 未写 response): 同样用 fallback 保证契约一致
-            logger.warning(f"[VLM] proxy 收到空结果, 走 fallback")
-            fb = self._ai._fallback_parse(text)
-            return json.dumps(fb, ensure_ascii=False)
+            logger.warning("[VLM] proxy 收到空结果")
+            failure = self._ai._parse_failure("vlm_no_result", text=text)
+            return json.dumps(failure, ensure_ascii=False)
         # TaskManager._vlm_parse_command 期望 chat 返回字符串 (vlm.chat 的契约)
         # 把解析后的 dict 重新序列化成 JSON 字符串, 让 TaskManager 再 parse 一次 (保持契约)
         try:

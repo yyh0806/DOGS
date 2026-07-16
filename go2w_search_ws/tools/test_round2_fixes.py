@@ -12,7 +12,7 @@
   - MockFrameGenerator.next_frame() 返回 BGR ndarray
   - 模拟 detect 在 1920 宽帧上跑, 写 _latest_frame(720p) + _detect_frame_w(1920)
   - get_frame_jpeg 返回 (b64, int)
-  - get_detections_world 返回 list 且 cx_norm 用 1920 (不偏)
+   - get_detections_world 只在 LiDAR 测距就绪时返回地图坐标，且 cx_norm 用 1920 (不偏)
 """
 import os
 import sys
@@ -85,10 +85,17 @@ print("===== 3. get_detections_world → list, 方位用检测帧宽 1920 (MEDIU
 import numpy as np
 with eng._lock:
     eng._latest_dets = [{"class": "person", "confidence": 0.9,
-                         "bbox": [480, 100, 1440, 900]}]  # 1920 系, cx=960 (正中)
+                         "bbox": [480, 100, 1440, 900],
+                         "ts": time.time()}]  # 1920 系, cx=960 (正中)
     eng._detect_frame_w = 1920
 import math
-dets_world = eng.get_detections_world(robot_x=0.0, robot_y=0.0, robot_yaw=0.0)
+# LaserScan 索引中点对应正前方；只给正前方窗口可靠距离。若帧宽误用
+# 1280，方位会偏离该窗口并被拒绝，测试也会失败。
+ranges = [float("inf")] * 360
+for idx in range(178, 183):
+    ranges[idx] = 3.0
+dets_world = eng.get_detections_world(
+    robot_x=0.0, robot_y=0.0, robot_yaw=0.0, ranges=ranges)
 if isinstance(dets_world, list) and len(dets_world) == 1:
     d0 = dets_world[0]
     if set(d0.keys()) >= {"x", "y", "class"}:
@@ -97,10 +104,10 @@ if isinstance(dets_world, list) and len(dets_world) == 1:
         cx_norm_1920 = 960.0 / 1920.0
         half_fov = math.radians(ai._CAMERA_HFOV_DEG / 2.0)
         angle_1920 = (cx_norm_1920 - 0.5) * 2.0 * half_fov
-        wx_expect_1920 = round(ai._DETECT_ASSUME_DIST_M * math.cos(angle_1920), 2)  # =3.0
+        wx_expect_1920 = round(3.0 * math.cos(angle_1920), 2)  # =3.0
         cx_norm_1280 = 960.0 / 1280.0
         angle_1280 = (cx_norm_1280 - 0.5) * 2.0 * half_fov
-        wx_wrong_1280 = round(ai._DETECT_ASSUME_DIST_M * math.cos(angle_1280), 2)  # <3.0
+        wx_wrong_1280 = round(3.0 * math.cos(angle_1280), 2)  # <3.0
         if abs(d0["x"] - wx_expect_1920) < 0.01 and abs(d0["x"] - wx_wrong_1280) > 0.01:
             ok("get_detections_world 用 _detect_frame_w=1920 归一化",
                f"x={d0['x']} (1920系期望={wx_expect_1920}, 错误1280系={wx_wrong_1280})")
@@ -150,14 +157,14 @@ proxy = ai.NxAiVlmProxy(eng3)
 # 不启动 worker, 让 wait(120) 走超时分支太慢; 临时把 wait 改成短超时
 # 直接验证: 超时返回的字符串能被 json.loads 解析且含 tasks/response
 # 启动一个 worker 但让 _init_vlm 失败 + 队列不消费 → result_box.done 不 set
-# 简化: 直接测 _fallback_parse 输出的 JSON 合法性 (超时分支就是 dump 它)
-fb = eng3._fallback_parse("前进两米")
+# 简化: 直接测失败关闭输出的 JSON 合法性 (超时分支就是 dump 它)
+fb = eng3._parse_failure("vlm_timeout", text="前进两米")
 fb_json = json.dumps(fb, ensure_ascii=False)
 parsed = json.loads(fb_json)
-if "tasks" in parsed and "response" in parsed:
+if parsed.get("tasks") == [] and parsed.get("parse_error") == "vlm_timeout":
     ok("超时/无结果分支 JSON 含 tasks+response (可被 _vlm_parse_command 解析)", f"response={parsed['response']!r}")
 else:
-    no("fallback JSON 缺字段", fb_json)
+    no("失败关闭 JSON 缺字段", fb_json)
 
 # 进一步: 真实跑 NxAiVlmProxy.chat 的超时分支, 验证 set done + 返回合法 JSON。
 # 不启动 worker → result_box.done 永远不会被 worker set → 走超时分支。
@@ -204,7 +211,7 @@ else:
 ev2 = FastTimeoutEvent()
 rb2 = {"text": "x", "response": None, "done": ev2}
 # 复刻 chat 超时分支的最后两步 (set + return json)
-fb_for_set = eng3_real._fallback_parse("x")
+failure_for_set = eng3_real._parse_failure("vlm_timeout", text="x")
 rb2["done"].set()
 if ev2.set_called:
     ok("HIGH-2: 超时分支 result_box.done.set() 被调用 (源码 :825)", "")
@@ -230,7 +237,7 @@ wt.join(timeout=2.0)
 if done:
     resp = rb.get("response")
     if isinstance(resp, dict) and "tasks" in resp and "response" in resp:
-        ok("MEDIUM-1: worker 异常后 pending_box done set + 回写 fallback", f"response={resp.get('response')!r}")
+        ok("MEDIUM-1: worker 异常后 pending_box done set + 回写空任务", f"response={resp.get('response')!r}")
     else:
         no("MEDIUM-1: done set 但 response 格式错", str(resp))
 else:
@@ -240,12 +247,12 @@ else:
 print()
 print("===== 7. 阶段A 契约: detections int/list 陷阱保持 =====")
 # get_frame_jpeg 已验 (int). get_detections_world 已验 (list).
-# 再确认 _fallback_parse 不破坏 TaskManager 契约 (tasks 是 list[dict])
-fb2 = ai.NxAiEngine._fallback_parse("搜索房间")
-if isinstance(fb2.get("tasks"), list) and all(isinstance(t, dict) and "type" in t for t in fb2["tasks"]):
-    ok("fallback tasks 是 list[dict{type}]", f"n={len(fb2['tasks'])}")
+# 再确认解析失败不生成任何运动任务。
+fb2 = ai.NxAiEngine._parse_failure("invalid_vlm_mission", text="搜索房间")
+if fb2.get("tasks") == [] and fb2.get("parse_error") == "invalid_vlm_mission":
+    ok("解析失败 tasks 为空", f"n={len(fb2['tasks'])}")
 else:
-    no("fallback tasks 格式错", str(fb2))
+    no("解析失败契约格式错", str(fb2))
 
 
 print()

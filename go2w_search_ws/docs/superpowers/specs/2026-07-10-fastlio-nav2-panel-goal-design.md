@@ -69,14 +69,20 @@ MID360 内部 LiDAR 与 IMU 随模组一起倾斜，两者相对外参不因整�
 body_to_base_pitch = -20° = -0.3490658504 rad
 ```
 
-fuser 使用双侧共轭换基：
+fuser 在每个新的 FastLIO 时间戳 `t_s` 上使用双侧共轭换基，并查询同一时刻的轮速里程计：
 
 ```text
-T_map_base = inverse(T_body_base) * T_camera_body * T_body_base
-T_map_odom = T_map_base * inverse(T_odom_base)
+T_map_base_slam(t_s) = inverse(T_body_base) * T_camera_body(t_s) * T_body_base
+C_map_odom = T_map_base_slam(t_s) * inverse(T_odom_base(t_s))
 ```
 
-静止时 `T_camera_body` 近似单位阵，左右安装变换严格相消；运动时传感器坐标中的旋转被转换为水平底盘坐标。fuser 同时发布 `/localization_pose`（`nav_msgs/Odometry`，frame=`map`，child=`base_link`），供 Panel 使用与 Nav2 完全一致的世界坐标。
+静止时 `T_camera_body` 近似单位阵，左右安装变换严格相消；运动时传感器坐标中的旋转被转换为水平底盘坐标。`C_map_odom` 是慢变化的 SLAM 校正，在下一帧 FastLIO 到来前保持；每个 fuser 周期用最新里程计 `T_odom_base(t)` 预测当前位姿：
+
+```text
+T_map_base(t) = C_map_odom * T_odom_base(t)
+```
+
+`map -> odom` TF 的矩阵为 `C_map_odom`，时间戳使用最新里程计时间 `t`，避免把约 1.5 秒前的 FastLIO stamp 伪装成可供 Nav2 当前查询的 TF，也不依赖 `transform_tolerance` 做 tf2 不支持的动态外推。fuser 同时发布 `/localization_pose`（`nav_msgs/Odometry`，frame=`map`，child=`base_link`，pose=`T_map_base(t)`），供 Panel 使用与 Nav2 完全一致的当前世界坐标。同一个 FastLIO stamp 只更新一次校正。
 
 ## 启动与恢复
 
@@ -133,8 +139,8 @@ MID360 继续负责 FastLIO 3D 建图。若后续需要 MID360 直接进入 cost
 实现采用 TDD，依次建立以下回归：
 
 1. shell contract 复现 `pipefail + grep -q` 假失败，修复后对真实/模拟 TF 输出正确返回。
-2. fuser 矩阵测试验证 -20° 参数、旋转矩阵正交性、静止严格相消和纯 yaw 不引入明显 roll/pitch。
-3. fuser pose topic 测试验证 frame、child、位置与四元数来自 `T_map_base`。
+2. fuser 矩阵测试验证 -20° 参数、旋转矩阵正交性、静止严格相消、纯 yaw 不引入明显 roll/pitch，以及同一 FastLIO/odom 时间求出的校正能正确预测较新的 odom 位姿。
+3. fuser pose topic 测试验证 frame、child、最新 odom 时间戳、位置与四元数来自 `C_map_odom * T_odom_base(t)`；重复 FastLIO stamp 不重复计算不同校正。
 4. Nav2 配置 contract 确认不存在 CustomMsg-as-PointCloud2，`/scan` marking/clearing 与速度平滑链完整。
 5. systemd contract 确认持久 unit、依赖、重启策略和实际 profile 路径。
 6. 单点导航控制器测试覆盖接受、替换、取消、成功、拒绝、超时与 aborted。

@@ -9,7 +9,7 @@
     - ReentrantCallbackGroup (静态检查)
     - yaw→四元数转换 (qz=sin(yaw/2), qw=cos(yaw/2))
     - status==4 判成功
-    - timeout 支持 (send_goal_and_wait 用 spin_until_complete timeout)
+    - timeout 支持 (Condition 有界等待，ROS future 只由既有 executor 驱动)
   D3 编排状态机完整性:
     - 六态全覆盖 (SELECT_ROOM/NAVIGATE/ARRIVED/SEARCH/DETECT/REPORT)
     - 失败子态 (no_room/no_nav/nav_aborted/cancelled)
@@ -163,7 +163,8 @@ def make_orch(events, fake_nav=None, fake_ai=None, rooms_yaml=None):
 
     o = orch.RoomSearchOrchestrator(
         node=None, ai_engine=fake_ai, ws_broadcast_fn=ws_broadcast,
-        rooms_yaml_path=rooms_yaml or os.path.join(ROOT, "config", "rooms.yaml"))
+        rooms_yaml_path=rooms_yaml or os.path.join(ROOT, "config", "rooms.yaml"),
+        _test_allow_uncalibrated_rooms=True)
     # 替换 _ensure_nav 返回 fake_nav (跳过真 Nav2 创建)
     if fake_nav is not None:
         def fake_ensure_nav():
@@ -329,11 +330,14 @@ if "ReentrantCallbackGroup" in src and "MutuallyExclusiveCallbackGroup" not in s
 else:
     no("callback group 可能用错 (D2.2)")
 
-# D2.3: spin_until_complete 带 timeout
-if "spin_until_complete" in src and "timeout_sec=" in src:
-    ok("spin_until_complete 带 timeout (D2.3)")
+# D2.3: 禁止 worker 对已在 executor 中的 node concurrent spin；Condition 有界等
+if ("spin_until_complete" not in src
+        and "threading.Condition" in src
+        and "goal_accept_timeout" in src
+        and "nav_complete_timeout" in src):
+    ok("唯一 executor + Condition 有界等待 (D2.3)")
 else:
-    no("spin_until_complete 缺 timeout (D2.3)")
+    no("发现 concurrent spin 或缺少 Condition timeout (D2.3)")
 
 # D2.6: yaw→四元数 (qz=sin(yaw/2), qw=cos(yaw/2), qx=qy=0)
 import inspect

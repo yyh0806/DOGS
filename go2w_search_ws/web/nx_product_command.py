@@ -2,11 +2,15 @@
 
 This module is intentionally offline and model-free. It only recognizes the
 product-grade room/person search command path and returns None for everything
-else so existing VLM/fallback parsing can continue unchanged.
+else so the strict search-only VLM path may try generic target classes.
 """
 
 import math
 import re
+import hashlib
+import json
+
+from nx_mission_schema import SearchMissionRequest
 
 
 _CURRENT_ROOM = "__current__"
@@ -41,6 +45,13 @@ _EXPLICIT_PERSON_TERMS = (
     "全部人员",
     "所有人员",
     "人员",
+)
+
+_TABLE_TERMS = (
+    "所有桌子",
+    "全部桌子",
+    "桌子",
+    "餐桌",
 )
 
 _MARK_TERMS = (
@@ -107,6 +118,7 @@ _REQUIRED_ROOM_PERSON_SEPARATOR_RE = r"(?:里|里面|内|中|的)"
 _SEARCH_TERMS_RE = r"(?:搜索|搜寻|寻找|查找|搜|找)"
 _PERSON_TARGET_RE = r"(?:所有人员|全部人员|所有人|全部人|人员|人)"
 _PERSON_TARGET_FOLLOW_RE = r"(?=$|一下$|一遍$|吧$|吗$|并?(?:标注|标记|标出来|标出|圈出))"
+_TARGET_FOLLOW_RE = _PERSON_TARGET_FOLLOW_RE
 
 
 def _terms_re(terms: tuple[str, ...]) -> str:
@@ -132,9 +144,21 @@ def parse_product_command(text: str) -> dict | None:
     if _is_current_room_person_search(normalized):
         return _command_result(_CURRENT_ROOM)
 
+    if _is_current_room_target_search(normalized, _TABLE_TERMS):
+        return _command_result(
+            _CURRENT_ROOM, target_class="dining table", target_label="所有桌子")
+
     named_room = _extract_named_room(normalized)
     if named_room:
         return _command_result(named_room)
+
+    named_table_room = _extract_named_room_target(normalized, _TABLE_TERMS)
+    if named_table_room:
+        return _command_result(
+            named_table_room,
+            target_class="dining table",
+            target_label="所有桌子",
+        )
 
     return None
 
@@ -173,24 +197,55 @@ def resolve_current_room(robot_x: float, robot_y: float, rooms: list[dict]) -> s
     return nearest_name
 
 
-def _command_result(room: str) -> dict:
-    # 无图场景默认: frontier_explore (边走边建图), 不依赖预建 RoomMap。
-    # room 保留作语义 hint (任务上下文/日志), frontier 路径不用于导航。
+def _command_result(
+    room: str,
+    *,
+    target_class: str = "person",
+    target_label: str = "所有人",
+) -> dict:
+    response = (
+        f"搜索当前房间并标注{target_label}"
+        if room == _CURRENT_ROOM
+        else f"搜索{room}并标注{target_label}"
+    )
+    mission = build_search_mission(room, target_class)
+    params = mission.to_task_params()
+    if room != _CURRENT_ROOM:
+        # Named-room orchestration already owns calibrated spatial bounds.  The
+        # canonical nested request retains its total mission budget.
+        params.pop("max_radius_m", None)
+        params.pop("max_time", None)
     return {
-        "response": "探索并标注所有人",
+        "response": response,
         "tasks": [{
             "type": "search_room",
             "priority": 8,
-            "params": {
-                "room": room,
-                "target_classes": ["person"],
-                "require_photos": True,
-                "mark_on_map": True,
-                "search_strategy": "frontier_explore",
-                "use_lidar_person_range": True,
-            },
+            "params": params,
         }],
     }
+
+
+def build_search_mission(room: str, target_class: str) -> SearchMissionRequest:
+    """Build the canonical, deterministic command template."""
+    canonical_room = "current_room" if room == _CURRENT_ROOM else str(room)
+    strategy = "frontier_explore" if room == _CURRENT_ROOM else "next_best_view"
+    seed = json.dumps(
+        {"room": canonical_room, "target_classes": [target_class],
+         "search_strategy": strategy},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return SearchMissionRequest(
+        request_id=f"command-{hashlib.sha256(seed).hexdigest()[:24]}",
+        room=canonical_room,
+        target_classes=(target_class,),
+        search_strategy=strategy,
+        require_photos=True,
+        mark_on_map=True,
+        max_radius_m=6.0 if room == _CURRENT_ROOM else 12.0,
+        # 2026-07-15 实测: 180s 预算太短, 狗探索 3-4 frontier 就 time_budget_exhausted,
+        # 卡住的 goal 没来得及超时 abort. 提到 480s 给多 frontier + 单 goal 超时留余量.
+        max_time_s=480.0 if room == _CURRENT_ROOM else 900.0,
+    )
 
 
 def _normalize_text(text: str) -> str:
@@ -216,6 +271,16 @@ def _is_current_room_person_search(text: str) -> bool:
     ))
 
 
+def _is_current_room_target_search(
+    text: str, target_terms: tuple[str, ...]
+) -> bool:
+    return (
+        _contains_any(text, _CURRENT_ROOM_TERMS)
+        and (_contains_any(text, _SEARCH_TERMS) or _contains_any(text, _MARK_TERMS))
+        and _contains_any(text, target_terms)
+    )
+
+
 def _extract_named_room(text: str) -> str | None:
     patterns = (
         rf"{_GO_TERMS_RE}(?P<room>{_KNOWN_ROOM_TERMS_RE}){_ROOM_SUFFIX_RE}"
@@ -226,6 +291,29 @@ def _extract_named_room(text: str) -> str | None:
         rf"{_SEARCH_TERMS_RE}{_PERSON_TARGET_RE}{_PERSON_TARGET_FOLLOW_RE}",
         rf"{_SEARCH_TERMS_RE}(?P<room>[\u4e00-\u9fffA-Za-z0-9_-]{{1,12}})"
         rf"{_REQUIRED_ROOM_PERSON_SEPARATOR_RE}{_PERSON_TARGET_RE}{_PERSON_TARGET_FOLLOW_RE}",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            room = _clean_room_name(match.group("room"))
+            if room and not _contains_any(room, _CURRENT_ROOM_TERMS):
+                return room
+    return None
+
+
+def _extract_named_room_target(
+    text: str, target_terms: tuple[str, ...]
+) -> str | None:
+    target_re = rf"(?:所有|全部)?(?:{_terms_re(target_terms)})"
+    patterns = (
+        rf"{_GO_TERMS_RE}(?P<room>{_KNOWN_ROOM_TERMS_RE}){_ROOM_SUFFIX_RE}"
+        rf"{_SEARCH_TERMS_RE}{target_re}{_TARGET_FOLLOW_RE}",
+        rf"{_SEARCH_TERMS_RE}(?P<room>{_KNOWN_ROOM_TERMS_RE})"
+        rf"{_ROOM_PERSON_SEPARATOR_RE}{target_re}{_TARGET_FOLLOW_RE}",
+        rf"{_GO_TERMS_RE}(?P<room>[\u4e00-\u9fffA-Za-z0-9_-]{{1,12}}){_ROOM_SUFFIX_RE}"
+        rf"{_SEARCH_TERMS_RE}{target_re}{_TARGET_FOLLOW_RE}",
+        rf"{_SEARCH_TERMS_RE}(?P<room>[\u4e00-\u9fffA-Za-z0-9_-]{{1,12}})"
+        rf"{_REQUIRED_ROOM_PERSON_SEPARATOR_RE}{target_re}{_TARGET_FOLLOW_RE}",
     )
     for pattern in patterns:
         match = re.search(pattern, text)

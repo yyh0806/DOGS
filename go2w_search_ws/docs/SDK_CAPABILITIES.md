@@ -1,5 +1,62 @@
 # Go2W 搜索系统 — 能力清单
 
+## 2026-07-14 权威基线：SDK 能力与产品安全策略
+
+本节是当前实现的权威说明；下方较早的实测记录仅保留作历史参考。宇树 SDK2 并未提供一套可直接复制的“产品状态机”，它提供运动 RPC、服务切换和状态订阅。我们的状态机必须以 SDK 操作为边界，并用狗自身反馈确认物理结果，不能把 RPC 返回码 `0` 当成已经完成动作。
+
+官方依据：
+
+- [Unitree SDK2 Python 官方仓库](https://github.com/unitreerobotics/unitree_sdk2_python)
+- [Go2 SportClient Python 实现](https://github.com/unitreerobotics/unitree_sdk2_python/blob/master/unitree_sdk2py/go2/sport/sport_client.py)
+- [Go2 SportClient C++ 公共接口](https://github.com/unitreerobotics/unitree_sdk2/blob/main/include/unitree/robot/go2/sport/sport_client.hpp)
+- [MotionSwitcherClient 官方实现](https://github.com/unitreerobotics/unitree_sdk2_python/blob/master/unitree_sdk2py/comm/motion_switcher/motion_switcher_client.py)
+
+### SDK 高层运动能力全集
+
+| 类别 | 官方接口 |
+|---|---|
+| 基础姿态/停止 | `Damp`, `BalanceStand`, `StopMove`, `StandUp`, `StandDown`, `RecoveryStand`, `Sit`, `RiseSit` |
+| 连续运动/姿态 | `Move(vx, vy, vyaw)`, `Euler(roll, pitch, yaw)`, `SpeedLevel(level)` |
+| 交互动作 | `Hello`, `Stretch`, `Content`, `Heart`, `Pose`, `Scrape` |
+| 特技动作 | `FrontFlip`, `FrontJump`, `FrontPounce`, `Dance1`, `Dance2`, `LeftFlip`, `BackFlip`, `HandStand` |
+| 步态/功能开关 | `FreeWalk`, `FreeBound`, `FreeJump`, `FreeAvoid`, `ClassicWalk`, `WalkUpright`, `CrossStep`, `StaticWalk`, `TrotRun`, `EconomicGait`, `SwitchAvoidMode`, `SwitchJoystick`, `AutoRecoverSet/Get` |
+| 运动服务管理 | `CheckMode`, `SelectMode`, `ReleaseMode` |
+
+这些是 SDK 暴露的能力，不等于 Go2W 当前固件、当前运动服务 `ai-w` 都支持，也不等于允许自动任务调用。轮式前进、后退、侧移、转向都通过 `Move(vx, vy, vyaw)`；Nav2 只产生速度，不能直接调用姿态或特技接口。
+
+### 自动导航允许的安全子集
+
+| SDK 操作 | 当前用途 | 约束 |
+|---|---|---|
+| `Move(0,0,0)` | 启动抑制残留速度、停车、故障保护 | 始终允许；默认停车策略不依赖 `StopMove` |
+| `Move(vx,vy,vyaw)` | 手动或 Nav2 速度执行 | 仅在反馈确认 `MANUAL_ACTIVE`/`NAV_ACTIVE`、所有权匹配、遥测新鲜、`gait_type=0` 时允许；检测到 trot/run/楼梯/adjust 步态立即锁零并报 `unexpected_gait` |
+| `BalanceStand()` | 从 `PARKED` 显式启动轮式会话 | 只响应用户/导航启动意图；必须由后续物理模式反馈确认 |
+| `StandUp()` | 已停止后回到实测的轮关节锁定停车模式 | 只在轮速已确认停止时发送；名称是 SDK 名称，产品语义由 Go2W 实测模式反馈定义 |
+| `StopMove()` | 可选终止策略 | 默认关闭；只有 `GO2W_STOP_PROFILE=move_zero_then_stop_move` 才使用 |
+| `CheckMode()` | 确认当前运动服务 | 只读；必须是预期的 `ai-w`，否则故障关闭 |
+
+自动工作流永不调用 `Damp`、`RecoveryStand`、`StandDown`、`Sit`、特技动作或 `SelectMode`。这些动作可能改变支撑或触发保护，必须留给人工、有明确安全流程的独立工具。
+
+### 产品状态机
+
+| 状态 | 含义 | 允许的下一步 |
+|---|---|---|
+| `BOOT_HOLD` | 等 SDK、`ai-w` 服务和新鲜反馈；速度未授权 | 已是关节锁定且轮停则进入 `PARKED`；轮模式滑动只发零速；轮模式静止才发一次 `StandUp` 进入停车确认 |
+| `PARKED` | `joint_lock` 且四轮停止 | 显式 `START_MANUAL` 或 `START_NAV`；导航还要求扫描新鲜 |
+| `ACTIVATING` | 已发 `BalanceStand`，等待物理模式反馈 | 反馈进入轮模式后转 `MANUAL_ACTIVE`/`NAV_ACTIVE`，否则超时故障 |
+| `MANUAL_ACTIVE` | 手动控制拥有速度权限 | 接收手动速度或停车 |
+| `NAV_ACTIVE` | Nav2 拥有速度权限 | 接收 Nav2 速度且持续要求扫描新鲜，或停车 |
+| `STOPPING` | 持续零速，等待轮速为零 | 确认停止后才进入 `PARKING` |
+| `PARKING` | 已发 `StandUp`，等待关节锁定反馈 | 确认后进入 `PARKED` |
+| `ESTOP` | 急停锁存 | 只发零速；仅在关节锁定、轮停、遥测新鲜时允许清除 |
+| `FAULT` | 服务、遥测、姿态、电机、电池、模式或超时异常 | 禁止速度；先排除原因并通过明确恢复流程重建会话 |
+
+状态正交拆分为：`session`（产品会话）、`physical_mode`（狗反馈的物理模式）、`actual_motion`（按四轮 `dq` 判定 `stopped/moving`）。状态消息为 schema v4，至少包含 `release_id`、`session`、`physical_mode`、`actual_motion`、`velocity_authorized`、`telemetry_fresh`、`motion_service`、`owner`、`transition` 和 `fault`。
+
+### 为什么启动时不直接发 `BalanceStand`
+
+`BalanceStand` 是“允许轮式运动会话”的转换，不是通用的安全停车命令。盲发会在未知姿态、未知服务或旧速度仍残留时改变支撑状态。当前启动顺序是：初始化唯一的 leased `SportClient` → 两轮零速抑制 → `CheckMode` → 等待新鲜低层反馈 → 根据物理模式决定保持停车、继续零速或在轮停后停车。只有用户明确点击手动/导航启动，才发送 `BalanceStand`。
+
 > 基于实际测试验证，非文档推测。测试环境：网线直连笔记本 ↔ Go2W，unitree_sdk2py 1.0.1。
 
 ## 一、我们能获取的数据

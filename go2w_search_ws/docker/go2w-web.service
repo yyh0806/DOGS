@@ -12,12 +12,28 @@ User=nx
 Environment=LD_LIBRARY_PATH=/home/nx/CycloneDDS/lib
 Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 Environment=ROS_DOMAIN_ID=0
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/nx/go2w/current/payload/docker/fastdds_udp.xml
+Environment=GO2W_RELEASE_ID=development
+Environment=GO2W_MISSION_ROOT=/home/nx/go2w/missions
+# C13 visible-light nominal optics from the product manual.  The zero yaw
+# assumes the gimbal is centered; field calibration can override these through
+# /etc/go2w/hardware.env and set the profile to measured.
+Environment=GO2W_CAMERA_HFOV_C13_VIS_DEG=77.4
+Environment=GO2W_CAMERA_HFOV=77.4
+Environment=GO2W_CAMERA_YAW_OFFSET_C13_VIS_DEG=0.0
+Environment=GO2W_CAMERA_CALIBRATION_C13_VIS=nominal_centered
+EnvironmentFile=-/etc/go2w/release.env
+# Root-owned (0600) file populated during commissioning.  systemd reads it
+# before dropping privileges to User=nx; absent/empty tokens fail closed.
+EnvironmentFile=-/etc/go2w/control.env
+Environment=GO2W_PANEL_ORIGINS=http://192.168.43.41:8000,http://127.0.0.1:8000,http://localhost:8000
 # 狗主控网卡: NxAiEngine.VideoClient 的 ChannelFactory 绑定用 (与 motion/sensor 一致,
 # 否则 reboot 后网卡名不对时 VideoClient 取不到帧 → 视频退回 mock).
 # 部署时 deploy_nx_web.sh 的 sed 会替换成实测网卡名.
 Environment=DOG_INTERFACE=enxc8a362616c4c
 # 前端访问用的公开 IP (可选, 仅影响 /api/foxglove 返回的 URL)
 Environment=GO2W_PUBLIC_IP=192.168.43.41
+# 原子部署根据 NX 访问地址和到狗主控的专用路由覆盖以上三个默认值。
 Environment=GO2W_LOCATE_BACKEND=cpp
 Environment=GO2W_LOCATE_BIN=/home/nx/locate-anything.cpp/build/locate-anything-cli
 Environment=GO2W_LOCATE_MODEL=/home/nx/models/locate-anything-q8_0.gguf
@@ -25,6 +41,9 @@ Environment=GO2W_LOCATE_MODE=hybrid
 Environment=GO2W_LOCATE_THREADS=4
 Environment=GO2W_LOCATE_TIMEOUT=120
 Environment=GO2W_YOLO_MODEL=/home/nx/go2w_ws/models/yolov8x-worldv2.pt
+# Atomic deployment writes the detected dog NIC, NX address, panel origins,
+# and installed YOLO-World model path here.  Keep it after bundled defaults.
+EnvironmentFile=-/etc/go2w/hardware.env
 # Frontend uses the C13 gimbal stream; keep the Unitree dog-camera background
 # video loop off unless YOLO/dog-camera AI is explicitly needed.
 Environment=GO2W_AI_VIDEO_ENABLE=0
@@ -39,9 +58,9 @@ Environment=HOME=/home/nx
 # ChannelFactory 是进程级单例不重试 → 网卡没就绪时 VideoClient Init 失败 → 视频退回 mock.
 # 等 60s 网卡就绪再启动; 超时 exit 1 触发 Restart=always 重试
 # (单次等 60s, 天然避开默认 start-limit 10s/5次, 狗没插线时持续重试不放弃).
-ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do ip link show enxc8a362616c4c >/dev/null 2>&1 && exit 0; sleep 1; done; echo "[wait-iface] enxc8a362616c4c 60s 未就绪, 等 Restart 重试" >&2; exit 1'
-ExecStart=/bin/bash /home/nx/go2w_ws/web/start_go2w_web.sh
-WorkingDirectory=/home/nx/go2w_ws
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do ip link show "$DOG_INTERFACE" >/dev/null 2>&1 && exit 0; sleep 1; done; echo "[wait-iface] ${DOG_INTERFACE} 60s 未就绪，等待 Restart 重试" >&2; exit 1'
+ExecStart=/bin/bash /home/nx/go2w/current/payload/web/start_go2w_web.sh
+WorkingDirectory=/home/nx/go2w/current/payload
 # 崩溃自动重启 (web 服务必须高可用, 否则前端失联)
 Restart=always
 RestartSec=2

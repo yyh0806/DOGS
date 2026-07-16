@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 SOURCE = Path(__file__).resolve().parent / "nx_web_server.py"
@@ -21,6 +22,17 @@ def test_frame_broadcast_does_not_include_unused_jpeg_payload():
     assert '"type": "frame", "detections": int(det_count)' in text
     assert "ai_engine.get_frame_jpeg()" not in text
     assert "ai_engine.get_frame_detection_count()" in text
+
+
+def test_costmap_broadcast_bypasses_realtime_frame_backpressure():
+    text = SOURCE.read_text(encoding="utf-8")
+
+    # One small map update every ~1.5 s must not be starved by the much faster
+    # camera/lidar streams, otherwise Panel never renders Nav2 obstacles.
+    assert re.search(
+        r'ws_broadcast\(\s*\{"type": "costmap", "data": json\.load\(_f\)\},\s*force=True\)',
+        text,
+    )
 
 
 def test_realtime_bridges_are_stopped_on_process_exit():

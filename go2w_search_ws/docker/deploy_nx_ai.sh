@@ -45,6 +45,7 @@ echo "[2/3] 拷贝阶段B AI 代码到 NX:$REMOTE_DIR/ ..."
 # ai/ 模块 (nx_ai_node.py import ai.detector/vlm/config; 不改原 ai/, 只增量传)
 ssh "$NX_USER@$NX_HOST" "mkdir -p $REMOTE_DIR/web/static $REMOTE_DIR/ai $REMOTE_DIR/docker"
 scp -q "$WS_DIR/web/nx_ai_node.py"          "$NX_USER@$NX_HOST:$REMOTE_DIR/web/"
+scp -q "$WS_DIR/web/nx_camera_calibration.py" "$NX_USER@$NX_HOST:$REMOTE_DIR/web/"
 scp -q "$WS_DIR/web/verify_nx_ai.sh"        "$NX_USER@$NX_HOST:$REMOTE_DIR/web/"
 scp -q "$WS_DIR/web/static/mock_person.png" "$NX_USER@$NX_HOST:$REMOTE_DIR/web/static/"
 scp -q "$WS_DIR/ai/config.py"               "$NX_USER@$NX_HOST:$REMOTE_DIR/ai/"

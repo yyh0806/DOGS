@@ -1,8 +1,9 @@
-# Nav2 参数 - Go2W + MID360 + FAST_LIO (3D 点云配置)
+# Nav2 参数 - Go2W + FAST_LIO 定位/建图 + 2D 激光避障
 #
 # 路线 (TECH_DECISIONS 第三节):
-#   MID360 点云 → pointcloud_to_laserscan → /scan → ObstacleLayer (主, 2D 射线追踪)
-#   local_costmap 额外加 VoxelLayer 直接吃 PointCloud2 (辅, 3D 体素, 双保险)
+#   nx_sensor_node 将狗自带 utlidar 过滤为 /scan (LaserScan)
+#   → local/global ObstacleLayer 做标记与清除 → InflationLayer 保留安全距离。
+#   MID360 的 Livox CustomMsg 只供 FAST_LIO 定位/建图，不直接接入 Nav2 costmap。
 #
 # 定位: FAST_LIO 替代 amcl (不发 OccupancyGrid, 直接发 camera_init→body TF +
 #       /Odometry)。Nav2 只消费 /Odometry, 不抢 map→odom TF。
@@ -20,10 +21,13 @@ bt_navigator:
   ros__parameters:
     global_frame: map                 # 阶段E 客户端 goal pose 的 frame_id, 必须一致
     robot_base_frame: base_link       # TF 树叶子, 与 TF 桥 (body→base_link) 一致
-    odom_topic: /Odometry             # FAST_LIO 原生 topic (大写 O), 显式声明避免 remap 链断裂
+    odom_topic: /odom                 # map_odom_fuser 水平化后的 MID360 里程计
     bt_loop_duration: 10
     default_server_timeout: 20
     action_server_result_timeout: 900.0
+    # Rewritten by nav2_3d.launch.py to our 2 Hz dynamic-replanning tree.
+    # It has no Spin/BackUp recovery: an invalid or blocked goal fails in place.
+    default_nav_to_pose_bt_xml: go2w_safe_dynamic_replan
     # Humble 必填: bt_navigator 要显式声明加载的 BT plugin 库列表,
     # 否则启动报错 "Failed to load BT plugin" 且 /navigate_to_pose 不暴露。
     # 列表取自 Nav2 Humble 官方 nav2_params.yaml (navigation_launch 默认 BT XML 用到的全部库)。
@@ -80,45 +84,70 @@ bt_navigator:
       - nav2_wait_action_bt_node
       - nav2_wait_cancel_bt_node
 
+smoother_server:
+  ros__parameters:
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: true
+
 controller_server:
   ros__parameters:
-    controller_frequency: 10.0
+    controller_frequency: 5.0  # 2026-07-16 匹配 TF 5.9Hz (fastlio/fuser 实际发布率), 消除 extrapolation-into-future
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.5
     min_theta_velocity_threshold: 0.001
-    progress_checker_plugins: ["progress_checker"]
+    progress_checker_plugin: "progress_checker"
     goal_checker_plugins: ["general_goal_checker"]
-    controllers: ["FollowPath"]
-    # /cmd_vel 默认 topic 名, 显式声明 (与 nx_motion_node 订阅 /cmd_vel 一致, 决策 5 零反转)。
-    cmd_vel_topic: /cmd_vel
+    controller_plugins: ["FollowPath"]
+    # Nav2 原始控制量由 launch remap 进入 velocity_smoother；最终
+    # /cmd_vel_nav 才到 motion 安全出口。
     FollowPath:
-      plugin: "dwb_core::DWBLocalPlanner"
+      # Sample a point ahead on the global path before handing control to DWB.
+      # For a goal exactly behind the robot, raw DWB repeatedly crossed the
+      # +/-pi wrap boundary and alternated left/right pure-turn commands. The
+      # shim commits to the sampled path heading until the error is small.
+      plugin: "nav2_rotation_shim_controller::RotationShimController"
+      primary_controller: "dwb_core::DWBLocalPlanner"
+      forward_sampling_distance: 0.5
+      angular_dist_threshold: 0.05    # 降: 避免 RotationShim 预转向占主导导致原地转圈
+      angular_disengage_threshold: 0.25
+      rotate_to_heading_angular_vel: 0.5    # 提速 (原0.05极慢, livox稳定后放宽)
+      max_angular_accel: 1.5
+      simulate_ahead_time: 2.0
+      rotate_to_goal_heading: false
+      closed_loop: true
       debug_trajectory_details: false
       # Go2W 差速起步 (全向模式: max_vel_y=0.3, vy_samples=10)
-      min_vel_x: 0.0
+      min_vel_x: 0.10        # 提速 (livox 10Hz 稳定后放宽, 原 0.05)
       min_vel_y: 0.0
-      max_vel_x: 0.6        # 室内安全速度 (TECH_DECISIONS 第三节)
+      max_vel_x: 0.6        # 提速: livox rmem 修复后稳 10Hz, 原 0.3 是抖动时代保守值
       max_vel_y: 0.0        # 差速; 全向改 0.3
-      max_vel_theta: 1.0    # 室内安全角速度 (TECH_DECISIONS 第三节)
-      min_speed_xy: 0.1
-      max_speed_xy: 0.6
-      min_speed_theta: 0.0
+      max_vel_theta: 0.6    # 修bug+提速: 原0.05 < min_speed_theta0.15 致DWB角速度采样区间空集无解, 恢复0.6
+      min_speed_xy: 0.05    # 允许慢速前进轨迹
+      max_speed_xy: 0.9
+      min_speed_theta: 0.15 # 纯旋转不得落入 Go2W 轮式死区 (现 < max_vel_theta, 区间有效)
       acc_lim_x: 0.5
       acc_lim_y: 0.0
-      acc_lim_theta: 2.0
+      acc_lim_theta: 1.5    # 10Hz 下一周期即到 0.15；角速度上限仍为实测安全值
       decel_lim_x: -1.0
       decel_lim_y: 0.0
-      decel_lim_theta: -2.0
+      decel_lim_theta: -1.5
       vx_samples: 20
       vy_samples: 0         # 差速; 全向改 10
       vtheta_samples: 40
       sim_time: 1.5
       linear_granularity: 0.05
       angular_granularity: 0.025
-      transform_tolerance: 0.2
-      xy_goal_tolerance: 0.20    # TECH_DECISIONS 第三节 Go2W 室内
-      yaw_goal_tolerance: 0.15   # TECH_DECISIONS 第三节 Go2W 室内
-      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      transform_tolerance: 0.5  # 有界 TF 等待窗口；时间同步由 fuser 的同时间戳校正保证
+      xy_goal_tolerance: 0.10    # 短目标也必须产生可验证的机身位移
+      yaw_goal_tolerance: 3.14   # Go2-W 纯转向会平移；目标朝向由搜索/云台单独处理
+      critics: ["Oscillation", "ObstacleFootprint", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      # BaseObstacle checks only the robot center. This critic evaluates the
+      # full 0.90 x 0.64 m rectangle at every sampled trajectory pose.
+      ObstacleFootprint.scale: 0.02
       BaseObstacle.scale: 0.02
       PathAlign.scale: 32.0
       PathAlign.forward_point_distance: 0.1
@@ -126,18 +155,29 @@ controller_server:
       GoalAlign.forward_point_distance: 0.1
       PathDist.scale: 32.0
       GoalDist.scale: 24.0
-      RotateToGoal.scale: 32.0
-      RotateToGoal.slowing_factor: 5.0
-      RotateToGoal.lookahead_time: -1.0
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      required_movement_radius: 0.1
+      movement_time_allowance: 30.0
     general_goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.20    # 与 FollowPath.xy_goal_tolerance 一致 (rubric #8 两处都查)
-      yaw_goal_tolerance: 0.15   # 与 FollowPath.yaw_goal_tolerance 一致
-      stateful: true
+      xy_goal_tolerance: 0.10    # 与 FollowPath.xy_goal_tolerance 一致
+      yaw_goal_tolerance: 3.14   # 点选/探索目标不要求终点原地对向
+      stateful: false            # 若滑出位置容差必须重新接近，不能只追逐朝向
+
+velocity_smoother:
+  ros__parameters:
+    smoothing_frequency: 20.0
+    scale_velocities: false
+    feedback: "OPEN_LOOP"
+    max_velocity: [0.6, 0.0, 0.6]   # 提速同步DWB (livox稳定后, 原[0.3,0,0.15]卡上限)
+    min_velocity: [0.0, 0.0, -0.6]  # autonomous channel never reverses
+    max_accel: [1.0, 0.0, 2.0]      # 提速越过轮式转向死区
+    max_decel: [-1.0, 0.0, -1.5]
+    odom_topic: /odom
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 0.3
 
 local_costmap:
   local_costmap:
@@ -146,98 +186,88 @@ local_costmap:
       publish_frequency: 2.0
       global_frame: odom              # rolling window 在 odom 系
       robot_base_frame: base_link
+      transform_tolerance: 0.5  # 有界 TF 等待窗口，不用于掩盖陈旧变换
       rolling_window: true            # 滚动窗口 (狗动跟着动)
       width: 5                        # 5×5m 局部地图
       height: 5
       resolution: 0.05
-      footprint: "[ [0.30, 0.20], [0.30, -0.20], [-0.25, -0.20], [-0.25, 0.20] ]"
-      # 双保险 layer 顺序 (叠加, inflation 必须最后):
-      #   obstacle_layer (主, 2D 射线追踪吃 /scan) → voxel_layer (辅, 3D 体素吃点云) → inflation_layer
-      plugins: ["obstacle_layer", "voxel_layer", "inflation_layer"]
+      # Go2-W official standing envelope is 0.70 x 0.43 m.  Pad every side by
+      # at least 0.10 m so wheels, turning sweep, scan latency and braking are
+      # represented by the hard collision polygon rather than a soft score.
+      footprint: "[ [0.45, 0.32], [0.45, -0.32], [-0.45, -0.32], [-0.45, 0.32] ]"
+      # MID360 三维障碍点先进入 voxel layer，再做足迹膨胀。
+      plugins: ["obstacle_layer", "inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
-        observation_sources: scan
-        scan:
-          topic: /scan                # 来自 pointcloud_to_laserscan
+        observation_sources: mid360
+        mid360:
+          topic: /scan_mid360
           data_type: "LaserScan"
           marking: True
           clearing: True
-          max_obstacle_height: 1.5    # 与 SDK_CAPABILITIES MID360 高度过滤对齐
-          min_obstacle_height: -0.1
-          obstacle_max_range: 7.0     # MID360 有效距离内 (稍保守于 8m)
-          obstacle_min_range: 0.2     # 稍保守于 0.15m
-          raytrace_max_range: 8.0
-          raytrace_min_range: 0.15
-      voxel_layer:
-        plugin: "nav2_costmap_2d::VoxelLayer"
-        enabled: true
-        publish_voxel_map: true       # rviz 可视化 3D 体素
-        origin_z: 0.0
-        z_resolution: 0.10            # 10cm 垂直分辨率
-        z_voxels: 16                  # 16 × 0.10 = 1.6m 高度 (覆盖 Go2W 站立 + 桌面)
-        max_obstacle_height: 1.5      # 与 SDK_CAPABILITIES 对齐
-        mark_threshold: 0
-        observation_sources: pointcloud
-        pointcloud:
-          # 外置 MID360 用 /livox/lidar (livox_ros_driver2 发, 推荐, 与 TECH_DECISIONS 第二节一致);
-          # 复用狗自带 utlidar 则改 /utlidar/cloud_base。二选一, 不能混。
-          topic: /livox/lidar
+          inf_is_valid: True
+          expected_update_rate: 1.8
+          observation_persistence: 2.0    # 2026-07-16 障碍2s未重新观察则过期清, 治costmap红色只增不减
           max_obstacle_height: 1.5
-          min_obstacle_height: 0.05   # 稍高于地面噪声 (pointcloud_to_laserscan 切 0.10, 这里独立)
-          clearing: True
-          marking: True
-          data_type: "PointCloud2"
+          min_obstacle_height: 0.0     # LaserScan z=0; source cloud was height-filtered
+          obstacle_max_range: 7.0
+          obstacle_min_range: 0.4     # 2026-07-16 剔近场自身/C13/载荷回波(假障碍), 原0.2     # 稍保守于 0.15m
           raytrace_max_range: 8.0
           raytrace_min_range: 0.15
-          obstacle_max_range: 7.0
-          obstacle_min_range: 0.2
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.7         # Go2W footprint 最大 0.30m, 膨胀 0.7m 离墙 0.4m+ (室内门框够走)
+        # Padded footprint turning radius is 0.552 m; preserve another 0.15 m
+        # cost gradient so the controller prefers clearance before collision.
+        inflation_radius: 0.75
       always_send_full_costmap: true
 
 global_costmap:
   global_costmap:
     ros__parameters:
-      update_frequency: 1.0           # 全局慢
+      update_frequency: 2.0           # live MID360 obstacles reach replanning within 0.5 s
       publish_frequency: 1.0
       global_frame: map               # 全局 frame, 与阶段E goal frame 一致
       robot_base_frame: base_link
-      footprint: "[ [0.30, 0.20], [0.30, -0.20], [-0.25, -0.20], [-0.25, 0.20] ]"
+      transform_tolerance: 0.5  # 有界 TF 等待窗口，不用于掩盖陈旧变换
+      # Navfn has no path-orientation state.  Use the local padded rectangle's
+      # circumscribed radius here so every possible wheel turning sweep is
+      # protected while the global planner reasons about robot centers.
+      robot_radius: 0.60
       resolution: 0.05
       track_unknown_space: true
-      # rolling_window (2026-07-07 实测必加): 无 static map (FastLIO 不发 OccupancyGrid),
-      # 固定 costmap 狗 y<0 时 'Robot out of bounds' → planner 失败 goal ABORTED.
-      # rolling 跟狗动 (狗始终在 costmap 中心), 10×10m 覆盖室内. 代价: 全局规划只看局部 10m.
-      rolling_window: true
-      width: 10
-      height: 10
-      # 全局规划用 2D 投影足够; 不加 voxel_layer (3D 体素是 local 双保险的事)。
-      plugins: ["obstacle_layer", "inflation_layer"]
-      # static_layer 删 (2026-07-07 实测): FastLIO 不发 OccupancyGrid, static_layer 订阅 /map
-      # 无数据 → global_costmap 不初始化 → "Robot out of bounds" → planner 失败狗不动
-      # (原注释"无害空层"误判). 改纯 obstacle_layer 实时累积 /scan. 未来加 map_server 再加回.
+      # Persistent SLAM supplies the whole explored floor. Live MID360 rays
+      # remain separate so moved people and boxes are avoided immediately.
+      rolling_window: false
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_topic: "/map_frontier"
+        map_subscribe_transient_local: true
+        subscribe_to_updates: true
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
-        observation_sources: scan
-        scan:
-          topic: /scan                # 来自 pointcloud_to_laserscan
+        observation_sources: mid360
+        mid360:
+          topic: /scan_mid360
           data_type: "LaserScan"
           marking: True
           clearing: True
+          inf_is_valid: True
+          expected_update_rate: 1.8
+          observation_persistence: 2.0    # 2026-07-16 障碍2s未重新观察则过期清, 治costmap红色只增不减
           max_obstacle_height: 1.5
-          min_obstacle_height: -0.1
+          min_obstacle_height: 0.0     # LaserScan z=0; source cloud was height-filtered
           obstacle_max_range: 7.0
-          obstacle_min_range: 0.2
+          obstacle_min_range: 0.4     # 2026-07-16 剔近场自身/C13/载荷回波(假障碍), 原0.2
           raytrace_max_range: 8.0
           raytrace_min_range: 0.15
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.7
+        inflation_radius: 0.75
       always_send_full_costmap: true
 
 planner_server:
@@ -267,7 +297,10 @@ behavior_server:
       plugin: "nav2_behaviors/Wait"
     global_frame: odom               # recovery 行为在 odom frame
     robot_base_frame: base_link
-    transform_tolerance: 0.2
+    max_rotational_vel: 0.15         # 实测稳定响应值；0.2 会使 FastLIO 发散
+    min_rotational_vel: 0.15         # 避免恢复动作落入轮式底盘死区
+    rotational_acc_lim: 1.5          # 与 DWB/速度平滑器一致
+    transform_tolerance: 0.5  # 有界 TF 等待窗口，不用于掩盖陈旧变换
 
 waypoint_follower:
   ros__parameters:

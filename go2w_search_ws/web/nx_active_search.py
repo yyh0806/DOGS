@@ -9,11 +9,19 @@ _MAX_GRID_CANDIDATES = 100_000
 
 
 class ActiveSearchPlanner:
-    def __init__(self, spacing: float = 1.0, obstacle_clearance: float = 0.5):
+    def __init__(
+        self,
+        spacing: float = 1.0,
+        obstacle_clearance: float = 0.5,
+        visual_range_m: float = 2.5,
+    ):
         self.spacing = self._finite_positive_value(spacing, "spacing")
         self.obstacle_clearance = self._finite_positive_value(obstacle_clearance, "obstacle_clearance")
+        self.visual_range_m = self._finite_positive_value(visual_range_m, "visual_range_m")
         self._blocked = set()
         self._visited = set()
+        self._search_cells = {}
+        self._observed = set()
 
     def generate_candidates(self, room_area: dict, robot_pose: tuple[float, float, float], obstacles) -> list[dict]:
         origin_x, origin_y, width, height = self._validate_room_area(room_area)
@@ -31,7 +39,11 @@ class ActiveSearchPlanner:
                 rounded_y = round(y, 2)
                 key = (rounded_x, rounded_y)
                 obstacle_distance = self._nearest_obstacle_distance(x, y, obstacle_points)
-                if key not in self._blocked and not self._too_close_to_obstacle(obstacle_distance):
+                if (
+                    key not in self._blocked
+                    and key not in self._visited
+                    and not self._too_close_to_obstacle(obstacle_distance)
+                ):
                     candidates.append(
                         {
                             "x": rounded_x,
@@ -47,10 +59,22 @@ class ActiveSearchPlanner:
                                 height,
                             ),
                             "obstacle_risk_cost": self._obstacle_risk_cost(obstacle_distance),
-                            "repeated_observation_penalty": 1.0 if key in self._visited else 0.0,
+                            "repeated_observation_penalty": 1.0 if key in self._observed else 0.0,
                         }
                     )
 
+        self._search_cells = {
+            self._key(candidate): {
+                "x": float(candidate["x"]),
+                "y": float(candidate["y"]),
+            }
+            for candidate in candidates
+        }
+        self._search_cells.update({
+            key: {"x": key[0], "y": key[1]}
+            for key in self._visited
+            if origin_x <= key[0] <= max_x and origin_y <= key[1] <= max_y
+        })
         return candidates
 
     def select_next_best(self, candidates: list[dict], robot_pose: tuple[float, float, float]) -> dict | None:
@@ -80,11 +104,66 @@ class ActiveSearchPlanner:
     def mark_blocked(self, candidate: dict) -> None:
         self._blocked.add(self._key(candidate))
 
-    def mark_visited(self, candidate: dict) -> None:
-        self._visited.add(self._key(candidate))
+    def mark_visited(
+        self,
+        candidate: dict,
+        camera_hfov_rad: float | None = None,
+        camera_yaw_offset_rad: float = 0.0,
+        observation_valid: bool = True,
+    ) -> None:
+        key = self._key(candidate)
+        hfov = (
+            math.tau
+            if camera_hfov_rad is None
+            else self._finite_positive_value(camera_hfov_rad, "camera_hfov_rad")
+        )
+        if hfov > math.tau:
+            raise ValueError("camera_hfov_rad must not exceed 2*pi")
+        camera_yaw_offset = self._finite_number(
+            camera_yaw_offset_rad, "camera_yaw_offset_rad")
+        heading = self._finite_number(
+            candidate.get("yaw", 0.0), "candidate.yaw") + camera_yaw_offset
+        self._visited.add(key)
+        if key not in self._search_cells:
+            self._search_cells[key] = {"x": key[0], "y": key[1]}
+        if not observation_valid:
+            return
+        for cell_key, point in self._search_cells.items():
+            dx = point["x"] - key[0]
+            dy = point["y"] - key[1]
+            distance = math.hypot(dx, dy)
+            if distance > self.visual_range_m + 1e-12:
+                continue
+            if distance > 1e-12 and abs(self._angle_diff(
+                math.atan2(dy, dx), heading)) > hfov / 2.0 + 1e-12:
+                continue
+            self._observed.add(cell_key)
+
+    def coverage_state(self) -> dict:
+        cells = set(self._search_cells)
+        observed = sorted(cells.intersection(self._observed))
+        visited = sorted(self._visited)
+        total = len(cells)
+        return {
+            "coverage_ratio": round(len(observed) / total, 6) if total else 0.0,
+            "observed_cells": [
+                {"x": float(x), "y": float(y)} for x, y in observed
+            ],
+            "total_cells": total,
+            "visited_viewpoints": [
+                {"x": float(x), "y": float(y)} for x, y in visited
+            ],
+            "visual_range_m": self.visual_range_m,
+        }
 
     def _key(self, candidate: dict) -> tuple[float, float]:
         return (round(float(candidate["x"]), 2), round(float(candidate["y"]), 2))
+
+    def _angle_diff(self, angle: float, reference: float) -> float:
+        return math.atan2(
+            math.sin(float(angle) - float(reference)),
+            math.cos(float(angle) - float(reference)),
+        )
 
     def _too_close_to_obstacle(self, obstacle_distance: float | None) -> bool:
         return obstacle_distance is not None and obstacle_distance < self.obstacle_clearance

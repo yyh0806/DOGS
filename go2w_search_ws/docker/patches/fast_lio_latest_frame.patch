@@ -1,0 +1,35 @@
+--- a/src/FAST_LIO_ROS2/src/laserMapping.cpp
++++ b/src/FAST_LIO_ROS2/src/laserMapping.cpp
+@@ -344,6 +344,20 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
+ 
+     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
+     p_pre->process(msg, ptr);
++    // Navigation needs the latest physical pose, not a lossless history.  A
++    // reliable depth-20 DDS queue plus this unbounded deque made the estimator
++    // run 1--3 seconds behind the robot.  Never invalidate a scan already
++    // claimed by sync_packages(); discard only unclaimed older scans.
++    if (!lidar_pushed)
++    {
++        lidar_buffer.clear();
++        time_buffer.clear();
++    }
++    else
++    {
++        while (lidar_buffer.size() > 1) lidar_buffer.pop_back();
++        while (time_buffer.size() > 1) time_buffer.pop_back();
++    }
+     lidar_buffer.push_back(ptr);
+     time_buffer.push_back(last_timestamp_lidar);
+     
+@@ -916,7 +930,10 @@ private:
+         /*** ROS subscribe initialization ***/
+         if (p_pre->lidar_type == AVIA)
+         {
+-            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
++            auto latest_livox_qos = rclcpp::SensorDataQoS();
++            latest_livox_qos.keep_last(1);
++            latest_livox_qos.best_effort();
++            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, latest_livox_qos, livox_pcl_cbk);
+         }
+         else
+         {

@@ -1,0 +1,27 @@
+--- a/src/FAST_LIO_ROS2/src/laserMapping.cpp
++++ b/src/FAST_LIO_ROS2/src/laserMapping.cpp
+@@ -560,12 +560,21 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
+ {
+-    int size = feats_undistort->points.size();
++    // Obstacle navigation needs angular coverage, not every deskewed return.
++    // Bound DDS serialization and UDP loopback traffic so adding Nav2's
++    // participants cannot push the pose estimator seconds behind real time.
++    constexpr int max_body_cloud_points = 1000;
++    const int source_size = feats_undistort->points.size();
++    const int stride = std::max(
++        1, (source_size + max_body_cloud_points - 1) / max_body_cloud_points);
++    const int size = (source_size + stride - 1) / stride;
+     PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
+ 
+-    for (int i = 0; i < size; i++)
++    int output_index = 0;
++    for (int source_index = 0; source_index < source_size;
++         source_index += stride, ++output_index)
+     {
+-        RGBpointBodyLidarToIMU(&feats_undistort->points[i], \
+-                            &laserCloudIMUBody->points[i]);
++        RGBpointBodyLidarToIMU(&feats_undistort->points[source_index], \
++                            &laserCloudIMUBody->points[output_index]);
+     }
+ 
+     sensor_msgs::msg::PointCloud2 laserCloudmsg;

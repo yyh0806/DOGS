@@ -18,10 +18,24 @@
 # ============================================================
 set -e
 
+# Compatibility entrypoint only. Never copy files into the live workspace;
+# build a complete immutable payload and restart the web subsystem only.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "deploy_nx_web.sh is retired; forwarding to the atomic web release flow" >&2
+artifact="$("$SCRIPT_DIR/build_release.sh" web)"
+exec "$SCRIPT_DIR/deploy_release.sh" "$artifact" "$@"
+
+# LEGACY IMPLEMENTATION BELOW IS UNREACHABLE
+
 NX_HOST="${NX_HOST:-192.168.43.41}"
 NX_USER="${NX_USER:-nx}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+GIT_RELEASE_ID="$(git -C "$WS_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+if [ -n "$(git -C "$WS_DIR" status --porcelain 2>/dev/null)" ]; then
+  GIT_RELEASE_ID="${GIT_RELEASE_ID}-dirty"
+fi
+GO2W_RELEASE_ID="${GO2W_RELEASE_ID:-$GIT_RELEASE_ID}"
 
 # --- 子命令: stop ---
 if [ "$1" = "stop" ]; then
@@ -49,8 +63,18 @@ echo "✅ NX 在线"
 echo ""
 echo "[2/3] 拷贝 nx_web 代码到 NX:~/$NX_USER/go2w_ws/ ..."
 ssh "$NX_USER@$NX_HOST" "mkdir -p ~/go2w_ws/web ~/go2w_ws/web/static"
+scp -q "$WS_DIR/src/go2w_bridge/go2w_bridge/build_info.py" "$NX_USER@$NX_HOST:~/go2w_ws/"
+scp -q "$WS_DIR/src/go2w_bridge/go2w_bridge/motion_types.py" "$NX_USER@$NX_HOST:~/go2w_ws/"
+scp -q "$WS_DIR/src/go2w_bridge/go2w_bridge/motion_machine.py" "$NX_USER@$NX_HOST:~/go2w_ws/"
+scp -q "$WS_DIR/src/go2w_bridge/go2w_bridge/motion_protocol.py" "$NX_USER@$NX_HOST:~/go2w_ws/"
 scp -q "$WS_DIR/web/start_go2w_web.sh"           "$NX_USER@$NX_HOST:~/go2w_ws/web/"
 scp -q "$WS_DIR/web/nx_web_server.py"            "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+scp -q "$WS_DIR/web/nx_control_auth.py"           "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+scp -q "$WS_DIR/web/nx_motion_intent.py"          "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+scp -q "$WS_DIR/web/nx_point_nav.py"             "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+scp -q "$WS_DIR/web/nx_navigation_arbiter.py"    "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+scp -q "$WS_DIR/web/nx_navigation_gateway.py"    "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+scp -q "$WS_DIR/web/nx_camera_calibration.py"    "$NX_USER@$NX_HOST:~/go2w_ws/web/"
 scp -q "$WS_DIR/web/nx_gimbal_node.py"           "$NX_USER@$NX_HOST:~/go2w_ws/web/"
 scp -q "$WS_DIR/web/nx_lidar_node.py"            "$NX_USER@$NX_HOST:~/go2w_ws/web/"
 scp -q "$WS_DIR/web/nx_slam_map.py"              "$NX_USER@$NX_HOST:~/go2w_ws/web/"
@@ -116,7 +140,9 @@ fi
 
 # 3b. 用实测网卡名生成 service (替换 ExecStartPre + DOG_INTERFACE 里的 enxc8a362616c4c)
 TMP_SERVICE=$(mktemp)
-sed "s|enxc8a362616c4c|$DOG_IFACE|g" "$WS_DIR/docker/go2w-web.service" > "$TMP_SERVICE"
+sed -e "s|enxc8a362616c4c|$DOG_IFACE|g" \
+    -e "s|GO2W_RELEASE_ID=development|GO2W_RELEASE_ID=$GO2W_RELEASE_ID|g" \
+    "$WS_DIR/docker/go2w-web.service" > "$TMP_SERVICE"
 scp -q "$TMP_SERVICE" "$NX_USER@$NX_HOST:/tmp/go2w-web.service"
 rm -f "$TMP_SERVICE"
 ssh "$NX_USER@$NX_HOST" "echo '$NX_USER' | sudo -S bash -c '

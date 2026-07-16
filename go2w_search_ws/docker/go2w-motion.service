@@ -1,6 +1,7 @@
 [Unit]
-Description=Go2W NX Motion Node (控狗, 持续持有lease压制残留乱跑程序)
-After=network-online.target
+Description=Go2W NX Motion Policy Node (local client of stable Sport gateway)
+Requires=go2w-sport-gateway.service
+After=network-online.target go2w-sport-gateway.service
 Wants=network-online.target
 
 [Service]
@@ -10,20 +11,25 @@ User=nx
 Environment=LD_LIBRARY_PATH=/home/nx/CycloneDDS/lib
 Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 Environment=ROS_DOMAIN_ID=0
-# 狗主控网卡 + 启动自动站立
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/nx/go2w/current/payload/docker/fastdds_udp.xml
+Environment=GO2W_RELEASE_ID=development
+Environment=GO2W_SPORT_GATEWAY_SOCKET=/run/go2w-sport-gateway/sport.sock
+EnvironmentFile=-/etc/go2w/release.env
+# 默认网卡仅用于首次兼容；原子部署会根据到狗主控的专用路由覆盖它。
 Environment=DOG_INTERFACE=enxc8a362616c4c
+EnvironmentFile=-/etc/go2w/hardware.env
 # 等连狗网卡"链路 UP 且狗主控 161 可达"再起 motion。原版只查 ip link show (网卡存在),
 # 但狗没上电时 USB 网卡仍枚举、仅链路 DOWN → CycloneDDS participant=None → SportClient
 # 构造访问 None._ref 崩 → Restart=always 每 2s 一循环 (实测 restart counter 998 次)。
 # 现在查 operstate=up + ping 161 通才放行; 60s 不通 exit 1 让 systemd 重启 (每 60s 一周期, 省 30x).
 # 双保险: 即使 ExecStartPre 通过后 motion 进程内 _sdk_init_loop 仍会重试 SDK (代码层兜底).
-ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do [ "$(cat /sys/class/net/enxc8a362616c4c/operstate 2>/dev/null)" = "up" ] && ping -c 1 -W 1 192.168.123.161 >/dev/null 2>&1 && exit 0; sleep 1; done; echo "[wait-dog] enxc8a362616c4c 链路/狗主控 161 60s 未就绪 (狗没上电?), 进程内 _sdk_init_loop 会兜底重试" >&2; exit 1'
-ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec python3 -u /home/nx/go2w_ws/nx_motion_node.py'
-WorkingDirectory=/home/nx/go2w_ws
-# 崩溃自动重启 (lease持有者绝不能长时间离线, 否则狗主控残留程序接管乱跑)
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do [ -S "${GO2W_SPORT_GATEWAY_SOCKET}" ] && exit 0; sleep 1; done; echo "[wait-gateway] ${GO2W_SPORT_GATEWAY_SOCKET} 60s 未就绪，motion 保持未启动" >&2; exit 1'
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec python3 -u /home/nx/go2w/current/payload/src/go2w_bridge/go2w_bridge/nx_motion_node.py'
+WorkingDirectory=/home/nx/go2w/current/payload
+# 崩溃自动重启；重新获取 lease 后仍从 BOOT_HOLD 观察反馈，不自动站立。
 Restart=always
 RestartSec=2
-# 正常停止: SIGTERM 触发 destroy_node → Damp趴下 → 释放lease
+# 正常停止触发有界关停；不会调用 Damp/RecoveryStand/StandDown。
 KillSignal=SIGINT
 TimeoutStopSec=10
 

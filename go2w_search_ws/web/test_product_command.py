@@ -11,21 +11,30 @@ WEB_DIR = Path(__file__).resolve().parent
 if str(WEB_DIR) not in sys.path:
     sys.path.insert(0, str(WEB_DIR))
 
-from nx_product_command import parse_product_command, resolve_current_room
+from nx_product_command import (
+    build_search_mission,
+    parse_product_command,
+    resolve_current_room,
+)
 
 
 def _expected_task(room):
+    current = room == "__current__"
+    params = {
+        "mission_request": build_search_mission(room, "person").to_dict(),
+        "room": room,
+        "target_classes": ["person"],
+        "require_photos": True,
+        "mark_on_map": True,
+        "search_strategy": "frontier_explore" if current else "next_best_view",
+        "use_lidar_person_range": True,
+    }
+    if current:
+        params.update({"max_radius_m": 6.0, "max_time": 480.0})
     return {
         "type": "search_room",
         "priority": 8,
-        "params": {
-            "room": room,
-            "target_classes": ["person"],
-            "require_photos": True,
-            "mark_on_map": True,
-            "search_strategy": "frontier_explore",
-            "use_lidar_person_range": True,
-        },
+        "params": params,
     }
 
 
@@ -33,8 +42,32 @@ def test_parse_current_room_all_people_command():
     result = parse_product_command("去搜索这个房间，把所有人标注出来")
 
     assert result == {
-        "response": "探索并标注所有人",
+        "response": "搜索当前房间并标注所有人",
         "tasks": [_expected_task("__current__")],
+    }
+
+
+def test_parse_current_room_all_tables_command():
+    result = parse_product_command("去搜索这个房间，把所有桌子标记出来")
+
+    assert result == {
+        "response": "搜索当前房间并标注所有桌子",
+        "tasks": [{
+            "type": "search_room",
+            "priority": 8,
+            "params": {
+                "mission_request": build_search_mission(
+                    "__current__", "dining table").to_dict(),
+                "room": "__current__",
+                "target_classes": ["dining table"],
+                "require_photos": True,
+                "mark_on_map": True,
+                "search_strategy": "frontier_explore",
+                "use_lidar_target_range": True,
+                "max_radius_m": 6.0,
+                "max_time": 480.0,
+            },
+        }],
     }
 
 
@@ -42,7 +75,7 @@ def test_parse_current_room_all_people_short_command():
     result = parse_product_command("搜索这个房间所有人")
 
     assert result == {
-        "response": "探索并标注所有人",
+        "response": "搜索当前房间并标注所有人",
         "tasks": [_expected_task("__current__")],
     }
 
@@ -51,8 +84,24 @@ def test_parse_named_room_people_command():
     result = parse_product_command("搜索客厅的人")
 
     assert result == {
-        "response": "探索并标注所有人",
+        "response": "搜索客厅并标注所有人",
         "tasks": [_expected_task("客厅")],
+    }
+
+
+def test_parse_named_room_tables_command():
+    result = parse_product_command("去会议室搜索餐桌并标注出来")
+
+    assert result["response"] == "搜索会议室并标注所有桌子"
+    assert result["tasks"][0]["params"] == {
+        "mission_request": build_search_mission(
+            "会议室", "dining table").to_dict(),
+        "room": "会议室",
+        "target_classes": ["dining table"],
+        "require_photos": True,
+        "mark_on_map": True,
+        "search_strategy": "next_best_view",
+        "use_lidar_target_range": True,
     }
 
 
@@ -60,7 +109,7 @@ def test_parse_go_named_room_find_people_command():
     result = parse_product_command("去卧室找人")
 
     assert result == {
-        "response": "探索并标注所有人",
+        "response": "搜索卧室并标注所有人",
         "tasks": [_expected_task("卧室")],
     }
 
@@ -235,6 +284,30 @@ def test_product_current_room_parser_keeps_current_when_odom_is_stale(monkeypatc
     manager._resolve_product_current_room(result)
 
     assert result["tasks"][0]["params"]["room"] == "__current__"
+
+
+def test_frontier_current_room_is_never_rewritten_to_uncalibrated_placeholder(
+        monkeypatch):
+    nx_web_server = _import_nx_web_server_with_ros_stubs(monkeypatch)
+    node = types.SimpleNamespace(get_localization_health=lambda: {
+        "healthy": True, "x": 0.1, "y": 0.1,
+    })
+    manager = nx_web_server.TaskManager.__new__(nx_web_server.TaskManager)
+    manager.robot = types.SimpleNamespace(_node=node)
+    manager.room_orchestrator = types.SimpleNamespace(list_rooms_detail=lambda: [{
+        "name": "占位客厅",
+        "calibrated": False,
+        "nav_pose": {"x": 0.0, "y": 0.0, "yaw": 0.0},
+        "search_area": {
+            "origin_x": 0.0, "origin_y": 0.0, "width": 2.0, "height": 2.0,
+        },
+    }])
+    result = parse_product_command("去搜索这个房间，把所有人标注出来")
+
+    manager._resolve_product_current_room(result)
+
+    assert result["tasks"][0]["params"]["room"] == "__current__"
+    assert result["tasks"][0]["params"]["search_strategy"] == "frontier_explore"
 
 
 def _import_nx_web_server_with_ros_stubs(monkeypatch):

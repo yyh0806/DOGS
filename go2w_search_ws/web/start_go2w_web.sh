@@ -14,6 +14,7 @@
 #   已验证: gst nvv4l2decoder hevc 硬解 pipeline 跑通 (NvMMLiteOpen BlockType=279),
 #   且 rclpy / livox_ros_driver2.msg / cv2 / gi.Gst 四个 import 全部正常.
 set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source /opt/ros/humble/setup.bash
 if [ -f /home/nx/ws_livox/install/setup.bash ]; then
@@ -23,4 +24,24 @@ fi
 # 剥离 ws_livox native lib (保留 ROS2 humble + CycloneDDS), 解锁 NVDEC 硬解
 export LD_LIBRARY_PATH=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v 'ws_livox' | paste -sd:)
 
-exec python3 -u /home/nx/go2w_ws/web/nx_web_server.py
+# livox CustomMsg 的 C typesupport 运行时依赖 ws_livox 的 native .so (livox_ros_driver2
+# + fast_lio); 只加回 livox_ros_driver2 会订阅建立但反序列化静默失败 → /livox/lidar
+# 收不到 → 前端无雷达。实测加回两者后 gi/Gst + nvv4l2decoder 硬解仍正常 (parse_launch OK)。
+for _pkg in livox_ros_driver2 fast_lio; do
+  _d=/home/nx/ws_livox/install/$_pkg/lib
+  [ -d "$_d" ] && export LD_LIBRARY_PATH="$_d:$LD_LIBRARY_PATH"
+done
+unset _pkg _d
+
+# 双保险默认: NVDEC 硬解 + 30fps。service Environment 漏掉 / 手动 bash 启动也生效;
+# 已 export 的 C13_BACKEND/C13_FPS 不覆盖 (:- 语法), 保留 A/B 对比能力。
+export C13_BACKEND="${C13_BACKEND:-gst}"
+export C13_FPS="${C13_FPS:-30}"
+
+# Mission reports and annotated photos must survive atomic release switches.
+# /home/nx/go2w is owned by nx; fail startup if evidence storage is not writable.
+export GO2W_MISSION_ROOT="${GO2W_MISSION_ROOT:-/home/nx/go2w/missions}"
+mkdir -p "$GO2W_MISSION_ROOT"
+test -w "$GO2W_MISSION_ROOT"
+
+exec python3 -u "$SCRIPT_DIR/nx_web_server.py"

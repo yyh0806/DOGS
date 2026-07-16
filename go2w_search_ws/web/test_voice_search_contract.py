@@ -16,6 +16,23 @@ if str(WEB_DIR) not in sys.path:
     sys.path.insert(0, str(WEB_DIR))
 
 from nx_product_command import parse_product_command, resolve_current_room
+from voice_command import parse_voice_command
+
+
+def test_search_room_api_validates_one_canonical_mission_contract():
+    source = (WEB_DIR / "nx_web_server.py").read_text(encoding="utf-8")
+
+    assert "SearchMissionRequest.from_api_payload" in source
+    assert "mission.to_task_params()" in source
+
+
+def test_voice_and_text_paths_serialize_the_same_mission_request():
+    text = "去搜索这个房间，把所有人标注出来"
+    product = parse_product_command(text)
+    voice = parse_voice_command(text, mock=True)
+
+    assert voice["task"]["mission_request"] == (
+        product["tasks"][0]["params"]["mission_request"])
 
 
 # ---- 用户核心场景: "去搜索这个房间，把所有人标注出来" ----
@@ -33,7 +50,35 @@ def test_core_command_current_room_all_people():
     assert t["params"]["require_photos"] is True      # 拍照
     assert t["params"]["mark_on_map"] is True          # 地图标注
     assert t["params"]["search_strategy"] == "frontier_explore"
+    assert t["params"]["max_radius_m"] == 6.0
+    assert t["params"]["max_time"] == 480.0
     assert t["params"]["use_lidar_person_range"] is True
+
+
+def test_core_command_current_room_all_tables():
+    result = parse_product_command("搜索这个房间，把所有桌子标记出来")
+
+    assert result is not None
+    task = result["tasks"][0]
+    assert task["type"] == "search_room"
+    assert task["params"]["room"] == "__current__"
+    assert task["params"]["target_classes"] == ["dining table"]
+    assert task["params"]["require_photos"] is True
+    assert task["params"]["mark_on_map"] is True
+    assert task["params"]["search_strategy"] == "frontier_explore"
+    assert task["params"]["use_lidar_target_range"] is True
+
+
+def test_table_command_variants_use_canonical_detector_class():
+    for text in (
+        "去搜索这个房间把桌子标注出来",
+        "找一下当前房间里的所有桌子",
+        "圈出本房间的餐桌",
+        "搜索这间屋的桌子",
+    ):
+        result = parse_product_command(text)
+        assert result is not None, text
+        assert result["tasks"][0]["params"]["target_classes"] == ["dining table"]
 
 
 # ---- 同义说法变体 (STT 产生的措辞差异 + 用户自然语言变化, 都应命中) ----
@@ -101,7 +146,7 @@ def test_named_room_office():
     assert result["tasks"][0]["params"]["room"] == "办公室"
 
 
-# ---- 非房间搜索指令不误判 (确保 fallback 到 VLM/关键词路径) ----
+# ---- 非房间搜索指令不误判 (严格 VLM 仍会拒绝非搜索任务) ----
 
 NON_ROOM = [
     "前进两米",

@@ -1,0 +1,57 @@
+# ============================================================
+# C13 可见光相机内参 (Fast-LIVO2 视觉输入标定文件)
+# ============================================================
+# 消费者:
+#   - nx_c13_image_node.py:_load_camera_info() → 填 sensor_msgs/CameraInfo 发 /c13/camera_info
+#   - Fast-LIVO2 读此 YAML 做视觉前端去畸变 + 重投影
+#
+# ⚠️ 当前是手册标称基线 (Skydroid C13 1280x720 H.265,
+#    HFOV=77.4°, VFOV=48.8°)，不是现场棋盘格标定结果。
+#    连通 NX 后必须实测标定覆盖 (见 docs/fastlivo2_runbook.md §3):
+#      ros2 run camera_calibration cameracalibrator \
+#        --size 8x6 --square 0.025 --no-service-check \
+#        image:=/c13/image_raw camera:=/c13
+#    (--no-service-check 必须: nx_c13_image_node 不提供 set_camera_info service)
+#    标定工具会输出本格式 YAML, 直接覆盖本文件即可 (字段名一致)。
+#
+# 格式: 标准 ROS camera_info (camera_calibration / Kalibr 兼容)。
+#       数值均为行优先; camera_matrix 是 3×3 内参 K, projection_matrix 是 3×4 P。
+# ============================================================
+
+image_width: 1280
+image_height: 720
+camera_name: c13
+
+# 内参矩阵 K (按手册标称 FOV 反推: fx≈798.85, fy≈793.62, 主点居中)
+# 真值待标定 — 标定后替换 data 区
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [ 798.8506,   0.0, 640.0,
+              0.0, 793.6156, 360.0,
+            0.0,   0.0,   1.0 ]
+
+# 畸变模型: plumb_bob (Brown-Conrady, 含径向 k1/k2/k3 + 切向 p1/p2)
+distortion_model: plumb_bob
+
+# 畸变系数 D (占位全零 = 无畸变; 标定后填实测)
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [ 0.0, 0.0, 0.0, 0.0, 0.0 ]
+
+# 矫正矩阵 R (单目恒为单位阵)
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [ 1.0, 0.0, 0.0,
+          0.0, 1.0, 0.0,
+          0.0, 0.0, 1.0 ]
+
+# 投影矩阵 P (3×4, 无立体基线时 = [fx 0 cx 0; 0 fy cy 0; 0 0 1 0])
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [ 798.8506,   0.0, 640.0, 0.0,
+              0.0, 793.6156, 360.0, 0.0,
+            0.0,   0.0,   1.0, 0.0 ]

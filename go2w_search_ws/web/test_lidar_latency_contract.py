@@ -3,6 +3,8 @@ import sys
 import types
 from pathlib import Path
 
+import numpy as np
+
 
 WEB_DIR = Path(__file__).resolve().parent
 if str(WEB_DIR) not in sys.path:
@@ -14,15 +16,18 @@ class _FakePng:
         return b"png"
 
 
-class _FakePoint:
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
-
-
 class _FakeMsg:
     def __init__(self):
-        self.points = [_FakePoint(1.0, 0.1), _FakePoint(2.0, -0.2), _FakePoint(3.0, 0.3)]
+        self.is_bigendian = False
+        self.point_step = 12
+        self.fields = [
+            types.SimpleNamespace(name="x", offset=0, datatype=7),
+            types.SimpleNamespace(name="y", offset=4, datatype=7),
+            types.SimpleNamespace(name="z", offset=8, datatype=7),
+        ]
+        self.data = np.asarray([
+            [1.0, 0.1, 0.0], [2.0, -0.2, 0.0], [3.0, 0.3, 0.0]
+        ], dtype="<f4").tobytes()
 
 
 def _load_lidar_module(monkeypatch):
@@ -63,3 +68,24 @@ def test_lidar_uses_low_cpu_png_compression():
     text = (WEB_DIR / "nx_lidar_node.py").read_text(encoding="utf-8")
 
     assert "cv2.IMWRITE_PNG_COMPRESSION, 1" in text
+
+
+def test_lidar_private_context_uses_a_private_executor():
+    text = (WEB_DIR / "nx_lidar_node.py").read_text(encoding="utf-8")
+
+    assert "SingleThreadedExecutor(context=self._ctx)" in text
+    assert "self._executor.add_node(self._node)" in text
+    assert "self._executor.spin_once(" in text
+    assert "rclpy.spin_once(self._node" not in text
+
+
+def test_web_lidar_consumes_filtered_pointcloud_not_raw_livox_custom_message():
+    text = (WEB_DIR / "nx_lidar_node.py").read_text(encoding="utf-8")
+
+    assert "from sensor_msgs.msg import PointCloud2" in text
+    assert 'PointCloud2, "/mid360/points_nav"' in text
+    assert "self._subscription = self._node.create_subscription" in text
+    assert "qos_profile_sensor_data" in text
+    assert "from livox_ros_driver2.msg import CustomMsg" not in text
+    active = text.split("def start(self, node):", 1)[1]
+    assert '"/livox/lidar"' not in active

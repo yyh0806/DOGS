@@ -5,7 +5,7 @@
 载荷 NX 上跑的 web 服务进程，内嵌 rclpy 节点：
   - HTTP:8000  + WebSocket:8001  (与 web/panel.py 端口/契约完全一致, 前端无感)
   - 本机发布 /cmd_vel (Twist) /cmd_pose (String)   → 被 nx_motion_node 消费控狗
-  - 本机订阅 /dog_state /imu /scan /odom          → broadcast_loop 推 WS 给前端
+  - 本机订阅 /dog_state /imu /scan /localization_pose → broadcast_loop 推 WS 给前端
 
 == 退役说明 (可追溯) ==
 阶段A 用本文件替代了下列 PC 端组件, 但源文件**保留不删** (PC fallback, 可回滚):
@@ -36,12 +36,24 @@ import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 _WEB_DIR = Path(__file__).resolve().parent
 _WS_DIR = _WEB_DIR.parent
 if str(_WS_DIR) not in sys.path:
     sys.path.insert(0, str(_WS_DIR))
+
+_BRIDGE_ROOT = _WS_DIR / "src" / "go2w_bridge"
+if _BRIDGE_ROOT.is_dir() and str(_BRIDGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BRIDGE_ROOT))
+
+try:
+    from go2w_bridge.build_info import release_id
+except ImportError:  # Direct-file compatibility deployment on the NX.
+    from build_info import release_id
+
+
+RELEASE_ID = release_id()
 
 # ---- ROS2 (NX 本机, Humble) ----
 import rclpy
@@ -50,13 +62,64 @@ from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, LaserScan
+try:
+    from sensor_msgs.msg import PointCloud2
+except ImportError:  # ROS-free contract-test stubs may omit this optional type.
+    class PointCloud2:  # pragma: no cover - production ROS always supplies it
+        pass
 from std_msgs.msg import String
 
 from nx_slam_map import ObstacleGridAccumulator
+from nx_point_nav import PointNavigationController
+from nx_navigation_gateway import (
+    MissionNavigationPort,
+    NavigationGateway,
+    OwnerNavigationPort,
+    RosComputePathPort,
+)
+from nx_navigation_arbiter import NavigationArbiter
+from nx_camera_calibration import resolve_camera_calibration
+from nx_person_localizer import decode_pointcloud_xyz
+from nx_motion_intent import build_motion_intent
+from nx_mission_schema import (
+    MissionValidationError,
+    SearchMissionRequest,
+    canonicalize_search_tasks,
+)
+from nx_observation_sync import ObservationSynchronizer
+from nx_control_auth import (
+    authorize_request,
+    cors_origin_allowed,
+    parse_allowed_origins,
+)
 
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("go2w.nx_web")
+
+try:
+    POINT_GOAL_MAX_DISTANCE = float(
+        os.environ.get("GO2W_POINT_GOAL_MAX_DISTANCE", "20.0")
+    )
+except (TypeError, ValueError):
+    POINT_GOAL_MAX_DISTANCE = 20.0
+if not math.isfinite(POINT_GOAL_MAX_DISTANCE) or POINT_GOAL_MAX_DISTANCE <= 0.0:
+    POINT_GOAL_MAX_DISTANCE = 20.0
+
+
+def _point_goal_within_local_radius(x, y, localization, max_distance=None):
+    """Reject map-frame goals too far from the current trusted pose."""
+    limit = POINT_GOAL_MAX_DISTANCE if max_distance is None else float(max_distance)
+    try:
+        values = (
+            float(x), float(y), float(localization["x"]),
+            float(localization["y"]), float(limit),
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for value in values) or values[4] <= 0.0:
+        return False
+    return math.hypot(values[0] - values[2], values[1] - values[3]) <= values[4]
 
 # web/ 目录 (static 资源与本文件同目录, 和 panel.py 共用)
 _WEB_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -86,7 +149,7 @@ except Exception as _e:
 # RoomSearchOrchestrator 作为"组件"注入 TaskManager (决策 3):
 #   - TaskManager._worker 遇 task.type=="search_room" 调 self.room_orchestrator.run(task)
 #   - 不破坏阶段A/B 契约: HTTP 现有 12 端点逐字不动, 仅新增 3 个; WS 现有 type 不动, 仅新增 2 个
-#   - Nav2 action client 用 ReentrantCallbackGroup (决策 4), 在 worker 线程 spin_until_complete
+#   - Nav2 action callbacks 仅由主 executor 驱动；worker 只等 Condition
 # ROOM_ORCH_OK=False 时退化 (search_room 任务会标 failed "房间编排未启用"), 不影响阶段A/B。
 # ============================================================================
 ROOM_ORCH_OK = False
@@ -102,7 +165,7 @@ except Exception as _e:
 
 
 # ============================================================================
-# Product command parser (deterministic offline path; falls back to VLM/fallback)
+# Product command parser (deterministic offline path; VLM remains fail-closed)
 # ============================================================================
 PRODUCT_COMMAND_OK = False
 _PRODUCT_COMMAND_ERR = ""
@@ -281,6 +344,24 @@ def _wp_to_moves(waypoints, speed=0.3, ang_speed=0.5):
 # 订阅缓存用 threading.Lock 保护 (H2.2, 参考 nx_sensor_node.py:82 _lock 模式)。
 # ============================================================================
 class NxWebNode(Node):
+    @staticmethod
+    def _validate_localization_safety_parameters(timeout, max_tilt_deg):
+        """Reject values that could disable stale/tilt safety gates."""
+        try:
+            timeout = float(timeout)
+            max_tilt_deg = float(max_tilt_deg)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("localization safety parameters must be finite numbers") from exc
+        if not math.isfinite(timeout) or timeout <= 0.0 or timeout > 10.0:
+            raise ValueError("localization_timeout must be in (0, 10] seconds")
+        if (
+            not math.isfinite(max_tilt_deg)
+            or max_tilt_deg <= 0.0
+            or max_tilt_deg > 45.0
+        ):
+            raise ValueError("localization_max_tilt must be in (0, 45] degrees")
+        return timeout, max_tilt_deg
+
     def __init__(self):
         super().__init__('nx_web_node')
 
@@ -289,32 +370,83 @@ class NxWebNode(Node):
         self.declare_parameter('port', int(os.environ.get('GO2W_PORT', '8000')))
         self.declare_parameter('ws_port', int(os.environ.get('GO2W_WS_PORT', '8001')))
         self.declare_parameter('state_timeout', 3.0)
+        self.declare_parameter(
+            'localization_timeout',
+            float(os.environ.get('GO2W_LOCALIZATION_TIMEOUT', '1.0')),
+        )
+        self.declare_parameter(
+            'localization_max_tilt',
+            float(os.environ.get('GO2W_LOCALIZATION_MAX_TILT_DEG', '10.0')),
+        )
 
         self.host = self.get_parameter('host').get_parameter_value().string_value
         self.port = self.get_parameter('port').get_parameter_value().integer_value
         self.ws_port = self.get_parameter('ws_port').get_parameter_value().integer_value
         self.state_timeout = self.get_parameter('state_timeout').get_parameter_value().double_value
+        localization_timeout = self.get_parameter(
+            'localization_timeout').get_parameter_value().double_value
+        localization_max_tilt_deg = self.get_parameter(
+            'localization_max_tilt').get_parameter_value().double_value
+        self.localization_timeout, localization_max_tilt_deg = (
+            self._validate_localization_safety_parameters(
+                localization_timeout, localization_max_tilt_deg
+            )
+        )
+        self.localization_max_tilt = math.radians(localization_max_tilt_deg)
+        self.observation_sync = ObservationSynchronizer(max_samples=240)
 
         # ---- 发布器 (本机 → nx_motion_node 订阅) ----
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.cmd_vel_nav_pub = self.create_publisher(Twist, '/cmd_vel_nav', 10)
         self.cmd_pose_pub = self.create_publisher(String, '/cmd_pose', 10)
+        self.motion_session_pub = self.create_publisher(String, '/motion_session', 10)
 
         # ---- 订阅器 (本机 ← nx_motion_node / nx_sensor_node 发布) ----
-        # QoS 说明: nx_sensor_node.py:104-107 的 /imu /scan /odom 发布端用的是
+        # QoS 说明: nx_sensor_node.py 的 /imu /scan 发布端与 map_odom_fuser 的
+        # /localization_pose 发布端都使用默认 RELIABLE QoS (depth=10)。
         # 默认 RELIABLE QoS (depth=10), 不是 qos_profile_sensor_data。ROS2 QoS 兼容性:
         # REL 发布 + BE 订阅 = 不兼容 (订阅收不到任何数据)。为能收到 nx_sensor_node 的数据,
-        # /imu /scan /odom 这里都用 depth=10 的默认 RELIABLE, 与发布端匹配。
+        # /imu /scan /localization_pose 这里都用 depth=10 的默认 RELIABLE, 与发布端匹配。
         # /dog_state 由 nx_motion_node 发布 (RELIABLE depth=10)。
         # (spec H2.4 字面写 sensor_data, 但与真实发布端冲突 → 以"能收到数据"为准, 见本注释)
-        self.create_subscription(String, '/dog_state', self._on_dog_state, 10)
-        self.create_subscription(Imu, '/imu', self._on_imu, 10)
-        self.create_subscription(LaserScan, '/scan', self._on_scan, 10)
-        self.create_subscription(Odometry, '/odom', self._on_odom, 10)
+        # Keep strong references.  rclpy entities can otherwise be garbage
+        # collected while their DDS endpoints remain visible, leaving Panel
+        # status permanently stale after a service restart.
+        self._dog_state_sub = self.create_subscription(
+            String, '/dog_state', self._on_dog_state, 10)
+        self._imu_sub = self.create_subscription(
+            Imu, '/livox/imu', self._on_imu, 10)
+        self._scan_sub = self.create_subscription(
+            LaserScan, '/scan_mid360', self._on_scan, 10)
+        self._pointcloud_sub = self.create_subscription(
+            PointCloud2, '/mid360/points_nav', self._on_pointcloud,
+            qos_profile_sensor_data)
+        self._localization_sub = self.create_subscription(
+            Odometry, '/localization_pose', self._on_localization_pose, 10)
 
         # ---- 订阅缓存 (Lock 保护, H2.2) ----
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._dog_state = "UNKNOWN"      # STOPPED/MOVING/STANDING/... (来自 /dog_state)
         self._dog_vx = self._dog_vy = self._dog_vyaw = 0.0
+        self._motion_sdk_ready = False
+        self._motion_nav_scan_fresh = False
+        self._motion_nav_guard_reason = None
+        self._motion_battery_soc = None
+        self._motion_drive_fault = None
+        self._motion_sport_mode = None
+        self._motion_wheel_dq = None
+        self._motion_wheel_activation_phase = "unknown"
+        self._motion_drive_session = "startup"
+        self._motion_drive_session_owner = None
+        self._motion_drive_session_phase = "startup"
+        self._motion_drive_session_reason = "waiting_for_feedback"
+        self._motion_release_id = None
+        self._motion_schema_version = 0
+        self._motion_physical_mode = "unknown"
+        self._motion_actual_motion = "unknown"
+        self._motion_velocity_authorized = False
+        self._motion_service = None
+        self.motion_min_battery_soc = 20.0
         self._imu_yaw = 0.0
         self._imu_count = 0
         self._scan_count = 0
@@ -324,25 +456,102 @@ class NxWebNode(Node):
         self._scan_range_min = 0.0
         self._scan_range_max = 0.0
         self._scan_timestamp = 0.0
-        self._odom_x = 0.0
-        self._odom_y = 0.0
-        self._odom_count = 0
-        self._odom_t = 0.0
+        self._pointcloud_msg = None
+        self._pointcloud_timestamp = 0.0
+        self._pointcloud_count = 0
+        self._map_x = 0.0
+        self._map_y = 0.0
+        self._map_z = 0.0
+        self._map_yaw = 0.0
+        self._localization_count = 0
+        self._localization_received_monotonic = None
+        self._localization_frame_id = ""
+        self._localization_child_frame_id = ""
+        self._localization_stamp = {"sec": 0, "nanosec": 0}
+        self._localization_valid = False
+        self._localization_reason = "not_received"
         self._last_state_t = 0.0         # 最近一次 /dog_state 时间 (判 connected)
 
         self.get_logger().info(
-            f"NxWebNode 就绪: 发 /cmd_vel /cmd_pose, 订阅 /dog_state /imu /scan /odom")
+            "NxWebNode 就绪: 发 /cmd_vel /cmd_pose, "
+            "订阅 /dog_state /livox/imu /scan_mid360 "
+            "/mid360/points_nav /localization_pose")
 
     # ---- ROS2 回调 (在 spin 线程内执行) ----
     def _on_dog_state(self, msg: String):
-        """nx_motion_node 发布的 JSON: {state, vx, vy, vyaw}。"""
+        """Cache motion state and its explicit SDK/scan readiness gates."""
         try:
             d = json.loads(msg.data)
             with self._lock:
+                self._motion_schema_version = int(d.get('schema_version', 0))
+                canonical_session = str(d.get('session', d.get(
+                    'drive_session', 'boot_hold')))
+                self._motion_physical_mode = str(
+                    d.get('physical_mode', 'unknown'))
+                self._motion_actual_motion = str(
+                    d.get('actual_motion', 'unknown'))
+                self._motion_velocity_authorized = (
+                    d.get('velocity_authorized') is True)
+                motion_service = d.get('motion_service')
+                self._motion_service = (
+                    str(motion_service) if motion_service else None)
+                raw = d.get('raw', {})
+                if not isinstance(raw, dict):
+                    raw = {}
                 self._dog_state = d.get('state', 'UNKNOWN')
                 self._dog_vx = float(d.get('vx', 0.0))
                 self._dog_vy = float(d.get('vy', 0.0))
                 self._dog_vyaw = float(d.get('vyaw', 0.0))
+                self._motion_sdk_ready = (
+                    self._motion_service == 'ai-w'
+                    if self._motion_schema_version >= 4
+                    else d.get('sdk_ready') is True)
+                self._motion_nav_scan_fresh = d.get('nav_scan_fresh') is True
+                nav_guard_reason = d.get('nav_guard_reason')
+                self._motion_nav_guard_reason = (
+                    str(nav_guard_reason) if nav_guard_reason else None)
+                battery_soc = d.get('battery_soc')
+                try:
+                    battery_soc = float(battery_soc)
+                except (TypeError, ValueError, OverflowError):
+                    battery_soc = None
+                self._motion_battery_soc = (
+                    battery_soc if battery_soc is not None
+                    and math.isfinite(battery_soc) and 0.0 <= battery_soc <= 100.0
+                    else None)
+                self._motion_drive_fault = d.get('drive_fault')
+                sport_mode = raw.get('sport_mode', d.get('sport_mode'))
+                try:
+                    sport_mode = int(sport_mode)
+                except (TypeError, ValueError, OverflowError):
+                    sport_mode = None
+                self._motion_sport_mode = (
+                    sport_mode if sport_mode is not None
+                    and 0 <= sport_mode <= 255 else None)
+                wheel_dq = d.get('wheel_dq')
+                try:
+                    wheel_dq = [float(value) for value in wheel_dq]
+                except (TypeError, ValueError, OverflowError):
+                    wheel_dq = None
+                self._motion_wheel_dq = (
+                    wheel_dq if wheel_dq is not None and len(wheel_dq) == 4
+                    and all(math.isfinite(value) for value in wheel_dq)
+                    else None)
+                self._motion_wheel_activation_phase = str(
+                    d.get('wheel_activation_phase', 'unknown'))
+                self._motion_drive_session = canonical_session
+                owner = d.get('owner', d.get('drive_session_owner'))
+                self._motion_drive_session_owner = (
+                    str(owner) if owner in ('manual', 'nav', 'startup', 'safety')
+                    else None)
+                self._motion_drive_session_phase = str(
+                    d.get('drive_session_phase', self._motion_drive_session))
+                self._motion_drive_session_reason = str(
+                    d.get('drive_session_reason', 'unknown'))
+                motion_release_id = d.get('release_id')
+                self._motion_release_id = (
+                    str(motion_release_id).strip()[:64]
+                    if motion_release_id else None)
                 self._last_state_t = time.time()
         except Exception as e:
             self.get_logger().warning(f"/dog_state 解析失败: {e}")
@@ -360,21 +569,163 @@ class NxWebNode(Node):
             self._imu_count += 1
 
     def _on_scan(self, msg: LaserScan):
+        stamp = self._message_stamp_seconds(msg)
+        scan_snapshot = {
+            "angle_min": float(msg.angle_min),
+            "angle_increment": float(msg.angle_increment),
+            "range_min": float(msg.range_min),
+            "range_max": float(msg.range_max),
+            "ranges": [float(r) for r in msg.ranges],
+            "timestamp": stamp,
+        }
         with self._lock:
-            self._scan_ranges = [round(float(r), 3) for r in msg.ranges]
-            self._scan_angle_min = float(msg.angle_min)
-            self._scan_angle_increment = float(msg.angle_increment)
-            self._scan_range_min = float(msg.range_min)
-            self._scan_range_max = float(msg.range_max)
-            self._scan_timestamp = time.time()
+            self._scan_ranges = [round(r, 3) for r in scan_snapshot["ranges"]]
+            self._scan_angle_min = scan_snapshot["angle_min"]
+            self._scan_angle_increment = scan_snapshot["angle_increment"]
+            self._scan_range_min = scan_snapshot["range_min"]
+            self._scan_range_max = scan_snapshot["range_max"]
+            self._scan_timestamp = stamp or time.time()
             self._scan_count += 1
+        synchronizer = getattr(self, "observation_sync", None)
+        if stamp is not None and synchronizer is not None:
+            synchronizer.add_scan(stamp=stamp, scan=scan_snapshot)
 
-    def _on_odom(self, msg: Odometry):
+    def _on_pointcloud(self, msg: PointCloud2):
+        # Retain the ROS message and decode only when a person observation
+        # needs height evidence.  This keeps the 10 Hz callback inexpensive.
+        stamp = self._message_stamp_seconds(msg)
         with self._lock:
-            self._odom_x = float(msg.pose.pose.position.x)
-            self._odom_y = float(msg.pose.pose.position.y)
-            self._odom_t = time.time()
-            self._odom_count += 1
+            self._pointcloud_msg = msg
+            self._pointcloud_timestamp = stamp or time.time()
+            self._pointcloud_count += 1
+        synchronizer = getattr(self, "observation_sync", None)
+        if stamp is not None and synchronizer is not None:
+            synchronizer.add_cloud(stamp=stamp, cloud=msg)
+
+    @staticmethod
+    def _message_stamp_seconds(msg):
+        try:
+            stamp = msg.header.stamp
+            value = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        return value if math.isfinite(value) and value > 0.0 else None
+
+    def _mark_localization_invalid(self, msg, reason):
+        header = getattr(msg, "header", None)
+        stamp = getattr(header, "stamp", None)
+        with self._lock:
+            self._localization_count += 1
+            self._localization_received_monotonic = time.monotonic()
+            self._localization_frame_id = str(getattr(header, "frame_id", ""))
+            self._localization_child_frame_id = str(getattr(msg, "child_frame_id", ""))
+            self._localization_stamp = {
+                "sec": int(getattr(stamp, "sec", 0)),
+                "nanosec": int(getattr(stamp, "nanosec", 0)),
+            }
+            self._localization_valid = False
+            self._localization_reason = str(reason)
+
+    def _on_localization_pose(self, msg: Odometry):
+        """Cache only a finite, horizontal map -> base_link localization pose."""
+        header = getattr(msg, "header", None)
+        source_stamp = self._message_stamp_seconds(msg)
+        frame_id = str(header.frame_id) if header is not None else ""
+        child_frame_id = str(getattr(msg, "child_frame_id", ""))
+        if frame_id != "map":
+            self._mark_localization_invalid(msg, "invalid_frame")
+            return
+        if child_frame_id != "base_link":
+            self._mark_localization_invalid(msg, "invalid_child_frame")
+            return
+
+        try:
+            pose = msg.pose.pose
+            p = pose.position
+            q = pose.orientation
+            values = tuple(float(value) for value in (
+                p.x, p.y, p.z, q.x, q.y, q.z, q.w,
+            ))
+        except (AttributeError, TypeError, ValueError):
+            self._mark_localization_invalid(msg, "nonfinite_pose")
+            return
+        if not all(math.isfinite(value) for value in values):
+            self._mark_localization_invalid(msg, "nonfinite_pose")
+            return
+
+        x, y, z, qx, qy, qz, qw = values
+        norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+        if not math.isfinite(norm) or norm <= 1e-12:
+            self._mark_localization_invalid(msg, "invalid_quaternion")
+            return
+        qx, qy, qz, qw = (component / norm for component in (qx, qy, qz, qw))
+
+        roll = math.atan2(
+            2.0 * (qw * qx + qy * qz),
+            1.0 - 2.0 * (qx * qx + qy * qy),
+        )
+        pitch_sine = max(-1.0, min(1.0, 2.0 * (qw * qy - qz * qx)))
+        pitch = math.asin(pitch_sine)
+        yaw = math.atan2(
+            2.0 * (qw * qz + qx * qy),
+            1.0 - 2.0 * (qy * qy + qz * qz),
+        )
+        if abs(roll) > self.localization_max_tilt or abs(pitch) > self.localization_max_tilt:
+            self._mark_localization_invalid(msg, "excessive_tilt")
+            return
+
+        stamp = getattr(header, "stamp", None)
+        with self._lock:
+            self._map_x = x
+            self._map_y = y
+            self._map_z = z
+            self._map_yaw = yaw
+            self._localization_count += 1
+            self._localization_received_monotonic = time.monotonic()
+            self._localization_frame_id = frame_id
+            self._localization_child_frame_id = child_frame_id
+            self._localization_stamp = {
+                "sec": int(getattr(stamp, "sec", 0)),
+                "nanosec": int(getattr(stamp, "nanosec", 0)),
+            }
+            self._localization_valid = True
+            self._localization_reason = "ok"
+        synchronizer = getattr(self, "observation_sync", None)
+        if source_stamp is not None and synchronizer is not None:
+            synchronizer.add_pose(
+                stamp=source_stamp, x=x, y=y, yaw=yaw)
+
+    def get_localization_health(self):
+        """Return a thread-safe map-localization snapshot and reception age."""
+        with self._lock:
+            received = self._localization_received_monotonic
+            valid = bool(self._localization_valid)
+            reason = str(self._localization_reason)
+            snapshot = {
+                "frame_id": self._localization_frame_id,
+                "child_frame_id": self._localization_child_frame_id,
+                "stamp": dict(self._localization_stamp),
+                "x": self._map_x,
+                "y": self._map_y,
+                "z": float(getattr(self, "_map_z", 0.0)),
+                "yaw": self._map_yaw,
+                "count": self._localization_count,
+            }
+        age_sec = None if received is None else time.monotonic() - received
+        if valid and (age_sec is None or not math.isfinite(age_sec) or age_sec < 0.0):
+            valid = False
+            reason = "invalid_reception_age"
+        elif valid and age_sec > self.localization_timeout:
+            valid = False
+            reason = "stale"
+        snapshot.update({
+            "healthy": valid,
+            "reason": reason,
+            "age_sec": age_sec,
+            "timeout_sec": self.localization_timeout,
+            "max_tilt_deg": math.degrees(self.localization_max_tilt),
+        })
+        return snapshot
 
     # ---- 发布 (HTTP handler 线程调用; rclpy publisher.publish 线程安全) ----
     def publish_cmd_vel(self, vx, vy, vyaw):
@@ -392,6 +743,17 @@ class NxWebNode(Node):
         except Exception as e:
             logger.warning(f"publish /cmd_vel 失败: {e}")
 
+    def publish_nav_cmd_vel(self, vx, vy, vyaw):
+        """Publish obstacle-gated autonomous velocity to the Nav2 channel."""
+        try:
+            tw = Twist()
+            tw.linear.x = float(vx)
+            tw.linear.y = float(vy)
+            tw.angular.z = float(vyaw)
+            self.cmd_vel_nav_pub.publish(tw)
+        except Exception as e:
+            logger.warning(f"publish /cmd_vel_nav 失败: {e}")
+
     def publish_cmd_pose(self, cmd):
         """发布 /cmd_pose: data ∈ {'stand','sit','estop'} (nx_motion_node:126 接收)。"""
         try:
@@ -401,23 +763,188 @@ class NxWebNode(Node):
         except Exception as e:
             logger.warning(f"publish /cmd_pose 失败: {e}")
 
+    def publish_motion_session(self, intent, source="nx_web"):
+        try:
+            msg = String()
+            msg.data = build_motion_intent(intent, source=source)
+            self.motion_session_pub.publish(msg)
+        except Exception as e:
+            logger.warning(f"publish /motion_session 失败: {e}")
+
     # ---- 给 /api/status & NxRobotBridge 取缓存 ----
     def get_status_snapshot(self):
+        localization = self.get_localization_health()
+        navigation = self.get_navigation_readiness()
         with self._lock:
             now = time.time()
             connected = (now - self._last_state_t) < self.state_timeout
             return {
+                "release_id": RELEASE_ID,
+                "motion_release_id": self._motion_release_id,
+                "release_consistent": (
+                    self._motion_release_id == RELEASE_ID
+                    if self._motion_release_id is not None else False),
                 "connected": connected,
                 "imu_yaw": round(self._imu_yaw, 3),
                 "dog_state": self._dog_state,
                 "stats": {
                     "imu_count": self._imu_count,
                     "scan_count": self._scan_count,
-                    "odom_count": self._odom_count,
+                    "odom_count": self._localization_count,
+                    "localization_count": self._localization_count,
                     "robot_mode": 0,
                     "robot_velocity": [self._dog_vx, self._dog_vy, self._dog_vyaw],
                 },
+                "localization": localization,
+                "navigation": navigation,
             }
+
+    def get_navigation_readiness(self):
+        """Separate parked-goal admission from active Nav2 continuation."""
+        localization = self.get_localization_health()
+        localization_healthy = bool(localization.get("healthy"))
+        localization_reason = str(localization.get("reason", "unknown"))
+        localization_age_sec = localization.get("age_sec")
+        with self._lock:
+            state = str(self._dog_state)
+            sdk_ready = bool(self._motion_sdk_ready)
+            scan_fresh = bool(self._motion_nav_scan_fresh)
+            nav_guard_reason = getattr(
+                self, '_motion_nav_guard_reason', None)
+            battery_soc = getattr(self, '_motion_battery_soc', None)
+            drive_fault = getattr(self, '_motion_drive_fault', None)
+            sport_mode = getattr(self, '_motion_sport_mode', None)
+            wheel_dq = getattr(self, '_motion_wheel_dq', None)
+            wheel_activation_phase = getattr(
+                self, '_motion_wheel_activation_phase', 'unknown')
+            drive_session = str(getattr(
+                self, '_motion_drive_session', 'startup'))
+            drive_session_owner = getattr(
+                self, '_motion_drive_session_owner', None)
+            drive_session_phase = str(getattr(
+                self, '_motion_drive_session_phase', drive_session))
+            drive_session_reason = str(getattr(
+                self, '_motion_drive_session_reason', 'unknown'))
+            physical_mode = str(getattr(
+                self, '_motion_physical_mode', 'unknown'))
+            actual_motion = str(getattr(
+                self, '_motion_actual_motion', 'unknown'))
+            velocity_authorized = bool(getattr(
+                self, '_motion_velocity_authorized', False))
+            status_schema = int(getattr(
+                self, '_motion_schema_version', 0))
+            motion_release_id = getattr(self, '_motion_release_id', None)
+            minimum_soc = float(getattr(self, 'motion_min_battery_soc', 20.0))
+            age_sec = time.time() - self._last_state_t
+            fresh = math.isfinite(age_sec) and 0.0 <= age_sec < self.state_timeout
+        drivable_state = state in {"STOPPED", "MOVING"}
+        wheels_stopped = (
+            wheel_dq is not None and len(wheel_dq) == 4
+            and all(math.isfinite(float(value)) for value in wheel_dq)
+            and sum(abs(float(value)) for value in wheel_dq) / 4.0 < 0.15)
+        if status_schema < 4:
+            physical_mode = (
+                "joint_lock" if sport_mode == 6
+                else "wheel_balance" if sport_mode in {1, 3}
+                else "unknown")
+            actual_motion = "stopped" if wheels_stopped else "moving"
+            velocity_authorized = drive_session == "active"
+            if drive_session == "active":
+                drive_session = (
+                    "nav_active" if drive_session_owner == "nav"
+                    else "manual_active")
+        release_consistent = (
+            status_schema < 4 or motion_release_id == RELEASE_ID)
+        parked = (
+            drive_session == "parked"
+            and physical_mode == "joint_lock"
+            and actual_motion == "stopped"
+            and wheels_stopped)
+        drive_ready = (
+            drive_session in {"manual_active", "nav_active"}
+            and drive_session_owner in {"manual", "nav"}
+            and physical_mode in {"wheel_balance", "wheel_locomotion"}
+            and velocity_authorized
+            and drivable_state)
+        battery_ok = (
+            battery_soc is not None and math.isfinite(float(battery_soc))
+            and float(battery_soc) >= minimum_soc)
+        drive_ok = drive_fault is None
+        drive_fault_reset_available = (
+            state in {"STOPPED", "EMERGENCY"}
+            and drive_fault == "wheel_no_response"
+            and sdk_ready and sport_mode == 6
+            and wheel_dq is not None and len(wheel_dq) == 4
+            and all(math.isfinite(float(value)) for value in wheel_dq)
+            and sum(abs(float(value)) for value in wheel_dq) / 4.0 < 0.15
+            and battery_ok)
+        base_ready = (
+            fresh and sdk_ready and scan_fresh and battery_ok
+            and release_consistent and nav_guard_reason is None
+            and drive_ok and localization_healthy)
+        activatable = base_ready and (parked or drive_ready)
+        ready = (
+            base_ready and drive_ready
+            and drive_session == "nav_active"
+            and drive_session_owner == "nav")
+        if not fresh:
+            reason = "dog_state_stale"
+        elif not sdk_ready:
+            reason = "sdk_not_ready"
+        elif not release_consistent:
+            reason = "release_mismatch"
+        elif not scan_fresh:
+            reason = "nav_scan_stale"
+        elif nav_guard_reason is not None:
+            reason = str(nav_guard_reason)
+        elif not drive_ok:
+            reason = str(drive_fault)
+        elif not battery_ok:
+            reason = "battery_low"
+        elif not localization_healthy:
+            reason = f"localization_{localization_reason}"
+        elif ready:
+            reason = "ok"
+        elif parked:
+            reason = "drive_session_parked"
+        elif drive_session == "activating":
+            reason = "drive_session_activating"
+        elif drive_session in {"stopping", "parking"}:
+            reason = "drive_session_parking"
+        elif not drivable_state and drive_session in {"manual_active", "nav_active"}:
+            reason = "motion_state_not_drivable"
+        else:
+            reason = "drive_session_not_activatable"
+        return {
+            "ready": ready,
+            "activatable": activatable,
+            "drive_ready": drive_ready,
+            "reason": reason,
+            "state": state,
+            "sdk_ready": sdk_ready,
+            "nav_scan_fresh": scan_fresh,
+            "nav_guard_reason": nav_guard_reason,
+            "battery_soc": battery_soc,
+            "minimum_battery_soc": minimum_soc,
+            "drive_fault": drive_fault,
+            "drive_fault_reset_available": drive_fault_reset_available,
+            "sport_mode": sport_mode,
+            "wheel_dq": list(wheel_dq) if wheel_dq is not None else None,
+            "wheel_activation_phase": wheel_activation_phase,
+            "drive_session": drive_session,
+            "drive_session_owner": drive_session_owner,
+            "drive_session_phase": drive_session_phase,
+            "drive_session_reason": drive_session_reason,
+            "physical_mode": physical_mode,
+            "actual_motion": actual_motion,
+            "velocity_authorized": velocity_authorized,
+            "release_consistent": release_consistent,
+            "motion_release_id": motion_release_id,
+            "dog_state_age_sec": age_sec,
+            "localization_healthy": localization_healthy,
+            "localization_reason": localization_reason,
+            "localization_age_sec": localization_age_sec,
+        }
 
     def get_scan_snapshot(self):
         with self._lock:
@@ -433,6 +960,28 @@ class NxWebNode(Node):
                 "timestamp": timestamp,
                 "age_sec": age_sec,
             }
+
+    def get_pointcloud_snapshot(self):
+        with self._lock:
+            message = self._pointcloud_msg
+            timestamp = float(self._pointcloud_timestamp or 0.0)
+            count = int(self._pointcloud_count)
+        if message is None or timestamp <= 0.0:
+            return {
+                "frame_id": "",
+                "points": (),
+                "count": count,
+                "timestamp": timestamp,
+                "age_sec": None,
+            }
+        points = decode_pointcloud_xyz(message, max_points=50000)
+        return {
+            "frame_id": str(getattr(message.header, "frame_id", "")),
+            "points": points,
+            "count": count,
+            "timestamp": timestamp,
+            "age_sec": time.time() - timestamp,
+        }
 
 
 # ============================================================================
@@ -464,6 +1013,59 @@ class NxRobotBridge:
             return (time.time() - self._node._last_state_t) < self._node.state_timeout
 
     @property
+    def navigation_ready(self):
+        """True only when motion SDK, scan watchdog, and state are all ready."""
+        return bool(self._node.get_navigation_readiness().get("ready"))
+
+    def start_drive_session(self, owner):
+        owner = str(owner).strip().lower()
+        if owner not in ("manual", "nav"):
+            return {"ok": False, "reason": "invalid_drive_session_owner"}
+        self._node.publish_motion_session(
+            f"start_{owner}", source="navigation_arbiter")
+        return {"ok": True, "phase": "activating", "owner": owner}
+
+    def wait_drive_ready(self, owner, timeout=5.0):
+        owner = str(owner).strip().lower()
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            readiness = self._node.get_navigation_readiness()
+            if (readiness.get("drive_ready") is True
+                    and readiness.get("drive_session_owner") == owner):
+                return {"ok": True, "phase": "active", "owner": owner}
+            if readiness.get("drive_fault"):
+                return {"ok": False, "reason": readiness["drive_fault"]}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return {
+                    "ok": False,
+                    "reason": "drive_session_activation_timeout",
+                    "navigation": readiness,
+                }
+            time.sleep(min(0.05, remaining))
+
+    def park_drive_session(self, reason="park"):
+        reason = str(reason or "park")
+        self.stop_move()
+        self._node.publish_motion_session("park", source="navigation_arbiter")
+        return {"ok": True, "phase": "parking", "reason": reason}
+
+    def wait_drive_parked(self, timeout=5.0):
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            readiness = self._node.get_navigation_readiness()
+            if readiness.get("drive_session") == "parked":
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            time.sleep(min(0.05, remaining))
+
+    def get_drive_session_state(self):
+        """Return cached physical feedback used for zero-speed handoff."""
+        return dict(self._node.get_navigation_readiness())
+
+    @property
     def imu_yaw(self):
         with self._node._lock:
             return self._node._imu_yaw
@@ -480,7 +1082,8 @@ class NxRobotBridge:
             return {
                 "imu_count": self._node._imu_count,
                 "scan_count": self._node._scan_count,
-                "odom_count": self._node._odom_count,
+                "odom_count": self._node._localization_count,
+                "localization_count": self._node._localization_count,
                 "robot_mode": 0,
                 "robot_velocity": [self._node._dog_vx, self._node._dog_vy, self._node._dog_vyaw],
             }
@@ -521,21 +1124,45 @@ class NxRobotBridge:
             self._vx = vx
             self._vy = vy
             self._vyaw = vyaw
-        self._node.publish_cmd_vel(vx, vy, vyaw)
+        if manual:
+            self._node.publish_cmd_vel(vx, vy, vyaw)
+        else:
+            self._node.publish_nav_cmd_vel(vx, vy, vyaw)
 
     def stop_move(self):
         with self._lock:
             self._vx = self._vy = self._vyaw = 0.0
         self._node.publish_cmd_vel(0.0, 0.0, 0.0)
+        self._node.publish_nav_cmd_vel(0.0, 0.0, 0.0)
 
     def stand(self):
         self._node.publish_cmd_pose('stand')
+
+    def confirm_stand(self):
+        """Record visual StandUp confirmation while velocity stays locked."""
+        self._node.publish_cmd_pose('confirm_stand')
+
+    def balance(self):
+        """Explicitly request the feedback-gated wheel-balance transition."""
+        self._node.publish_cmd_pose('balance')
+
+    def adopt_stand(self):
+        """Adopt an already-upright pose after a safe motion-service restart."""
+        self._node.publish_cmd_pose('adopt_stand')
+
+    def confirm_balance(self):
+        """Confirm a wheel mode that already existed before service startup."""
+        self._node.publish_cmd_pose('confirm_balance')
 
     def sit(self):
         self._node.publish_cmd_pose('sit')
 
     def e_stop(self):
         self._node.publish_cmd_pose('estop')
+
+    def reset_drive_fault(self):
+        """Request the motion node's guarded, zero-motion fault reset."""
+        self._node.publish_cmd_pose('reset_drive_fault')
 
     def stop(self):
         """Compatibility for ai.tracker.TargetTracker.stop()."""
@@ -605,25 +1232,46 @@ class TaskManager:
                 logger.warning(f"TargetTracker 初始化失败, follow 将不可用: {e}")
         # 阶段E: 房间级搜索编排注入 (spec §7.2.2); None 时 search_room 任务标 failed
         self.room_orchestrator = room_orchestrator
+        self._navigation_arbiter = None
 
-    def add(self, task):
+    def set_navigation_arbiter(self, arbiter):
+        self._navigation_arbiter = arbiter
+
+    def _notify_navigation_drained(self):
+        if self._navigation_arbiter is None:
+            return
         with self._lock:
-            self._tasks.append(task)
-        ws_broadcast({"type": "tasks", "data": self.get_state()})
+            drained = self._active is None and not any(
+                task.status == "pending" for task in self._tasks)
+        if drained:
+            self._navigation_arbiter.on_tasks_drained()
 
-    def add_list(self, tasks):
+    def add(self, task, reason=None):
+        if self._navigation_arbiter is not None:
+            return self._navigation_arbiter.start_tasks(
+                [task], reason=reason or task.type)
+        return self._add_list_unchecked([task])
+
+    def add_list(self, tasks, reason=None):
+        task_list = list(tasks)
+        if self._navigation_arbiter is not None:
+            inferred = reason or (task_list[0].type if task_list else "task_command")
+            return self._navigation_arbiter.start_tasks(task_list, reason=inferred)
+        return self._add_list_unchecked(task_list)
+
+    def _add_list_unchecked(self, tasks):
         with self._lock:
             for i, t in enumerate(tasks):
                 if t.priority == 5:
                     t.priority = max(1, 8 - i)
                 self._tasks.append(t)
         ws_broadcast({"type": "tasks", "data": self.get_state()})
+        return {"ok": True, "count": len(tasks)}
 
     def cancel_all(self):
         with self._lock:
             if self._active:
                 self._active.status = "cancelled"
-            self._active = None
             self._tasks.clear()
         self.robot.stop_move()
         if self._tracker and self._follow_active:
@@ -638,6 +1286,29 @@ class TaskManager:
                 logger.warning(f"room_orchestrator.cancel 异常: {_e}")
         ws_broadcast({"type": "tasks", "data": self.get_state()})
 
+    def wait_drained(self, timeout):
+        """Bounded wait for worker exit and room action terminal ownership."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            with self._lock:
+                local_drained = self._active is None and not any(
+                    task.status == "pending" for task in self._tasks)
+            room_drained = True
+            room = self.room_orchestrator
+            if room is not None:
+                waiter = getattr(room, "wait_drained", None)
+                if callable(waiter):
+                    try:
+                        room_drained = bool(waiter(0.0))
+                    except Exception:
+                        room_drained = False
+            if local_drained and room_drained:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            time.sleep(min(0.02, remaining))
+
     def get_state(self):
         with self._lock:
             return {"active": self._active.to_dict() if self._active else None,
@@ -647,21 +1318,88 @@ class TaskManager:
     def process_command(self, text):
         threading.Thread(target=self._process_command_bg, args=(text,), daemon=True).start()
 
+    def submit_command(self, text):
+        """Synchronously admit deterministic product commands.
+
+        The voice client must not report success before the navigation arbiter
+        has accepted a room-search task.  Commands that require the VLM keep
+        the existing asynchronous path because model inference can block.
+        """
+        result = self._parse_product_command(text)
+        if result is None:
+            self.process_command(text)
+            return {
+                "ok": True,
+                "accepted": None,
+                "queued": True,
+                "parser": "async",
+                "text": text,
+            }
+        return self._admit_command_result(text, result, parser="product")
+
     def _process_command_bg(self, text):
         try:
             result = self._parse_product_command(text)
             if result is None:
                 result = self._vlm_parse_command(text) if (self.vlm and getattr(self.vlm, 'loaded', False)) \
-                    else self._fallback_parse(text)
-            response = result.get("response", "")
-            tasks = result.get("tasks", [])
-            logger.info(f"指令解析: '{text}' → response='{response}' tasks={len(tasks)}")
-            ws_broadcast({"type": "vlm", "data": {"text": text, "response": response, "tasks": tasks}})
-            if tasks:
-                self.add_list([Task(t.get("type", "move"), t.get("params", {}), t.get("priority", 5)) for t in tasks])
+                    else {
+                        "response": "无法解析为受支持的搜索任务",
+                        "tasks": [],
+                        "parse_error": "deterministic_parser_no_match",
+                    }
+            self._admit_command_result(text, result, parser="async")
         except Exception as e:
             logger.error(f"指令处理失败: {e}")
             traceback.print_exc()
+
+    def _admit_command_result(self, text, result, *, parser):
+        response = result.get("response", "")
+        tasks = result.get("tasks", [])
+        invalid_reason = None
+        if tasks:
+            try:
+                tasks = canonicalize_search_tasks(tasks)
+            except MissionValidationError as exc:
+                logger.warning("拒绝非规范搜索任务: %s", exc)
+                response = "搜索任务格式无效"
+                tasks = []
+                invalid_reason = "invalid_search_mission"
+        logger.info(f"指令解析: '{text}' → response='{response}' tasks={len(tasks)}")
+        ws_broadcast({
+            "type": "vlm",
+            "data": {"text": text, "response": response, "tasks": tasks},
+        })
+        payload = {
+            "ok": False,
+            "accepted": False,
+            "parser": parser,
+            "text": text,
+            "response": response,
+            "tasks": tasks,
+        }
+        if not tasks:
+            payload["reason"] = invalid_reason or "no_tasks"
+            return payload
+
+        admission = self.add_list(
+            [Task(t["type"], t["params"], t["priority"]) for t in tasks],
+            reason="task_command",
+        )
+        if not isinstance(admission, dict):
+            admission = {"ok": bool(admission)}
+        accepted = bool(admission.get("ok"))
+        payload.update({
+            "ok": accepted,
+            "accepted": accepted,
+            "admission": admission,
+        })
+        if not accepted:
+            payload["reason"] = admission.get("reason", "admission_failed")
+            logger.warning("指令任务因导航仲裁失败未启动: %s", admission)
+            ws_broadcast({"type": "tasks", "data": {
+                "admission_failed": admission,
+            }})
+        return payload
 
     def _parse_product_command(self, text):
         if parse_product_command is None:
@@ -683,6 +1421,7 @@ class TaskManager:
             isinstance(t, dict)
             and isinstance(t.get("params"), dict)
             and t["params"].get("room") == "__current__"
+            and t["params"].get("search_strategy") != "frontier_explore"
             for t in tasks
         )
         if not needs_current_room:
@@ -716,25 +1455,31 @@ class TaskManager:
             node_obj = getattr(self.robot, "_node", None)
             if node_obj is None:
                 return None
+            health_getter = getattr(node_obj, "get_localization_health", None)
+            if callable(health_getter):
+                health = health_getter()
+                if not health.get("healthy"):
+                    return None
+                return float(health["x"]), float(health["y"])
+
+            # Compatibility for injected non-ROS adapters. Production
+            # NxWebNode always supplies get_localization_health() above.
             lock = getattr(node_obj, "_lock", threading.Lock())
             with lock:
-                if int(getattr(node_obj, "_odom_count", 0)) <= 0:
-                    return None
-                odom_t = float(getattr(node_obj, "_odom_t", 0.0) or 0.0)
-                x = float(getattr(node_obj, "_odom_x"))
-                y = float(getattr(node_obj, "_odom_y"))
-            if not all(math.isfinite(value) for value in (x, y, odom_t)):
-                return None
-            if odom_t <= 0.0:
+                count = int(getattr(node_obj, "_odom_count", 0) or 0)
+                received = float(getattr(node_obj, "_odom_t", 0.0) or 0.0)
+                x = float(getattr(node_obj, "_odom_x", 0.0))
+                y = float(getattr(node_obj, "_odom_y", 0.0))
+            if count <= 0 or not all(math.isfinite(v) for v in (x, y, received)):
                 return None
             try:
-                max_age_sec = float(os.environ.get("GO2W_ODOM_MAX_AGE_SEC", "2.0"))
+                max_age = float(os.environ.get("GO2W_ODOM_MAX_AGE_SEC", "2.0"))
             except (TypeError, ValueError):
-                max_age_sec = 2.0
-            if not math.isfinite(max_age_sec) or max_age_sec <= 0.0:
-                max_age_sec = 2.0
-            age_sec = time.time() - odom_t
-            if not math.isfinite(age_sec) or age_sec < 0.0 or age_sec > max_age_sec:
+                max_age = 2.0
+            if not math.isfinite(max_age) or max_age <= 0.0:
+                max_age = 2.0
+            age = time.time() - received
+            if received <= 0.0 or not math.isfinite(age) or age < 0.0 or age > max_age:
                 return None
             return x, y
         except Exception:
@@ -753,35 +1498,23 @@ class TaskManager:
 
     def _vlm_parse_command(self, text):
         # 阶段B: 真接 VLM (vlm 是 NxAiVlmProxy 时, chat 同步阻塞后台线程等队列结果)。
-        # panel.py:472-518 等价: sys_prompt + chat + JSON 解析 + 失败 fallback。
+        # sys_prompt + chat + JSON 解析；失败时返回空任务。
         # 阶段A 时 self.vlm=None, 走不到这里 (上层 _process_command_bg 先判 vlm.loaded)。
-        sys_prompt = """你是机器狗指令解析器。把用户中文指令转成JSON任务列表。
+        sys_prompt = """你是机器狗搜索任务解析器。只把用户的搜索指令转换成一个 JSON 任务。
 
-任务类型和参数:
-- move: {"vx":前进速度m/s, "vy":侧移, "vyaw":旋转(正=左转), "duration":秒}
-- follow: {"target":"目标"}
-- search_area: {"pattern":"lawnmower", "width":米, "height":米}
-- search_room: {"room":"房间名或__current__(当前房间)", "target_classes":["person"], "require_photos":true, "mark_on_map":true} — 进房间搜索 + 拍照 + 地图标注
-- stop: {}
-- return_home: {}
+唯一允许的任务类型和参数:
+- search_room: {"room":"房间名或__current__(当前房间)", "target_classes":["person"], "require_photos":true, "mark_on_map":true}
+
+target_classes 是需要搜索和地图标注的英文视觉类别数组，例如 person、table、chair；不要替用户改写类别。
 
 示例:
-输入"前进两米然后左转"
-输出: {"tasks":[{"type":"move","priority":8,"params":{"vx":0.5,"duration":4.0}},{"type":"move","priority":7,"params":{"vyaw":0.5,"duration":3.0}}]}
-
 输入"搜索这个房间标注所有人"
 输出: {"tasks":[{"type":"search_room","priority":8,"params":{"room":"__current__","target_classes":["person"],"require_photos":true,"mark_on_map":true}}]}
 
-输入"去客厅找所有人"
-输出: {"tasks":[{"type":"search_room","priority":8,"params":{"room":"客厅","target_classes":["person"]}}]}
+输入"去客厅找桌子并标在地图上"
+输出: {"tasks":[{"type":"search_room","priority":8,"params":{"room":"客厅","target_classes":["table"],"require_photos":true,"mark_on_map":true}}]}
 
-输入"跟着前面的人"
-输出: {"tasks":[{"type":"follow","priority":8,"params":{"target":"前面的人"}}]}
-
-输入"后退"
-输出: {"tasks":[{"type":"move","priority":6,"params":{"vx":-0.5,"duration":2.0}}]}
-
-只输出JSON, 不要解释, 不要markdown代码块。注意: 后退要用vx负数, 不是vyaw!"""
+无法解析为搜索任务时输出 {"tasks":[]}。只输出 JSON，不要解释，不要 markdown 代码块。"""
         try:
             response = self.vlm.chat([
                 {"role": "system", "content": sys_prompt},
@@ -789,7 +1522,11 @@ class TaskManager:
             ], max_new_tokens=512)
         except Exception as e:
             logger.warning(f"VLM chat 异常: {e}")
-            return self._fallback_parse(text)
+            return {
+                "response": "搜索任务解析失败",
+                "tasks": [],
+                "parse_error": "vlm_unavailable",
+            }
         import re as _re, json as _json
         logger.info(f"VLM 原始响应: {str(response)[:200]}")
         try:
@@ -806,84 +1543,17 @@ class TaskManager:
                         if depth == 0: end = i + 1; break
                 data = _json.loads(clean[start:end])
                 if "tasks" in data:
-                    data.setdefault("response", "已解析")
-                    return data
+                    return {
+                        "response": str(data.get("response") or "已解析搜索任务"),
+                        "tasks": canonicalize_search_tasks(data.get("tasks")),
+                    }
         except Exception as e:
             logger.warning(f"VLM JSON 解析失败: {e}")
-        return self._fallback_parse(text)
-
-    @staticmethod
-    def _extract_room_name(text):
-        """阶段E (spec §7.2.4): 从中文指令提取房间名。
-        扫描注入的 room_orchestrator 的房间地图 (name + aliases), 用 RoomMap.find 匹配。
-        匹配不到 → None (调用方退化阶段A 矩形搜索)。
-        room_orchestrator 未注入/房间地图未加载 → None (不破坏现有行为)。
-        """
-        try:
-            orch_obj = getattr(TaskManager, "_global_room_orchestrator", None)
-            if orch_obj is None:
-                return None
-            # 用 RoomMap.find 走完整 4 级匹配 (name>aliases 完全相等>子串)
-            import nx_room_orchestrator as _orch
-            # 优先用已加载的 _room_map (避免每次解析都 IO)
-            rm = getattr(orch_obj, "_room_map", None)
-            if rm is None:
-                rooms_detail = orch_obj.list_rooms_detail()
-                if not rooms_detail:
-                    return None
-                # 临时构造 RoomMap (path 不重要)
-                import os as _os
-                yaml_path = getattr(orch_obj, "_rooms_yaml",
-                                    _os.path.join(_WEB_DIR, "..", "config", "rooms.yaml"))
-                rm = _orch.RoomMap.load(yaml_path)
-            room = rm.find(text)
-            return room.name if room is not None else None
-        except Exception:
-            return None
-
-    @staticmethod
-    def _fallback_parse(text):
-        r = {"understanding": text, "tasks": [], "response": ""}
-        if "跟着" in text or "跟随" in text or "跟上" in text:
-            target = ""
-            for kw in ["跟着", "跟随", "跟上"]:
-                if kw in text:
-                    target = text[text.index(kw) + len(kw):].strip().rstrip("。，！？")
-            r["tasks"] = [{"type": "follow", "priority": 8, "params": {"target": target}}]
-            r["response"] = f"跟踪{target}"
-        elif "搜索" in text or "找" in text:
-            # 阶段E (spec §7.2.4): 尝试从指令提取房间名 (扫 rooms.yaml 的 name/aliases)
-            room = TaskManager._extract_room_name(text)
-            if room:
-                r["tasks"] = [{"type": "search_room", "priority": 7,
-                               "params": {"room": room}}]
-                r["response"] = f"搜索{room}"
-            else:
-                # 无房间名 → 退化阶段A 矩形覆盖搜索 (现有行为不破坏)
-                r["tasks"] = [{"type": "search_area", "priority": 5,
-                               "params": {"pattern": "lawnmower", "width": 10, "height": 10}}]
-                r["response"] = "开始搜索"
-        elif "停" in text:
-            r["tasks"] = [{"type": "stop", "priority": 10, "params": {}}]
-            r["response"] = "已停止"
-        elif "回来" in text or "返回" in text:
-            r["tasks"] = [{"type": "return_home", "priority": 7, "params": {}}]
-            r["response"] = "返回"
-        elif "前进" in text or "向前" in text:
-            r["tasks"] = [{"type": "move", "priority": 6, "params": {"vx": 0.5, "duration": 2.0}}]
-            r["response"] = "前进"
-        elif "后退" in text or "向后" in text:
-            r["tasks"] = [{"type": "move", "priority": 6, "params": {"vx": -0.5, "duration": 2.0}}]
-            r["response"] = "后退"
-        elif "左转" in text:
-            r["tasks"] = [{"type": "move", "priority": 6, "params": {"vyaw": 0.5, "duration": 2.0}}]
-            r["response"] = "左转"
-        elif "右转" in text:
-            r["tasks"] = [{"type": "move", "priority": 6, "params": {"vyaw": -0.5, "duration": 2.0}}]
-            r["response"] = "右转"
-        else:
-            r["response"] = f"收到: {text}"
-        return r
+        return {
+            "response": "搜索任务解析失败",
+            "tasks": [],
+            "parse_error": "invalid_vlm_mission",
+        }
 
     def start_worker(self):
         self._running = True
@@ -903,6 +1573,14 @@ class TaskManager:
             if task is None:
                 time.sleep(0.1)
                 continue
+            if task.status == "cancelled":
+                with self._lock:
+                    self._tasks = [t for t in self._tasks if t.id != task.id]
+                    if self._active is task:
+                        self._active = None
+                ws_broadcast({"type": "tasks", "data": self.get_state()})
+                self._notify_navigation_drained()
+                continue
             ws_broadcast({"type": "tasks", "data": self.get_state()})
             try:
                 p = task.params
@@ -918,7 +1596,8 @@ class TaskManager:
                         self.robot.move(vx, vy, vyaw)
                         time.sleep(0.1)
                     self.robot.stop_move()
-                    task.status = "completed"
+                    if task.status != "cancelled":
+                        task.status = "completed"
                 elif task.type == "stop":
                     self.robot.stop_move()
                     self.cancel_all()
@@ -954,8 +1633,10 @@ class TaskManager:
                 task.result = str(e)
             with self._lock:
                 self._tasks = [t for t in self._tasks if t.id != task.id]
-                self._active = None
+                if self._active is task:
+                    self._active = None
             ws_broadcast({"type": "tasks", "data": self.get_state()})
+            self._notify_navigation_drained()
 
     def _execute_follow(self, task):
         target = task.params.get("target", "")
@@ -1004,6 +1685,9 @@ class TaskManager:
             logger.info(f"搜索 {i + 1}/{len(move_tasks)}: move(vx={vx},vyaw={vyaw},dur={duration})")
             end_time = time.time() + duration
             while time.time() < end_time:
+                if task.status == "cancelled":
+                    self.robot.stop_move()
+                    return
                 self.robot.move(vx, vy, vyaw)
                 # 阶段A 无 detector (传 None), 不做视觉检测 — 与 panel.py 一致的判断条件
                 if vx != 0 and self.detector:
@@ -1036,17 +1720,155 @@ class TaskManager:
 robot = None            # NxRobotBridge
 task_mgr = None         # TaskManager
 node = None             # NxWebNode
+point_nav = None        # OwnerNavigationPort
+navigation_gateway = None  # sole NavigateToPose owner
 room_orchestrator = None  # 阶段E: RoomSearchOrchestrator (main 注入)
+navigation_arbiter = None  # NavigationArbiter: process-wide autonomous owner
 
 
-def create_server(host, port, static_dir):
+def _perception_health(robot_bridge):
+    ai = getattr(robot_bridge, "_ai_engine", None) if robot_bridge else None
+    get_health = getattr(ai, "get_person_detection_health", None)
+    if not callable(get_health):
+        health = {
+            "healthy": False,
+            "reason": "ai_engine_unavailable",
+            "running": False,
+            "detector_initialized": False,
+            "detector_ready": False,
+            "detector_open_vocabulary": False,
+            "detector_model": "",
+            "frame_available": False,
+            "source": "",
+            "timestamp": 0.0,
+            "age_sec": None,
+            "frame_width": 0,
+            "frame_height": 0,
+            "detection_count": 0,
+            "person_count": 0,
+        }
+        health["map_annotation"] = resolve_camera_calibration("")
+        return health
+    try:
+        health = dict(get_health())
+        health["map_annotation"] = resolve_camera_calibration(
+            health.get("source"))
+        return health
+    except Exception as exc:
+        logger.warning(f"perception health snapshot failed: {exc}")
+        health = {
+            "healthy": False,
+            "reason": "perception_health_error",
+            "running": True,
+            "detector_initialized": False,
+            "detector_ready": False,
+            "detector_open_vocabulary": False,
+            "detector_model": "",
+            "frame_available": False,
+            "source": "",
+            "timestamp": 0.0,
+            "age_sec": None,
+            "frame_width": 0,
+            "frame_height": 0,
+            "detection_count": 0,
+            "person_count": 0,
+        }
+        health["map_annotation"] = resolve_camera_calibration("")
+        return health
+
+
+def _handle_point_nav_state(state):
+    ws_broadcast({"type": "nav_goal", "data": state}, force=True)
+    if navigation_arbiter is not None:
+        navigation_arbiter.on_point_state(state)
+
+
+def _point_navigation_health(nx_node):
+    """Cancel/block PointNav if either localization or motion safety drops."""
+    return bool(_point_navigation_health_sample(nx_node).get("healthy"))
+
+
+def _point_navigation_health_sample(nx_node):
+    """Classify hard motion failures separately from transient localization loss."""
+    try:
+        localization = nx_node.get_localization_health()
+        motion = nx_node.get_navigation_readiness()
+    except Exception:
+        return {
+            "healthy": False,
+            "immediate": True,
+            "reason": "health_check_error",
+            "motion_reason": None,
+            "localization_reason": None,
+        }
+
+    localization_ok = bool(localization.get("healthy"))
+    motion_ok = bool(motion.get("ready"))
+    common = {
+        "motion_reason": motion.get("reason"),
+        "localization_reason": localization.get("reason"),
+    }
+    if not motion_ok:
+        return {
+            "healthy": False,
+            "immediate": True,
+            "reason": "motion_unhealthy",
+            **common,
+        }
+    if not localization_ok:
+        return {
+            "healthy": False,
+            "immediate": False,
+            "reason": "localization_unhealthy",
+            **common,
+        }
+    return {
+        "healthy": True,
+        "immediate": False,
+        "reason": None,
+        **common,
+    }
+
+
+def create_server(host, port, static_dir, mission_root=None):
+    mission_root = os.path.realpath(
+        mission_root
+        or os.environ.get("GO2W_MISSION_ROOT")
+        or os.path.join(static_dir, "missions")
+    )
+    control_token = os.environ.get("GO2W_CONTROL_TOKEN", "")
+    allowed_origins = parse_allowed_origins(os.environ.get(
+        "GO2W_PANEL_ORIGINS",
+        "http://127.0.0.1:8000,http://localhost:8000,http://192.168.43.41:8000",
+    ))
+
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
             p = urlparse(self.path)
+            q = parse_qs(p.query)
             if p.path in ('/', '/index.html'):
                 self._serve(os.path.join(static_dir, 'panel.html'), 'text/html')
             elif p.path == '/map.js':
                 self._serve(os.path.join(static_dir, 'map.js'), 'application/javascript')
+            elif p.path.startswith('/missions/'):
+                self._serve_mission_artifact(p.path)
+            elif p.path == '/api/detection_snapshot':
+                snapshot_id = q.get('id', [''])[0]
+                kind = q.get('kind', ['crop'])[0]
+                ai = getattr(robot, "_ai_engine", None) if robot is not None else None
+                data = ai.get_detection_snapshot_jpeg(snapshot_id, kind) if ai is not None else None
+                if not data:
+                    self.send_error(404)
+                    return
+                self._send_jpeg(data)
+            elif p.path == '/api/video_frame':
+                source = q.get('source', [''])[0]
+                ai = getattr(robot, "_ai_engine", None) if robot is not None else None
+                data = ai.get_video_frame_jpeg(source) if ai is not None and hasattr(ai, "get_video_frame_jpeg") else None
+                if not data:
+                    self.send_error(404)
+                    return
+                self._send_jpeg(data)
             elif p.path == '/api/foxglove':
                 # Foxglove bridge URL (需另起 foxglove_bridge 节点, 默认 8765)
                 host_ip = os.environ.get("GO2W_PUBLIC_IP", "localhost")
@@ -1054,10 +1876,29 @@ def create_server(host, port, static_dir):
             elif p.path == '/api/status':
                 snap = node.get_status_snapshot() if node else {}
                 self._json({
+                    "release_id": RELEASE_ID,
+                    "motion_release_id": snap.get("motion_release_id"),
+                    "release_consistent": snap.get("release_consistent", False),
                     "connected": robot.connected if robot else False,
                     "imu_yaw": robot.imu_yaw if robot else 0,
+                    "dog_state": snap.get("dog_state", "UNKNOWN"),
                     "stats": robot.stats if robot else {},
                     "tasks": task_mgr.get_state() if task_mgr else {},
+                    "localization": snap.get("localization", {}),
+                    "navigation": snap.get("navigation", {}),
+                    "point_nav": point_nav.get_state() if point_nav else {},
+                    "room_nav": (
+                        room_orchestrator.get_navigation_state()
+                        if room_orchestrator else {}
+                    ),
+                    "perception": _perception_health(robot),
+                })
+            elif p.path == '/api/version':
+                snap = node.get_status_snapshot() if node else {}
+                self._json({
+                    "release_id": RELEASE_ID,
+                    "motion_release_id": snap.get("motion_release_id"),
+                    "release_consistent": snap.get("release_consistent", False),
                 })
             elif p.path == '/api/rooms':
                 # 阶段E (spec §7.2.3): 列出 rooms.yaml 所有房间 (主名 + 详情)
@@ -1081,43 +1922,224 @@ def create_server(host, port, static_dir):
             else:
                 self.send_error(404)
 
+        def do_OPTIONS(self):
+            origin = self.headers.get("Origin")
+            if not cors_origin_allowed(origin, allowed_origins):
+                self.send_error(403)
+                return
+            self.send_response(204)
+            self._send_cors_headers()
+            self.send_header(
+                "Access-Control-Allow-Headers", "Authorization, Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.end_headers()
+
         def do_POST(self):
             p = urlparse(self.path)
             q = parse_qs(p.query)
+            decision = authorize_request(
+                method="POST",
+                path=p.path,
+                headers=self.headers,
+                configured_token=control_token,
+            )
+            if not decision.allowed:
+                self._json({"ok": False, "reason": decision.reason},
+                           status=decision.status_code)
+                return
             L = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(L).decode() if L else ''
+            audited_paths = {
+                "/api/connect", "/api/stand", "/api/confirm_stand",
+                "/api/balance", "/api/confirm_balance", "/api/sit",
+                "/api/e_stop", "/api/reset_drive_fault", "/api/stop",
+                "/api/manual_stop", "/api/navigate", "/api/search",
+            }
+            audit_request = p.path in audited_paths
+            if p.path == "/api/move" and navigation_arbiter is not None:
+                try:
+                    audit_request = (
+                        navigation_arbiter.get_motion_owner() != "manual"
+                    )
+                except Exception:
+                    audit_request = True
+            if audit_request:
+                logger.warning(
+                    "control request path=%s client=%s user_agent=%r referer=%r",
+                    p.path,
+                    self.client_address[0] if self.client_address else "unknown",
+                    self.headers.get("User-Agent"),
+                    self.headers.get("Referer"),
+                )
             if p.path == '/api/connect':
-                # NX 模式: 发 /cmd_pose="stand" 让 nx_motion_node 站起 (异步, 不阻塞等待完成)
-                if robot and not robot.connected:
-                    robot.stand()
-                elif robot:
-                    robot.stand()
-                self._json({"ok": True, "msg": "已连接"})
+                result = navigation_arbiter.run_operator_action(
+                    "connect_stand", robot.stand) if navigation_arbiter else {
+                        "ok": False, "reason": "arbiter_unavailable"}
+                self._json(result, status=200 if result.get("ok") else 409)
             elif p.path == '/api/stand':
-                robot.stand(); self._json({"ok": True})
+                result = navigation_arbiter.run_operator_action(
+                    "stand", robot.stand) if navigation_arbiter else {
+                        "ok": False, "reason": "arbiter_unavailable"}
+                self._json(result, status=200 if result.get("ok") else 409)
+            elif p.path == '/api/confirm_stand':
+                result = navigation_arbiter.run_operator_action(
+                    "confirm_stand", robot.confirm_stand) if navigation_arbiter else {
+                        "ok": False, "reason": "arbiter_unavailable"}
+                self._json(result, status=200 if result.get("ok") else 409)
+            elif p.path == '/api/balance':
+                result = navigation_arbiter.run_operator_action(
+                    "balance", robot.balance) if navigation_arbiter else {
+                        "ok": False, "reason": "arbiter_unavailable"}
+                self._json(result, status=200 if result.get("ok") else 409)
+            elif p.path == '/api/adopt_stand':
+                result = navigation_arbiter.run_operator_action(
+                    "adopt_stand", robot.adopt_stand) if navigation_arbiter else {
+                        "ok": False, "reason": "arbiter_unavailable"}
+                self._json(result, status=200 if result.get("ok") else 409)
+            elif p.path == '/api/confirm_balance':
+                result = navigation_arbiter.run_operator_action(
+                    "confirm_balance", robot.confirm_balance) if navigation_arbiter else {
+                        "ok": False, "reason": "arbiter_unavailable"}
+                self._json(result, status=200 if result.get("ok") else 409)
             elif p.path == '/api/sit':
-                robot.sit(); self._json({"ok": True})
+                result = navigation_arbiter.run_operator_action(
+                    "sit", robot.sit) if navigation_arbiter else {
+                        "ok": False, "reason": "arbiter_unavailable"}
+                self._json(result, status=200 if result.get("ok") else 409)
+            elif p.path == '/api/manual_stop':
+                result = navigation_arbiter.release_manual(
+                    "manual_release") if navigation_arbiter else {
+                        "ok": False, "reason": "arbiter_unavailable"}
+                self._json(result, status=200 if result.get("ok") else 409)
             elif p.path == '/api/stop':
-                robot.stop_move(); self._json({"ok": True})
+                result = navigation_arbiter.stop_all(
+                    "operator_stop") if navigation_arbiter else {
+                        "ok": False, "reason": "arbiter_unavailable"}
+                self._json(result, status=(
+                    200 if result.get("ok") else
+                    503 if result.get("reason") == "arbiter_unavailable" else 409))
             elif p.path == '/api/e_stop':
-                robot.e_stop(); task_mgr.cancel_all(); self._json({"ok": True})
+                result = navigation_arbiter.emergency_stop() if navigation_arbiter else {
+                    "ok": False, "reason": "arbiter_unavailable"}
+                self._json(result, status=(
+                    200 if result.get("ok") else 503))
+            elif p.path == '/api/reset_drive_fault':
+                result = navigation_arbiter.run_operator_action(
+                    "reset_drive_fault", robot.reset_drive_fault
+                ) if navigation_arbiter else {
+                    "ok": False, "reason": "arbiter_unavailable"}
+                self._json(result, status=200 if result.get("ok") else 409)
             elif p.path == '/api/move':
                 # query string: vx,vy,vyaw (panel.html:242/248/317 约定)
-                vx = float(q.get('vx', ['0'])[0])
-                vy = float(q.get('vy', ['0'])[0])
-                vyaw = float(q.get('vyaw', ['0'])[0])
-                robot.move(vx, vy, vyaw, manual=True)  # /api/move = 操作员手动, bypass 自主 guard (C1 critic 收敛)
-                self._json({"ok": True})
+                try:
+                    vx = float(q.get('vx', ['0'])[0])
+                    vy = float(q.get('vy', ['0'])[0])
+                    vyaw = float(q.get('vyaw', ['0'])[0])
+                except (TypeError, ValueError):
+                    self._json({"ok": False, "msg": "vx/vy/vyaw 必须是数字"}, status=400)
+                    return
+                if not all(math.isfinite(v) for v in (vx, vy, vyaw)):
+                    self._json({"ok": False, "msg": "vx/vy/vyaw 必须是有限数字"}, status=400)
+                    return
+                if abs(vx) > 0.4 or abs(vy) > 0.3 or abs(vyaw) > 0.5:
+                    self._json({
+                        "ok": False,
+                        "msg": "手动速度超过安全上限 (vx=0.4, vy=0.3, vyaw=0.5)",
+                    }, status=400)
+                    return
+                if vx == 0.0 and vy == 0.0 and vyaw == 0.0:
+                    result = navigation_arbiter.release_manual(
+                        "manual_zero") if navigation_arbiter else {
+                            "ok": False, "reason": "arbiter_unavailable"}
+                else:
+                    result = navigation_arbiter.run_manual_action(
+                        "manual_move",
+                        lambda: robot.move(vx, vy, vyaw, manual=True),
+                    ) if navigation_arbiter else {
+                        "ok": False, "reason": "arbiter_unavailable"}
+                self._json(result, status=200 if result.get("ok") else 409)
             elif p.path == '/api/command':
                 text = q.get('text', [''])[0] or body
                 if body:
                     try:
-                        text = json.loads(body).get('text', '')
+                        payload = json.loads(body)
+                        text = payload.get('text', '') if isinstance(payload, dict) else ''
                     except Exception:
                         text = body
-                if text:
-                    task_mgr.process_command(text)
-                self._json({"ok": True, "text": text})
+                text = text.strip() if isinstance(text, str) else ''
+                if not text:
+                    self._json({
+                        "ok": False,
+                        "accepted": False,
+                        "reason": "empty_command",
+                    }, status=400)
+                    return
+                if task_mgr is None:
+                    self._json({
+                        "ok": False,
+                        "accepted": False,
+                        "reason": "task_manager_unavailable",
+                    }, status=503)
+                    return
+                result = task_mgr.submit_command(text)
+                self._json(result, status=(202 if result.get("ok") else 409))
+            elif p.path == '/api/navigate':
+                try:
+                    payload = json.loads(body)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    self._json({"ok": False, "msg": "请求体必须是 JSON 对象"}, status=400)
+                    return
+                if not isinstance(payload, dict):
+                    self._json({"ok": False, "msg": "请求体必须是 JSON 对象"}, status=400)
+                    return
+                if payload.get("frame_id", "map") != "map":
+                    self._json({"ok": False, "msg": "frame_id 必须是 map"}, status=400)
+                    return
+                if "x" not in payload or "y" not in payload:
+                    self._json({"ok": False, "msg": "缺少 x/y"}, status=400)
+                    return
+                try:
+                    values = (payload["x"], payload["y"], payload.get("yaw", 0.0))
+                    if any(isinstance(value, bool) for value in values):
+                        raise ValueError("boolean is not a coordinate")
+                    x, y, yaw = (float(value) for value in values)
+                except (TypeError, ValueError):
+                    self._json({"ok": False, "msg": "x/y/yaw 必须是数字"}, status=400)
+                    return
+                if not all(math.isfinite(value) for value in (x, y, yaw)):
+                    self._json({"ok": False, "msg": "x/y/yaw 必须是有限数字"}, status=400)
+                    return
+                if point_nav is None or node is None or navigation_arbiter is None:
+                    self._json({"ok": False, "msg": "点导航仲裁器未就绪"}, status=503)
+                    return
+                localization = node.get_localization_health()
+                if not localization.get("healthy"):
+                    self._json({
+                        "ok": False,
+                        "msg": "地图定位不可用",
+                        "localization": localization,
+                    }, status=409)
+                    return
+                if not _point_goal_within_local_radius(x, y, localization):
+                    self._json({
+                        "ok": False,
+                        "msg": f"目标必须在当前位置 {POINT_GOAL_MAX_DISTANCE:.0f}m 内",
+                    }, status=400)
+                    return
+                navigation = node.get_navigation_readiness()
+                if robot is None or not navigation.get("activatable"):
+                    self._json({
+                        "ok": False,
+                        "msg": "机器人运动链未就绪",
+                        "navigation": navigation,
+                    }, status=503)
+                    return
+                result = navigation_arbiter.start_point_goal(x, y, yaw)
+                if result.get("ok"):
+                    self._json(result, status=202)
+                else:
+                    self._json(result, status=(
+                        400 if result.get("reason") == "invalid_goal" else 409))
             elif p.path == '/api/locate':
                 target = q.get('target', [''])[0] or q.get('text', [''])[0] or body
                 if body:
@@ -1152,60 +2174,89 @@ def create_server(host, port, static_dir):
                 ox = float(q.get('origin_x', ['0'])[0])
                 oy = float(q.get('origin_y', ['0'])[0])
                 pattern = q.get('pattern', ['lawnmower'])[0]
-                task_mgr.add_list([Task("search_area",
-                                         {"pattern": pattern, "width": w, "height": h,
-                                          "spacing": sp, "origin_x": ox, "origin_y": oy}, 5)])
-                self._json({"ok": True, "msg": f"搜索 {w}x{h}m 间距{sp}m 已入队"})
+                admission = task_mgr.add_list([Task("search_area",
+                    {"pattern": pattern, "width": w, "height": h,
+                     "spacing": sp, "origin_x": ox, "origin_y": oy}, 5)],
+                    reason="search_area")
+                payload = dict(admission or {})
+                if payload.get("ok"):
+                    payload["msg"] = f"搜索 {w}x{h}m 间距{sp}m 已入队"
+                self._json(payload, status=200 if payload.get("ok") else 409)
             elif p.path == '/api/search_room':
-                # 阶段E (spec §7.2.3): 房间级搜索任务入队
-                # query: room (必填), target_classes (可选, 逗号分隔)
-                # body JSON 也支持: {"room":"客厅","target_classes":["person"]}
-                room = q.get('room', [''])[0]
+                body_payload = {}
                 if body:
                     try:
-                        jb = json.loads(body)
-                        if isinstance(jb, dict) and jb.get('room'):
-                            room = jb.get('room', room)
-                    except Exception:
-                        pass
-                if not room:
-                    self._json({"ok": False, "msg": "缺少 room 参数"})
+                        parsed = json.loads(body)
+                        if isinstance(parsed, dict):
+                            body_payload = parsed
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        self._json({"ok": False, "reason": "invalid_json"}, status=400)
+                        return
+                if not body_payload:
+                    body_payload = {
+                        "room": q.get('room', [''])[0],
+                        "target_classes": [
+                            value.strip() for value in
+                            q.get('target_classes', [''])[0].split(',')
+                            if value.strip()
+                        ],
+                    }
+                    strategy = q.get('search_strategy', [''])[0]
+                    if strategy:
+                        body_payload["search_strategy"] = strategy
+                try:
+                    mission = SearchMissionRequest.from_api_payload(body_payload)
+                except MissionValidationError as exc:
+                    self._json({
+                        "ok": False,
+                        "reason": "invalid_mission_request",
+                        "message": str(exc),
+                    }, status=400)
                     return
-                tc_str = q.get('target_classes', [''])[0]
-                target_classes = [s.strip() for s in tc_str.split(',') if s.strip()] if tc_str else []
-                if not target_classes and body:
-                    try:
-                        jb = json.loads(body)
-                        if isinstance(jb, dict) and jb.get('target_classes'):
-                            target_classes = list(jb.get('target_classes'))
-                    except Exception:
-                        pass
-                # search_strategy 透传 (frontier_explore / next_best_view);
-                # 不传则 task_params 与原代码一致, 走 RoomSearchOrchestrator 默认路径
-                search_strategy = q.get('search_strategy', [''])[0]
-                if not search_strategy and body:
-                    try:
-                        jb = json.loads(body)
-                        if isinstance(jb, dict):
-                            search_strategy = jb.get('search_strategy', '') or ''
-                    except Exception:
-                        pass
-                task_params = {"room": room, "target_classes": target_classes}
-                if search_strategy:
-                    task_params["search_strategy"] = search_strategy
-                task_mgr.add_list([Task("search_room", task_params, 5)])
-                self._json({"ok": True, "msg": f"搜索房间 '{room}' 已入队"
-                            + (f" (strategy={search_strategy})" if search_strategy else "")})
+                task_params = mission.to_task_params()
+                for key in ("max_frontiers", "max_frontier_plan_probes"):
+                    if key in body_payload:
+                        task_params[key] = body_payload[key]
+                if task_mgr is None:
+                    self._json({
+                        "ok": False, "reason": "task_manager_unavailable",
+                    }, status=503)
+                    return
+                admission = task_mgr.add_list(
+                    [Task("search_room", task_params, 5)], reason="search_room")
+                payload = dict(admission or {})
+                payload["mission_request"] = mission.to_dict()
+                if payload.get("ok"):
+                    payload["msg"] = f"搜索任务 {mission.request_id} 已入队"
+                self._json(payload, status=200 if payload.get("ok") else 409)
             else:
                 self.send_error(404)
 
-        def _json(self, d):
+        def _send_jpeg(self, data):
+            try:
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Content-Length', len(data))
+                self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                logger.debug("client disconnected while sending jpeg")
+
+        def _json(self, d, status=200):
             # CORS: 跨端口(8000 HTTP ↔ 8001 WS) 与跨机访问都需要 (panel.py:714)
-            self.send_response(200)
+            self.send_response(status)
             self.send_header('Content-Type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
+            self._send_cors_headers()
             self.end_headers()
             self.wfile.write(json.dumps(d, ensure_ascii=False).encode())
+
+        def _send_cors_headers(self):
+            origin = self.headers.get("Origin")
+            if origin and cors_origin_allowed(origin, allowed_origins):
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
 
         def _serve(self, path, ct):
             if os.path.exists(path):
@@ -1219,6 +2270,31 @@ def create_server(host, port, static_dir):
                 self.wfile.write(data)
             else:
                 self.send_error(404)
+
+        def _serve_mission_artifact(self, url_path):
+            """Serve only persisted mission evidence below mission_root."""
+            relative = unquote(str(url_path or ''))
+            prefix = '/missions/'
+            relative = relative[len(prefix):] if relative.startswith(prefix) else ''
+            candidate = os.path.realpath(os.path.join(mission_root, relative))
+            try:
+                contained = os.path.commonpath(
+                    [mission_root, candidate]) == mission_root
+            except ValueError:
+                contained = False
+            if not contained or not os.path.isfile(candidate):
+                self.send_error(404)
+                return
+            extension = os.path.splitext(candidate)[1].lower()
+            content_type = {
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg',
+                '.json': 'application/json',
+            }.get(extension)
+            if content_type is None:
+                self.send_error(404)
+                return
+            self._serve(candidate, content_type)
 
         def log_message(self, *a):
             pass
@@ -1249,7 +2325,7 @@ def run_ws(host, port):
 # ----------------------------------------------------------------------------
 # 与 panel.py 的差异:
 #   - 数据源从 _read_ros2_state() 文件 → 改读 NxWebNode 的订阅缓存 (退役 dog_state.json)
-#   - xy 用 /odom 真值 (不再 _update_dead_reckon 速度积分)
+#   - xy/yaw 用 /localization_pose 的 map -> base_link 位姿
 #   - trail 本地累积, 每 0.1m 一个点, 上限 2000 (panel.py:772-775 同款)
 #   - slam_source = "ros2_nx" (H1.1, 前端地图右上角显示 "SLAM: ros2_nx")
 #   - scan 转世界坐标公式照抄 panel.py:815-821
@@ -1258,11 +2334,11 @@ def run_ws(host, port):
 _trail = []
 _obstacle_grid = ObstacleGridAccumulator(
     resolution=float(os.environ.get("GO2W_MAP_RESOLUTION", "0.1")),
-    max_points=int(os.environ.get("GO2W_MAP_MAX_POINTS", "50000")),  # M3 fix: 5000→50000 (0.1m 栅格 20m×20m=40000 cell, LRU 太小会让墙点被淘汰)
+    max_points=int(os.environ.get("GO2W_MAP_MAX_POINTS", "2000")),
 )
 
 
-def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager: TaskManager, ai_engine=None):
+def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager: TaskManager, ai_engine=None, lidar_bridge=None):
     global _trail
     logger.info("广播启动")
     slam_counter = 0
@@ -1270,10 +2346,14 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
         try:
             # ---- 取订阅缓存快照 (一次锁定) ----
             with nx_node._lock:
-                yaw = nx_node._imu_yaw
+                localization = nx_node.get_localization_health()
+                navigation = nx_node.get_navigation_readiness()
+                localization_healthy = bool(localization.get("healthy"))
+                yaw = nx_node._map_yaw
+                raw_imu_heading = nx_node._imu_yaw
                 imu_count = nx_node._imu_count
-                x = nx_node._odom_x
-                y = nx_node._odom_y
+                x = nx_node._map_x
+                y = nx_node._map_y
                 ranges = list(nx_node._scan_ranges)
                 dog_state = nx_node._dog_state
                 dog_vx = nx_node._dog_vx
@@ -1284,26 +2364,50 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
             # ---- 阶段B: 视频/YOLO 帧 (来自 ai_engine._video_yolo_loop 缓存, 不阻塞) ----
             # type=frame 格式严格对齐 panel.py:847-849 / panel.html:384-389:
             #   detections = 整数计数 (C1.4), 不是数组! 像素 bbox 已画在 jpeg 里。
+            if ai_engine is not None and hasattr(ai_engine, "submit_external_frame"):
+                try:
+                    gimbal = getattr(robot_bridge, "_gimbal_bridge", None)
+                    if gimbal is not None:
+                        c13_vis_frame = gimbal.get_vis_frame()
+                        if c13_vis_frame is not None:
+                            ai_engine.submit_external_frame(c13_vis_frame, source="c13_vis")
+                        # 红外不进 YOLO (256x205 测小物体不准 + 减一路推理提 fps);
+                        # 红外视频流不受影响 (gimbal ir 推 WS 在 nx_gimbal_node, 独立于 ai)
+                        # if hasattr(gimbal, "get_ir_frame"):
+                        #     c13_ir_frame = gimbal.get_ir_frame()
+                        #     if c13_ir_frame is not None:
+                        #         ai_engine.submit_external_frame(c13_ir_frame, source="c13_ir")
+                except Exception as e:
+                    logger.debug(f"C13 frame submit failed: {e}")
+            if ai_engine is not None and (hasattr(ai_engine, "get_detection_overlays") or hasattr(ai_engine, "get_detection_overlay")):
+                try:
+                    payload = (ai_engine.get_detection_overlays()
+                               if hasattr(ai_engine, "get_detection_overlays")
+                               else ai_engine.get_detection_overlay())
+                    ws_broadcast({"type": "detections", "data": payload})
+                except Exception as e:
+                    logger.debug(f"detection overlay broadcast failed: {e}")
             if ai_engine is not None:
                 det_count = ai_engine.get_frame_detection_count()
                 if det_count is not None:
                     ws_broadcast({"type": "frame", "detections": int(det_count)})
 
             # ---- trail 累积 (每 0.1m 一个点, 上限 2000) ----
-            if not _trail:
-                _trail.append([round(x, 2), round(y, 2)])
-            else:
-                lx, ly = _trail[-1]
-                if math.hypot(x - lx, y - ly) > 0.1:
+            if localization_healthy:
+                if not _trail:
                     _trail.append([round(x, 2), round(y, 2)])
-                    if len(_trail) > 2000:
-                        _trail = _trail[-2000:]
+                else:
+                    lx, ly = _trail[-1]
+                    if math.hypot(x - lx, y - ly) > 0.1:
+                        _trail.append([round(x, 2), round(y, 2)])
+                        if len(_trail) > 2000:
+                            _trail = _trail[-2000:]
 
             # ---- scan 机体系 → 世界坐标 (yaw 旋转 + 平移), 截断 200 点 ----
             cos_y = math.cos(yaw)
             sin_y = math.sin(yaw)
             scan_pts = []
-            if ranges:
+            if localization_healthy and ranges:
                 n = len(ranges)
                 for i, r in enumerate(ranges):
                     if 0.1 < r < 9.9:
@@ -1315,14 +2419,20 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
                         if len(scan_pts) >= 200:
                             break
             map_pts = _obstacle_grid.update(scan_pts) if scan_pts else _obstacle_grid.points()
+            lidar_points = []
+            if lidar_bridge is not None and hasattr(lidar_bridge, "get_latest_points"):
+                try:
+                    lidar_points = lidar_bridge.get_latest_points()
+                except Exception:
+                    lidar_points = []
 
             # ---- SLAM 推送 (字段名严格匹配 map.js update()) ----
             # 阶段B: slam.data.detections 是数组 [{x,y,class}] (C1.5, map.js:52),
             # 与 type=frame 的整数 detections 相反! 由 ai_engine 世界坐标转换填值。
             slam_counter += 1
-            if slam_counter % 2 == 0:   # 约 3Hz, 够画地图 (与 panel.py:856 一致)
-                det_world = (ai_engine.get_detections_world(x, y, yaw)
-                             if ai_engine is not None else [])
+            if slam_counter % 2 == 0:
+                det_world = (ai_engine.get_detections_world(x, y, yaw, ranges=ranges, lidar_points=lidar_points)
+                    if ai_engine is not None and localization_healthy else [])
                 ws_broadcast({"type": "slam", "data": {
                     "x": round(x, 2),
                     "y": round(y, 2),
@@ -1334,19 +2444,39 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
                     "waypoints": [],
                     "currentWP": -1,
                     "slam_source": "ros2_nx",
-                }})
+                }}, force=True)
+
+            # ---- costmap 推送 (独立 costmap_bridge 写 /tmp/costmap_lite.json, web 读转发) ----
+            # 不在 web 直接订阅 costmap: web rclpy 订阅数临界 wait_set 上限, 加订阅触发
+            # "IndexError: wait set index too big" → spin 崩 (见 costmap_bridge.py 头注释).
+            # bridge 独立进程降采写 JSON, web 读文件转发 WS (不加 rclpy 订阅), 前端 map.js 渲染.
+            if slam_counter % 10 == 0:
+                try:
+                    with open('/tmp/costmap_lite.json') as _f:
+                        # Camera and lidar streams may saturate the bounded
+                        # realtime queue.  This compact, low-rate state update
+                        # must still reach Panel or Nav2 obstacles disappear.
+                        ws_broadcast(
+                            {"type": "costmap", "data": json.load(_f)}, force=True)
+                except Exception:
+                    pass  # costmap_bridge 未起 / nav2 未起 / 文件没就绪, 静默跳过
 
             # ---- status 推送 (字段名匹配 panel.html:396-400) ----
             det_list = ai_engine.get_detection_list() if ai_engine is not None and hasattr(ai_engine, "get_detection_list") else []
             ws_broadcast({"type": "status",
-                          "imu_yaw": round(yaw, 3),
+                          "imu_yaw": round(raw_imu_heading, 3),
                           "stats": {"imu_count": imu_count,
                                      "robot_mode": 0,
                                      "robot_velocity": [dog_vx, dog_vy, dog_vyaw],
                                      "connected": connected},
                           "dog_state": dog_state,
                           "tasks": task_manager.get_state() if task_manager else {},
-                          "det_list": det_list})
+                          "localization": localization,
+                           "navigation": navigation,
+                           "point_nav": point_nav.get_state() if point_nav else {},
+                           "room_nav": room_orchestrator.get_navigation_state() if room_orchestrator else {},
+                           "perception": _perception_health(robot_bridge),
+                           "det_list": det_list})
 
             time.sleep(0.15)
         except Exception as e:
@@ -1358,15 +2488,34 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
 # Main
 # ============================================================================
 def main():
-    global robot, task_mgr, node, room_orchestrator
+    global robot, task_mgr, node, point_nav, navigation_gateway
+    global room_orchestrator, navigation_arbiter
 
     rclpy.init()
     node = NxWebNode()
+    static_dir = os.path.join(_WEB_DIR, 'static')
+    mission_root = os.environ.get(
+        "GO2W_MISSION_ROOT", os.path.join(static_dir, "missions"))
 
-    # 决策 2: rclpy.spin 独立 daemon 线程 (不能与 HTTPServer.serve_forever 同线程)
-    # 参考 cmd_publisher.py:88-90
-    spin_th = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
-    spin_th.start()
+    # 创建控制器和 watchdog timer 后才启动 executor，避免请求在控制器未注入时进入。
+    raw_point_nav = PointNavigationController(
+        node,
+        state_callback=_handle_point_nav_state,
+        health_check=lambda: _point_navigation_health_sample(node),
+    )
+    try:
+        path_port = RosComputePathPort(node)
+    except Exception as exc:
+        logger.warning("ComputePathToPose adapter unavailable: %s", exc)
+        path_port = None
+    navigation_gateway = NavigationGateway(
+        action_port=raw_point_nav,
+        path_port=path_port,
+    )
+    point_nav = OwnerNavigationPort(navigation_gateway, "point")
+    mission_navigation = MissionNavigationPort(
+        navigation_gateway, owner="mission")
+    node.create_timer(0.1, navigation_gateway.tick)
 
     # 机器人抽象 + 任务管理器 (阶段A detector/vlm 传 None; 阶段B 注入 AI 代理)
     robot = NxRobotBridge(node)
@@ -1422,16 +2571,29 @@ def main():
                 node=node,
                 ai_engine=ai_engine,           # 阶段B NxAiEngine (读 get_detections_world 快照)
                 ws_broadcast_fn=ws_broadcast,  # 推 type=search_room / mission_report / search
+                navigation_port=mission_navigation,
+                observation_sync=node.observation_sync,
+                mission_root=mission_root,
             )
             task_mgr.room_orchestrator = room_orchestrator
-            # _fallback_parse._extract_room_name 通过类属性拿到 room_orchestrator
+            # Current-room resolution compatibility for injected orchestrators.
             TaskManager._global_room_orchestrator = room_orchestrator
             logger.info("阶段E: RoomSearchOrchestrator 已注入 TaskManager")
         except Exception as e:
             logger.error(f"阶段E RoomSearchOrchestrator 启动失败 (search_room 任务将标 failed): {e}")
             room_orchestrator = None
 
-    static_dir = os.path.join(_WEB_DIR, 'static')
+    # All HTTP threads and background command parsing share this one admission
+    # lock.  It never spins ROS; each ownership hand-off is terminal-state gated.
+    navigation_arbiter = NavigationArbiter(point_nav, task_mgr, robot)
+    task_mgr.set_navigation_arbiter(navigation_arbiter)
+
+    # Humble's rclpy wait-set cannot be mutated while an executor is waiting.
+    # PointNav and RoomSearch both create ActionClients, so start spin only
+    # after every ROS entity has been constructed.
+    spin_th = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    spin_th.start()
+
     host = node.host
     port = node.port
     ws_port = node.ws_port
@@ -1441,9 +2603,9 @@ def main():
     # 启动 WS server 线程 + 任务 worker + 广播线程
     threading.Thread(target=run_ws, args=(host, ws_port), daemon=True).start()
     task_mgr.start_worker()
-    threading.Thread(target=broadcast_loop, args=(robot, node, task_mgr, ai_engine), daemon=True).start()
+    threading.Thread(target=broadcast_loop, args=(robot, node, task_mgr, ai_engine, lidar_bridge), daemon=True).start()
 
-    server = create_server(host, port, static_dir)
+    server = create_server(host, port, static_dir, mission_root=mission_root)
     try:
         # 主线程阻塞 serve_forever (M2.3, 与 panel.py:940 一致)
         server.serve_forever()
@@ -1457,6 +2619,22 @@ def main():
             server.shutdown()
         except Exception:
             pass
+        # ROS executor 仍在运行时封住新请求，并同时 drain PointNav、
+        # TaskManager worker 与 Room Nav2 action ownership。
+        try:
+            shutdown_state = navigation_arbiter.shutdown()
+            if not shutdown_state.get("ok"):
+                logger.critical(
+                    "Autonomous owners did not drain during shutdown: %s",
+                    shutdown_state,
+                )
+        except Exception as exc:
+            logger.critical("导航仲裁退出清理失败，执行急停: %s", exc)
+            try:
+                if robot is not None:
+                    robot.e_stop()
+            except Exception:
+                pass
         try:
             if ai_engine is not None:
                 ai_engine.stop()  # 阶段B: 停 3 daemon 线程 + unload VLM

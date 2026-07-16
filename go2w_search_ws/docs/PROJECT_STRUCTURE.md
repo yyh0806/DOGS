@@ -1,5 +1,48 @@
 # Go2W 搜索系统 — 项目结构
 
+## 2026-07-14 当前权威架构
+
+本节取代下方历史架构描述。运行时的核心约束是“每种有副作用的资源只有一个所有者”：
+
+```text
+PC 语音/浏览器
+  -> 带 Bearer Token 的规范 search_room 任务
+  -> NX Web / 任务编排
+       -> 持久化前沿探索 -> 唯一 NavigationGateway -> 唯一 NavigateToPose action 端口
+       -> 时间同步观测 -> YOLO/YOLO-World -> 目标去重 -> 地图标注/照片
+  -> Nav2 cmd_vel
+  -> 唯一 Go2WMotionMachine -> 唯一 UnitreeSportAdapter -> 唯一 leased SportClient
+```
+
+| 责任 | 唯一权威实现 |
+|---|---|
+| 宇树运动调用 | `src/go2w_bridge/go2w_bridge/unitree_sport_adapter.py` |
+| 产品运动状态机 | `motion_types.py` + `motion_machine.py` |
+| ROS 运动节点 | `nx_motion_node.py`，回调只入队，单 actor 串行执行 SDK |
+| 运动协议 | `motion_protocol.py`：intent v1、feedback v2、status v4，含发布指纹 |
+| Nav2 目标所有权 | `web/nx_navigation_gateway.py`，点选和搜索任务共享一个 action 端口 |
+| 点选导航实现 | `web/nx_point_nav.py`，含迟到接受/取消隔离与健康门禁 |
+| 探索 | `web/nx_frontier_planner.py` + `nx_exploration_manager.py`，按地图 revision 持久化 visited/blacklist/budget |
+| 搜索任务协议 | `web/nx_mission_schema.py`，语音、文本和 HTTP 使用同一 schema |
+| 感知同步 | `web/nx_observation_sync.py`，以拍摄时间插值位姿并匹配扫描/点云 |
+| 目标去重 | `web/nx_person_mission.py`，按 mission/class 去重并保留质量最高的同步位置 |
+| API 安全 | `web/nx_control_auth.py`，所有控制 POST 在读 body 前校验 Bearer Token |
+| 离线发布门禁 | `tools/verify_release.py` |
+| 发布包严格校验 | `tools/verify_release_artifact.py`，校验归档路径、类型、完整清单、hash 与 release ID |
+| 部署后只读验收 | `tools/nx_release_probe.py`、`nav2_preflight.py`、`perception_preflight.py`，分别写 safe-park/release、单链 TF/action/双 costmap/障碍桥、开放词汇感知凭证 |
+| 地图坐标采集 | `tools/capture_map_pose.py`，只读 `map -> base_link` TF 并生成房间标定片段 |
+| 原子发布 | `docker/build_release.sh` + `docker/deploy_release.sh` |
+
+发布目录是 `/home/nx/go2w/releases/<release_id>`，`/home/nx/go2w/current` 通过原子符号链接指向完整不可变 payload。归档显式包含 `ai/` 运行时和部署验收工具；严格校验器会拒绝哈希正确但缺关键文件的包。systemd 的 motion/web/nav/sensor 服务必须从 `current/payload` 启动，并读取 `/etc/go2w/release.env` 与自动探测生成的 `/etc/go2w/hardware.env`。旧的 `deploy_nx*.sh` 和直接覆盖 `~/go2w_ws` 的脚本只作历史排障参考，不再是生产发布入口。
+
+规范搜索任务示例：
+
+```json
+{"schema_version":1,"request_id":"voice-001","room":"current_room","target_classes":["person"],"search_strategy":"frontier_explore","require_photos":true,"mark_on_map":true,"max_radius_m":6.0,"max_time_s":480.0}
+```
+
+将 `target_classes` 改为 `["dining table"]` 即搜索桌子；任意通过 schema 校验的英文 YOLO-World 类别都走同一条任务、探索、定位、去重和标注链路。VLM 只允许生成一个 `search_room`，加载失败、超时或非法输出均返回带 `parse_error` 的空任务，不会回退生成运动步骤。
+
 > 2026-06-30 重写。反映 **NX 中心化架构**（旧 PC 中心化架构已于本日全部删除）。
 > 旧版描述的 `panel.py` 主前端 / `cmd_publisher` / `ros_to_json` / PC go2w_humble 容器 **均已废弃删除**，勿再参考。
 
@@ -64,15 +107,16 @@ PC (浏览器, 瘦客户端)
 |------|------|
 | `config.py` | 全局配置（CUDA/模型路径）|
 | `detector.py` | YOLO 检测（yolov8n，可降级 TensorRT）|
-| `vlm.py` | Qwen2.5-VL 指令解析（加载失败降级关键词）|
+| `vlm.py` | Qwen2.5-VL 推理后端；输出由 `nx_ai_node.py` 强制校验成统一搜索任务，失败关闭为空任务 |
 | `tracker.py` | 视觉跟踪状态机 |
 | `locate_anything.py` | 开放词汇定位(locate-anything.cpp CLI 包装，gguf)，慢路径按需触发 |
 
 ### `docker/` — 部署 ✅ active
 | 文件 | 用途 |
 |------|------|
-| `go2w-{motion,sensor,web}.service` | systemd 服务（崩溃自启；含 ExecStartPre 等网卡就绪）|
-| `deploy_nx.sh` / `deploy_nx_web.sh` / `deploy_nx_ai.sh` | NX 分阶段部署脚本 |
+| `go2w-{motion,sensor,web,slam-nav}.service` | systemd 服务，从 `/home/nx/go2w/current/payload` 启动并读取 release 指纹 |
+| `build_release.sh` / `deploy_release.sh` | 当前唯一生产发布入口；内容寻址、显式安全 Token 首次创建、狗/MID360/AI 自动探测、最终 release 前缀构建、主/辅助 unit 安装、MID360 网络/驱动/watchdog 在 Nav2 前显式重启、配置/unit/enable 完整回滚、全量三项只读 probe |
+| `deploy_nx.sh` / `deploy_nx_web.sh` / `deploy_nav2_bprime.sh` | 兼容入口，只负责转发到原子 builder/deployer；旧脚本主体不可达 |
 | `deploy_fastlio.sh` | Livox MID360 + FAST_LIO 部署（**前提：雷达物理连 NX**）|
 
 ### `config/rooms.yaml` — 房间标定坐标
@@ -114,12 +158,12 @@ SDK_CAPABILITIES（狗能力调研）/ REFACTOR_NX_CENTRIC（架构方向）/ sl
 
 **新待办**：
 - wheel odom 轮径(0.065) 待建图后标定；轮足切换/打滑会漂，FAST_LIO 是更精确备选。
-- 雷达 NX 网络 `ip addr/route add` 重启丢失，待写 systemd oneshot 持久化。
+- ✅ 雷达 NX 网络已由 `livox-mid360-net.service` 持久化；部署器自动探测或读取 `LIVOX_INTERFACE`，接口不存在时 fail-closed 并由 systemd 重试。
 
 ## 六、启动方式
 
-**NX 端**：`go2w-{motion,sensor,web}.service` 已 enabled，开机自启（ExecStartPre 自动等 USB 网卡就绪）。
+**NX 端**：全量 Nav 模式启用 `go2w-{motion,web,slam-nav}.service`；完整 `go2w-sensor.service` 保留为 fallback 但默认禁用，Nav bringup 只启动受限 `/wheel_odom` 实例。狗与 MID360 USB 网卡均从 `/etc/go2w/hardware.env` 读取。
 
 **PC 端**：浏览器访问 `http://<NX_IP>:8000`（或 `bash web/start_pc_browser.sh`）。
 
-**首次部署新 NX**：`NX_HOST=<IP> bash docker/deploy_nx.sh` → `deploy_nx_web.sh` → `deploy_nx_ai.sh`。
+**首次/后续生产部署**：先运行 `python tools/verify_release.py`，再运行 `bash docker/build_release.sh all`，最后在狗放稳且场地安全时执行 `NX_HOST=<IP> NX_USER=nx bash docker/deploy_release.sh dist/<artifact>-all.tar.gz --allow-motion-restart --control-token-file control-token.txt`。

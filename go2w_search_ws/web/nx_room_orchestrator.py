@@ -4,8 +4,7 @@
 == 职责 ==
 作为"组件"注入 nx_web_server.py 的 TaskManager (同进程, spec 决策 3 方案 b):
   1. RoomMap: 加载静态 YAML 房间地图 (config/rooms.yaml), 校验 schema + 房间匹配
-  2. Nav2ActionClient: Nav2 NavigateToPose action client 封装 (worker 线程 spin_until_complete)
-  3. RoomSearchOrchestrator: 状态机驱动 (SELECT_ROOM→NAVIGATE→ARRIVED→SEARCH→DETECT→REPORT)
+  2. RoomSearchOrchestrator: 状态机驱动 (SELECT_ROOM→NAVIGATE→ARRIVED→SEARCH→DETECT→REPORT)
      每阶段切换 ws_broadcast type=search_room; 完成推 type=mission_report
 
 == 线程模型 (spec 决策 4) ==
@@ -13,15 +12,12 @@
   - 线程1 (daemon): rclpy.spin(NxWebNode)         ← 主 spin (驱动订阅回调)
   - 线程X (TaskManager worker): 执行 search_room 时
        └─ RoomSearchOrchestrator.run(task)
-            └─ Nav2ActionClient.send_goal_and_wait()
-                 ├─ send_goal_async → goal_future
-                 ├─ rclpy.spin_until_complete(node, goal_future, timeout=5s)   ← worker 临时驱动
-                 └─ rclpy.spin_until_complete(node, result_future, timeout=120s)
-  关键: ActionClient 用 ReentrantCallbackGroup (否则与主 spin 的默认组死锁)
-  关键: 所有共享状态 (_current_handle/_cancelled) 用 threading.Lock 保护
+            └─ 注入的 MissionNavigationPort → 进程唯一 NavigationGateway
+  关键: action late acceptance / cancel / terminal ownership 由共享 gateway 保留
+  关键: 编排器不创建 ROS action client，也不执行自己的 executor
 
 == 红线 (spec §0 + §12 反模式) ==
-  - 懒加载: __init__ 不加载 YAML, 不创建 Nav2Client (启动快, Nav2 未就绪不报错)
+  - 懒加载: __init__ 不加载 YAML；NavigationGateway 必须由主进程注入
   - 不自己发 /cmd_vel 做航点导航 (决策 1, 走 Nav2 action 标准接口)
   - 不用 NavigateThroughPoses 一次发整条航点链 (决策 1, 丢失中间停留检测语义)
   - 不复活 src/go2w_orchestrator 包 (决策 3, planner 已在 nx_web_server 内联)
@@ -38,6 +34,14 @@ import os
 import threading
 import time
 import uuid
+
+from nx_mission_schema import MissionValidationError, SearchMissionRequest
+from nx_camera_calibration import resolve_camera_calibration
+from nx_exploration_manager import ExplorationManager
+from nx_frontier_planner import (
+    find_frontier_clusters as _planner_find_frontier_clusters,
+    select_frontier_candidates as _planner_select_frontier_candidates,
+)
 from typing import Optional, List, Dict
 
 logger = logging.getLogger("go2w.room_orch")
@@ -48,16 +52,30 @@ except Exception:
     ActiveSearchPlanner = None
 
 try:
-    from nx_person_localizer import DetectionFrame, LaserScanSnapshot, localize_person_detection
+    from nx_person_localizer import (
+        DetectionFrame,
+        LaserScanSnapshot,
+        PointCloudSnapshot,
+        localize_person_detection,
+        localize_target_detection,
+    )
 except Exception:
     DetectionFrame = None
     LaserScanSnapshot = None
+    PointCloudSnapshot = None
     localize_person_detection = None
+    localize_target_detection = None
 
 try:
-    from nx_person_mission import PersonMissionStore
+    from nx_person_mission import (
+        PersonMissionStore,
+        TargetMissionStore,
+        load_latest_mission_report,
+    )
 except Exception:
     PersonMissionStore = None
+    TargetMissionStore = None
+    load_latest_mission_report = None
 
 try:
     from nx_product_command import resolve_current_room
@@ -67,254 +85,76 @@ except Exception:
 # web/ 目录 (与 nx_web_server.py 同目录, 复用其内联的 plan_lawnmower/plan_spiral)
 _WEB_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# rclpy / Nav2 action 接口 (懒导入, Windows 开发机无 rclpy 时也能 import 本模块做静态检查)
+# rclpy/nav_msgs 接口 (懒导入, Windows 开发机无 rclpy 时也能静态检查)
 _rclpy = None
-_NavigateToPose = None
-_ReentrantCallbackGroup = None
-_ActionClient = None
 _OccupancyGrid = None  # nav_msgs/OccupancyGrid (frontier 探索订阅 /map_frontier 用)
+_QoSProfile = None
+_ReliabilityPolicy = None
+_DurabilityPolicy = None
+_HistoryPolicy = None
 
 
 def _import_ros():
-    """懒导入 rclpy + nav_msgs (必需, frontier 探索用) + nav2 action (可选, NAVIGATE 路径用)。
+    """懒导入 frontier 订阅所需的 rclpy、nav_msgs 和 QoS 类型。
 
-    返回 True if rclpy+nav_msgs 都成 (frontier 可跑); False = 无 ROS 环境 (Windows 开发机)。
-    nav2_msgs 失败不阻塞 frontier (只阻塞 NAVIGATE/next_best_view 路径) — 解耦后
-    无图场景(只走 frontier)在没装 nav2 的 NX 上也能跑。
+    Nav2 action 客户端由主进程的 NavigationGateway 创建，编排器不导入或
+    构造第二个客户端。
     """
-    global _rclpy, _NavigateToPose, _ReentrantCallbackGroup, _ActionClient
-    global _OccupancyGrid
+    global _rclpy, _OccupancyGrid
+    global _QoSProfile, _ReliabilityPolicy, _DurabilityPolicy, _HistoryPolicy
     if _rclpy is not None:
         return True
     # 必需: rclpy + nav_msgs (frontier 订阅 /map_frontier 用 OccupancyGrid)
     try:
         import rclpy as _r
-        from rclpy.action import ActionClient as _AC
-        from rclpy.callback_groups import ReentrantCallbackGroup as _RCG
+        from rclpy.qos import (
+            DurabilityPolicy as _DP,
+            HistoryPolicy as _HP,
+            QoSProfile as _QP,
+            ReliabilityPolicy as _RP,
+        )
         from nav_msgs.msg import OccupancyGrid as _OG
         _rclpy = _r
-        _ActionClient = _AC
-        _ReentrantCallbackGroup = _RCG
         _OccupancyGrid = _OG
+        _QoSProfile = _QP
+        _ReliabilityPolicy = _RP
+        _DurabilityPolicy = _DP
+        _HistoryPolicy = _HP
     except Exception as e:
         logger.debug(f"rclpy/nav_msgs 不可导入 (NX 部署外正常): {e}")
         return False
-    # 可选: nav2_msgs (NAVIGATE/next_best_view 路径用; frontier 不需要, 失败不阻塞)
-    try:
-        from nav2_msgs.action import NavigateToPose as _NTP
-        _NavigateToPose = _NTP
-    except Exception as e:
-        logger.info(f"nav2_msgs 不可导入 (NAVIGATE 路径禁用, frontier 探索仍可用): {e}")
     return True
 
 
-# ============================================================================
-# Frontier 检测器 (plan 2026-07-03 §3.3.2 / §6)
-# 用户已选方法 (c) cost-distance 加权; 评分公式为 LEARNING-MODE 红线
-# ============================================================================
-def _find_frontier_clusters(map_msg, robot_pose, visited,
-                            min_cluster_size=3, revisit_radius=1.0):
-    """从 OccupancyGrid 提取 frontier 簇列表 (脚手架, 不含评分)。
-
-    解析 map_msg → 检测边界 cell (自由 cell 8 邻域含未知) → BFS 8 连通聚簇
-    → 过滤小簇 / 已访簇 → 返回每个簇的 center/size/distance。
-
-    Args:
-        map_msg: nav_msgs/OccupancyGrid 或测试 mock (SimpleNamespace, 属性访问)。
-            容错读 info.resolution/width/height/origin.position.x/y;
-            data 是 list[int], row-major (idx = row*width + col);
-            cell 三态: -1 未知 / 0 自由 / 100 占据 (1..99 当占据, 边界判定只看 -1 和 0)。
-        robot_pose: tuple (x, y, yaw) in map frame (m, rad)。取 x,y 算簇距离。
-        visited: list[dict] 已访 frontier 中心 [{"x":, "y":}]。
-        min_cluster_size: int, 小于此 cell 数的簇视为噪点丢弃。
-        revisit_radius: float (m), 簇中心到任一 visited 点距离小于此值则跳过 (防重访)。
-
-    Returns:
-        list[dict], 每个 dict:
-          {"center_cell": (row, col), "center_world": (x_m, y_m),
-           "size": int (簇 cell 数), "distance": float (簇中心到机器人距离, 米)}
-        无簇返回 []。
-    """
-    # ---- 1. 容错解析 map_msg ----
-    if map_msg is None:
-        return []
-    info = getattr(map_msg, "info", None)
-    if info is None:
-        return []
-    resolution = float(getattr(info, "resolution", 0.0) or 0.0)
-    width = int(getattr(info, "width", 0) or 0)
-    height = int(getattr(info, "height", 0) or 0)
-    if resolution <= 0.0 or width <= 0 or height <= 0:
-        return []
-    origin = getattr(info, "origin", None)
-    if origin is not None:
-        pos = getattr(origin, "position", None)
-        if pos is not None:
-            origin_x = float(getattr(pos, "x", 0.0) or 0.0)
-            origin_y = float(getattr(pos, "y", 0.0) or 0.0)
-        else:
-            origin_x, origin_y = 0.0, 0.0
-    else:
-        origin_x, origin_y = 0.0, 0.0
-    data = getattr(map_msg, "data", None)
-    if not data:
-        return []
-    # 统一成 list[int]
-    if not isinstance(data, list):
-        try:
-            data = list(data)
-        except Exception:
-            return []
-
-    robot_x = float(robot_pose[0]) if robot_pose else 0.0
-    robot_y = float(robot_pose[1]) if len(robot_pose) > 1 else 0.0
-
-    def cell_value(r, c):
-        """越界返回 None (不视作未知); 否则返回 data 值。"""
-        if r < 0 or r >= height or c < 0 or c >= width:
-            return None
-        return data[r * width + c]
-
-    # ---- 2. 边界 cell 检测: 自由 cell 且 8 邻域至少一个未知 ----
-    UNKNOWN, FREE = -1, 0
-    frontier_cells = []
-    # 8 邻域偏移 (dr, dc)
-    neighbors8 = [(-1, -1), (-1, 0), (-1, 1),
-                  (0, -1),          (0, 1),
-                  (1, -1),  (1, 0),  (1, 1)]
-    for row in range(height):
-        row_base = row * width
-        for col in range(width):
-            if data[row_base + col] != FREE:
-                continue
-            for dr, dc in neighbors8:
-                v = cell_value(row + dr, col + dc)
-                if v == UNKNOWN:
-                    frontier_cells.append((row, col))
-                    break  # 一个未知邻居即可
-
-    if not frontier_cells:
-        return []
-
-    # ---- 3. connected-components 聚簇 (BFS, 8 连通) ----
-    frontier_set = set(frontier_cells)
-    visited_cells = set()
-    clusters_raw = []
-    for seed in frontier_cells:
-        if seed in visited_cells:
-            continue
-        # BFS
-        queue = [seed]
-        visited_cells.add(seed)
-        component = [seed]
-        head = 0
-        while head < len(queue):
-            r, c = queue[head]
-            head += 1
-            for dr, dc in neighbors8:
-                nb = (r + dr, c + dc)
-                if nb in frontier_set and nb not in visited_cells:
-                    visited_cells.add(nb)
-                    queue.append(nb)
-                    component.append(nb)
-        if len(component) >= min_cluster_size:
-            clusters_raw.append(component)
-
-    if not clusters_raw:
-        return []
-
-    # ---- 4. 簇中心 + world 坐标 + 距离 + visited 过滤 ----
-    out = []
-    for comp in clusters_raw:
-        n = len(comp)
-        mean_row = sum(r for r, _ in comp) / n
-        mean_col = sum(c for _, c in comp) / n
-        center_row = int(round(mean_row))
-        center_col = int(round(mean_col))
-        cx_world = origin_x + center_col * resolution
-        cy_world = origin_y + center_row * resolution
-
-        # visited 过滤: 簇中心到任一 visited 点 < revisit_radius 则跳过
-        too_close = False
-        if visited:
-            for vp in visited:
-                vx = float(vp.get("x", 0.0)) if isinstance(vp, dict) else 0.0
-                vy = float(vp.get("y", 0.0)) if isinstance(vp, dict) else 0.0
-                if math.hypot(cx_world - vx, cy_world - vy) < revisit_radius:
-                    too_close = True
-                    break
-        if too_close:
-            continue
-
-        distance = math.hypot(cx_world - robot_x, cy_world - robot_y)
-        out.append({
-            "center_cell": (center_row, center_col),
-            "center_world": (cx_world, cy_world),
-            "size": n,
-            "distance": distance,
-        })
-    return out
+def _frontier_map_qos():
+    """Match the padded map publisher's reliable/transient-local contract."""
+    if not all((_QoSProfile, _ReliabilityPolicy,
+                _DurabilityPolicy, _HistoryPolicy)):
+        return 10
+    return _QoSProfile(
+        history=_HistoryPolicy.KEEP_LAST,
+        depth=1,
+        reliability=_ReliabilityPolicy.RELIABLE,
+        durability=_DurabilityPolicy.TRANSIENT_LOCAL,
+    )
 
 
-def select_next_frontier(map_msg, robot_pose, visited,
-                         min_cluster_size=3, revisit_radius=1.0):
-    """从 occupancy grid 选下一个 frontier 目标点。
+# Runtime authority lives in the pure planner module.  The names remain
+# exported for compatibility with existing offline callers.
+_find_frontier_clusters = _planner_find_frontier_clusters
 
-    已实现 cost-distance 加权 (方法 c, 默认 α=1.0, 环境变量 GO2W_FRONTIER_ALPHA 可覆盖):
-    平衡探索收益 (簇 size) 与行走代价 (distance)。
-    frontier 簇列表由 `_find_frontier_clusters` 提供 (脚手架已实现): 每个簇含
-      - center_cell (row, col), center_world (x_m, y_m)
-      - size (簇 cell 数, 探索收益代理)
-      - distance (簇中心到机器人欧氏距离, 米)
-    visited 过滤 / 小簇过滤 / 8 连通 BFS 聚簇均在脚手架内完成。
 
-    Args:
-        map_msg: nav_msgs/OccupancyGrid (slam_toolbox 发的 /map 或 /map_frontier)
-            - data[] 是 row-major int8[], -1=未知 / 0=自由 / 100=占据
-            - info.resolution (m/cell), info.width, info.height, info.origin (Pose)
-        robot_pose: tuple (x, y, yaw) in map frame (m, rad)
-        visited: list[dict] 已访 frontier 中心 [{"x":, "y":}]
-        min_cluster_size: int, 小簇过滤阈值 (默认 3)。
-        revisit_radius: float (m), 重访过滤半径 (默认 1.0)。
+def select_frontier_candidates(map_msg, robot_pose, visited, **kwargs):
+    kwargs.setdefault("cluster_finder", _find_frontier_clusters)
+    return _planner_select_frontier_candidates(
+        map_msg, robot_pose, visited, **kwargs)
 
-    Returns:
-        dict {"x": float, "y": float, "yaw": float, "size": int, "score": float}
-        代表下一个 Nav2 goal (map frame), 或 None 表示无可用 frontier。
 
-    # 三种 valid frontier 选择方法 (已实现 c):
-    #   (a) 最近邻 frontier: 遍历 grid 找未知/自由边界 cell, 选欧氏距离最近的簇中心。
-    #   (b) 信息增益最大化: 按 frontier 簇大小 (cell 数) 评分, 选最大簇。
-    #   (c) cost-distance 加权: score = size / (1 + distance * alpha), 平衡探索收益与行走代价。
-    #
-    # 实现说明: 默认走 (c), α=1.0 (GO2W_FRONTIER_ALPHA 可覆盖)。score = size/(1+distance*α)。
-    """
-    # ---- 脚手架: 找簇 (已实现) ----
-    clusters = _find_frontier_clusters(map_msg, robot_pose, visited,
-                                       min_cluster_size, revisit_radius)
-    if not clusters:
-        return None
-
-    # ===== cost-distance 评分 (默认实现: alpha=1.0, 经典公式, yaw 指向簇中心) =====
-    # score = size / (1 + distance * alpha) — 平衡探索收益与行走代价
-    # alpha 可由调用方/环境变量调参 (大→保守就近, 小→贪心探索); 默认 1.0
-    robot_x, robot_y, _ = robot_pose
-    try:
-        alpha = float(os.environ.get("GO2W_FRONTIER_ALPHA", "1.0"))
-    except (TypeError, ValueError):
-        logger.warning("GO2W_FRONTIER_ALPHA 非法, 回退到默认 1.0")
-        alpha = 1.0
-    if not math.isfinite(alpha) or alpha <= 0.0:
-        logger.warning(f"GO2W_FRONTIER_ALPHA={alpha} 必须 > 0, 回退到 1.0")
-        alpha = 1.0
-
-    def _score(c):
-        return c["size"] / (1.0 + c["distance"] * alpha)
-
-    best = max(clusters, key=_score)
-    bx, by = best["center_world"]
-    yaw = math.atan2(by - robot_y, bx - robot_x)
-    return {"x": bx, "y": by, "yaw": yaw,
-            "size": best["size"], "score": _score(best)}
+def select_next_frontier(map_msg, robot_pose, visited, **kwargs):
+    """Choose (a) nearest/(b) gain candidates using (c) cost-distance."""
+    candidates = select_frontier_candidates(
+        map_msg, robot_pose, visited, **kwargs)
+    return candidates[0] if candidates else None
 
 
 # ============================================================================
@@ -324,7 +164,8 @@ class Room:
     """单个房间定义 (从 rooms.yaml 一条 room 反序列化)。"""
 
     def __init__(self, name: str, aliases: List[str], nav_pose: dict,
-                 search_area: dict, target_classes: Optional[List[str]] = None):
+                 search_area: dict, target_classes: Optional[List[str]] = None,
+                 calibrated: bool = False):
         self.name = name
         self.aliases = list(aliases or [])
         self.nav_pose = {
@@ -341,6 +182,7 @@ class Room:
             "pattern": str(search_area.get("pattern", "lawnmower")),
         }
         self.target_classes = list(target_classes or [])
+        self.calibrated = bool(calibrated)
 
     def to_dict(self) -> dict:
         """序列化 (供 /api/rooms 或 mission_report.area 用)。"""
@@ -350,6 +192,7 @@ class Room:
             "nav_pose": dict(self.nav_pose),
             "search_area": dict(self.search_area),
             "target_classes": list(self.target_classes),
+            "calibrated": self.calibrated,
         }
 
     @classmethod
@@ -410,8 +253,12 @@ class Room:
         target_classes = d.get("target_classes", [])
         if not isinstance(target_classes, list):
             raise ValueError(f"room[{name}].target_classes 必须是 list")
+        calibrated = d.get("calibrated", False)
+        if not isinstance(calibrated, bool):
+            raise ValueError(f"room[{name}].calibrated 必须是 bool")
 
-        return cls(name, aliases, nav_pose, search_area, target_classes)
+        return cls(name, aliases, nav_pose, search_area, target_classes,
+                   calibrated=calibrated)
 
 
 class RoomMap:
@@ -508,210 +355,6 @@ class RoomMap:
         return [r.to_dict() for r in self.rooms]
 
 
-# ============================================================================
-# Nav2ActionClient — Nav2 NavigateToPose action client 封装 (spec 决策 1/4)
-# ============================================================================
-# NavigateToPose action 标准状态码 (rclpy rclpy.action GoalStatus)
-_STATUS_SUCCEEDED = 4
-_STATUS_ABORTED = 6
-_STATUS_CANCELED = 7
-
-
-class Nav2ActionClient:
-    """Nav2 NavigateToPose action client 的同步等待封装。
-
-    线程模型 (spec 决策 4):
-      - 构造时挂在 nx_web_server 的 NxWebNode 上 (与主 rclpy.spin 共享 node)
-      - send_goal_and_wait() 在 TaskManager worker 线程内调,
-        用 rclpy.spin_until_complete(node, future, timeout) 同步等
-      - 主 spin 线程 (线程1) 不干涉 (spin_until_complete 临时驱动 future 回调)
-    """
-
-    def __init__(self, node, action_name: str = '/navigate_to_pose',
-                 goal_accept_timeout: float = 5.0,
-                 nav_complete_timeout: float = 120.0):
-        if not _import_ros():
-            raise RuntimeError("rclpy/nav2_msgs 不可用, 无法创建 Nav2ActionClient")
-        self._node = node
-        self._client = _ActionClient(
-            node, _NavigateToPose, action_name,
-            callback_group=_ReentrantCallbackGroup()  # spec 决策 4 约束 2: 必须 Reentrant
-        )
-        self._goal_accept_timeout = float(goal_accept_timeout)
-        self._nav_complete_timeout = float(nav_complete_timeout)
-        self._lock = threading.Lock()
-        self._current_handle = None      # 当前 goal_handle (cancel 用)
-        self._feedback_callback = None   # 外部注入的 feedback 回调 (推进度用)
-        self._cancelled = False
-
-    def wait_for_server(self, timeout: float = 2.0) -> bool:
-        """探测 Nav2 action server 是否在线 (阶段D/mock 判据)。"""
-        try:
-            return self._client.wait_for_server(timeout_sec=float(timeout))
-        except Exception as e:
-            logger.warning(f"Nav2 wait_for_server 异常: {e}")
-            return False
-
-    def set_feedback_callback(self, cb):
-        """注入 feedback 回调: cb(distance_remaining, estimated_time_remaining, *extra)。"""
-        self._feedback_callback = cb
-
-    def _yaw_to_quaternion(self, yaw: float):
-        """yaw (弧度) → (qx, qy, qz, qw) 四元数 (REP-103)。
-        spec §7.1: qz=sin(yaw/2), qw=cos(yaw/2), qx=qy=0
-        (对齐休眠包 orchestrator_node.py:176-180)
-        """
-        half = float(yaw) / 2.0
-        qz = math.sin(half)
-        qw = math.cos(half)
-        return 0.0, 0.0, qz, qw
-
-    def _on_feedback(self, feedback_msg):
-        """Nav2 feedback 回调 (主 spin 或 worker spin 驱动, 线程安全)。
-        feedback_msg.feedback 含 distance_remaining / estimated_time_remaining。
-        """
-        try:
-            fb = getattr(feedback_msg, "feedback", None)
-            if fb is None or self._feedback_callback is None:
-                return
-            dist = float(getattr(fb, "distance_remaining", 0.0) or 0.0)
-            try:
-                eta = float(getattr(fb, "estimated_time_remaining", 0.0).sec
-                            + getattr(fb, "estimated_time_remaining", 0.0).nanosec * 1e-9)
-            except Exception:
-                eta = 0.0
-            self._feedback_callback(dist, eta)
-        except Exception as e:
-            logger.debug(f"Nav2 feedback 处理异常: {e}")
-
-    def send_goal_and_wait(self, x: float, y: float, yaw: float,
-                           frame_id: str = 'map') -> Dict:
-        """同步发 Nav2 goal + 等接受 + 等到达 (spec 决策 4)。
-
-        返回:
-          {"ok": True, "status": 4}                              成功 (STATUS_SUCCEEDED)
-          {"ok": False, "reason": "no_server"}                   server 不在线
-          {"ok": False, "reason": "rejected"}                    goal 被拒绝
-          {"ok": False, "reason": "timeout"}                     导航超时
-          {"ok": False, "reason": "aborted", "status": N}        Nav2 主动 abort
-          {"ok": False, "reason": "cancelled"}                   被 cancel_goal 取消
-        """
-        # 1. wait_for_server → 不在则 no_server
-        if not self.wait_for_server(self._goal_accept_timeout):
-            return {"ok": False, "reason": "no_server"}
-
-        # 2. 构造 NavigateToPose.Goal (PoseStamped, yaw→四元数)
-        goal = _NavigateToPose.Goal()
-        goal.pose.header.stamp = self._node.get_clock().now().to_msg()
-        goal.pose.header.frame_id = frame_id
-        goal.pose.pose.position.x = float(x)
-        goal.pose.pose.position.y = float(y)
-        goal.pose.pose.position.z = 0.0
-        qx, qy, qz, qw = self._yaw_to_quaternion(yaw)
-        goal.pose.pose.orientation.x = qx
-        goal.pose.pose.orientation.y = qy
-        goal.pose.pose.orientation.z = qz
-        goal.pose.pose.orientation.w = qw
-
-        with self._lock:
-            self._cancelled = False
-            self._current_handle = None
-
-        # 3. send_goal_async → goal_future
-        try:
-            goal_future = self._client.send_goal_async(
-                goal, feedback_callback=self._on_feedback)
-        except Exception as e:
-            logger.warning(f"send_goal_async 异常: {e}")
-            return {"ok": False, "reason": "no_server"}
-
-        # 4. spin_until_complete(node, goal_future, goal_accept_timeout)
-        #    → 超时 no_server / rejected / 拿到 handle
-        try:
-            _rclpy.spin_until_complete(self._node, goal_future,
-                                       timeout_sec=self._goal_accept_timeout)
-        except Exception as e:
-            logger.warning(f"spin_until_complete(goal) 异常: {e}")
-            return {"ok": False, "reason": "no_server"}
-
-        if not goal_future.done():
-            return {"ok": False, "reason": "no_server"}  # 接受超时
-        goal_handle = goal_future.result()
-        if goal_handle is None:
-            return {"ok": False, "reason": "no_server"}
-        if not getattr(goal_handle, "accepted", False):
-            return {"ok": False, "reason": "rejected"}
-
-        # 持有 handle (cancel 用)
-        with self._lock:
-            self._current_handle = goal_handle
-
-        # 5. handle.get_result_async → result_future
-        try:
-            result_future = goal_handle.get_result_async()
-        except Exception as e:
-            logger.warning(f"get_result_async 异常: {e}")
-            return {"ok": False, "reason": "aborted", "status": -1}
-
-        # 6. spin_until_complete(node, result_future, nav_complete_timeout)
-        #    → 超时 timeout / status==4 ok / 其他 aborted / cancelled
-        try:
-            _rclpy.spin_until_complete(self._node, result_future,
-                                       timeout_sec=self._nav_complete_timeout)
-        except Exception as e:
-            logger.warning(f"spin_until_complete(result) 异常: {e}")
-            # 尝试 cancel 后返回 timeout
-            try:
-                goal_handle.cancel_goal_async()
-            except Exception:
-                pass
-            return {"ok": False, "reason": "timeout"}
-
-        # 检查是否被外部 cancel
-        with self._lock:
-            if self._cancelled:
-                return {"ok": False, "reason": "cancelled"}
-            self._current_handle = None
-
-        if not result_future.done():
-            # 导航超时 → 尝试 cancel
-            try:
-                goal_handle.cancel_goal_async()
-            except Exception:
-                pass
-            return {"ok": False, "reason": "timeout"}
-
-        result = result_future.result()
-        status = int(getattr(result, "status", -1))
-        if status == _STATUS_SUCCEEDED:
-            return {"ok": True, "status": status}
-        if status == _STATUS_ABORTED:
-            return {"ok": False, "reason": "aborted", "status": status}
-        if status == _STATUS_CANCELED:
-            return {"ok": False, "reason": "cancelled"}
-        # 其他非成功状态统一算 aborted
-        return {"ok": False, "reason": "aborted", "status": status}
-
-    def cancel_current(self) -> bool:
-        """取消当前进行中的 Nav2 goal (cancel_all / e_stop 时调)。
-        spec 决策 4 约束 4: 标 _cancelled=True + 调 handle.cancel_goal_async()
-        """
-        with self._lock:
-            self._cancelled = True
-            handle = self._current_handle
-        if handle is None:
-            return False
-        try:
-            handle.cancel_goal_async()
-            return True
-        except Exception as e:
-            logger.warning(f"cancel_goal_async 异常: {e}")
-            return False
-
-
-# ============================================================================
-# MissionReport — 任务最终报告 (go2w_interfaces/MissionReport.msg 的 dict 等价)
-# ============================================================================
 def build_mission_report(mission_id: str, room: Room, waypoints_total: int,
                          waypoints_visited: int, detections: List[dict],
                          start_time: float, end_time: float,
@@ -755,8 +398,12 @@ class RoomSearchOrchestrator:
 
     def __init__(self, node=None, ai_engine=None,
                  ws_broadcast_fn=None,
-                 rooms_yaml_path: Optional[str] = None):
-        self._node = node                  # NxWebNode (供 Nav2ActionClient 挂载)
+                 rooms_yaml_path: Optional[str] = None,
+                 *, navigation_port=None,
+                 observation_sync=None,
+                 mission_root=None,
+                 _test_allow_uncalibrated_rooms: bool = False):
+        self._node = node                  # NxWebNode (只用于订阅/快照，不创建 action client)
         self._ai = ai_engine               # NxAiEngine (阶段B), 读 get_detections_world
         self._ws = ws_broadcast_fn         # ws_broadcast 注入 (与 nx_ai_node 同款)
         self._lock = threading.Lock()
@@ -766,7 +413,8 @@ class RoomSearchOrchestrator:
         self._room_map: Optional[RoomMap] = None
         self._room_map_err: Optional[str] = None  # 加载失败原因 (供 /api/rooms 显示)
         # Nav2 client (懒创建, 首次 run 时)
-        self._nav: Optional[Nav2ActionClient] = None
+        self._nav = navigation_port
+        self._observation_sync = observation_sync
         # 当前 mission 状态 (cancel 检查 + 推进度用)
         self._current_mission_id: Optional[str] = None
         self._current_room_name: Optional[str] = None
@@ -774,8 +422,32 @@ class RoomSearchOrchestrator:
         self._current_wp_idx: int = 0
         self._current_targets_found: int = 0
         self._person_markers: List[dict] = []
+        self._mission_state: Dict = {"phase": "idle"}
+        configured_mission_root = (
+            mission_root
+            if mission_root is not None
+            else os.environ.get("GO2W_MISSION_ROOT")
+        )
+        self._mission_root = (
+            os.path.abspath(os.path.expanduser(str(configured_mission_root)))
+            if str(configured_mission_root or "").strip()
+            else None
+        )
+        self._last_report: Optional[Dict] = None
         self._static_root = os.path.join(_WEB_DIR, "static")
+        if self._mission_root and callable(load_latest_mission_report):
+            restored_report = load_latest_mission_report(self._mission_root)
+            if restored_report is not None:
+                restored_markers = restored_report.get("detections") or []
+                self._last_report = dict(restored_report)
+                self._person_markers = [
+                    dict(marker) for marker in restored_markers
+                    if isinstance(marker, dict)
+                ]
+                self._current_targets_found = len(self._person_markers)
         self._cancelled = False
+        self._test_allow_uncalibrated_rooms = bool(
+            _test_allow_uncalibrated_rooms)
 
     # ---- 房间地图加载 ----
     def _ensure_room_map(self) -> Optional[RoomMap]:
@@ -850,27 +522,13 @@ class RoomSearchOrchestrator:
             return []
         return self._room_map.list_rooms_detail()
 
-    # ---- Nav2 client ----
-    def _ensure_nav(self) -> Optional[Nav2ActionClient]:
-        """懒创建 Nav2ActionClient (首次 run 时)。失败返回 None。"""
+    # ---- Shared Nav2 gateway facade ----
+    def _ensure_nav(self):
+        """Return the injected MissionNavigationPort; never create a client."""
         if self._nav is not None:
             return self._nav
-        if self._node is None:
-            logger.error("Nav2 创建失败: rclpy node 未注入")
-            return None
-        if not _import_ros():
-            logger.error("Nav2 创建失败: rclpy/nav2_msgs 不可用")
-            return None
-        try:
-            self._nav = Nav2ActionClient(self._node)
-            # 注入 feedback 回调: 把 distance_remaining 写进当前 mission 推进度
-            self._nav.set_feedback_callback(self._on_nav_feedback)
-            logger.info("Nav2ActionClient 已创建 (/navigate_to_pose)")
-            return self._nav
-        except Exception as e:
-            logger.error(f"Nav2ActionClient 创建失败: {e}")
-            self._nav = None
-            return None
+        logger.error("Nav2 shared navigation gateway was not injected")
+        return None
 
     def _on_nav_feedback(self, distance_remaining: float, eta_sec: float):
         """Nav2 feedback 回调: 推 type=search_room 进度 (NAVIGATING 时)。"""
@@ -892,14 +550,41 @@ class RoomSearchOrchestrator:
         任何阶段失败: task.status=failed, ws 推 phase:FAILED + reason。
         """
         params = task.params or {}
+        mission_payload = params.get("mission_request")
+        if mission_payload is not None:
+            try:
+                mission_request = SearchMissionRequest.from_dict(
+                    mission_payload)
+            except MissionValidationError as exc:
+                self._fail("invalid_mission_request", room=None, msg=str(exc))
+                task.status = "failed"
+                task.result = {
+                    "reason": "invalid_mission_request", "message": str(exc)}
+                return
+            extras = {
+                key: params[key] for key in (
+                    "max_frontiers", "max_frontier_plan_probes",
+                    "max_frontier_rejections", "frontier_planning_timeout",
+                ) if key in params
+            }
+            params = mission_request.to_task_params()
+            params.update(extras)
+            task.params = params
+        else:
+            mission_request = None
         room_query = params.get("room", "")
         is_product_search = params.get("search_strategy") == "next_best_view"
         # 任务级 target_classes 覆盖 (room.target_classes 优先, 任务级次之)
         task_target_classes = params.get("target_classes", []) or []
 
-        mission_id = uuid.uuid4().hex[:8]
+        mission_id = (
+            mission_request.request_id if mission_request is not None
+            else uuid.uuid4().hex[:8])
         start_time = time.time()
         with self._lock:
+            if getattr(task, "status", None) == "cancelled":
+                self._cancelled = True
+                return
             self._cancelled = False
             self._current_mission_id = mission_id
             self._current_room_name = room_query
@@ -910,7 +595,13 @@ class RoomSearchOrchestrator:
         # ---- frontier 探索: 无预建图模式, 绕过 RoomMap/SELECT_ROOM ----
         # plan 2026-07-03 §3.3.3: 分发前移到 run() 入口, 不进 SELECT_ROOM/RoomMap 路径
         if params.get("search_strategy") == "frontier_explore":
-            self._run_frontier_explore(task, mission_id, start_time, params)
+            target_classes = self._normalize_target_classes(
+                task_target_classes)
+            target_scope = self._activate_detection_targets(target_classes)
+            try:
+                self._run_frontier_explore(task, mission_id, start_time, params)
+            finally:
+                self._restore_detection_targets(target_scope)
             return
 
         detections_log: List[dict] = []   # 累积所有检测 (含 robot 位姿 + 时间戳)
@@ -962,17 +653,32 @@ class RoomSearchOrchestrator:
             task.status = "failed"
             task.result = {"reason": "no_room", "query": room_query}
             return
+        if not room.calibrated and not self._test_allow_uncalibrated_rooms:
+            self._fail(
+                "room_uncalibrated",
+                room=room.name,
+                msg="calibrate nav_pose/search_area and set calibrated: true",
+            )
+            task.status = "failed"
+            task.result = {"reason": "room_uncalibrated", "room": room.name}
+            return
         with self._lock:
             self._current_room_name = room.name
         self._phase("SELECT_ROOM", progress=0.1, room=room.name,
                     info=f"匹配到房间 '{room.name}'")
 
         # 决定 target_classes: room 优先, 任务级次之, 空则全记
-        target_classes = room.target_classes if room.target_classes else task_target_classes
+        target_classes = (
+            task_target_classes if task_target_classes else room.target_classes)
+        target_classes = self._normalize_target_classes(target_classes)
         if params.get("search_strategy") == "next_best_view":
-            self._run_product_person_search(
-                task, mission_id, start_time, room_map, room,
-                target_classes, params)
+            target_scope = self._activate_detection_targets(target_classes)
+            try:
+                self._run_product_person_search(
+                    task, mission_id, start_time, room_map, room,
+                    target_classes, params)
+            finally:
+                self._restore_detection_targets(target_scope)
             return
 
         # ---- 2. NAVIGATE (发房间入口 goal) ----
@@ -1065,7 +771,7 @@ class RoomSearchOrchestrator:
             self._phase("DETECT", progress=float(i + 1) / float(max(1, total_wp)),
                         room=room.name, current_wp=i, total_wp=total_wp)
             if self._check_cancel("DETECT", room.name): return
-            # 取狗当前位姿 (map 坐标) — 优先用航点位姿 (Nav2 已到), nx_web 注入时也可读 /odom
+            # 取狗当前位姿 (map 坐标) — 优先用 /localization_pose, 失败再用航点 fallback
             robot_x, robot_y, robot_yaw = self._get_robot_pose(fallback=wp)
             self._snapshot_detections(room, target_classes,
                                       robot_x, robot_y, robot_yaw,
@@ -1092,18 +798,19 @@ class RoomSearchOrchestrator:
             task.result = {"reason": "product_search_unavailable"}
             return
 
-        get_snapshot = getattr(self._ai, "get_person_detection_snapshot", None)
-        if self._ai is None or not callable(get_snapshot):
+        target_classes = self._normalize_target_classes(target_classes)
+        get_snapshot = self._detection_snapshot_getter(target_classes)
+        if self._ai is None or get_snapshot is None:
             self._fail("no_yolo", room=room.name)
             task.status = "failed"
             task.result = {"reason": "no_yolo"}
             return
 
-        target_classes = list(target_classes or [])
-        if "person" not in target_classes:
-            target_classes = ["person"]
-
-        if self._param_explicitly_false(params.get("use_lidar_person_range")):
+        lidar_range_setting = params.get(
+            "use_lidar_target_range",
+            params.get("use_lidar_person_range"),
+        )
+        if self._param_explicitly_false(lidar_range_setting):
             self._fail("lidar_required", room=room.name)
             task.status = "failed"
             task.result = {"reason": "lidar_required"}
@@ -1158,17 +865,21 @@ class RoomSearchOrchestrator:
             planner = ActiveSearchPlanner(
                 spacing=self._active_search_spacing(room),
                 obstacle_clearance=self._positive_float(
-                    params.get("obstacle_clearance_m"), 0.5))
+                    params.get("obstacle_clearance_m"), 0.5),
+                visual_range_m=self._positive_float(
+                    params.get("visual_range_m"), 2.5))
         except Exception as e:
             self._fail("invalid_search_area", room=room.name, msg=str(e))
             task.status = "failed"
             task.result = {"reason": "invalid_search_area", "error": str(e)}
             return
 
-        store = PersonMissionStore(mission_id, static_root=self._static_root)
+        store = self._new_target_store(mission_id, target_classes[0])
         visited = 0
         require_photos = bool(params.get("require_photos", False))
         last_viewpoint_failure = None
+        coverage_threshold = self._coverage_threshold(
+            params.get("coverage_threshold"), 0.9)
 
         for view_idx in range(max_views):
             with self._lock:
@@ -1195,7 +906,13 @@ class RoomSearchOrchestrator:
             self._phase("NEXT_BEST_VIEW", progress=progress, room=room.name,
                         current_wp=view_idx, total_wp=max_views,
                         waypoint=(candidate["x"], candidate["y"]),
-                        score=candidate.get("score"))
+                        score=candidate.get("score"),
+                        room_area=dict(room.search_area),
+                        candidate_viewpoints=[
+                            {"x": item["x"], "y": item["y"]}
+                            for item in candidates[:200]
+                        ],
+                        **planner.coverage_state())
             result = nav.send_goal_and_wait(
                 candidate["x"], candidate["y"], candidate.get("yaw", 0.0),
                 frame_id=room_map.frame_id)
@@ -1215,7 +932,6 @@ class RoomSearchOrchestrator:
                 continue
 
             visited += 1
-            planner.mark_visited(candidate)
             observe_pose = self._get_live_robot_pose()
             if observe_pose is None:
                 self._fail("no_pose", room=room.name, stage=f"viewpoint_{view_idx}",
@@ -1225,6 +941,7 @@ class RoomSearchOrchestrator:
                 return
             self._phase("DETECT", progress=float(view_idx + 1) / float(max(1, max_views)),
                         room=room.name, current_wp=view_idx, total_wp=max_views)
+            unresolved_before_observation = len(store.unresolved())
             observed = self._observe_people_at_viewpoint(
                 store, room.name, view_idx, observe_pose, target_classes,
                 require_photos=require_photos, use_lidar=True)
@@ -1233,14 +950,60 @@ class RoomSearchOrchestrator:
                 task.status = "failed"
                 task.result = {"reason": "no_scan"}
                 return
+            observation_warning = None
             if isinstance(observed, dict) and observed.get("reason"):
                 reason = str(observed.get("reason"))
-                self._fail(reason, room=room.name, stage=f"viewpoint_{view_idx}",
-                           detections=observed.get("detections"))
-                task.status = "failed"
-                task.result = observed
-                return
+                if reason == "no_lidar_range":
+                    resolved_count = self._positive_int(
+                        observed.get("resolved_count"), 0)
+                    store.resolve_unresolved(min(
+                        resolved_count, unresolved_before_observation))
+                    observation_warning = reason
+                else:
+                    self._fail(reason, room=room.name, stage=f"viewpoint_{view_idx}",
+                               detections=observed.get("detections"))
+                    task.status = "failed"
+                    task.result = observed
+                    return
+            elif isinstance(observed, dict):
+                resolved_count = self._positive_int(
+                    observed.get("resolved_count"), 0)
+                store.resolve_unresolved(min(
+                    resolved_count, unresolved_before_observation))
+            elif isinstance(observed, int) and observed > 0:
+                store.resolve_unresolved(min(
+                    observed, unresolved_before_observation))
+            observation_source = (
+                observed.get("source") if isinstance(observed, dict) else None)
+            observation_valid = (
+                bool(observed.get("observation_valid", True))
+                if isinstance(observed, dict) else True
+            )
+            planner.mark_visited(
+                candidate,
+                camera_hfov_rad=self._camera_hfov_rad(observation_source),
+                camera_yaw_offset_rad=self._camera_yaw_offset_rad(
+                    observation_source),
+                observation_valid=observation_valid,
+            )
+            coverage = planner.coverage_state()
+            self._phase(
+                "ACTIVE_SEARCH",
+                progress=coverage["coverage_ratio"],
+                room=room.name,
+                current_wp=view_idx,
+                total_wp=max_views,
+                room_area=dict(room.search_area),
+                coverage_threshold=coverage_threshold,
+                warning=observation_warning,
+                **coverage,
+            )
             self._broadcast_person_markers(mission_id, store.markers())
+            if (
+                coverage["coverage_ratio"] >= coverage_threshold
+                and not store.unresolved()
+            ):
+                break
 
         if visited == 0:
             reason = "no_viewpoint_reached"
@@ -1250,12 +1013,60 @@ class RoomSearchOrchestrator:
             return
 
         markers = store.markers()
+        unresolved = store.unresolved()
+        coverage = planner.coverage_state()
         self._broadcast_person_markers(mission_id, markers)
+        if unresolved:
+            reason = "no_lidar_range"
+            self._fail(
+                reason,
+                room=room.name,
+                detections=unresolved,
+                coverage_ratio=coverage["coverage_ratio"],
+            )
+            task.status = "failed"
+            task.result = {
+                "reason": reason,
+                "detections": unresolved,
+                "resolved_detections": markers,
+                "coverage_ratio": coverage["coverage_ratio"],
+            }
+            return
+        if coverage["coverage_ratio"] < coverage_threshold:
+            reason = "coverage_incomplete"
+            self._fail(
+                reason,
+                room=room.name,
+                coverage_ratio=coverage["coverage_ratio"],
+                coverage_threshold=coverage_threshold,
+                observed_cells=coverage["observed_cells"],
+                total_cells=coverage["total_cells"],
+            )
+            task.status = "failed"
+            task.result = {
+                "reason": reason,
+                "coverage_complete": False,
+                "coverage_ratio": coverage["coverage_ratio"],
+                "coverage_threshold": coverage_threshold,
+                "observed_cells": coverage["observed_cells"],
+                "total_cells": coverage["total_cells"],
+                "detections": markers,
+            }
+            return
         self._phase("REPORT", progress=1.0, room=room.name,
                     targets_found=len(markers))
         self._finalize_report(task, mission_id, room, total_wp=max_views,
                               visited=visited, detections_log=markers,
-                              start_time=start_time)
+                              start_time=start_time,
+                              extra_result={
+                                  "coverage_complete": True,
+                                  "coverage_ratio": coverage["coverage_ratio"],
+                                  "coverage_threshold": coverage_threshold,
+                                  "observed_cells": coverage["observed_cells"],
+                                  "total_cells": coverage["total_cells"],
+                                  "visited_viewpoints": coverage["visited_viewpoints"],
+                                  "visual_range_m": coverage["visual_range_m"],
+                              })
 
     def _make_sentry_room(self, name: str = "__frontier__") -> Room:
         """构造最小哨兵 Room 供 frontier 探索 _finalize_report 用 (无真实 rooms.yaml 房间)。
@@ -1269,6 +1080,7 @@ class RoomSearchOrchestrator:
         room.nav_pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
         room.search_area = {}
         room.target_classes = []
+        room.calibrated = True
         return room
 
     def _run_frontier_explore(self, task, mission_id: str, start_time: float,
@@ -1277,7 +1089,7 @@ class RoomSearchOrchestrator:
 
         状态流: INIT_SLAM → (FRONTIER_DETECT → NAVIGATING → DETECT)* → REPORT
         复用 _phase/_fail/_check_cancel/_finalize_report/_observe_people_at_viewpoint/
-        _broadcast_person_markers/_get_live_robot_pose/_laser_scan_snapshot/Nav2ActionClient。
+        _broadcast_person_markers/_get_live_robot_pose/_laser_scan_snapshot/共享导航端口。
         不依赖 RoomMap / rooms.yaml; room 名固定 "__frontier__" (哨兵 Room)。
         与 _run_product_person_search 同构, 便于前端复用 ws type=search_room 渲染。
         """
@@ -1305,14 +1117,20 @@ class RoomSearchOrchestrator:
             task.result = {"reason": "frontier_unavailable"}
             return
 
-        get_snapshot = getattr(self._ai, "get_person_detection_snapshot", None)
-        if self._ai is None or not callable(get_snapshot):
+        target_classes = self._normalize_target_classes(
+            params.get("target_classes", []))
+        get_snapshot = self._detection_snapshot_getter(target_classes)
+        if self._ai is None or get_snapshot is None:
             self._fail("no_yolo", room="__frontier__")
             task.status = "failed"
             task.result = {"reason": "no_yolo"}
             return
 
-        if self._param_explicitly_false(params.get("use_lidar_person_range")):
+        lidar_range_setting = params.get(
+            "use_lidar_target_range",
+            params.get("use_lidar_person_range"),
+        )
+        if self._param_explicitly_false(lidar_range_setting):
             self._fail("lidar_required", room="__frontier__")
             task.status = "failed"
             task.result = {"reason": "lidar_required"}
@@ -1323,10 +1141,6 @@ class RoomSearchOrchestrator:
             task.status = "failed"
             task.result = {"reason": "no_scan"}
             return
-
-        target_classes = list(params.get("target_classes", []) or [])
-        if "person" not in target_classes:
-            target_classes = ["person"]
 
         with self._lock:
             self._current_room_name = "__frontier__"
@@ -1352,7 +1166,8 @@ class RoomSearchOrchestrator:
         try:
             # 创建订阅 (NxWebNode 上挂; 主 spin 线程驱动回调)
             sub_handle = self._node.create_subscription(
-                _OccupancyGrid, "/map_frontier", _on_map_frontier, 10)
+                _OccupancyGrid, "/map_frontier", _on_map_frontier,
+                _frontier_map_qos())
 
             # 等首帧 (超时 10s → no_map)
             if not map_received.wait(timeout=10.0):
@@ -1369,24 +1184,140 @@ class RoomSearchOrchestrator:
                 task.status = "failed"
                 task.result = {"reason": "no_nav"}
                 return
+            wait_for_planner = getattr(nav, "wait_for_planner", None)
+            compute_path = getattr(nav, "compute_path_to_pose", None)
+            if (not callable(wait_for_planner) or not callable(compute_path)
+                    or not wait_for_planner(timeout=2.0)):
+                self._fail("no_planner", room="__frontier__")
+                task.status = "failed"
+                task.result = {"reason": "no_planner"}
+                return
 
             sentry_room = self._make_sentry_room("__frontier__")
 
             # ---- 循环: frontier 驱动 Nav2 走 → 每停留点 DETECT ----
             max_frontiers = self._positive_int(params.get("max_frontiers"), 15)
             max_time = self._positive_float(params.get("max_time"), 300.0)
+            radius_value = params.get("max_radius_m")
+            max_radius = (
+                None if radius_value is None
+                else self._positive_float(radius_value, 6.0))
+            mission_origin = self._get_live_robot_pose()
+            if mission_origin is None:
+                self._fail("no_pose", room="__frontier__",
+                           stage="mission_origin",
+                           msg="live robot pose required to bound current-room search")
+                task.status = "failed"
+                task.result = {"reason": "no_pose"}
+                return
             with self._lock:
                 self._current_total_wp = max_frontiers
 
-            store = PersonMissionStore(mission_id, static_root=self._static_root)
-            visited: List[dict] = []
+            store = self._new_target_store(mission_id, target_classes[0])
             require_photos = bool(params.get("require_photos", False))
+            max_frontier_rejections = min(
+                5,
+                self._positive_int(params.get("max_frontier_rejections"), 2),
+            )
+            planning_timeout = self._positive_float(
+                params.get("frontier_planning_timeout"), 3.0)
+            max_plan_probes = self._positive_int(
+                params.get("max_frontier_plan_probes"),
+                max(8, max_frontiers * 4),
+            )
+            mission_deadline = start_time + max_time
+            canonical_request = params.get("mission_request") or {}
+            exploration_mode = (
+                "current_room"
+                if canonical_request.get("room") == "current_room"
+                or params.get("room") in {"__current__", "current_room"}
+                else "whole_floor"
+            )
+            exploration = ExplorationManager(
+                navigation_port=nav,
+                mission_origin=mission_origin,
+                observation_sync=self._observation_sync,
+                mode=exploration_mode,
+                room_radius_m=max_radius,
+                room_polygon=params.get("room_polygon"),
+                max_time_s=max_time,
+                max_distance_m=params.get("max_distance_m"),
+                battery_reserve_percent=self._positive_float(
+                    params.get("battery_reserve_percent"), 20.0),
+                max_failures_per_cell=max_frontier_rejections,
+                max_blacklist_entries=self._positive_int(
+                    params.get("max_frontier_blacklist"), 256),
+                reject_map_edge=bool(params.get(
+                    "reject_rolling_map_edge", True)),
+                planning_timeout_s=planning_timeout,
+                max_plan_probes=max_plan_probes,
+                candidate_selector=lambda *args, **kwargs: (
+                    select_frontier_candidates(*args, **kwargs)),
+            )
+            nav_attempts = 0
+            waypoints_reached = 0
+            completion_reason = "waypoint_budget_exhausted"
 
-            for iteration in range(max_frontiers):
+            # Observe at the start pose before asking for a frontier. A fully
+            # mapped room can legitimately have zero frontiers while a person
+            # is already visible from the command location.
+            self._phase("DETECT", progress=0.0, room="__frontier__",
+                        current_wp=0, total_wp=max_frontiers,
+                        info="initial_viewpoint")
+            unresolved_before_observation = len(store.unresolved())
+            initial_observed = self._observe_people_at_viewpoint(
+                store, "__frontier__", -1, mission_origin,
+                target_classes, require_photos=require_photos,
+                use_lidar=True)
+            if initial_observed is None:
+                self._fail("no_scan", room="__frontier__", stage="initial_viewpoint")
+                task.status = "failed"
+                task.result = {"reason": "no_scan"}
+                return
+            if (isinstance(initial_observed, dict)
+                    and initial_observed.get("reason")):
+                reason = str(initial_observed.get("reason"))
+                if reason == "no_lidar_range":
+                    resolved_count = self._positive_int(
+                        initial_observed.get("resolved_count"), 0)
+                    store.resolve_unresolved(min(
+                        resolved_count, unresolved_before_observation))
+                    self._phase(
+                        "FRONTIER_DETECT", progress=0.0,
+                        room="__frontier__", current_wp=0,
+                        total_wp=max_frontiers,
+                        warning="person seen without reliable lidar range; "
+                                "continuing from another viewpoint",
+                    )
+                else:
+                    self._fail(reason, room="__frontier__",
+                               stage="initial_viewpoint",
+                               detections=initial_observed.get("detections"))
+                    task.status = "failed"
+                    task.result = initial_observed
+                    return
+            elif isinstance(initial_observed, dict):
+                resolved_count = self._positive_int(
+                    initial_observed.get("resolved_count"), 0)
+                store.resolve_unresolved(min(
+                    resolved_count, unresolved_before_observation))
+            elif isinstance(initial_observed, int) and initial_observed > 0:
+                store.resolve_unresolved(min(
+                    initial_observed, unresolved_before_observation))
+            self._broadcast_person_markers(mission_id, store.markers())
+
+            while nav_attempts < max_frontiers:
+                iteration = nav_attempts
                 with self._lock:
                     self._current_wp_idx = iteration
 
-                # cancel 检查
+                if time.time() >= mission_deadline:
+                    completion_reason = "time_budget_exhausted"
+                    break
+                if exploration.snapshot()["plan_probes"] >= max_plan_probes:
+                    completion_reason = "planning_budget_exhausted"
+                    break
+
                 if self._check_cancel("FRONTIER_DETECT", "__frontier__"):
                     task.status = "failed"
                     task.result = {"reason": "cancelled"}
@@ -1407,16 +1338,25 @@ class RoomSearchOrchestrator:
                     task.result = {"reason": "no_pose"}
                     return
 
-                target = select_next_frontier(map_msg, robot_pose, visited)
-                if target is None:
-                    break  # 无可用 frontier, 正常结束
-
-                # FRONTIER_DETECT phase
                 progress = float(iteration) / float(max(1, max_frontiers))
-                self._phase("FRONTIER_DETECT", progress=progress,
-                            room="__frontier__", current_wp=iteration,
-                            total_wp=max_frontiers,
-                            waypoint=(target["x"], target["y"]))
+                self._phase(
+                    "FRONTIER_DETECT", progress=progress,
+                    room="__frontier__", current_wp=iteration,
+                    total_wp=max_frontiers, info="reachability_preflight")
+                target = exploration.choose_next(map_msg, robot_pose)
+                if target is None:
+                    selection_reason = exploration.snapshot().get(
+                        "last_selection_reason")
+                    if selection_reason == "retry_pending":
+                        continue
+                    completion_reason = {
+                        "information_gain_exhausted":
+                            "reachable_frontiers_exhausted",
+                        "reachable_frontiers_exhausted":
+                            "reachable_frontiers_exhausted",
+                    }.get(selection_reason, selection_reason or
+                          "reachable_frontiers_exhausted")
+                    break
 
                 # NAVIGATING: 发 Nav2 goal
                 self._phase("NAVIGATING", progress=progress,
@@ -1427,6 +1367,7 @@ class RoomSearchOrchestrator:
                     task.result = {"reason": "cancelled"}
                     return
 
+                nav_attempts += 1
                 result = nav.send_goal_and_wait(
                     target["x"], target["y"], target.get("yaw", 0.0),
                     frame_id="map")
@@ -1439,15 +1380,15 @@ class RoomSearchOrchestrator:
                         task.status = "failed"
                         task.result = {"reason": reason, "raw": result}
                         return
-                    # 其余 (aborted/timeout/wp_nav_err) 标 visited 并 continue
-                    visited.append({"x": target["x"], "y": target["y"]})
+                    exploration.mark_navigation_failed(reason, target)
                     self._phase("FRONTIER_DETECT", progress=progress,
                                 room="__frontier__", current_wp=iteration,
                                 total_wp=max_frontiers,
                                 warning=f"frontier {iteration} skipped ({reason})")
                     continue
 
-                visited.append({"x": target["x"], "y": target["y"]})
+                exploration.mark_visited(target)
+                waypoints_reached += 1
 
                 # DETECT: 到达后调 _observe_people_at_viewpoint
                 self._phase("DETECT",
@@ -1468,6 +1409,7 @@ class RoomSearchOrchestrator:
                     task.result = {"reason": "no_pose"}
                     return
 
+                unresolved_before_observation = len(store.unresolved())
                 observed = self._observe_people_at_viewpoint(
                     store, "__frontier__", iteration, observe_pose,
                     target_classes, require_photos=require_photos,
@@ -1480,29 +1422,112 @@ class RoomSearchOrchestrator:
                     return
                 if isinstance(observed, dict) and observed.get("reason"):
                     reason = str(observed.get("reason"))
-                    self._fail(reason, room="__frontier__",
-                               stage=f"frontier_{iteration}",
-                               detections=observed.get("detections"))
-                    task.status = "failed"
-                    task.result = observed
-                    return
+                    if reason == "no_lidar_range":
+                        resolved_count = self._positive_int(
+                            observed.get("resolved_count"), 0)
+                        store.resolve_unresolved(min(
+                            resolved_count, unresolved_before_observation))
+                        self._phase(
+                            "FRONTIER_DETECT", progress=progress,
+                            room="__frontier__", current_wp=iteration,
+                            total_wp=max_frontiers,
+                            warning="person seen without reliable lidar range; "
+                                    "continuing from another viewpoint",
+                        )
+                    else:
+                        self._fail(reason, room="__frontier__",
+                                   stage=f"frontier_{iteration}",
+                                   detections=observed.get("detections"))
+                        task.status = "failed"
+                        task.result = observed
+                        return
+                elif isinstance(observed, dict):
+                    resolved_count = self._positive_int(
+                        observed.get("resolved_count"), 0)
+                    store.resolve_unresolved(min(
+                        resolved_count, unresolved_before_observation))
+                elif isinstance(observed, int) and observed > 0:
+                    store.resolve_unresolved(min(
+                        observed, unresolved_before_observation))
 
                 self._broadcast_person_markers(mission_id, store.markers())
 
-                # 时间检查 (max_time 双保险)
-                if (time.time() - start_time) > max_time:
-                    logger.info(
-                        f"[{mission_id}] frontier 探索达 max_time={max_time}s, 停止迭代")
+                if time.time() >= mission_deadline:
+                    completion_reason = "time_budget_exhausted"
                     break
 
             # ---- REPORT ----
             markers = store.markers()
+            unresolved = store.unresolved()
             self._broadcast_person_markers(mission_id, markers)
+            exploration_state = exploration.snapshot()
+            blocked_frontiers = [
+                {
+                    **item,
+                    "rejections": int(item.get("failures", 0)),
+                }
+                for item in exploration_state["blacklist"]
+            ]
+            frontier_result = {
+                "completion_reason": completion_reason,
+                "waypoints_reached": waypoints_reached,
+                "navigation_attempts": nav_attempts,
+                "frontier_plan_probes": exploration_state["plan_probes"],
+                "frontier_plan_rejections": exploration_state[
+                    "plan_rejections"],
+                "frontier_nav_failures": exploration_state[
+                    "navigation_failures"],
+                "blocked_frontiers": sorted(
+                    blocked_frontiers,
+                    key=lambda item: (item["x"], item["y"])),
+                "time_budget_sec": max_time,
+                "search_radius_m": max_radius,
+                "exploration_state": exploration_state,
+            }
+            if unresolved:
+                reason = "no_lidar_range"
+                self._fail(
+                    reason,
+                    room="__frontier__",
+                    detections=unresolved,
+                    resolved_detections=markers,
+                    **frontier_result,
+                )
+                task.status = "failed"
+                task.result = {
+                    "reason": reason,
+                    "detections": unresolved,
+                    "resolved_detections": markers,
+                    **frontier_result,
+                }
+                return
+            if completion_reason != "reachable_frontiers_exhausted":
+                reason = "exploration_incomplete"
+                self._fail(
+                    reason,
+                    room="__frontier__",
+                    detections=markers,
+                    targets_found=len(markers),
+                    **frontier_result,
+                )
+                task.status = "failed"
+                task.result = {
+                    "reason": reason,
+                    "mission_id": mission_id,
+                    "room": "__frontier__",
+                    "detections": markers,
+                    "targets_found": len(markers),
+                    **frontier_result,
+                }
+                return
             self._phase("REPORT", progress=1.0, room="__frontier__",
                         targets_found=len(markers))
             self._finalize_report(task, mission_id, sentry_room,
-                                  total_wp=max_frontiers, visited=len(visited),
-                                  detections_log=markers, start_time=start_time)
+                                  total_wp=nav_attempts,
+                                  visited=len(exploration_state[
+                                      "visited_frontiers"]),
+                                  detections_log=markers, start_time=start_time,
+                                  extra_result=frontier_result)
         finally:
             # 清理订阅 (防重复 frontier 任务累积订阅泄漏)
             if sub_handle is not None:
@@ -1516,87 +1541,305 @@ class RoomSearchOrchestrator:
             ActiveSearchPlanner is not None,
             DetectionFrame is not None,
             LaserScanSnapshot is not None,
-            localize_person_detection is not None,
-            PersonMissionStore is not None,
+            localize_target_detection is not None,
+            TargetMissionStore is not None,
         ))
+
+    def _new_target_store(self, mission_id, default_class="person"):
+        kwargs = {"default_class": default_class}
+        if self._mission_root:
+            kwargs["mission_root"] = self._mission_root
+        else:
+            kwargs["static_root"] = self._static_root
+        return TargetMissionStore(mission_id, **kwargs)
+
+    @staticmethod
+    def _normalize_target_classes(target_classes) -> List[str]:
+        normalized = []
+        for value in target_classes or []:
+            target_class = " ".join(str(value or "").strip().split()).lower()
+            if target_class and target_class not in normalized:
+                normalized.append(target_class)
+        return normalized or ["person"]
+
+    def _detection_snapshot_getter(self, target_classes):
+        if self._ai is None:
+            return None
+        targets = self._normalize_target_classes(target_classes)
+        generic = getattr(self._ai, "get_detection_snapshot", None)
+        if callable(generic):
+            return lambda: generic(targets)
+        legacy = getattr(self._ai, "get_person_detection_snapshot", None)
+        if targets == ["person"] and callable(legacy):
+            return legacy
+        return None
+
+    def _activate_detection_targets(self, target_classes):
+        setter = getattr(self._ai, "set_detection_targets", None)
+        if not callable(setter):
+            return None
+        targets = self._normalize_target_classes(target_classes)
+        try:
+            previous = setter(targets)
+        except Exception as exc:
+            logger.warning("set_detection_targets failed: %s", exc)
+            return None
+        return setter, previous
+
+    @staticmethod
+    def _restore_detection_targets(target_scope) -> None:
+        if target_scope is None:
+            return
+        setter, previous = target_scope
+        try:
+            setter(previous)
+        except Exception as exc:
+            logger.warning("restore detection targets failed: %s", exc)
 
     def _observe_people_at_viewpoint(self, store, room_name: str, view_idx: int,
                                      robot_pose, target_classes: List[str],
                                      require_photos: bool = True,
-                                     use_lidar: bool = True) -> int:
-        get_snapshot = getattr(self._ai, "get_person_detection_snapshot", None)
-        if not callable(get_snapshot):
-            return 0
-        try:
-            snapshot = get_snapshot() or {}
-        except Exception as e:
-            logger.warning(f"get_person_detection_snapshot failed: {e}")
-            return 0
+                                     use_lidar: bool = True):
+        target_classes = self._normalize_target_classes(target_classes)
+        get_snapshot = self._detection_snapshot_getter(target_classes)
+        if get_snapshot is None:
+            return {
+                "resolved_count": 0,
+                "source": None,
+                "observation_valid": False,
+            }
+        max_frame_age_sec = self._positive_float(
+            os.environ.get("GO2W_DETECTION_MAX_AGE_SEC"), 2.0)
+        # C13/YOLO inference is intentionally slower than the video stream and
+        # can take several seconds per frame on the NX.  A viewpoint reached
+        # between inference frames must wait for the next fresh observation;
+        # immediately rejecting the cached frame makes room search fail at
+        # random even though the camera and detector are healthy.
+        fresh_wait_sec = self._positive_float(
+            os.environ.get("GO2W_DETECTION_WAIT_SEC"), 12.0)
+        fresh_deadline = time.monotonic() + fresh_wait_sec
+        wait_started = time.monotonic()
+        while True:
+            try:
+                snapshot = get_snapshot() or {}
+            except Exception as e:
+                logger.warning(f"get_detection_snapshot failed: {e}")
+                return {
+                    "resolved_count": 0,
+                    "source": None,
+                    "observation_valid": False,
+                }
 
-        detections = snapshot.get("detections") or []
-        if not detections:
-            return 0
-
-        scan = self._laser_scan_snapshot()
-        if scan is None:
-            return None
+            source = snapshot.get("source")
+            if str(source or "").strip().lower() == "mock":
+                return {
+                    "reason": "mock_detection_source",
+                    "source": "mock",
+                    "observation_valid": False,
+                    "resolved_count": 0,
+                }
+            try:
+                captured_at = float(snapshot.get("timestamp"))
+                frame_age_sec = time.time() - captured_at
+            except (TypeError, ValueError):
+                captured_at = 0.0
+                frame_age_sec = float("inf")
+            stale = (
+                not math.isfinite(captured_at)
+                or captured_at <= 0.0
+                or not math.isfinite(frame_age_sec)
+                or frame_age_sec < -0.5
+                or frame_age_sec > max_frame_age_sec
+            )
+            if not stale:
+                break
+            with self._lock:
+                cancelled = self._cancelled
+            if cancelled:
+                return {
+                    "reason": "cancelled",
+                    "source": source,
+                    "observation_valid": False,
+                }
+            remaining = fresh_deadline - time.monotonic()
+            if remaining <= 0.0:
+                return {
+                    "reason": "stale_detection_frame",
+                    "frame_age_sec": frame_age_sec,
+                    "max_frame_age_sec": max_frame_age_sec,
+                    "waited_sec": time.monotonic() - wait_started,
+                    "source": source,
+                    "observation_valid": False,
+                }
+            time.sleep(min(0.1, remaining))
 
         frame = snapshot.get("frame")
         frame_width, frame_height = self._snapshot_frame_size(snapshot, frame)
+        calibration = resolve_camera_calibration(
+            source,
+            gimbal_yaw_rad=snapshot.get("gimbal_yaw_rad"),
+        )
+        observation_meta = {
+            "source": source,
+            "observation_valid": frame_width > 0 and frame_height > 0,
+            "camera_calibration": calibration,
+        }
+        detections = snapshot.get("detections") or []
+        if not detections:
+            return {**observation_meta, "resolved_count": 0}
+
+        bundle = None
+        if self._observation_sync is not None:
+            try:
+                if frame is not None:
+                    self._observation_sync.add_frame(
+                        stamp=captured_at, frame=frame)
+                self._observation_sync.add_detection(
+                    stamp=captured_at, detection=snapshot)
+                current_cloud = self._pointcloud_snapshot()
+                cloud_stamp = current_cloud.get("timestamp")
+                if cloud_stamp:
+                    self._observation_sync.add_cloud(
+                        stamp=cloud_stamp, cloud=current_cloud)
+                tolerance = self._positive_float(
+                    os.environ.get("GO2W_OBSERVATION_SYNC_TOLERANCE_SEC"),
+                    0.20,
+                )
+                bundle = self._observation_sync.bundle_for_detection(
+                    stamp=captured_at, tolerance=tolerance)
+            except Exception as exc:
+                logger.warning("observation synchronization failed: %s", exc)
+                bundle = None
+            if bundle is None:
+                return {
+                    **observation_meta,
+                    "reason": "unsynchronized_observation",
+                    "capture_stamp": captured_at,
+                    "observation_valid": False,
+                }
+            scan = bundle.scan.value
+            pointcloud = bundle.cloud.value if bundle.cloud is not None else None
+            robot_pose = (bundle.pose.x, bundle.pose.y, bundle.pose.yaw)
+            observation_meta.update({
+                "capture_stamp": bundle.capture_stamp,
+                "pose_stamp": bundle.pose.stamp,
+                "scan_stamp": bundle.scan.stamp,
+                "pose_delta_s": bundle.pose_delta_s,
+                "scan_delta_s": bundle.scan_delta_s,
+                "cloud_stamp": (
+                    bundle.cloud.stamp if bundle.cloud is not None else None),
+                "cloud_delta_s": bundle.cloud_delta_s,
+                "localization_quality": "timestamp_interpolated",
+            })
+        else:
+            scan = self._laser_scan_snapshot()
+            if scan is None:
+                return None
+            pointcloud = self._pointcloud_snapshot()
+
         if frame_width <= 0 or frame_height <= 0:
-            return 0
+            if require_photos:
+                return {
+                    **observation_meta,
+                    "reason": "photo_artifact_failed",
+                    "error": "detection frame dimensions missing",
+                }
+            return {**observation_meta, "resolved_count": 0}
+        if require_photos and frame is None:
+            return {
+                **observation_meta,
+                "reason": "photo_artifact_failed",
+                "error": "detection frame missing",
+            }
 
         frame_info = DetectionFrame(
             width=frame_width,
             height=frame_height,
-            camera_hfov_rad=self._camera_hfov_rad(),
+            camera_hfov_rad=math.radians(calibration["hfov_deg"]),
+            camera_yaw_offset_rad=math.radians(
+                calibration["yaw_offset_deg"]),
+            gimbal_yaw_rad=math.radians(
+                calibration["gimbal_yaw_deg"] or 0.0),
         )
         robot_x, robot_y, robot_yaw = robot_pose
-        allowed = set(target_classes or ["person"])
+        localization = self._localization_health()
+        try:
+            robot_z = float(localization.get("z", 0.0))
+        except (TypeError, ValueError):
+            robot_z = 0.0
+        if not math.isfinite(robot_z):
+            robot_z = 0.0
+        allowed = set(target_classes)
         added = 0
         no_lidar_context = []
         for det in detections:
-            if det.get("class") != "person":
-                continue
-            if allowed and "person" not in allowed:
+            if det.get("class") not in allowed:
                 continue
             try:
-                localized = localize_person_detection(
-                    det, frame_info, scan, robot_x, robot_y, robot_yaw)
+                localized = localize_target_detection(
+                    det, frame_info, scan, robot_x, robot_y, robot_yaw,
+                    robot_z=robot_z, pointcloud=pointcloud)
             except Exception as e:
-                logger.warning(f"localize_person_detection failed: {e}")
-                continue
-            if use_lidar and localized.get("position_quality") != "range_lidar":
-                no_lidar_context.append({
-                    "class": det.get("class"),
-                    "confidence": det.get("confidence"),
-                    "bbox": det.get("bbox"),
-                    "position_quality": localized.get("position_quality"),
-                    "range_source": localized.get("range_source"),
-                    "bearing_base": localized.get("bearing_base"),
-                    "bearing_map": localized.get("bearing_map"),
-                    "range_m": localized.get("range_m"),
-                })
+                logger.warning(f"localize_target_detection failed: {e}")
                 continue
             localized.update({
+                **observation_meta,
                 "robot_x": round(float(robot_x), 3),
                 "robot_y": round(float(robot_y), 3),
                 "robot_yaw": round(float(robot_yaw), 3),
                 "room": room_name,
                 "wp_index": int(view_idx),
                 "view_index": int(view_idx),
-                "timestamp": time.time(),
+                "timestamp": captured_at,
+                "detector_source": source,
             })
+            if use_lidar and localized.get("position_quality") != "range_lidar":
+                try:
+                    unresolved = store.add_unresolved_observation(
+                        localized, frame=frame if require_photos else None)
+                except Exception as e:
+                    logger.warning(f"unresolved target artifact storage failed: {e}")
+                    if require_photos:
+                        return {
+                            **observation_meta,
+                            "reason": "photo_artifact_failed",
+                            "error": str(e),
+                        }
+                    unresolved = localized
+                no_lidar_context.append(unresolved)
+                continue
             try:
-                store.add_observation(
+                marker = store.add_observation(
                     localized, frame=frame if require_photos else None)
             except Exception as e:
-                logger.warning(f"person observation storage failed: {e}")
+                logger.warning(f"target observation storage failed: {e}")
+                if require_photos:
+                    return {
+                        **observation_meta,
+                        "reason": "photo_artifact_failed",
+                        "error": str(e),
+                        "detection": {
+                            "class": det.get("class"),
+                            "confidence": det.get("confidence"),
+                            "bbox": det.get("bbox"),
+                        },
+                    }
                 continue
+            if require_photos and (not marker.get("photo_url") or not marker.get("crop_url")):
+                return {
+                    **observation_meta,
+                    "reason": "photo_artifact_failed",
+                    "error": "required annotated photo or crop missing",
+                }
             added += 1
-        if use_lidar and added == 0 and no_lidar_context:
-            return {"reason": "no_lidar_range", "detections": no_lidar_context}
-        return added
+        if use_lidar and no_lidar_context:
+            return {
+                **observation_meta,
+                "reason": "no_lidar_range",
+                "detections": no_lidar_context,
+                "resolved_count": added,
+            }
+        return {**observation_meta, "resolved_count": added}
 
     def _laser_scan_snapshot(self):
         if self._node is None or LaserScanSnapshot is None:
@@ -1656,6 +1899,39 @@ class RoomSearchOrchestrator:
             logger.warning(f"get_scan_snapshot failed: {e}")
             return None
 
+    def _pointcloud_snapshot(self):
+        """Return a fresh base_link MID360 cloud for optional height evidence."""
+        if self._node is None or PointCloudSnapshot is None:
+            return None
+        getter = getattr(self._node, "get_pointcloud_snapshot", None)
+        if not callable(getter):
+            return None
+        try:
+            data = getter() or {}
+            if str(data.get("frame_id") or "") != "base_link":
+                return None
+            points = data.get("points")
+            if points is None or len(points) == 0:
+                return None
+            timestamp = float(data.get("timestamp"))
+            age_sec = (
+                float(data.get("age_sec"))
+                if data.get("age_sec") is not None
+                else time.time() - timestamp
+            )
+            max_age_sec = self._positive_float(
+                os.environ.get("GO2W_POINTCLOUD_MAX_AGE_SEC"), 1.0)
+            if (
+                not math.isfinite(timestamp) or timestamp <= 0.0
+                or not math.isfinite(age_sec) or age_sec < 0.0
+                or age_sec > max_age_sec
+            ):
+                return None
+            return PointCloudSnapshot(points=points, frame_id="base_link")
+        except Exception as e:
+            logger.warning(f"get_pointcloud_snapshot failed: {e}")
+            return None
+
     def _snapshot_frame_size(self, snapshot: dict, frame) -> tuple:
         width = self._positive_int(snapshot.get("frame_width"), 0)
         height = self._positive_int(snapshot.get("frame_height"), 0)
@@ -1675,6 +1951,17 @@ class RoomSearchOrchestrator:
             self._person_markers = marker_list
             self._current_targets_found = len(marker_list)
         self._safe_broadcast({
+            "type": "target_markers",
+            "data": {
+                "mission_id": mission_id,
+                "markers": marker_list,
+            },
+        })
+        if marker_list and any(
+                marker.get("class", "person") != "person"
+                for marker in marker_list):
+            return
+        self._safe_broadcast({
             "type": "person_markers",
             "data": {
                 "mission_id": mission_id,
@@ -1686,15 +1973,18 @@ class RoomSearchOrchestrator:
         try:
             if self._node is None:
                 return []
+            health = self._localization_health()
+            if not health.get("healthy"):
+                return []
             with getattr(self._node, "_lock", threading.Lock()):
                 ranges = list(getattr(self._node, "_scan_ranges", []) or [])
                 angle_min = float(getattr(self._node, "_scan_angle_min", 0.0))
                 angle_increment = float(getattr(self._node, "_scan_angle_increment", 0.0))
                 range_min = float(getattr(self._node, "_scan_range_min", 0.15) or 0.15)
                 range_max = float(getattr(self._node, "_scan_range_max", 10.0) or 10.0)
-                robot_x = float(getattr(self._node, "_odom_x", 0.0))
-                robot_y = float(getattr(self._node, "_odom_y", 0.0))
-                robot_yaw = float(getattr(self._node, "_imu_yaw", 0.0))
+                robot_x = float(getattr(self._node, "_map_x", 0.0))
+                robot_y = float(getattr(self._node, "_map_y", 0.0))
+                robot_yaw = float(getattr(self._node, "_map_yaw", 0.0))
             if not ranges or angle_increment <= 0.0:
                 return []
             stride = max(1, len(ranges) // 720)
@@ -1718,14 +2008,19 @@ class RoomSearchOrchestrator:
     def _active_search_spacing(self, room: Room) -> float:
         return self._positive_float(room.search_area.get("spacing"), 1.0)
 
-    def _camera_hfov_rad(self) -> float:
-        try:
-            hfov_deg = float(os.environ.get("GO2W_CAMERA_HFOV", "70"))
-            if math.isfinite(hfov_deg) and hfov_deg > 0.0:
-                return math.radians(hfov_deg)
-        except (TypeError, ValueError):
-            pass
-        return math.radians(70.0)
+    def _camera_hfov_rad(self, source=None) -> float:
+        return math.radians(
+            resolve_camera_calibration(source)["hfov_deg"])
+
+    def _camera_yaw_offset_rad(self, source=None) -> float:
+        return math.radians(
+            resolve_camera_calibration(source)["effective_yaw_offset_deg"])
+
+    def _camera_source_key(self, source) -> str:
+        return "".join(
+            character if character.isalnum() else "_"
+            for character in str(source or "").upper()
+        ).strip("_")
 
     def _nav_failure_reason(self, result: dict) -> str:
         reason = (result or {}).get("reason", "nav_aborted")
@@ -1763,6 +2058,15 @@ class RoomSearchOrchestrator:
             return float(default)
         return parsed
 
+    def _coverage_threshold(self, value, default: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = float(default)
+        if not math.isfinite(parsed) or parsed <= 0.0 or parsed > 1.0:
+            return float(default)
+        return parsed
+
     def _plan_room_waypoints(self, room: Room) -> List[dict]:
         """用 plan_lawnmower/plan_spiral 把房间 search_area 切成航点序列。
         spec 决策: planner 已在 nx_web_server 内联, 从 nx_web_server import 复用 (避免三处复制)。
@@ -1792,12 +2096,9 @@ class RoomSearchOrchestrator:
         """
         try:
             if self._node is not None:
-                with getattr(self._node, "_lock", threading.Lock()):
-                    x = float(getattr(self._node, "_odom_x", 0.0))
-                    y = float(getattr(self._node, "_odom_y", 0.0))
-                    yaw = float(getattr(self._node, "_imu_yaw", 0.0))
-                if x != 0.0 or y != 0.0:
-                    return x, y, yaw
+                health = self._localization_health()
+                if health.get("healthy"):
+                    return float(health["x"]), float(health["y"]), float(health["yaw"])
         except Exception:
             pass
         if fallback is not None:
@@ -1805,36 +2106,51 @@ class RoomSearchOrchestrator:
         return 0.0, 0.0, 0.0
 
     # ---- 辅助 ----
+    def _localization_health(self):
+        """Read NxWebNode localization, with support for legacy injected test adapters."""
+        if self._node is None:
+            return {"healthy": False, "reason": "no_node"}
+        getter = getattr(self._node, "get_localization_health", None)
+        if callable(getter):
+            return getter()
+
+        # Older injected adapters do not subscribe ROS topics themselves. Keep
+        # them usable while the production NxWebNode always takes this method's
+        # /localization_pose path above.
+        with getattr(self._node, "_lock", threading.Lock()):
+            count = int(getattr(self._node, "_odom_count", 0) or 0)
+            received = float(getattr(self._node, "_odom_t", 0.0) or 0.0)
+            x = float(getattr(self._node, "_odom_x", 0.0))
+            y = float(getattr(self._node, "_odom_y", 0.0))
+            z = float(getattr(self._node, "_map_z", 0.0))
+            yaw = float(getattr(self._node, "_map_yaw", 0.0))
+        max_age = self._positive_float(os.environ.get("GO2W_ODOM_MAX_AGE_SEC"), 2.0)
+        age = time.time() - received if received > 0.0 else None
+        healthy = (
+            count > 0
+            and all(math.isfinite(value) for value in (x, y, yaw, received))
+            and age is not None
+            and math.isfinite(age)
+            and 0.0 <= age <= max_age
+        )
+        return {
+            "healthy": healthy,
+            "reason": "ok" if healthy else "legacy_pose_unavailable",
+            "x": x,
+            "y": y,
+            "z": z,
+            "yaw": yaw,
+            "age_sec": age,
+        }
+
     def _get_live_robot_pose(self):
         try:
             if self._node is None:
                 return None
-            lock = getattr(self._node, "_lock", None)
-            if lock is not None:
-                with lock:
-                    odom_count = int(getattr(self._node, "_odom_count", 0) or 0)
-                    odom_t = float(getattr(self._node, "_odom_t", 0.0) or 0.0)
-                    x = float(getattr(self._node, "_odom_x", 0.0))
-                    y = float(getattr(self._node, "_odom_y", 0.0))
-                    yaw = float(getattr(self._node, "_imu_yaw", 0.0))
-            else:
-                odom_count = int(getattr(self._node, "_odom_count", 0) or 0)
-                odom_t = float(getattr(self._node, "_odom_t", 0.0) or 0.0)
-                x = float(getattr(self._node, "_odom_x", 0.0))
-                y = float(getattr(self._node, "_odom_y", 0.0))
-                yaw = float(getattr(self._node, "_imu_yaw", 0.0))
-            if odom_count <= 0:
+            health = self._localization_health()
+            if not health.get("healthy"):
                 return None
-            if not all(math.isfinite(value) for value in (x, y, yaw, odom_t)):
-                return None
-            if odom_t <= 0.0:
-                return None
-            age_sec = time.time() - odom_t
-            max_age_sec = self._positive_float(
-                os.environ.get("GO2W_ODOM_MAX_AGE_SEC"), 2.0)
-            if not math.isfinite(age_sec) or age_sec < 0.0 or age_sec > max_age_sec:
-                return None
-            return x, y, yaw
+            return float(health["x"]), float(health["y"]), float(health["yaw"])
         except Exception:
             return None
 
@@ -1868,6 +2184,8 @@ class RoomSearchOrchestrator:
             if k in ("room",):
                 continue  # room 单独处理
             data[k] = v
+        with self._lock:
+            self._mission_state = dict(data)
         self._safe_broadcast({"type": "search_room", "data": data})
 
     def _fail(self, reason: str, room: Optional[str] = None, **extra) -> None:
@@ -1887,6 +2205,8 @@ class RoomSearchOrchestrator:
             }
         for k, v in extra.items():
             data[k] = v
+        with self._lock:
+            self._mission_state = dict(data)
         logger.warning(f"[{data.get('mission_id')}] 房间搜索 FAILED: reason={reason} {extra}")
         self._safe_broadcast({"type": "search_room", "data": data})
 
@@ -1968,13 +2288,36 @@ class RoomSearchOrchestrator:
 
     def _finalize_report(self, task, mission_id: str, room: Room,
                          total_wp: int, visited: int,
-                         detections_log: List[dict], start_time: float) -> None:
+                         detections_log: List[dict], start_time: float,
+                         extra_result: Optional[dict] = None) -> None:
         """REPORT 阶段: 生成 MissionReport + 推 type=mission_report + 标 task 完成。"""
         end_time = time.time()
+        evidence_store = None
+        result_path = ""
+        if self._mission_root and TargetMissionStore is not None:
+            evidence_store = self._new_target_store(mission_id)
+            result_path = (
+                f"/missions/{evidence_store.mission_slug}/report.json")
         report = build_mission_report(
             mission_id=mission_id, room=room,
             waypoints_total=total_wp, waypoints_visited=visited,
-            detections=detections_log, start_time=start_time, end_time=end_time)
+            detections=detections_log, start_time=start_time, end_time=end_time,
+            result_path=result_path)
+        if extra_result:
+            report.update(dict(extra_result))
+        if evidence_store is not None:
+            try:
+                evidence_store.save_report(report)
+            except Exception as exc:
+                logger.error("mission report persistence failed: %s", exc)
+                self._fail(
+                    "mission_artifact_failed", room=room.name, msg=str(exc))
+                task.status = "failed"
+                task.result = {
+                    "reason": "mission_artifact_failed", "error": str(exc)}
+                return
+        with self._lock:
+            self._last_report = dict(report)
         self._safe_broadcast({"type": "mission_report", "data": report})
         self._phase("DONE", progress=1.0, room=room.name,
                     targets_found=len(detections_log))
@@ -2007,6 +2350,51 @@ class RoomSearchOrchestrator:
             except Exception as e:
                 logger.warning(f"nav.cancel_current 异常: {e}")
         logger.info(f"RoomSearchOrchestrator.cancel 已调 (mission={self._current_mission_id})")
+
+    def wait_drained(self, timeout: float) -> bool:
+        """Wait only for Nav2 ownership; TaskManager separately owns the worker."""
+        nav = self._nav
+        if nav is None:
+            return True
+        waiter = getattr(nav, "wait_drained", None)
+        if not callable(waiter):
+            return False
+        try:
+            return bool(waiter(timeout))
+        except Exception:
+            return False
+
+    def get_navigation_state(self) -> Dict:
+        nav = self._nav
+        if nav is None:
+            state = {"phase": "idle", "drained": True, "in_flight": False}
+        else:
+            getter = getattr(nav, "get_state", None)
+            if not callable(getter):
+                state = {"phase": "unknown", "drained": False, "in_flight": True}
+            else:
+                try:
+                    state = dict(getter())
+                except Exception:
+                    state = {"phase": "unknown", "drained": False, "in_flight": True}
+        with self._lock:
+            mission_state = dict(self._mission_state)
+            markers = list(self._person_markers)
+            last_report = (
+                None if self._last_report is None else dict(self._last_report))
+            state.update({
+                "search_phase": mission_state.get("phase", "idle"),
+                "mission_id": self._current_mission_id,
+                "room": self._current_room_name,
+                "current_wp": self._current_wp_idx,
+                "total_wp": self._current_total_wp,
+                "targets_found": self._current_targets_found,
+                "target_markers": markers,
+                "person_markers": markers,
+                "last_report": last_report,
+                "search_state": mission_state,
+            })
+        return state
 
 
 # ============================================================================

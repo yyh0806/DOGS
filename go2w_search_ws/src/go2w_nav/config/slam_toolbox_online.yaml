@@ -22,6 +22,8 @@ slam_toolbox:
     map_frame: map          # Nav2 global_costmap.global_frame + orchestrator goal frame
     base_frame: base_link
     scan_topic: /scan_mid360   # MID360 经 pointcloud_to_laserscan 压的 2D scan
+    # SLAM is the only map->odom owner in persistent exploration mode.
+    transform_publish_period: 0.05
 
     # ============================================================
     # ⚠️ 头号风险 (决策 4): QoS 匹配 pointcloud_to_laserscan 发布端
@@ -45,8 +47,9 @@ slam_toolbox:
     # 扫描缓冲 + 范围
     # ============================================================
     scan_buffer_size: 10
-    scan_buffer_maximum_scan_distance: 10.0
-    max_laser_range: 10.0
+    scan_buffer_maximum_scan_distance: 8.0
+    min_laser_range: 0.2
+    max_laser_range: 8.0
     minimum_score: 0.0
 
     # ============================================================

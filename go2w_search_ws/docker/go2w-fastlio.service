@@ -1,0 +1,26 @@
+[Unit]
+Description=Go2W FastLIO pose backbone
+After=livox-mid360-driver.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=nx
+WorkingDirectory=/home/nx/ws_livox
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=ROS_DOMAIN_ID=0
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/nx/go2w/current/payload/docker/fastdds_udp.xml
+Environment=LD_LIBRARY_PATH=/home/nx/CycloneDDS/lib:/home/nx/ws_livox/install/fast_lio/lib:/home/nx/ws_livox/install/livox_ros_driver2/lib
+Nice=-5
+# NTP gate (2026-07-16): livox stamps lidar/imu with system_clock; if FastLIO
+# starts before systemd-timesyncd synchronizes, the eventual NTP clock jump is
+# fed into IMU_Processing dt (unbounded) and diverges ESKF instantly.
+# See memory fastlio-ntp-jump-divergence. Wait up to 300s for NTP, else fail.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 300); do [ "$(/usr/bin/timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ] && exit 0; /usr/bin/sleep 1; done; echo "FastLIO startup blocked: NTP not synchronized in 300s (clock jump would diverge ESKF, see fastlio-ntp-jump-divergence)" >&2; exit 1'
+ExecStart=/bin/bash -lc 'source /home/nx/ws_livox/install/setup.bash && ros2 launch fast_lio mapping.launch.py rviz:=false config_path:=/home/nx/go2w/current/payload/src/go2w_nav/config/fastlio_low_latency'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

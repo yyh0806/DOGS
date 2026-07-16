@@ -1,316 +1,465 @@
-"""载荷NX 运动控制节点 — 订阅 /cmd_vel + /cmd_pose → 控狗。
+"""NX-local Go2W motion node with one feedback-driven state owner.
 
-go2w_bridge 的运动控制职责从"PC直连狗"迁移到"载荷NX"。
-这样:
-1. 控狗走网线直连狗主控(不依赖热点), 可靠
-2. 持续持有 lease → 压制狗主控里的残留乱跑程序(它抢不到lease)
-3. 看门狗在NX上 → 即使笔记本↔NX热点断了, NX也会自动停狗
-
-ROS2 接口:
-  订阅 /cmd_vel  (geometry_msgs/Twist)  - 速度指令 vx vy vyaw
-  订阅 /cmd_pose (std_msgs/String)      - "stand"/"sit"/"estop"
-  发布 /dog_state (std_msgs/String JSON) - 狗当前状态 (供监控)
-
-状态机 (复用 panel.py 验证过的逻辑):
-  DISCONNECTED → STANDING → STOPPED (BalanceStand静止, 每0.5s发零速保lease)
-  STOPPED → MOVING (Move@20Hz)
-  MOVING → STOPPED (StopMove + BalanceStand, 看门狗1s超时自动停)
-  任意 → EMERGENCY (Damp趴下)
-
-运行 (载荷NX):
-  export LD_LIBRARY_PATH=$HOME/CycloneDDS/lib:$LD_LIBRARY_PATH
-  source /opt/ros/humble/setup.bash
-  ros2 run go2w_bridge nx_motion_node
+ROS callbacks only enqueue events.  One actor thread owns the state machine
+and sends serialized effects to the stable local Sport lease gateway.
+Startup never blindly changes posture: feedback decides whether the robot is
+already parked, needs one stationary parking transition, or must remain in a
+zero-velocity fault hold.
 """
 
+from __future__ import annotations
+
 import json
-import math
 import os
+import queue
 import threading
 import time
+import uuid
 
 import rclpy
-from rclpy.node import Node
 from geometry_msgs.msg import Twist
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
 try:
-    from unitree_sdk2py.core.channel import ChannelFactory
-    from unitree_sdk2py.go2.sport.sport_client import SportClient
-    SDK_OK = True
-except Exception as _e:
-    SDK_OK = False
-    _SDK_ERR = str(_e)
+    from .build_info import release_id
+    from .motion_controller import MotionController
+    from .motion_machine import Go2WMotionMachine
+    from .motion_protocol import (
+        MotionIntentEnvelope,
+        MotionProtocolError,
+        motion_status_dict,
+    )
+    from .motion_safety import DriveExecutionWatchdog, ScanFreshnessWatchdog
+    from .motion_types import ActualMotionState, SessionState, StopProfile
+    from .sport_gateway_client import SportGatewayClient
+except ImportError:  # Direct-file compatibility deployment on the NX.
+    from build_info import release_id
+    from motion_controller import MotionController
+    from motion_machine import Go2WMotionMachine
+    from motion_protocol import (
+        MotionIntentEnvelope,
+        MotionProtocolError,
+        motion_status_dict,
+    )
+    from motion_safety import DriveExecutionWatchdog, ScanFreshnessWatchdog
+    from motion_types import ActualMotionState, SessionState, StopProfile
+    from sport_gateway_client import SportGatewayClient
 
 
-# 状态
-DISCONNECTED, STANDING, STOPPED, MOVING, SITTING, SEATED, EMERGENCY = range(7)
+RELEASE_ID = release_id()
+
+def _parameter_value(node, name, default):
+    node.declare_parameter(name, default)
+    return node.get_parameter(name).value
+
+
+def _stop_profile_from_environment():
+    raw = os.environ.get(
+        "GO2W_STOP_PROFILE", StopProfile.MOVE_ZERO_ONLY.value).strip()
+    try:
+        return StopProfile(raw)
+    except ValueError:
+        return StopProfile.MOVE_ZERO_ONLY
 
 
 class NxMotionNode(Node):
+    """Thin ROS adapter around the single-thread MotionController."""
+
+    _POSE_TO_INTENT = {
+        "stand": "park",
+        "balance": "start_manual",
+        "estop": "estop",
+        "reset_drive_fault": "clear_estop",
+    }
+
     def __init__(self):
-        super().__init__('nx_motion_node')
+        super().__init__("nx_motion_node")
+        default_iface = os.environ.get("DOG_INTERFACE", "enxc8a362616c4c")
+        self._dog_interface = str(
+            _parameter_value(self, "dog_interface", default_iface))
+        default_gateway_socket = os.environ.get(
+            "GO2W_SPORT_GATEWAY_SOCKET",
+            "/run/go2w-sport-gateway/sport.sock",
+        )
+        self._gateway_socket = str(_parameter_value(
+            self, "sport_gateway_socket", default_gateway_socket))
+        self._move_rate = float(_parameter_value(self, "move_rate", 20.0))
+        self._sdk_call_timeout = float(
+            _parameter_value(self, "sdk_call_timeout", 0.8))
+        self._sdk_retry_sec = float(
+            _parameter_value(self, "sdk_retry_sec", 1.0))
+        self._nav_scan_timeout = float(
+            _parameter_value(self, "nav_scan_timeout", 1.8))
+        self._manual_cmd_timeout = float(
+            _parameter_value(self, "manual_cmd_timeout", 0.5))
+        self._nav_cmd_timeout = float(
+            _parameter_value(self, "nav_cmd_timeout", 0.3))
+        self._drive_response_timeout = float(
+            _parameter_value(self, "drive_response_timeout", 0.6))
+        self._min_wheel_response = float(
+            _parameter_value(self, "min_wheel_response", 0.15))
+        self._minimum_battery_soc = float(
+            _parameter_value(self, "min_drive_battery_soc", 20.0))
+        self._transition_timeout = float(
+            _parameter_value(self, "pose_feedback_timeout", 4.0))
+        self._max_vx = float(_parameter_value(self, "max_vx", 0.30))
+        self._max_vy = float(_parameter_value(self, "max_vy", 0.0))
+        self._max_vyaw = float(_parameter_value(self, "max_vyaw", 0.15))
+        self._turn_creep_gain = float(
+            _parameter_value(self, "turn_creep_compensation_gain", 1.0))
+        self._turn_creep_maximum = float(
+            _parameter_value(self, "turn_creep_compensation_max", 0.15))
+        self._turn_linear_epsilon = float(
+            _parameter_value(self, "pure_turn_linear_epsilon", 0.02))
+        self._turn_angular_threshold = float(
+            _parameter_value(self, "pure_turn_angular_threshold", 0.05))
+        self._pure_turn_clearance = float(
+            _parameter_value(self, "pure_turn_clearance", 0.95))
+        self._turn_flip_window = float(
+            _parameter_value(self, "nav_turn_flip_window", 3.0))
+        self._max_turn_flips = int(
+            _parameter_value(self, "nav_max_turn_flips", 3))
 
-        # 连狗网卡: 优先用 DOG_INTERFACE 环境变量 (service 部署时传入),
-        # 兜底硬编码默认值 (老 NX 的网卡名, 新 NX 部署时会被覆盖)
-        _default_iface = os.environ.get('DOG_INTERFACE', 'enxc8a362616c4c')
-        self.declare_parameter('dog_interface', _default_iface)
-        self.declare_parameter('stand_on_start', True)
-        self.declare_parameter('cmd_timeout', 1.0)   # 看门狗超时
-        self.declare_parameter('move_rate', 20.0)     # MOVING发Move频率
-        self._cmd_timeout = self.get_parameter('cmd_timeout').get_parameter_value().double_value
+        clock = time.monotonic
+        machine = Go2WMotionMachine(
+            now=clock,
+            stop_profile=_stop_profile_from_environment(),
+            minimum_battery_soc=self._minimum_battery_soc,
+            transition_timeout=self._transition_timeout,
+        )
+        scan_watchdog = ScanFreshnessWatchdog(
+            timeout=self._nav_scan_timeout,
+            clock=clock,
+            pure_turn_clearance=self._pure_turn_clearance,
+            pure_turn_linear_epsilon=self._turn_linear_epsilon,
+            pure_turn_angular_threshold=self._turn_angular_threshold,
+            turn_flip_window=self._turn_flip_window,
+            max_turn_flips=self._max_turn_flips,
+        )
+        drive_watchdog = DriveExecutionWatchdog(
+            timeout=self._drive_response_timeout,
+            min_wheel_speed=self._min_wheel_response,
+            clock=clock,
+        )
+        self._controller = MotionController(
+            machine=machine,
+            scan_watchdog=scan_watchdog,
+            drive_watchdog=drive_watchdog,
+            clock=clock,
+            manual_timeout=self._manual_cmd_timeout,
+            nav_timeout=self._nav_cmd_timeout,
+            max_vx=self._max_vx,
+            max_vy=self._max_vy,
+            max_vyaw=self._max_vyaw,
+            turn_creep_gain=self._turn_creep_gain,
+            turn_creep_maximum=self._turn_creep_maximum,
+            turn_linear_epsilon=self._turn_linear_epsilon,
+            turn_angular_threshold=self._turn_angular_threshold,
+        )
 
-        # 控制状态 (锁保护) — 提前初始化, 保证 _publish_state 在 SDK 未就绪时也安全
-        self._lock = threading.Lock()
-        self._state = DISCONNECTED
-        self._vx = self._vy = self._vyaw = 0.0
-        self._last_cmd_time = 0.0
-        self._pose_cmd = None  # 'stand'/'sit'/'estop'
-        self._cmd_vel_count = 0  # 可观测性: 收到的 /cmd_vel 累计(排查 subscription 静默失效)
+        self._events = queue.Queue()
+        self._status_lock = threading.Lock()
+        self._status = self._initial_status()
+        self._last_command = (0.0, 0.0, 0.0)
+        self._last_command_source = None
+        self._invalid_feedback_count = 0
+        self._invalid_intent_count = 0
+        self._scan_valid_count = 0
+        self._scan_invalid_count = 0
+        self._sdk_initialized = False
+        self._shutdown_enqueued = False
+        self._actor_thread = threading.Thread(
+            target=self._actor_loop,
+            name="go2w-motion-actor",
+            daemon=True,
+        )
+        self._actor_thread.start()
 
-        # SDK 句柄 — _init_sdk 填充; None 表示狗主控未就绪 (狗没上电/链路 DOWN)
-        self._factory = None
-        self._sport = None
-        self._SWITCHGAIT_API_ID = 1011
-        self._sdk_ready = False
-        self._sdk_retry_sec = 5.0   # 狗没电时 SDK 重试间隔 (比原崩溃循环 2s 省 60% CPU/日志)
+        self._state_pub = self.create_publisher(String, "/dog_state", 10)
+        self._drive_feedback_sub = self.create_subscription(
+            String, "/wheel_feedback", self._on_drive_feedback, 10)
+        self._scan_sub = self.create_subscription(
+            LaserScan, "/scan_mid360", self._on_scan, 10)
+        self._cmd_vel_sub = self.create_subscription(
+            Twist, '/cmd_vel', self._on_cmd_vel, 10)
+        self._nav_cmd_vel_sub = self.create_subscription(
+            Twist, "/cmd_vel_nav", self._on_nav_cmd_vel, 10)
+        self._motion_session_sub = self.create_subscription(
+            String, "/motion_session", self._on_motion_session, 10)
+        self._cmd_pose_sub = self.create_subscription(
+            String, "/cmd_pose", self._on_cmd_pose, 10)
+        self._state_timer = self.create_timer(0.5, self._publish_state)
 
-        # ROS2 接口
-        # ⚠️ rclpy 坑根治 (2026-07-02): publisher/subscription 必须存 self, 否则 GC 回收静默失效。
-        # subscription 延迟到 SDK 就绪后创建: SDK 没起来时收 /cmd_vel 会误触发状态机但控不了狗。
-        self._cmd_vel_sub = None
-        self._cmd_pose_sub = None
-        self._state_pub = self.create_publisher(String, '/dog_state', 10)
+        self.get_logger().info(
+            "motion v4 started in BOOT_HOLD; actor owns all SDK effects; "
+            f"release={RELEASE_ID} stop_profile={_stop_profile_from_environment().value}")
 
-        # SDK 初始化在后台线程重试 — 狗主控没上电时: 不崩进程、不爆 journal、不 CPU 空转,
-        # 狗上电后 _sdk_init_loop 自动检测到并恢复。原版 SportClient 构造直接访问
-        # CycloneDDS participant._ref, 网卡 DOWN 时 participant=None → AttributeError 崩 →
-        # systemd Restart=always 每 2s 一个循环 (实测 restart counter 998 次)。
-        if not SDK_OK:
-            self.get_logger().error(f"unitree_sdk2py 不可用: {_SDK_ERR}; 节点空转, 控狗功能禁用")
-        else:
-            threading.Thread(target=self._sdk_init_loop, daemon=True).start()
+    def _initial_status(self):
+        return {
+            "schema_version": 4,
+            "release_id": RELEASE_ID,
+            "state": "DISCONNECTED",
+            "session": "boot_hold",
+            "drive_session": "startup",
+            "drive_session_phase": "boot_hold",
+            "drive_session_owner": None,
+            "drive_session_reason": "waiting_for_sdk_and_feedback",
+            "sdk_ready": False,
+            "motion_service": None,
+            "velocity_authorized": False,
+            "nav_scan_fresh": False,
+            "nav_guard_reason": None,
+            "drive_fault": None,
+            "vx": 0.0,
+            "vy": 0.0,
+            "vyaw": 0.0,
+        }
 
-        # 状态发布始终起 (SDK 未就绪时发 "DISCONNECTED + sdk_ready=false",
-        # web 能区分"motion 在等狗"还是"motion 失联")
-        self.create_timer(0.5, self._publish_state)
+    def _enqueue(self, kind, payload=None):
+        self._events.put((kind, payload))
 
-    # ---- SDK 初始化 (狗主控没上电时不崩, 后台重试到狗上电自动恢复) ----
-    def _init_sdk(self) -> bool:
-        """初始化 unitree SDK (ChannelFactory + SportClient). 成功 True, 失败 False (不抛).
+    def _on_drive_feedback(self, message):
+        self._enqueue("feedback", getattr(message, "data", ""))
 
-        狗主控没上电时: 连狗网卡链路 DOWN → CycloneDDS domain participant=None →
-        SportClient 构造访问 None._ref 抛 AttributeError. catch 住返回 False,
-        _sdk_init_loop 定期重试, 狗上电自动恢复。
-        """
-        iface = self.get_parameter('dog_interface').get_parameter_value().string_value
-        try:
-            factory = ChannelFactory()
+    def _on_scan(self, message):
+        self._enqueue("scan", message)
+
+    def _on_cmd_vel(self, message):
+        self._enqueue("velocity", (
+            "manual",
+            (message.linear.x, message.linear.y, message.angular.z),
+        ))
+
+    def _on_nav_cmd_vel(self, message):
+        self._enqueue("velocity", (
+            "nav",
+            (message.linear.x, message.linear.y, message.angular.z),
+        ))
+
+    def _on_motion_session(self, message):
+        self._enqueue("intent", getattr(message, "data", ""))
+
+    def _on_cmd_pose(self, message):
+        self._enqueue("pose", getattr(message, "data", ""))
+
+    def _actor_loop(self):
+        period = 1.0 / max(1.0, self._move_rate)
+        next_tick = time.monotonic()
+        next_sdk_attempt = 0.0
+        while rclpy.ok():
+            now = time.monotonic()
+            if not self._sdk_initialized and now >= next_sdk_attempt:
+                self._try_initialize_sdk()
+                next_sdk_attempt = now + max(0.2, self._sdk_retry_sec)
+            wait = max(0.0, min(0.05, next_tick - now))
             try:
-                factory.Init(0, iface)
-            except Exception as e:
-                # 网卡名不对时 fallback 自动检测 (与原逻辑一致)
-                self.get_logger().warning(f"网卡 {iface} Init 失败 {e}, 自动检测")
-                factory.Init(0, None)
-            self._factory = factory
+                kind, payload = self._events.get(timeout=wait)
+            except queue.Empty:
+                kind, payload = None, None
+            if kind == "shutdown":
+                self._controller.shutdown()
+                self._refresh_status()
+                return
+            if kind is not None:
+                self._process_event(kind, payload)
+            now = time.monotonic()
+            if now >= next_tick:
+                self._controller.tick()
+                next_tick = now + period
+            self._refresh_status()
 
-            # 关键检测点: SportClient 构造触发 DDS topic 创建, participant=None 时
-            # 在 cyclonedds/topic.py 访问 None._ref 抛 AttributeError — catch 住即"狗没就绪"。
-            sport = SportClient(enableLease=True)
-            sport.SetTimeout(10.0)
-            sport.Init()
-            # ⚠️ 历史遗留: 手动注册 SwitchGait API 1011。实测 SwitchGait(1)=trot 让 Go2W
-            # 摔倒 (docs/TECH_DECISIONS.md 第一节), 已停用, 注册保留待清理。
-            sport._RegistApi(self._SWITCHGAIT_API_ID, 0)
-            time.sleep(2)  # 等 lease 激活
-            self._sport = sport
-            self.get_logger().info(f"SportClient lease 已激活 (网卡={iface}, 持续持有压制残留程序)")
-            return True
-        except Exception as e:
+    def _try_initialize_sdk(self):
+        adapter = None
+        try:
+            adapter = SportGatewayClient(
+                self._gateway_socket,
+                timeout=self._sdk_call_timeout,
+            )
+            initialized = adapter.initialize()
+            if (initialized.code != 0
+                    or initialized.motion_service != "ai-w"):
+                adapter.close()
+                self.get_logger().error(
+                    "Sport gateway mode check is not healthy; retrying "
+                    "without velocity or posture command: "
+                    f"code={initialized.code} data={initialized.raw_mode!r}")
+                return
+            self._controller.attach_adapter(adapter, initialized.motion_service)
+            self._sdk_initialized = True
+            self.get_logger().info(
+                "stable Sport gateway connected; MotionSwitcher=ai-w; "
+                "waiting for feedback-confirmed startup state")
+        except Exception as exc:
+            if adapter is not None:
+                adapter.close()
             self.get_logger().warning(
-                f"SDK 初始化失败 (狗主控没上电? 网卡 {iface} 链路 DOWN?): "
-                f"{type(e).__name__}: {e}; {self._sdk_retry_sec:.0f}s 后重试")
-            self._sport = None
-            self._factory = None
-            return False
+                "Sport gateway connection failed; retrying without posture "
+                f"command: {exc}")
 
-    def _sdk_init_loop(self):
-        """后台线程: 反复重试 SDK 初始化直到成功 (狗上电自动恢复). 独立线程, sleep 不阻塞 executor."""
-        while not self._sdk_ready and rclpy.ok():
-            if self._init_sdk():
-                self._on_sdk_ready()
+    def _process_event(self, kind, payload):
+        try:
+            if kind == "feedback":
+                self._controller.observe_feedback(payload)
+            elif kind == "scan":
+                if self._controller.observe_scan(payload):
+                    self._scan_valid_count += 1
+                else:
+                    self._scan_invalid_count += 1
+            elif kind == "intent":
+                self._controller.handle_intent(payload)
+            elif kind == "pose":
+                self._handle_pose_compatibility(payload)
+            elif kind == "velocity":
+                owner, velocity = payload
+                self._last_command_source = owner
+                self._last_command = tuple(float(value) for value in velocity)
+                self._controller.update_velocity(owner, velocity)
+        except (MotionProtocolError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            if kind == "feedback":
+                self._invalid_feedback_count += 1
             else:
-                time.sleep(self._sdk_retry_sec)
+                self._invalid_intent_count += 1
+            self.get_logger().warning(f"rejected motion {kind}: {exc}")
+        except Exception as exc:
+            self.get_logger().error(f"motion actor event {kind} failed: {exc}")
 
-    def _on_sdk_ready(self):
-        """SDK 就绪后: 创建 /cmd_vel /cmd_pose 订阅 + 启动控制/看门狗线程 + 自动站立."""
-        self._sdk_ready = True
-        self.get_logger().info("SDK 就绪, 启用 /cmd_vel /cmd_pose 订阅 + 控制/看门狗线程")
-        self._cmd_vel_sub = self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
-        self._cmd_pose_sub = self.create_subscription(String, '/cmd_pose', self._on_cmd_pose, 10)
-        # 启动控制线程 (独立线程, 避免 SDK 调用阻塞 ROS2 executor)
-        threading.Thread(target=self._ctrl_loop, daemon=True).start()
-        # 看门狗线程
-        threading.Thread(target=self._watchdog, daemon=True).start()
-        # 自动站立
-        if self.get_parameter('stand_on_start').get_parameter_value().bool_value:
-            with self._lock: self._pose_cmd = 'stand'
+    def _handle_pose_compatibility(self, payload):
+        command = str(payload).strip().lower()
+        intent = self._POSE_TO_INTENT.get(command)
+        if intent is None:
+            self._invalid_intent_count += 1
+            self.get_logger().warning(
+                f"unsupported legacy pose command {command!r}; "
+                "use the versioned motion intent protocol")
+            return
+        envelope = MotionIntentEnvelope.parse({
+            "schema_version": 1,
+            "request_id": f"pose-{uuid.uuid4()}",
+            "intent": intent,
+            "source": "legacy_pose_panel",
+        })
+        self._controller.handle_intent(envelope)
 
-    # ---- ROS2 回调 ----
-    def _on_cmd_vel(self, msg):
-        self._cmd_vel_count += 1  # 可观测性: 累计收到的指令数(_publish_state 带入 /dog_state)
-        with self._lock:
-            # 坐标系: vx前后 vy左右 vyaw旋转(正=左转)
-            # 实测 Go2W SDK Move(x,y,z): z正=左转 (与cmd_vel angular.z约定一致, 无需反转)
-            self._vx = msg.linear.x
-            self._vy = msg.linear.y
-            self._vyaw = msg.angular.z
-            self._last_cmd_time = time.time()
-            if self._state in (STOPPED, MOVING):
-                self._state = MOVING
+    def _refresh_status(self):
+        snapshot = self._controller.machine.snapshot()
+        raw = self._controller.last_feedback_payload
+        canonical = motion_status_dict(
+            snapshot,
+            release_id=RELEASE_ID,
+            raw={
+                "sport_mode": raw.get("sport_mode"),
+                "error_code": raw.get("sport_error_code"),
+                "sample_id": raw.get("sample_id"),
+            },
+            legacy_deprecation_count=self._controller.legacy_deprecation_count,
+        )
+        state = self._legacy_state(snapshot)
+        drive_session = self._legacy_drive_session(snapshot.session)
+        velocity = (
+            self._last_command
+            if snapshot.velocity_authorized else (0.0, 0.0, 0.0))
+        receipt = self._controller.last_receipt
+        canonical.update({
+            "state": state,
+            "sdk_ready": self._controller.sdk_ready,
+            "vx": round(float(velocity[0]), 3),
+            "vy": round(float(velocity[1]), 3),
+            "vyaw": round(float(velocity[2]), 3),
+            "sdk_vx": round(float(velocity[0]), 3),
+            "sdk_vy": round(float(velocity[1]), 3),
+            "sdk_vyaw": round(float(velocity[2]), 3),
+            "motion_source": self._last_command_source,
+            "nav_scan_fresh": self._controller.scan_watchdog.is_fresh(),
+            "nav_guard_reason": self._controller.scan_watchdog.nav_guard_reason(),
+            "scan_valid_n": self._scan_valid_count,
+            "scan_invalid_n": self._scan_invalid_count,
+            "invalid_feedback_n": self._invalid_feedback_count,
+            "invalid_intent_n": self._invalid_intent_count,
+            "battery_soc": raw.get("battery_soc"),
+            "bms_status": raw.get("bms_status"),
+            "sport_mode": raw.get("sport_mode"),
+            "sport_progress": raw.get("sport_progress"),
+            "gait_type": raw.get("gait_type"),
+            "wheel_dq": raw.get("wheel_dq"),
+            "roll": raw.get("roll"),
+            "pitch": raw.get("pitch"),
+            "motor_lost": raw.get("motor_lost"),
+            "drive_fault": snapshot.fault,
+            "drive_session": drive_session,
+            "drive_session_owner": snapshot.owner,
+            "drive_session_phase": snapshot.session.value,
+            "drive_session_reason": (
+                snapshot.fault or snapshot.transition_operation or "stable"),
+            "wheel_activation_phase": snapshot.session.value,
+            "last_sdk_code": receipt.code if receipt is not None else None,
+            "last_sdk_operation": (
+                receipt.operation if receipt is not None else None),
+            "state_model_version": 4,
+            "link_state": "online" if snapshot.telemetry_fresh else "stale",
+            "motion_state": snapshot.actual_motion.value,
+            "safety_state": (
+                "normal" if snapshot.velocity_authorized else "inhibited"),
+            "safety_reason": snapshot.fault,
+            "raw_sport_mode": raw.get("sport_mode"),
+            "raw_error_code": raw.get("sport_error_code"),
+            "feedback_age_sec": None,
+        })
+        with self._status_lock:
+            self._status = canonical
 
-    def _on_cmd_pose(self, msg):
-        cmd = msg.data.strip().lower()
-        if cmd in ('stand', 'sit', 'estop'):
-            with self._lock: self._pose_cmd = cmd
-            self.get_logger().info(f"收到姿态指令: {cmd}")
+    @staticmethod
+    def _legacy_state(snapshot):
+        if snapshot.session is SessionState.PARKED:
+            return "STOPPED"
+        if snapshot.session in {
+                SessionState.MANUAL_ACTIVE, SessionState.NAV_ACTIVE}:
+            return (
+                "MOVING" if snapshot.actual_motion is ActualMotionState.MOVING
+                else "STOPPED")
+        if snapshot.session is SessionState.ACTIVATING:
+            return "STOOD"
+        if snapshot.session in {SessionState.STOPPING, SessionState.PARKING}:
+            return "STANDING"
+        if snapshot.session is SessionState.ESTOP:
+            return "EMERGENCY"
+        if snapshot.session is SessionState.FAULT:
+            # 应用故障(parked_state_lost/physical_mode_lost等), 非宇树底盘急停;
+            # P2 自愈可恢复。前端据此与真急停区分显示, 不再误导为"狗硬件EMERGENCY"。
+            return "FAULT"
+        return "DISCONNECTED"
 
-    def _watchdog(self):
-        """看门狗: MOVING 状态超过 cmd_timeout 无新指令 → 自动停。"""
-        while True:
-            with self._lock:
-                state = self._state
-                last = self._last_cmd_time
-            if state == MOVING and last > 0 and time.time() - last > self._cmd_timeout:
-                with self._lock:
-                    if self._state == MOVING:
-                        self._state = STOPPED
-                        self._vx = self._vy = self._vyaw = 0.0
-                self.get_logger().info(f"看门狗: {self._cmd_timeout}s无指令, 自动停")
-            time.sleep(0.2)
-
-    def _ctrl_loop(self):
-        """控制循环 (复用 panel.py 验证过的状态机)。所有 SDK 调用只在此线程。"""
-        self.get_logger().info("控制线程启动")
-        last_zero_move = 0.0
-        while True:
-            try:
-                # 消费姿态指令 (优先)
-                cmd = None
-                with self._lock:
-                    cmd = self._pose_cmd; self._pose_cmd = None
-                if cmd == 'stand':
-                    self._do_stand(); last_zero_move = 0; continue
-                if cmd == 'sit':
-                    self._do_sit(); last_zero_move = 0; continue
-                if cmd == 'estop':
-                    self._do_estop(); last_zero_move = 0; continue
-
-                # 速度控制
-                state, vx, vy, vyaw = STOPPED, 0.0, 0.0, 0.0
-                with self._lock:
-                    state, vx, vy, vyaw = self._state, self._vx, self._vy, self._vyaw
-                if state == STOPPED:
-                    # STOPPED: 高频(20Hz)发Move(0,0,0)钉住瞬时速度,
-                    # 且每0.5s补一次StopMove清除运动控制器内部残留目标速度。
-                    # Go2W ai-w 轮式模式: 仅Move(0,0,0)无法停轮子(实测轮子仍
-                    # 以~1rad/s转), 必须StopMove()才能真正刹住。
-                    # ⚠️ 与 SDK_CAPABILITIES.md"StopMove对Go2W无效"冲突, 待 LowState 轮速
-                    # 实测裁决(见 TECH_DECISIONS §一 实车 TODO)。
-                    now = time.time()
-                    if now - last_zero_move > 0.5:
-                        self._sport.StopMove()
-                        last_zero_move = now
-                    self._sport.Move(0, 0, 0)
-                elif state == MOVING:
-                    self._sport.Move(vx, vy, vyaw)
-                time.sleep(0.05)
-            except Exception as e:
-                self.get_logger().error(f"控制循环异常: {e}")
-                time.sleep(0.5)
-
-    def _switch_gait(self, gait_type):
-        """⚠️ 已禁用(当前无调用方)。SwitchGait(1)=trot 实测让 Go2W 摔倒,
-        见 docs/TECH_DECISIONS.md 第一节。保留仅供后续研究轮式步态切换参考, 勿盲调。"""
-        import json as _json
-        p = {"data": gait_type}
-        code, _ = self._sport._Call(self._SWITCHGAIT_API_ID, _json.dumps(p))
-        if code != 0:
-            self.get_logger().warning(f"SwitchGait({gait_type}) 返回 code={code}")
-        return code
-
-    def _do_stand(self):
-        try:
-            with self._lock:
-                self._state = STANDING
-                self._vx = self._vy = self._vyaw = 0.0
-            self.get_logger().info("STANDING: StandUp → BalanceStand → Move(0,0,0)")
-            # 站立序列对齐 web/panel.py:RobotConnection._do_stand (SDK_CAPABILITIES 实测能动版)。
-            # 关键: BalanceStand 让狗进入主动平衡态, 轮子才接受 Move 速度指令; 早期版本误删
-            # 此步(误判"后滑危险"), 导致 Move 返回 code=0 但轮子不转。后滑是 BalanceStand
-            # 进入瞬间轮子调平衡的副作用, 紧接 Move(0,0,0) 可压住。
-            # ⚠️ 待实车验证(硬件装完后): vx=0.1 短按, 手放 Damp 急停。
-            self._sport.StandUp(); time.sleep(2)
-            self._sport.BalanceStand(); time.sleep(0.5)
-            self._sport.Move(0, 0, 0)
-            with self._lock:
-                self._state = STOPPED
-                self._vx = self._vy = self._vyaw = 0.0
-                self._last_cmd_time = 0.0
-            self.get_logger().info("STANDING → STOPPED")
-        except Exception as e:
-            self.get_logger().error(f"站立失败: {e}")
-            with self._lock: self._state = STOPPED
-
-    def _do_sit(self):
-        try:
-            with self._lock: self._state = SITTING
-            self.get_logger().info("SITTING: StopMove → Damp")
-            self._sport.Move(0, 0, 0); time.sleep(0.05)
-            self._sport.StopMove(); time.sleep(0.3)
-            self._sport.Damp()
-            with self._lock:
-                self._state = SEATED
-                self._last_cmd_time = 0.0
-            self.get_logger().info("SITTING → SEATED")
-        except Exception as e:
-            self.get_logger().error(f"坐下失败: {e}")
-            with self._lock: self._state = STOPPED
-
-    def _do_estop(self):
-        try:
-            with self._lock: self._state = EMERGENCY
-            self._sport.Damp()
-            self.get_logger().warn("⚠️ EMERGENCY: Damp 趴下")
-            with self._lock: self._last_cmd_time = 0.0
-        except Exception as e:
-            self.get_logger().error(f"急停失败: {e}")
+    @staticmethod
+    def _legacy_drive_session(session):
+        if session is SessionState.PARKED:
+            return "parked"
+        if session in {SessionState.MANUAL_ACTIVE, SessionState.NAV_ACTIVE}:
+            return "active"
+        if session is SessionState.ACTIVATING:
+            return "activating"
+        if session in {SessionState.STOPPING, SessionState.PARKING}:
+            return "parking"
+        if session is SessionState.ESTOP:
+            return "estop"
+        if session is SessionState.FAULT:
+            return "fault"
+        return "startup"
 
     def _publish_state(self):
-        with self._lock:
-            state, vx, vy, vyaw = self._state, self._vx, self._vy, self._vyaw
-        names = ['DISCONNECTED','STANDING','STOPPED','MOVING','SITTING','SEATED','EMERGENCY']
-        msg = String()
-        msg.data = json.dumps({
-            'state': names[state] if state < len(names) else str(state),
-            'sdk_ready': self._sdk_ready,  # False = 狗没上电/SDK 未就绪, motion 在等 (web 可显"等待狗")
-            'vx': round(vx, 3), 'vy': round(vy, 3), 'vyaw': round(vyaw, 3),
-            'cmd_vel_n': self._cmd_vel_count,  # 卡在 0 = subscription 又静默失效了
-        })
-        self._state_pub.publish(msg)
+        with self._status_lock:
+            payload = dict(self._status)
+        message = String()
+        message.data = json.dumps(payload, separators=(",", ":"))
+        self._state_pub.publish(message)
 
     def destroy_node(self):
-        # SDK 未就绪时 self._sport=None, 跳过趴下 (没句柄也没必要)
-        if self._sport is not None:
-            try:
-                self._sport.Move(0, 0, 0); time.sleep(0.05)
-                self._sport.StopMove(); time.sleep(0.2)
-                self._sport.Damp()
-                self.get_logger().info("退出: 已趴下释放")
-            except Exception: pass
-        else:
-            self.get_logger().info("退出: SDK 未就绪, 无需趴下")
-        super().destroy_node()
+        if not self._shutdown_enqueued:
+            self._shutdown_enqueued = True
+            self._enqueue('shutdown')
+            if self._actor_thread.is_alive():
+                self._actor_thread.join(timeout=2.0)
+        return super().destroy_node()
 
 
 def main(args=None):
@@ -322,8 +471,9 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

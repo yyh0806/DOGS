@@ -6,7 +6,7 @@
 
 线程: daemon ×2 = _capture_loop (vis/ir) + daemon ×1 = _broadcast_loop。
 配置 (环境变量, 默认对应 C13 出厂 192.168.144.108):
-  C13_VIS_URL / C13_IR_URL / C13_FPS(10) / C13_JPEG_Q(55) / C13_ENABLE(1)
+  C13_VIS_URL / C13_IR_URL / C13_FPS(30) / C13_JPEG_Q(38) / C13_ENABLE(1) / C13_BACKEND(gst=NVDEC硬解)
 红线: 懒加载 cv2 (缺失则禁用, 不崩主服务); 异常只 warning 不抛; 断流自动重连;
       不动 nx_ai_node 的 VideoClient/YOLO 路径 (type=frame 与 type=gimbal 并存)。
 """
@@ -22,8 +22,12 @@ logger = logging.getLogger("go2w.gimbal")
 
 _VIS_URL = os.environ.get("C13_VIS_URL", "rtsp://192.168.144.108:554/stream=1")
 _IR_URL = os.environ.get("C13_IR_URL", "rtsp://192.168.144.108:555/stream=2")
-_BACKEND = os.environ.get("C13_BACKEND", "ffmpeg").strip().lower()
-_FPS = max(1.0, float(os.environ.get("C13_FPS", "12")))
+# 默认 gst = Jetson NVDEC 硬解 (nvv4l2decoder), 30fps 对齐 C13 源帧率。
+# 不再依赖 service Environment 注入 — 手动启 / 旧 service / env 漏了也走硬解,
+# 治 fps 回归 (service 未重部署时默认 12 + ffmpeg 软解 → 前端 ~13fps 卡顿)。
+# gi.Gst 不可用时, 顶部 _BACKEND in ("gst",..) 分支会 warning + _open 自动降级 ffmpeg。
+_BACKEND = os.environ.get("C13_BACKEND", "gst").strip().lower()
+_FPS = max(1.0, float(os.environ.get("C13_FPS", "30")))
 _JPEG_Q = int(os.environ.get("C13_JPEG_Q", "38"))
 _DROP_GRABS = max(0, int(os.environ.get("C13_DROP_GRABS", "0")))  # M2 fix: 默认 0 (FFmpeg 已 nobuffer+max_delay, grab-drop 反增延迟降帧率; 需要时 export C13_DROP_GRABS=2)
 _VIS_WIDTH = max(1, int(os.environ.get("C13_VIS_WIDTH", "640")))  # M3: 480→640 提 locate bbox 精度 (grounding 模型低分辨率 bbox 粗略; 带宽代价可接受)
@@ -170,6 +174,7 @@ class GimbalRtspBridge:
         self._vis_b64 = None
         self._ir_b64 = None
         self._vis_frame = None
+        self._ir_frame = None
         self._running = False
         self._captures = []
         self._threads = []
@@ -244,6 +249,9 @@ class GimbalRtspBridge:
                 if name == "vis":
                     with self._lock:
                         self._vis_frame = frame.copy()
+                elif name == "ir":
+                    with self._lock:
+                        self._ir_frame = frame.copy()
                 ws_frame = _resize_for_ws(frame, max_width) if max_width else frame
                 ok, jpg = cv2.imencode('.jpg', ws_frame, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_Q])
                 if ok:
@@ -297,6 +305,11 @@ class GimbalRtspBridge:
         """Return the latest visible-light frame for grounding/follow tasks."""
         with self._lock:
             return self._vis_frame.copy() if self._vis_frame is not None else None
+
+    def get_ir_frame(self):
+        """Return the latest infrared frame for detection overlays."""
+        with self._lock:
+            return self._ir_frame.copy() if self._ir_frame is not None else None
 
     def stop(self):
         self._running = False

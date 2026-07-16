@@ -1,0 +1,22 @@
+--- a/src/FAST_LIO_ROS2/src/laserMapping.cpp
++++ b/src/FAST_LIO_ROS2/src/laserMapping.cpp
+@@ -566,11 +566,17 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
+     const int source_size = feats_undistort->points.size();
+     const int stride = std::max(
+         1, (source_size + max_body_cloud_points - 1) / max_body_cloud_points);
+-    const int size = (source_size + stride - 1) / stride;
++    // Livox follows a deterministic scan pattern. Rotate the sampled residue
++    // class so a short downstream scan history recovers angular coverage.
++    static std::uint64_t body_cloud_phase = 0;
++    const int offset = source_size > 0 ?
++        static_cast<int>(body_cloud_phase++ % stride) : 0;
++    const int size = source_size > offset ?
++        (source_size - offset + stride - 1) / stride : 0;
+     PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
+ 
+     int output_index = 0;
+-    for (int source_index = 0; source_index < source_size;
++    for (int source_index = offset; source_index < source_size;
+          source_index += stride, ++output_index)
+     {
+         RGBpointBodyLidarToIMU(&feats_undistort->points[source_index], \

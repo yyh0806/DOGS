@@ -14,6 +14,9 @@ __pycache__/
 build/
 install/
 
+# 本机/NX 控制凭据
+control-token*.txt
+
 # 模型文件 (太大, 单独管理)
 *.pt
 

@@ -9,11 +9,15 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+Environment=LIVOX_INTERFACE=enx207bd2edf780
+EnvironmentFile=-/etc/go2w/hardware.env
 # 等 USB-网口转换器枚举到位 (插拔后最多等 30s)
-ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do [ -e /sys/class/net/enx207bd2edf780 ] && exit 0; sleep 1; done; exit 0'
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do [ -e "/sys/class/net/${LIVOX_INTERFACE}" ] && exit 0; sleep 1; done; echo "MID360 interface ${LIVOX_INTERFACE} not found" >&2; exit 1'
 # 关键: /32 不抢 WiFi 的 192.168.1.0/24 路由 (配 /24 会断 SSH, 见 memory mid360-livox-online)
-ExecStart=/bin/bash -c 'ip link set enx207bd2edf780 up; ip addr add 192.168.1.200/32 dev enx207bd2edf780 2>/dev/null || true; ip route add 192.168.1.160/32 dev enx207bd2edf780 metric 50 2>/dev/null || true'
-ExecStop=/bin/bash -c 'ip route del 192.168.1.160/32 dev enx207bd2edf780 2>/dev/null || true; ip addr del 192.168.1.200/32 dev enx207bd2edf780 2>/dev/null || true'
+ExecStart=/bin/bash -c 'ip link set "$LIVOX_INTERFACE" up; ip addr replace 192.168.1.200/32 dev "$LIVOX_INTERFACE"; ip route replace 192.168.1.160/32 dev "$LIVOX_INTERFACE" metric 50'
+ExecStop=/bin/bash -c 'ip route del 192.168.1.160/32 dev "$LIVOX_INTERFACE" 2>/dev/null || true; ip addr del 192.168.1.200/32 dev "$LIVOX_INTERFACE" 2>/dev/null || true'
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

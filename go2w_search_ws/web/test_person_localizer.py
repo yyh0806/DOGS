@@ -1,7 +1,9 @@
 import math
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 
@@ -12,7 +14,11 @@ if str(WEB_DIR) not in sys.path:
 from nx_person_localizer import (  # noqa: E402
     DetectionFrame,
     LaserScanSnapshot,
+    PointCloudSnapshot,
+    decode_pointcloud_xyz,
+    height_at_bearing,
     localize_person_detection,
+    localize_target_detection,
     range_at_bearing,
 )
 
@@ -33,6 +39,126 @@ def test_center_bbox_uses_forward_lidar_range():
     assert result["range_m"] == pytest.approx(2.5)
     assert result["world_x"] == pytest.approx(3.5)
     assert result["world_y"] == pytest.approx(2.0)
+
+
+def test_generic_table_detection_uses_same_lidar_geometry_and_preserves_class():
+    det = {
+        "class": "dining table",
+        "confidence": 0.88,
+        "bbox": [590, 100, 690, 500],
+    }
+    frame = DetectionFrame(
+        width=1280,
+        height=720,
+        camera_hfov_rad=math.radians(70.0),
+    )
+    scan = LaserScanSnapshot(
+        angle_min=-math.pi,
+        angle_increment=math.pi / 180.0,
+        ranges=[0.0] * 360,
+    )
+    scan.ranges[180] = 2.0
+
+    result = localize_target_detection(
+        det, frame, scan, robot_x=1.0, robot_y=2.0, robot_yaw=0.0)
+
+    assert result["class"] == "dining table"
+    assert result["position_quality"] == "range_lidar"
+    assert result["range_m"] == pytest.approx(2.0)
+    assert result["world_x"] == pytest.approx(3.0)
+    assert result["world_y"] == pytest.approx(2.0)
+
+
+def test_pointcloud_association_adds_evidence_backed_world_z():
+    det = {"class": "person", "confidence": 0.9,
+           "bbox": [590, 100, 690, 500]}
+    frame = DetectionFrame(
+        width=1280, height=720, camera_hfov_rad=math.radians(70.0))
+    scan = LaserScanSnapshot(
+        angle_min=-math.pi,
+        angle_increment=math.pi / 180.0,
+        ranges=[0.0] * 360,
+    )
+    scan.ranges[180] = 2.5
+    cloud = PointCloudSnapshot(points=[
+        (2.48, -0.02, -0.2),
+        (2.50, 0.00, 0.6),
+        (2.52, 0.03, 1.2),
+        (1.00, 0.00, 0.1),  # wrong range: must not influence height
+        (2.50, 1.00, 1.4),  # wrong bearing: must not influence height
+    ])
+
+    result = localize_person_detection(
+        det, frame, scan, robot_x=1.0, robot_y=2.0, robot_yaw=0.0,
+        robot_z=0.15, pointcloud=cloud)
+
+    assert result["world_z"] == pytest.approx(0.75)
+    assert result["position_dimension"] == 3
+    assert result["height_source"] == "mid360_pointcloud"
+    assert result["height_point_count"] == 3
+
+
+def test_missing_pointcloud_match_keeps_explicit_2d_quality():
+    det = {"class": "person", "confidence": 0.9,
+           "bbox": [590, 100, 690, 500]}
+    frame = DetectionFrame(
+        width=1280, height=720, camera_hfov_rad=math.radians(70.0))
+    scan = LaserScanSnapshot(
+        angle_min=-math.pi,
+        angle_increment=math.pi / 180.0,
+        ranges=[0.0] * 360,
+    )
+    scan.ranges[180] = 2.5
+    cloud = PointCloudSnapshot(points=[(4.0, 0.0, 1.0)])
+
+    result = localize_person_detection(
+        det, frame, scan, robot_x=0.0, robot_y=0.0, robot_yaw=0.0,
+        pointcloud=cloud)
+
+    assert result["world_z"] is None
+    assert result["position_dimension"] == 2
+    assert result["height_source"] == "unresolved"
+
+
+def test_height_at_bearing_rejects_malformed_points():
+    cloud = PointCloudSnapshot(points=[
+        (2.0, 0.0, 0.4),
+        (float("nan"), 0.0, 1.0),
+        (2.0, "bad", 1.0),
+        (2.0, 0.0),
+    ])
+
+    result = height_at_bearing(
+        cloud, bearing_rad=0.0, range_m=2.0,
+        window_rad=math.radians(5.0), range_tolerance_m=0.2)
+
+    assert result == {"height_m": pytest.approx(0.4), "point_count": 1}
+
+
+def test_decode_pointcloud_xyz_reads_float_fields_and_bounds_size():
+    values = np.asarray([
+        (1.0, 2.0, 3.0),
+        (4.0, 5.0, 6.0),
+        (7.0, 8.0, 9.0),
+    ], dtype="<f4")
+    message = SimpleNamespace(
+        is_bigendian=False,
+        point_step=12,
+        width=3,
+        height=1,
+        data=values.tobytes(),
+        fields=[
+            SimpleNamespace(name="x", offset=0, datatype=7),
+            SimpleNamespace(name="y", offset=4, datatype=7),
+            SimpleNamespace(name="z", offset=8, datatype=7),
+        ],
+    )
+
+    points = decode_pointcloud_xyz(message, max_points=2)
+
+    assert points.shape == (2, 3)
+    assert points[0].tolist() == pytest.approx([1.0, 2.0, 3.0])
+    assert points[1].tolist() == pytest.approx([7.0, 8.0, 9.0])
 
 
 def test_invalid_scan_returns_bearing_only():

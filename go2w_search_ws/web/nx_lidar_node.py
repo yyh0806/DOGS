@@ -26,11 +26,41 @@ _MAX_WS_POINTS = max(1, int(os.environ.get("LIDAR_WS_POINTS", "600")))
 try:
     import rclpy
     from rclpy.node import Node
-    from livox_ros_driver2.msg import CustomMsg
+    from rclpy.qos import qos_profile_sensor_data
+    from sensor_msgs.msg import PointCloud2
     _LIDAR_OK = True
 except Exception as _e:
     _LIDAR_OK = False
     logger.warning(f"[lidar] rclpy/livox_ros_driver2 不可用 ({_e}), 雷达点云展示禁用")
+
+
+def _decode_pointcloud_xy(msg):
+    """Decode little-endian float32 x/y fields without per-point objects."""
+    if getattr(msg, "is_bigendian", False):
+        return np.empty((0, 2), dtype=np.float32)
+    point_step = int(getattr(msg, "point_step", 0) or 0)
+    data = getattr(msg, "data", b"")
+    if point_step <= 0 or not data:
+        return np.empty((0, 2), dtype=np.float32)
+    fields = {field.name: field for field in getattr(msg, "fields", [])}
+    if any(name not in fields for name in ("x", "y")):
+        return np.empty((0, 2), dtype=np.float32)
+    # sensor_msgs/PointField.FLOAT32 is wire value 7.  Keeping the constant
+    # local lets workstation tests run without a ROS installation.
+    if any(int(fields[name].datatype) != 7 for name in ("x", "y")):
+        return np.empty((0, 2), dtype=np.float32)
+    count = len(data) // point_step
+    if count <= 0:
+        return np.empty((0, 2), dtype=np.float32)
+    raw = np.frombuffer(data, dtype=np.uint8, count=count * point_step).reshape(
+        count, point_step
+    )
+    columns = [
+        raw[:, fields[name].offset:fields[name].offset + 4]
+        .copy().reshape(-1).view("<f4")
+        for name in ("x", "y")
+    ]
+    return np.column_stack(columns)
 
 
 class LidarBridge:
@@ -43,6 +73,9 @@ class LidarBridge:
         self._latest_points = []
         self._running = False
         self._node = None
+        self._subscription = None
+        self._ctx = None
+        self._executor = None
         self._next_render_t = 0.0
 
     def _cb(self, msg):
@@ -66,11 +99,10 @@ class LidarBridge:
             cv2.line(img, (0, cy), (_SIZE, cy), (45, 45, 45), 1)
             cv2.circle(img, (cx, cy), 3, (0, 0, 255), -1)
             # M1: 一次构造 xy 数组, 后续全 numpy (替代逐点 float/abs/比较/赋值循环)
-            pts = msg.points or []
             n = 0
             xs = ys = np.empty(0, dtype=np.float32)
-            if pts:
-                xy = np.array([[p.x, p.y] for p in pts], dtype=np.float32)
+            xy = _decode_pointcloud_xy(msg)
+            if xy.size:
                 xs, ys = xy[:, 0], xy[:, 1]
                 m = (np.abs(xs) <= _RANGE) & (np.abs(ys) <= _RANGE)
                 xs, ys = xs[m], ys[m]
@@ -97,15 +129,19 @@ class LidarBridge:
                     self._latest_png = base64.b64encode(png.tobytes()).decode()
                     self._latest_points = local_points
         except Exception as e:
-            logger.debug(f"[lidar] 投影异常: {e}")
+            logger.warning(f"[lidar] 投影异常: {e}")
 
     def _spin_thread(self):
+        # 独立 context 下 wait_for_ready_callbacks 不真正阻塞 (livox 持续 ready),
+        # spin_once 循环会 busy-loop 占 70%+ CPU 拖垮 gimbal; rclpy.spin 更糟 (回调不触发).
+        # 解法: spin_once + 显式 sleep 把每轮拉到 ~0.2s, CPU 砍半; livox 10Hz 仍够喂 _cb 的 5fps 节流.
         while self._running and self._node is not None:
             try:
-                rclpy.spin_once(self._node, timeout_sec=0.1)
+                self._executor.spin_once(timeout_sec=0.1)
             except Exception as e:
-                logger.debug(f"[lidar] spin 异常: {e}")
+                logger.warning(f"[lidar] spin 异常: {e}")
                 time.sleep(0.5)
+            time.sleep(0.2)  # livox 10Hz 发, spin 取 ~5Hz 匹配 _FPS=5 渲染 (再快也被 _cb 节流掉, 白耗 CPU)
 
     def _bcast_thread(self):
         interval = 1.0 / _FPS
@@ -126,21 +162,55 @@ class LidarBridge:
             time.sleep(interval)
 
     def start(self, node):
-        """接收已存在的 rclpy node (NxWebNode), 在其上订阅 /livox/lidar。
-        不自建 node/spin — 避免同进程多线程 spin 同 rclpy context 冲突 (executor Traceback)。
-        回调由 node 的主 spin 线程驱动, 本类只跑广播线程。
+        """自建独立 rclpy context + node 订阅 /livox/lidar + 自 spin。
+
+        早期版本挂 NxWebNode 主 spin, 但 web 进程对 livox CustomMsg 反序列化静默失败
+        (imu/scan/odom 标准 msg 正常, 独立 python 订阅也正常, 唯独挂 NxWebNode 不触发 _cb
+        → _latest_png 终身空 → 前端无雷达)。独立 context 隔离 = 等价独立 python 订阅路径,
+        实测能收; 同进程多 *context* 不冲突 (冲突的是同 context 多 spin)。
         """
         if not _LIDAR_OK:
             logger.warning("[lidar] rclpy/livox msg 缺失, 不启动雷达点云展示")
             return
         try:
-            node.create_subscription(CustomMsg, "/livox/lidar", self._cb, 10)
+            from rclpy.executors import SingleThreadedExecutor
+            from rclpy.node import Node
+            self._ctx = rclpy.Context()
+            self._ctx.init()
+            self._node = Node("nx_lidar_sub", context=self._ctx)
+            self._subscription = self._node.create_subscription(
+                PointCloud2, "/mid360/points_nav", self._cb,
+                qos_profile_sensor_data,
+            )
+            self._executor = SingleThreadedExecutor(context=self._ctx)
+            self._executor.add_node(self._node)
         except Exception as e:
             logger.error(f"[lidar] 订阅 /livox/lidar 失败: {e}")
             return
         self._running = True
         threading.Thread(target=self._bcast_thread, daemon=True, name="lidar_bc").start()
-        logger.info(f"[lidar] 雷达点云展示启动 (订阅 /livox/lidar on {node.get_name()}, {_FPS}fps, ±{_RANGE}m)")
+        threading.Thread(target=self._spin_thread, daemon=True, name="lidar_spin").start()
+        logger.info(f"[lidar] 雷达点云展示启动 (独立 context 订阅 /livox/lidar, {_FPS}fps, ±{_RANGE}m)")
+
+    def get_latest_points(self):
+        """Return latest sampled Livox local points as [x_forward, y_left]."""
+        with self._lock:
+            return list(self._latest_points)
 
     def stop(self):
         self._running = False
+        if self._executor is not None:
+            try:
+                self._executor.shutdown(timeout_sec=1.0)
+            except Exception:
+                pass
+        if self._node is not None:
+            try:
+                self._node.destroy_node()
+            except Exception:
+                pass
+        if self._ctx is not None:
+            try:
+                self._ctx.shutdown()
+            except Exception:
+                pass

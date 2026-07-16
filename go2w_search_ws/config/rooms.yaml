@@ -4,7 +4,8 @@
 # yaw: 弧度 (ROS REP-103, 正=左转), 与 Nav2 PoseStamped.orientation 四元数等价转换
 # search_area.origin_*: map 绝对坐标 (不是相对 nav_pose), 直接喂 planner.plan_lawnmower
 #
-# ⚠️ 坐标为占位值, 部署时必须人工标定替换! 标定流程见 docs/room_calibration.md:
+# ⚠️ 坐标为占位值, 部署时必须人工标定替换! calibrated=false 会阻止向占位坐标发导航目标。
+# 标定流程见 docs/room_calibration.md:
 #    1. 建 Nav2 地图完成 (FAST_LIO + map_server)
 #    2. 遥控狗站到房间入口, ros2 topic echo /odom 记录 x/y/yaw (yaw 取 quaternion→euler)
 #    3. 把值填进对应 room.nav_pose
@@ -21,6 +22,7 @@ default_search_pattern: lawnmower  # 默认覆盖模式, 可被 room.search_area
 rooms:
   # 客厅: 大房间, 全类别检测 (target_classes 为空 = 检测所有)
   - name: 客厅
+    calibrated: false          # 完成 docs/room_calibration.md 后改为 true
     aliases: ["living room", "living", "起居室"]
     nav_pose:
       x: 2.5                   # map 坐标系 X (米), 占位值
@@ -37,6 +39,7 @@ rooms:
 
   # 卧室: 中等房间, 只检测 person (target_classes 限定)
   - name: 卧室
+    calibrated: false          # 完成实测前禁止向占位坐标发导航目标
     aliases: ["bedroom", "睡房"]
     nav_pose: {x: -1.2, y: 3.4, yaw: 1.5708}   # yaw=π/2 (90°, 朝左)
     search_area:
@@ -50,6 +53,7 @@ rooms:
 
   # 厨房: 小房间, 全类别检测
   - name: 厨房
+    calibrated: false          # 完成实测前禁止向占位坐标发导航目标
     aliases: ["kitchen"]
     nav_pose: {x: 4.0, y: -2.0, yaw: -1.5708}  # yaw=-π/2 (-90°, 朝右)
     search_area:

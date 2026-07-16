@@ -1,0 +1,23 @@
+[Unit]
+Description=Go2W read-only raw safety observer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nx
+Environment=LD_LIBRARY_PATH=/home/nx/CycloneDDS/lib
+Environment=DOG_INTERFACE=enxc8a362616c4c
+Environment=GO2W_SAFETY_EVENT_LOG=/home/nx/go2w/safety-events/events.jsonl
+EnvironmentFile=-/etc/go2w/release.env
+EnvironmentFile=-/etc/go2w/hardware.env
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do [ "$(cat "/sys/class/net/${DOG_INTERFACE}/operstate" 2>/dev/null)" = "up" ] && ping -c 1 -W 1 192.168.123.161 >/dev/null 2>&1 && exit 0; sleep 1; done; echo "[wait-dog] ${DOG_INTERFACE} link/controller 161 not ready; safety observer remains stopped" >&2; exit 1'
+ExecStart=/bin/bash -c 'exec python3 -u /home/nx/go2w/current/payload/src/go2w_bridge/go2w_bridge/nx_safety_observer.py'
+WorkingDirectory=/home/nx/go2w/current/payload
+Restart=always
+RestartSec=0.5
+KillSignal=SIGINT
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target
