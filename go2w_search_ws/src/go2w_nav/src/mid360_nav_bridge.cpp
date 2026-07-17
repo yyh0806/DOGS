@@ -195,7 +195,19 @@ private:
       }
       const bool self_return =
         x >= -0.45 && x <= 0.45 && y >= -0.32 && y <= 0.32;
-      if (!self_return) {
+      // 2026-07-17: 狗后方 C13 云台机械结构多级反射 -> /scan_mid360 在
+      // atan2(y,x)≈-70° (右后方)、radius≈3-4m 处持续假点 (scan_probe 实测
+      // 98 finite 全挤 -64°~-78° 窄簇)。该假点相对狗方位固定, 每帧 mark ->
+      // obstacle_layer 持续刷新 observation_persistence -> costmap 永久红
+      // (随狗移动) + 烤进 /map_frontier (狗走后 static 遗留)。z 过滤
+      // [-0.45,1.50] 与 footprint 近场 (<0.55m) 都漏了这种远场回波。
+      // 角度盲区 [-90°,-60°] (-1.5708~-1.0472 rad) + 远场门槛(radius>1m):
+      // 只剔云台回波, 不动近场真障碍; 狗转身后真障碍会在新方位被看到。
+      // 残留假点时收窄/平移此区间实测微调。
+      const double angle = std::atan2(y, x);
+      const bool gimbal_echo =
+        radius > 1.0 && angle > -1.5708 && angle < -1.0472;
+      if (!(self_return || gimbal_echo)) {
         filtered.push_back(PointXYZ{
           static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)});
       }

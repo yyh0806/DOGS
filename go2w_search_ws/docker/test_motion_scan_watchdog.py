@@ -66,6 +66,19 @@ def test_pure_turn_requires_clearance_and_latches_guard():
     assert watchdog.nav_guard_reason() == "pure_turn_clearance"
 
 
+def test_open_space_scan_stays_fresh_and_allows_pure_turn():
+    """Open environment: all-inf scan must stay fresh and must not lock the
+    pure-turn guard (no near obstacle means it is safe to turn in place)."""
+    clock = [10.0]
+    watchdog = ScanFreshnessWatchdog(
+        timeout=1.8, clock=lambda: clock[0], pure_turn_clearance=0.35)
+    empty = _scan(distance=float("inf"))
+    assert watchdog.observe_scan(empty) is True
+    assert watchdog.is_fresh() is True
+    assert watchdog.filter_nav_velocity((0.0, 0.0, 0.5)) == (0.0, 0.0, 0.5)
+    assert watchdog.nav_guard_reason() is None
+
+
 def test_turn_creep_compensation_never_creates_reverse_velocity():
     result = compensate_pure_turn_creep(
         (0.0, 0.0, 0.12), gain=1.0, maximum=0.15,

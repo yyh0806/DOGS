@@ -1953,7 +1953,7 @@ def create_server(host, port, static_dir, mission_root=None):
                 "/api/connect", "/api/stand", "/api/confirm_stand",
                 "/api/balance", "/api/confirm_balance", "/api/sit",
                 "/api/e_stop", "/api/reset_drive_fault", "/api/stop",
-                "/api/manual_stop", "/api/navigate", "/api/search",
+                "/api/manual_stop", "/api/navigate", "/api/search", "/api/clear_all",
             }
             audit_request = p.path in audited_paths
             if p.path == "/api/move" and navigation_arbiter is not None:
@@ -2018,6 +2018,32 @@ def create_server(host, port, static_dir, mission_root=None):
                 self._json(result, status=(
                     200 if result.get("ok") else
                     503 if result.get("reason") == "arbiter_unavailable" else 409))
+            elif p.path == '/api/clear_all':
+                # 清前端轨迹源头: broadcast_loop 每帧推 _trail 给前端 (slam.trail),
+                # 不清后端则前端 clearTrail() 清了下一帧又被灌回 = "清不掉"。
+                import subprocess  # 局部 import: 顶部未导入 subprocess, /api/locate 走别的机制
+                _trail.clear()
+                # 清 nav2 costmap: subprocess 调 nav2 clear service, 隔离 web rclpy 节点
+                # wait_set (costmap_bridge.py 注释: web 订阅数已临界, 加 service client 有
+                # "IndexError: wait set index too big" 溢出风险)。串行 ~3s 可接受 (清操作低频)。
+                # 类型 nav2_msgs/srv/ClearEntireCostmap (ros2 service type 实测确认)。
+                # 语义: 清当前 obstacle_layer 标记 (含云台历史 ghost/动态滞留), static_layer
+                # (/map_frontier) 下次 update 会重载; 结合云台盲区修复后不再产生新假点。
+                cleared = {}
+                for _srv in ('/global_costmap/clear_entirely_global_costmap',
+                             '/local_costmap/clear_entirely_local_costmap'):
+                    _key = _srv.rsplit('/', 1)[-1]
+                    try:
+                        _r = subprocess.run(
+                            ['ros2', 'service', 'call', _srv,
+                             'nav2_msgs/srv/ClearEntireCostmap'],
+                            capture_output=True, text=True, timeout=6)
+                        cleared[_key] = (_r.returncode == 0)
+                    except subprocess.TimeoutExpired:
+                        cleared[_key] = 'timeout'
+                    except Exception as _e:
+                        cleared[_key] = f'err:{type(_e).__name__}'
+                self._json({"ok": True, "trail_cleared": True, "costmap": cleared})
             elif p.path == '/api/e_stop':
                 result = navigation_arbiter.emergency_stop() if navigation_arbiter else {
                     "ok": False, "reason": "arbiter_unavailable"}

@@ -104,9 +104,15 @@ class NxMotionNode(Node):
             _parameter_value(self, "min_drive_battery_soc", 20.0))
         self._transition_timeout = float(
             _parameter_value(self, "pose_feedback_timeout", 4.0))
-        self._max_vx = float(_parameter_value(self, "max_vx", 0.30))
+        # Unitree Go2-W SportClient.Move(vx,vy,vyaw) 官方默认档位上限
+        # (https://support.unitree.com/home/zh/Go2-W_developer/sports_services):
+        #   vx [-1.5,1.5] m/s (高速档 2.5), vy [-0.6,0.6] m/s, vyaw [-1.0,1.0] rad/s
+        # 这道 _limits 是 nav2->SDK 的最后一道 clamp (motion_controller.py:65-66
+        # self._limits = (max_vx, max_vy, max_vyaw)), 必须与 nav2 max_vel_x /
+        # max_vel_theta 对齐, 否则 nav2 的输出在此被夹断, 表现为"提速没生效"。
+        self._max_vx = float(_parameter_value(self, "max_vx", 1.5))
         self._max_vy = float(_parameter_value(self, "max_vy", 0.0))
-        self._max_vyaw = float(_parameter_value(self, "max_vyaw", 0.15))
+        self._max_vyaw = float(_parameter_value(self, "max_vyaw", 1.0))
         self._turn_creep_gain = float(
             _parameter_value(self, "turn_creep_compensation_gain", 1.0))
         self._turn_creep_maximum = float(
@@ -116,7 +122,7 @@ class NxMotionNode(Node):
         self._turn_angular_threshold = float(
             _parameter_value(self, "pure_turn_angular_threshold", 0.05))
         self._pure_turn_clearance = float(
-            _parameter_value(self, "pure_turn_clearance", 0.95))
+            _parameter_value(self, "pure_turn_clearance", 0.35))
         self._turn_flip_window = float(
             _parameter_value(self, "nav_turn_flip_window", 3.0))
         self._max_turn_flips = int(

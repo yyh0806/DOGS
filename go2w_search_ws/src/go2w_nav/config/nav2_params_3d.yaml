@@ -123,15 +123,15 @@ controller_server:
       # Go2W 差速起步 (全向模式: max_vel_y=0.3, vy_samples=10)
       min_vel_x: 0.10        # 提速 (livox 10Hz 稳定后放宽, 原 0.05)
       min_vel_y: 0.0
-      max_vel_x: 0.6        # 提速: livox rmem 修复后稳 10Hz, 原 0.3 是抖动时代保守值
+      max_vel_x: 1.5        # 提速: livox rmem 修复后稳 10Hz, 原 0.3 是抖动时代保守值
       max_vel_y: 0.0        # 差速; 全向改 0.3
-      max_vel_theta: 0.6    # 修bug+提速: 原0.05 < min_speed_theta0.15 致DWB角速度采样区间空集无解, 恢复0.6
+      max_vel_theta: 1.0    # Unitree Go2-W Move vyaw 上限 1.0 rad/s (官方文档 sports_services); nav2 不得超过 SDK 物理上限
       min_speed_xy: 0.05    # 允许慢速前进轨迹
-      max_speed_xy: 0.9
+      max_speed_xy: 1.6
       min_speed_theta: 0.15 # 纯旋转不得落入 Go2W 轮式死区 (现 < max_vel_theta, 区间有效)
-      acc_lim_x: 0.5
+      acc_lim_x: 1.2
       acc_lim_y: 0.0
-      acc_lim_theta: 1.5    # 10Hz 下一周期即到 0.15；角速度上限仍为实测安全值
+      acc_lim_theta: 2.5    # 10Hz 下一周期即到 0.15；角速度上限仍为实测安全值
       decel_lim_x: -1.0
       decel_lim_y: 0.0
       decel_lim_theta: -1.5
@@ -170,10 +170,10 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [0.6, 0.0, 0.6]   # 提速同步DWB (livox稳定后, 原[0.3,0,0.15]卡上限)
-    min_velocity: [0.0, 0.0, -0.6]  # autonomous channel never reverses
-    max_accel: [1.0, 0.0, 2.0]      # 提速越过轮式转向死区
-    max_decel: [-1.0, 0.0, -1.5]
+    max_velocity: [1.5, 0.0, 1.0]   # vx≤1.5 m/s, vyaw≤1.0 rad/s (Unitree Go2-W Move SDK 上限, sports_services)
+    min_velocity: [0.0, 0.0, -1.0]  # autonomous channel never reverses; vyaw 下限对齐 SDK (-1.0)
+    max_accel: [1.2, 0.0, 2.5]      # 提速越过轮式转向死区
+    max_decel: [-1.2, 0.0, -2.5]
     odom_topic: /odom
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
@@ -208,7 +208,7 @@ local_costmap:
           clearing: True
           inf_is_valid: True
           expected_update_rate: 1.8
-          observation_persistence: 2.0    # 2026-07-16 障碍2s未重新观察则过期清, 治costmap红色只增不减
+          observation_persistence: 0.3    # 2026-07-17 降到 0.3 (云台假点已在 bridge 源头滤除; persistence 仅清动态滞留, 2s 太长留 ghost)
           max_obstacle_height: 1.5
           min_obstacle_height: 0.0     # LaserScan z=0; source cloud was height-filtered
           obstacle_max_range: 7.0
@@ -220,7 +220,7 @@ local_costmap:
         cost_scaling_factor: 3.0
         # Padded footprint turning radius is 0.552 m; preserve another 0.15 m
         # cost gradient so the controller prefers clearance before collision.
-        inflation_radius: 0.75
+        inflation_radius: 0.30
       always_send_full_costmap: true
 
 global_costmap:
@@ -257,7 +257,7 @@ global_costmap:
           clearing: True
           inf_is_valid: True
           expected_update_rate: 1.8
-          observation_persistence: 2.0    # 2026-07-16 障碍2s未重新观察则过期清, 治costmap红色只增不减
+          observation_persistence: 0.3    # 2026-07-17 降到 0.3 (云台假点已在 bridge 源头滤除; persistence 仅清动态滞留, 2s 太长留 ghost)
           max_obstacle_height: 1.5
           min_obstacle_height: 0.0     # LaserScan z=0; source cloud was height-filtered
           obstacle_max_range: 7.0
@@ -267,7 +267,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.75
+        inflation_radius: 0.30
       always_send_full_costmap: true
 
 planner_server:

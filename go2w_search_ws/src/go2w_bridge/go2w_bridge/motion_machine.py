@@ -210,6 +210,17 @@ class Go2WMotionMachine:
             if self._session is SessionState.PARKED:
                 self._fault = None
                 return []
+            # v0.6 (2026-07-17): ESTOP/FAULT/PARKING 态 park 视为幂等——狗已停或已故障,
+            # park 是多余请求但不该叠加 park_not_allowed fault 锁死状态机 (v0.5 实测:
+            # nav 完成后 ESTOP/FAULT 残留时收到 PARK -> 不在允许集合 -> park_not_allowed
+            # fault 叠加, session 仍 ESTOP, 只能 restart go2w-motion 清)。这三种 session
+            # 本就禁止速度, 无需 park 转换, 直接幂等返回。ESTOP/FAULT 的清除仍由
+            # CLEAR_ESTOP (reset_drive_fault) / 自愈路径负责。
+            if self._session in (
+                    SessionState.ESTOP,
+                    SessionState.FAULT,
+                    SessionState.PARKING):
+                return []
             if self._session not in {
                     SessionState.BOOT_HOLD,
                     SessionState.ACTIVATING,

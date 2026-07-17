@@ -151,7 +151,7 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
       <span class="nav-status idle" id="navStatus">导航 · 待命</span>
       <span class="label" title="橙色为 MID360 累积建图；红色为 Nav2 致命障碍；蓝色为膨胀避障区">MID360 建图 · Nav2 实时障碍</span>
       <button class="btn" style="padding:3px 9px;font-size:11px;" onclick="clearRegion()">清除选区</button>
-      <button class="btn" style="padding:3px 9px;font-size:11px;" onclick="clearTrail()">清空轨迹</button>
+      <button class="btn" style="padding:3px 9px;font-size:11px;" onclick="clearTrail()">清除地图+轨迹</button>
       <span class="label" style="margin-left:auto;">单击导航 · 拖框选搜索区域</span>
     </div>
     <div class="map-canvas-wrap">
@@ -551,7 +551,14 @@ function initMap() {
   map.start();
 }
 function clearRegion() { if (map) map.clearRegion(); }
-function clearTrail() { if (map) { map.slam.trail = []; } }
+function clearTrail() {
+  if (map) { map.slam.trail = []; }
+  // 联动后端清 _trail (轨迹源头) + nav2 costmap (clearEntirely service);
+  // 否则前端清了, 下一帧 WS 又把后端 _trail 灌回 = 轨迹"清不掉"。
+  controlFetch('/api/clear_all', { method: 'POST' }).then(r => r.json()).then(d => {
+    console.log('clear_all:', d);
+  }).catch(e => console.warn('clear_all failed:', e));
+}
 
 // ---- 运动控制 ----
 // 速度档位 (偏稳, 后期可调): 前进0.4 后退0.4 转向0.5 平移0.3

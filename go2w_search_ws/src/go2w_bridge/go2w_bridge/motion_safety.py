@@ -143,7 +143,6 @@ class ScanFreshnessWatchdog:
         if range_min < 0.0 or range_max <= range_min or len(ranges) < 16:
             return False
         usable = 0
-        finite_returns = 0
         for raw in ranges:
             try:
                 value = float(raw)
@@ -159,8 +158,11 @@ class ScanFreshnessWatchdog:
             if value < range_min or value > range_max:
                 return False
             usable += 1
-            finite_returns += 1
-        return usable >= max(8, len(ranges) // 4) and finite_returns >= 8
+        # Only structural sanity (enough non-NaN bins) is required. The count
+        # of finite returns is deliberately NOT gated: an open environment
+        # legitimately yields zero finite returns and must still be a valid,
+        # fresh scan. See observe_scan.
+        return usable >= max(8, len(ranges) // 4)
 
     @staticmethod
     def coerce_velocity(velocity):
@@ -174,24 +176,34 @@ class ScanFreshnessWatchdog:
 
     def observe_scan(self, msg):
         stamp = self._coerce_stamp(msg)
-        if stamp is None or not self._legal_ranges(msg):
+        if stamp is None:
+            return False
+        try:
+            now = float(self._clock())
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(now):
+            return False
+        # Structural gate only: a valid LaserScan arriving on the right frame
+        # marks the stream fresh regardless of how many finite returns it has.
+        # An open environment legitimately yields zero finite returns;
+        # staleness must mean "messages stopped", not "content empty".
+        if not self._legal_ranges(msg):
             return False
         try:
             finite_ranges = [
                 float(value) for value in msg.ranges
                 if math.isfinite(float(value))
             ]
-            now = float(self._clock())
         except (AttributeError, TypeError, ValueError, OverflowError):
-            return False
-        if not finite_ranges or not math.isfinite(now):
             return False
         with self._lock:
             if self._last_stamp is not None and stamp <= self._last_stamp:
                 return False
             self._last_stamp = stamp
             self._last_receive = now
-            self._nearest_obstacle = min(finite_ranges)
+            self._nearest_obstacle = (
+                min(finite_ranges) if finite_ranges else None)
         return True
 
     def _fresh_locked(self, now):
@@ -243,8 +255,8 @@ class ScanFreshnessWatchdog:
                 self._turn_flip_times = []
                 return values
             if (
-                self._nearest_obstacle is None
-                or self._nearest_obstacle < self._pure_turn_clearance
+                self._nearest_obstacle is not None
+                and self._nearest_obstacle < self._pure_turn_clearance
             ):
                 self._nav_guard_reason = "pure_turn_clearance"
                 return self.ZERO
