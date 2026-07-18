@@ -38,8 +38,12 @@ class Go2WMap {
       },
       slamSource: '',
       costmap: null,
+      costmapLocal: null,    // 2026-07-18 DWB 避障用 local_costmap (前端默认显示)
+      costmapGlobal: null,   // 2026-07-18 Navfn 规划用 global_costmap (切换看 ghost 对比)
+      plan: null,            // 2026-07-18 nav2 /plan 规划路线 {pts:[[x,y],...]}
     };
     this._cmDirty = false; this._cmCanvas = null; this._cmCtx = null;
+    this._showGlobalCostmap = false;  // 2026-07-18 切换 local(避障)/global(规划) costmap 显示
     this._lidarCells = new Map();
     // 用户选区 (世界坐标), 由 panel.html 设置 (表单输入时也同步显示)
     this.searchRegion = null; // {x, y, w, h}
@@ -78,8 +82,23 @@ class Go2WMap {
     }
     if (data.scan) this.slam.scanPoints = data.scan;
     if (data.slam_source !== undefined) this.slam.slamSource = data.slam_source;
-    if (data.costmap) { this.slam.costmap = data.costmap; this._cmDirty = true; }
+    if (data.costmap) {
+      this.slam.costmapLocal = data.costmap;
+      if (!this._showGlobalCostmap) { this.slam.costmap = data.costmap; this._cmDirty = true; }
+    }
+    if (data.costmap_global) {
+      this.slam.costmapGlobal = data.costmap_global;
+      if (this._showGlobalCostmap) { this.slam.costmap = data.costmap_global; this._cmDirty = true; }
+    }
+    if (data.plan) this.slam.plan = data.plan;
     this._tf = null;
+  }
+
+  /** 切换前端显示的 costmap: false=local(避障,默认) / true=global(规划) */
+  setShowGlobalCostmap(v) {
+    this._showGlobalCostmap = !!v;
+    const src = this._showGlobalCostmap ? this.slam.costmapGlobal : this.slam.costmapLocal;
+    if (src) { this.slam.costmap = src; this._cmDirty = true; this._tf = null; }
   }
 
   _updateRoomSearch(progress) {
@@ -451,12 +470,30 @@ class Go2WMap {
       }
     }
 
-    // 1. 障碍栅格点
-    const obstaclePoints = s.mapPoints.concat(s.lidarMapPoints);
-    if (obstaclePoints.length) {
-      ctx.fillStyle = 'rgba(255,145,0,0.7)';
-      for (const p of obstaclePoints) ctx.fillRect(toX(p[0]) - 1, toY(p[1]) - 1, 2, 2);
+    // 0b. nav2 规划路径 /plan (青色虚线 polyline —— 显示狗要走的规划路线)
+    if (s.plan && s.plan.pts && s.plan.pts.length > 1) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(0,229,255,0.9)';
+      ctx.lineWidth = 2.5;
+      ctx.setLineDash([7, 4]);
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      for (let i = 0; i < s.plan.pts.length; i++) {
+        const px = toX(s.plan.pts[i][0]), py = toY(s.plan.pts[i][1]);
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+      ctx.restore();
     }
+
+    // 1. 障碍栅格点 [2026-07-18 关闭] mapPoints/lidarMapPoints 是 /map_frontier 建图
+    //    历史累积点(满2000上限), 含 FastLIO 抖动留下的 ghost, 位置不对干扰判断.
+    //    用户: "只有绿色scan点是正确扫描障碍, 黄(橙)和红都有问题". 只留 scan 绿 + costmap 红.
+    // const obstaclePoints = s.mapPoints.concat(s.lidarMapPoints);
+    // if (obstaclePoints.length) {
+    //   ctx.fillStyle = 'rgba(255,145,0,0.7)';
+    //   for (const p of obstaclePoints) ctx.fillRect(toX(p[0]) - 1, toY(p[1]) - 1, 2, 2);
+    // }
     // 2. 实时扫描
     const rx = toX(s.robotX), ry = toY(s.robotY);
     if (s.scanPoints.length) {

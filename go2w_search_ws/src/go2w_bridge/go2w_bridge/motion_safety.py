@@ -231,47 +231,13 @@ class ScanFreshnessWatchdog:
         with self._lock:
             if not self._fresh_locked(now):
                 return self.ZERO
-            if self._nav_guard_reason is not None:
-                # Self-heal (2026-07-16): release the latched pure-turn guard
-                # once Nav2 stops spinning in place and commands forward motion.
-                # Otherwise one transient near-obstacle pure-turn locks nav
-                # forever (nx_motion_node never calls reset_nav_guard), which
-                # makes indoor navigation unusable at the 0.95m threshold.
-                _vx, _vy, _vyaw = values
-                if (abs(_vx) > self._pure_turn_linear_epsilon
-                        or abs(_vy) > self._pure_turn_linear_epsilon
-                        or abs(_vyaw) < self._pure_turn_angular_threshold):
-                    self._nav_guard_reason = None
-                else:
-                    return self.ZERO
-            vx, vy, vyaw = values
-            pure_turn = (
-                abs(vx) <= self._pure_turn_linear_epsilon
-                and abs(vy) <= self._pure_turn_linear_epsilon
-                and abs(vyaw) >= self._pure_turn_angular_threshold
-            )
-            if not pure_turn:
-                self._turn_sign = 0
-                self._turn_flip_times = []
-                return values
-            if (
-                self._nearest_obstacle is not None
-                and self._nearest_obstacle < self._pure_turn_clearance
-            ):
-                self._nav_guard_reason = "pure_turn_clearance"
-                return self.ZERO
-            sign = 1 if vyaw > 0.0 else -1
-            if self._turn_sign and sign != self._turn_sign:
-                self._turn_flip_times.append(now)
-            self._turn_sign = sign
-            cutoff = now - self._turn_flip_window
-            self._turn_flip_times = [
-                timestamp for timestamp in self._turn_flip_times
-                if timestamp >= cutoff
-            ]
-            if len(self._turn_flip_times) >= self._max_turn_flips:
-                self._nav_guard_reason = "pure_turn_oscillation"
-                return self.ZERO
+            # 2026-07-17 治本 (用户: 去掉 pure_turn guard 保护): 原逻辑死锁——
+            # pure_turn_oscillation 锁存后, 停车(cmd_vel=0)时 :225 ZERO 早返回
+            # 绕过自愈, 且 guard 阻止 web 放行导航 → nav2 不发 cmd_vel 触发自愈 =
+            # 鸡生蛋永久死锁, 点导航狗不动. 去掉后 cmd_vel 透传不锁零,
+            # nav_guard_reason 恒 None. 代价: 失去纯转扫掠碰撞保护, 靠 costmap
+            # inflation + DWB min_vel_x 避免原地纯转兜底.
+            self._nav_guard_reason = None
             return values
 
     def nav_must_stop(self):

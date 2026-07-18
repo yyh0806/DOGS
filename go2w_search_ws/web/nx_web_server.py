@@ -343,6 +343,57 @@ def _wp_to_moves(waypoints, speed=0.3, ang_speed=0.5):
 # publisher 在 __init__ 创建一次, handler 只 publish (H2.3)。
 # 订阅缓存用 threading.Lock 保护 (H2.2, 参考 nx_sensor_node.py:82 _lock 模式)。
 # ============================================================================
+
+# ---- nav2 自主导航链路服务状态 (前端顶部红/黄/绿灯) ----
+# 用户需求 (2026-07-17): "梳理执行 nav2 所需的所有服务, 前端上方红黄绿灯".
+# 11 个服务 = 雷达→LIO→TF→建图→地图→扫描→Nav2→运动→底盘→代价图→Web 全链.
+NAV2_SERVICE_LIST = [
+    "livox-mid360-driver",
+    "fastlio",
+    "map-odom-fuser",
+    "slam-online",
+    "map-padding",
+    "mid360-nav-bridge",
+    "nav2-3d",
+    "go2w-motion",
+    "go2w-sport-gateway",
+    "costmap-bridge",
+    "go2w-web",
+]
+_NAV2_SERVICE_LABEL = {
+    "livox-mid360-driver": "雷达",
+    "fastlio": "LIO",
+    "map-odom-fuser": "TF",
+    "slam-online": "建图",
+    "map-padding": "地图",
+    "mid360-nav-bridge": "扫描",
+    "nav2-3d": "Nav2",
+    "go2w-motion": "运动",
+    "go2w-sport-gateway": "底盘",
+    "costmap-bridge": "代价图",
+    "go2w-web": "Web",
+}
+
+
+def _systemctl_services_active(names):
+    """一次 systemctl is-active 批量查询. 返回 {name: state_str}.
+
+    systemctl is-active 接受多 unit, stdout 每行一个状态 (active/inactive/failed/
+    activating/...), exit code 仅当全 active 才 0 (故用 stdout 解析, 不看 rc).
+    局部 import subprocess: 顶部未导入 (与 /api/clear_all 端点一致).
+    """
+    import subprocess  # 局部: 顶部未 import (见 /api/clear_all 同模式)
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", *names],
+            capture_output=True, text=True, timeout=4)
+        lines = (r.stdout or "").strip().splitlines()
+        return {n: (lines[i].strip() if i < len(lines) else "unknown")
+                for i, n in enumerate(names)}
+    except Exception:
+        return {n: "err" for n in names}
+
+
 class NxWebNode(Node):
     @staticmethod
     def _validate_localization_safety_parameters(timeout, max_tilt_deg):
@@ -464,6 +515,7 @@ class NxWebNode(Node):
         self._map_z = 0.0
         self._map_yaw = 0.0
         self._localization_count = 0
+        self._svc_cache = (0.0, None)  # (ts, {svc: state}) systemctl 批量结果缓存 2s
         self._localization_received_monotonic = None
         self._localization_frame_id = ""
         self._localization_child_frame_id = ""
@@ -797,7 +849,56 @@ class NxWebNode(Node):
                 },
                 "localization": localization,
                 "navigation": navigation,
+                "services": self._collect_nav2_services(),
             }
+
+    def _collect_nav2_services(self):
+        """nav2 链路服务红/黄/绿灯 (前端顶部状态条).
+
+        红 = systemd inactive/failed/err; 绿 = active + 关联数据流活;
+        黄 = active 但数据流停滞 (service 活但 topic 无数据, 如 fastlio
+        stamp 非单调那种隐性挂). systemctl 批量结果缓存 2s —— broadcast_loop
+        每 0.15s 调一次, 每次 fork 子进程会拖死 NX. 数据流指标复用现有
+        count/health (imu/scan/localization/navigation.ready/connected), 不加
+        ROS 订阅 (web wait_set 已临界, 见 costmap_bridge.py 头注释).
+        """
+        now = time.time()
+        cached_ts, cached_states = self._svc_cache
+        if cached_states is not None and (now - cached_ts) < 2.0:
+            states = cached_states
+        else:
+            states = _systemctl_services_active(NAV2_SERVICE_LIST)
+            self._svc_cache = (now, states)
+        loc_healthy = bool(self.get_localization_health().get("healthy"))
+        # nav2-3d 灯只判 nav2 栈本身 (active + sdk + scan + 定位 + 无 fault),
+        # 不判 drive_session 激活态: 狗未激活(parked)也能导航, 激活属 motion 层非 nav2 层.
+        _nav = self.get_navigation_readiness()
+        nav2_stack_ok = (bool(_nav.get("sdk_ready")) and bool(_nav.get("nav_scan_fresh"))
+                         and loc_healthy and not _nav.get("drive_fault"))
+        connected = (now - self._last_state_t) < self.state_timeout
+        flow_alive = {
+            "livox-mid360-driver": self._imu_count > 0,
+            "fastlio": loc_healthy,
+            "map-odom-fuser": loc_healthy,
+            "slam-online": loc_healthy,
+            "map-padding": loc_healthy,
+            "mid360-nav-bridge": self._scan_count > 0,
+            "nav2-3d": nav2_stack_ok,
+            "go2w-motion": connected,
+            "go2w-sport-gateway": True,   # 无直接 topic 指标, active 即绿
+            "costmap-bridge": True,
+            "go2w-web": True,
+        }
+        out = {}
+        for n in NAV2_SERVICE_LIST:
+            st = states.get(n, "unknown")
+            color = "red" if st != "active" else ("green" if flow_alive.get(n) else "yellow")
+            out[n] = {
+                "label": _NAV2_SERVICE_LABEL.get(n, n),
+                "state": st,
+                "color": color,
+            }
+        return out
 
     def get_navigation_readiness(self):
         """Separate parked-goal admission from active Nav2 continuation."""
@@ -1886,6 +1987,7 @@ def create_server(host, port, static_dir, mission_root=None):
                     "tasks": task_mgr.get_state() if task_mgr else {},
                     "localization": snap.get("localization", {}),
                     "navigation": snap.get("navigation", {}),
+                    "services": snap.get("services", {}),
                     "point_nav": point_nav.get_state() if point_nav else {},
                     "room_nav": (
                         room_orchestrator.get_navigation_state()
@@ -1952,6 +2054,7 @@ def create_server(host, port, static_dir, mission_root=None):
             audited_paths = {
                 "/api/connect", "/api/stand", "/api/confirm_stand",
                 "/api/balance", "/api/confirm_balance", "/api/sit",
+                "/api/activate",
                 "/api/e_stop", "/api/reset_drive_fault", "/api/stop",
                 "/api/manual_stop", "/api/navigate", "/api/search", "/api/clear_all",
             }
@@ -2006,6 +2109,17 @@ def create_server(host, port, static_dir, mission_root=None):
                     "sit", robot.sit) if navigation_arbiter else {
                         "ok": False, "reason": "arbiter_unavailable"}
                 self._json(result, status=200 if result.get("ok") else 409)
+            elif p.path == '/api/activate':
+                # 一键激活: parked→active 可导航态. start_drive_session 发 start_nav
+                # intent (与点导航时 arbiter 自动激活同路径, 已验证安全), wait_drive_ready
+                # 阻塞等 drive_ready (≤8s). 进入轮式平衡轮子可能小幅移动, 注意场地.
+                if robot is None:
+                    self._json({"ok": False, "reason": "robot_unavailable"}, status=409)
+                else:
+                    _r = robot.start_drive_session("nav")
+                    if _r.get("ok"):
+                        _r.update(robot.wait_drive_ready("nav", timeout=8.0))
+                    self._json(_r, status=200 if _r.get("ok") else 409)
             elif p.path == '/api/manual_stop':
                 result = navigation_arbiter.release_manual(
                     "manual_release") if navigation_arbiter else {
@@ -2486,6 +2600,19 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
                             {"type": "costmap", "data": json.load(_f)}, force=True)
                 except Exception:
                     pass  # costmap_bridge 未起 / nav2 未起 / 文件没就绪, 静默跳过
+                # 2026-07-18: global costmap (规划用, 前端切换看 ghost 对比) + plan (规划路线 polyline)
+                try:
+                    with open('/tmp/costmap_global.json') as _f:
+                        ws_broadcast(
+                            {"type": "costmap_global", "data": json.load(_f)}, force=True)
+                except Exception:
+                    pass
+                try:
+                    with open('/tmp/plan_lite.json') as _f:
+                        ws_broadcast(
+                            {"type": "plan", "data": json.load(_f)}, force=True)
+                except Exception:
+                    pass
 
             # ---- status 推送 (字段名匹配 panel.html:396-400) ----
             det_list = ai_engine.get_detection_list() if ai_engine is not None and hasattr(ai_engine, "get_detection_list") else []
@@ -2499,6 +2626,7 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
                           "tasks": task_manager.get_state() if task_manager else {},
                           "localization": localization,
                            "navigation": navigation,
+                           "services": nx_node._collect_nav2_services(),
                            "point_nav": point_nav.get_state() if point_nav else {},
                            "room_nav": room_orchestrator.get_navigation_state() if room_orchestrator else {},
                            "perception": _perception_health(robot_bridge),

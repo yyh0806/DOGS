@@ -19,6 +19,14 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
 .status-dot.warn { background: #ff9800; }
 .status-dot.off { background: #666; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* nav2 链路服务状态灯条: 绿=active+数据活, 黄=active但数据停, 红=inactive */
+.svc-bar { display: flex; gap: 9px; align-items: center; margin-left: 14px; padding-left: 14px; border-left: 1px solid #2a2a2a; flex-wrap: wrap; }
+.svc-item { font-size: 10px; color: #888; display: inline-flex; align-items: center; cursor: help; white-space: nowrap; }
+.svc-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 3px; background: #666; flex-shrink: 0; }
+.svc-dot.green { background: #4caf50; }
+.svc-dot.yellow { background: #ff9800; }
+.svc-dot.red { background: #f44336; box-shadow: 0 0 4px rgba(244,67,54,0.6); }
 .pose-info { font-size: 11px; color: #aaa; font-family: monospace; }
 
 /* 主体: 左地图 + 右栏 */
@@ -139,6 +147,7 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
       <span class="status-item"><span class="status-dot off" id="nxDot"></span>NX</span>
       <span class="status-item"><span class="status-dot off" id="slamDot"></span>SLAM</span>
     </div>
+    <div class="svc-bar" id="svcBar" title="Nav2 导航链路: 绿=active+数据流活, 黄=active但数据停, 红=inactive"></div>
   </div>
   <div class="pose-info" id="poseInfo">位姿: --</div>
 </header>
@@ -152,6 +161,7 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
       <span class="label" title="橙色为 MID360 累积建图；红色为 Nav2 致命障碍；蓝色为膨胀避障区">MID360 建图 · Nav2 实时障碍</span>
       <button class="btn" style="padding:3px 9px;font-size:11px;" onclick="clearRegion()">清除选区</button>
       <button class="btn" style="padding:3px 9px;font-size:11px;" onclick="clearTrail()">清除地图+轨迹</button>
+      <button class="btn" id="cmViewBtn" style="padding:3px 9px;font-size:11px;" title="切换 local_costmap(狗避障用,默认) / global_costmap(规划用,看ghost对比)" onclick="if(map){map.setShowGlobalCostmap(!map._showGlobalCostmap);this.textContent=map._showGlobalCostmap?'规划图':'避障图'}">避障图</button>
       <span class="label" style="margin-left:auto;">单击导航 · 拖框选搜索区域</span>
     </div>
     <div class="map-canvas-wrap">
@@ -246,13 +256,8 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
   </div>
   <div class="action-row">
     <div class="ctrl-group">
-      <button class="btn primary" onclick="connect()">连接并站立</button>
       <button class="btn" onclick="stand()">站立</button>
-      <button class="btn primary" id="confirmStandBtn" onclick="confirmStand()" disabled>确认 StandUp 站稳</button>
-      <button class="btn danger" id="balanceBtn" onclick="enterBalance()" disabled title="轮子可能在进入平衡时小幅移动；请确保场地空旷并随时急停">进入轮式平衡（会动）</button>
-      <button class="btn primary" id="confirmBalanceBtn" onclick="confirmBalance()" disabled>确认轮式平衡稳定并使能移动</button>
-      <button class="btn" id="resetDriveFaultBtn" onclick="resetDriveFault()" disabled>安全复位轮驱故障</button>
-      <button class="btn" onclick="sit()">坐下</button>
+      <button class="btn primary" onclick="activateDog()" title="激活狗进入轮式可导航态 (parked→active); 进入轮式平衡时轮子可能小幅移动, 请确保场地空旷并随时急停">激活</button>
       <button class="btn danger" onclick="eStop()">急停</button>
     </div>
     <div class="divider"></div>
@@ -595,6 +600,7 @@ function enterBalance() { controlFetch('/api/balance', { method: 'POST' }); }
 function confirmBalance() { controlFetch('/api/confirm_balance', { method: 'POST' }); }
 function sit() { controlFetch('/api/sit', { method: 'POST' }); }
 function eStop() { clearInterval(_moveInterval); _moveInterval = null; if (_locateLoopTimer) { clearTimeout(_locateLoopTimer); _locateLoopTimer = null; } pressedKeys.clear(); resetKeyHighlight(); controlFetch('/api/e_stop', { method: 'POST' }); }
+function activateDog() { controlFetch('/api/activate', { method: 'POST' }).then(r => r.json()).then(d => { console.log('activate:', d); }).catch(e => console.warn('activate failed:', e)); }
 
 // ---- 键盘控制 ----
 const KEY_MAP = {
@@ -1217,6 +1223,10 @@ function connectWS() {
         updateDetectionListRich(dets);
       } else if (data.type === 'costmap') {
         if (map) map.update({ costmap: data.data });
+      } else if (data.type === 'costmap_global') {
+        if (map) map.update({ costmap_global: data.data });
+      } else if (data.type === 'plan') {
+        if (map) map.update({ plan: data.data });
       } else if (data.type === 'slam') {
         if (map) map.update(data.data);
         updateSlamStatus(data.data.slam_source);
@@ -1229,6 +1239,16 @@ function connectWS() {
         if (data.connected !== undefined) { connected = data.connected; updateDogStatus(connected); }
         if (data.dog_state) updateDogState(data.dog_state);
         if (data.navigation) applyNavigationReadiness(data.navigation);
+        if (data.services) {
+          const bar = document.getElementById('svcBar');
+          if (bar) {
+            let h = '';
+            for (const [name, info] of Object.entries(data.services)) {
+              h += `<span class="svc-item" title="${name}: ${info.state}"><span class="svc-dot ${info.color}"></span>${info.label}</span>`;
+            }
+            bar.innerHTML = h;
+          }
+        }
         if (data.point_nav) applyNavStateForEpoch(data.point_nav, 'ws', socketEpoch);
         if (data.room_nav && map) {
           const roomNav = data.room_nav;

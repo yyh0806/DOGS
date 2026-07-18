@@ -20,7 +20,7 @@ import json
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path
 
 
 def _downsample_values(values, width, height, step):
@@ -46,13 +46,25 @@ class CostmapBridge(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
+        # local (DWB 避障用, 前端默认显示 —— 用户要看狗避障时实际用的 costmap)
         self.create_subscription(
-            OccupancyGrid, '/global_costmap/costmap', self._cb, qos)
+            OccupancyGrid, '/local_costmap/costmap',
+            lambda msg: self._cb(msg, '/tmp/costmap_lite.json'), qos)
+        # global (Navfn 规划用, 前端可切换看规划视野/ghost 对比)
+        self.create_subscription(
+            OccupancyGrid, '/global_costmap/costmap',
+            lambda msg: self._cb(msg, '/tmp/costmap_global.json'), qos)
+        # plan (nav2 规划路径, 前端 polyline 显示狗要走的路线)
+        plan_qos = QoSProfile(
+            depth=1, reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE)
+        self.create_subscription(Path, '/plan', self._plan_cb, plan_qos)
         self.get_logger().info(
-            'costmap_bridge: /global_costmap/costmap -> '
-            '/tmp/costmap_lite.json (max-pool ~80x80)')
+            'costmap_bridge: /local_costmap->costmap_lite.json (避障,默认) + '
+            '/global_costmap->costmap_global.json (规划,切换) + '
+            '/plan->plan_lite.json (路线 polyline)')
 
-    def _cb(self, msg):
+    def _cb(self, msg, out_path):
         # Nav2 already fused MID360 rays, unknown space and inflated obstacles
         # in map coordinates. Reusing it avoids a second SLAM TF publisher.
         info = msg.info
@@ -69,10 +81,35 @@ class CostmapBridge(Node):
             'vals': sub,
         }
         try:
-            with open('/tmp/costmap_lite.json', 'w') as f:
+            with open(out_path, 'w') as f:
                 json.dump(out, f)
         except Exception as e:
-            self.get_logger().warning(f'写 costmap_lite.json 失败: {e}', throttle_duration_sec=5.0)
+            self.get_logger().warning(f'写 {out_path} 失败: {e}', throttle_duration_sec=5.0)
+
+    def _plan_cb(self, msg):
+        """nav2 /plan (nav_msgs/Path) -> [[x,y],...] 抽稀写 plan_lite.json, 前端画 polyline."""
+        poses = getattr(msg, 'poses', None) or []
+        pts = []
+        for pose in poses:
+            try:
+                p = pose.pose.position
+                pts.append([round(float(p.x), 3), round(float(p.y), 3)])
+            except (AttributeError, TypeError, ValueError):
+                continue
+        # 抽稀到 ~120 点 (路径可能几百点, 前端折线够画)
+        if len(pts) > 120:
+            stride = len(pts) / 120.0
+            sparse, i = [], 0.0
+            while i < len(pts):
+                sparse.append(pts[int(i)]); i += stride
+            if sparse and sparse[-1] != pts[-1]:
+                sparse.append(pts[-1])
+            pts = sparse
+        try:
+            with open('/tmp/plan_lite.json', 'w') as f:
+                json.dump({'pts': pts}, f)
+        except Exception as e:
+            self.get_logger().warning(f'写 plan_lite.json 失败: {e}', throttle_duration_sec=5.0)
 
 
 def main(args=None):

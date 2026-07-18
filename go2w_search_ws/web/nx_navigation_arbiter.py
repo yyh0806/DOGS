@@ -223,6 +223,16 @@ class NavigationArbiter:
             return False
 
     def _emergency_stop(self) -> None:
+        # 2026-07-17 治本(可观测): estop 触发点十几个, 之前全靠逆推猜.
+        # 用 inspect 抓调用者函数:行号 print 到 stdout→go2w-web journal, 下次
+        # EMERGENCY 直接 journalctl 看 caller, 不再猜.
+        try:
+            import inspect
+            frm = inspect.stack()[1]
+            print(f"[ARBITER] _emergency_stop from {frm.function}:{frm.lineno} "
+                  f"(→ e_stop → estop_latched)", flush=True)
+        except Exception:
+            pass
         try:
             self._robot.e_stop()
         except Exception:
@@ -390,7 +400,10 @@ class NavigationArbiter:
             tasks_drained = self._wait_tasks_drained(self._transition_timeout)
             ok = point_drained and tasks_drained
             if not ok:
-                self._emergency_stop()
+                # 2026-07-17 治本(用户a): drain失败改 park 不 estop 锁存. 原 _emergency_stop
+                # → estop_latched 锁死(需 restart 清)致反复 EMERGENCY (cancel_all_and_drain
+                # 导航停止 + shutdown web restart 两处). park 失败才由 _park_drive :86 兜底 estop.
+                self._park_drive("drain_timeout")
             return {
                 "ok": ok,
                 "point_drained": point_drained,
@@ -544,7 +557,10 @@ class NavigationArbiter:
             tasks_drained = self._wait_tasks_drained(self._transition_timeout)
             ok = point_drained and tasks_drained
             if not ok:
-                self._emergency_stop()
+                # 2026-07-17 治本(用户a): drain失败改 park 不 estop 锁存. 原 _emergency_stop
+                # → estop_latched 锁死(需 restart 清)致反复 EMERGENCY (cancel_all_and_drain
+                # 导航停止 + shutdown web restart 两处). park 失败才由 _park_drive :86 兜底 estop.
+                self._park_drive("drain_timeout")
             return {
                 "ok": ok,
                 "point_drained": point_drained,
