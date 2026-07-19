@@ -30,7 +30,16 @@ def _expected_task(room):
         "use_lidar_person_range": True,
     }
     if current:
-        params.update({"max_radius_m": 6.0, "max_time": 480.0})
+        params.update({
+            "max_radius_m": 30.0,
+            "max_time": 1800.0,
+            "initial_radius_m": 6.0,
+            "radius_step_m": 6.0,
+            "tile_size_m": 6.0,
+            "stable_exhaustion_cycles": 3,
+            "max_frontiers": 200,
+            "max_plan_probes_per_cycle": 12,
+        })
     return {
         "type": "search_room",
         "priority": 8,
@@ -64,8 +73,14 @@ def test_parse_current_room_all_tables_command():
                 "mark_on_map": True,
                 "search_strategy": "frontier_explore",
                 "use_lidar_target_range": True,
-                "max_radius_m": 6.0,
-                "max_time": 480.0,
+                "max_radius_m": 30.0,
+                "max_time": 1800.0,
+                "initial_radius_m": 6.0,
+                "radius_step_m": 6.0,
+                "tile_size_m": 6.0,
+                "stable_exhaustion_cycles": 3,
+                "max_frontiers": 200,
+                "max_plan_probes_per_cycle": 12,
             },
         }],
     }

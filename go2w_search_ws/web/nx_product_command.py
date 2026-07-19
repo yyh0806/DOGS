@@ -241,10 +241,10 @@ def build_search_mission(room: str, target_class: str) -> SearchMissionRequest:
         search_strategy=strategy,
         require_photos=True,
         mark_on_map=True,
-        max_radius_m=6.0 if room == _CURRENT_ROOM else 12.0,
+        max_radius_m=30.0 if room == _CURRENT_ROOM else 12.0,
         # 2026-07-15 实测: 180s 预算太短, 狗探索 3-4 frontier 就 time_budget_exhausted,
         # 卡住的 goal 没来得及超时 abort. 提到 480s 给多 frontier + 单 goal 超时留余量.
-        max_time_s=480.0 if room == _CURRENT_ROOM else 900.0,
+        max_time_s=1800.0 if room == _CURRENT_ROOM else 900.0,
     )
 
 

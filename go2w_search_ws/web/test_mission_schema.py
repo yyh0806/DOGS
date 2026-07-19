@@ -18,6 +18,19 @@ def test_person_and_table_commands_share_one_schema():
     assert person.search_strategy == table.search_strategy == "frontier_explore"
 
 
+def test_current_room_defaults_support_adaptive_large_room_search():
+    request = SearchMissionRequest.current_room(["person"], request_id="large-room")
+
+    assert request.max_radius_m == 30.0
+    assert request.max_time_s == 1800.0
+    assert request.initial_radius_m == 6.0
+    assert request.radius_step_m == 6.0
+    assert request.tile_size_m == 6.0
+    assert request.stable_exhaustion_cycles == 3
+    assert request.max_frontiers == 200
+    assert request.max_plan_probes_per_cycle == 12
+
+
 def test_schema_round_trip_is_stable_and_generates_orchestrator_params():
     request = SearchMissionRequest.from_dict({
         "schema_version": 1,
@@ -29,6 +42,12 @@ def test_schema_round_trip_is_stable_and_generates_orchestrator_params():
         "mark_on_map": True,
         "max_radius_m": 6.0,
         "max_time_s": 180.0,
+        "initial_radius_m": 3.0,
+        "radius_step_m": 2.0,
+        "tile_size_m": 4.0,
+        "stable_exhaustion_cycles": 4,
+        "max_frontiers": 120,
+        "max_plan_probes_per_cycle": 9,
     })
     assert request.target_classes == ("person", "dining table")
     assert SearchMissionRequest.from_dict(request.to_dict()) == request
@@ -41,6 +60,12 @@ def test_schema_round_trip_is_stable_and_generates_orchestrator_params():
         "mark_on_map": True,
         "max_radius_m": 6.0,
         "max_time": 180.0,
+        "initial_radius_m": 3.0,
+        "radius_step_m": 2.0,
+        "tile_size_m": 4.0,
+        "stable_exhaustion_cycles": 4,
+        "max_frontiers": 120,
+        "max_plan_probes_per_cycle": 9,
         "use_lidar_target_range": True,
     }
 
@@ -61,6 +86,12 @@ def test_legacy_http_table_payload_is_migrated_to_the_same_schema():
         {"target_classes": ["../bad"]},
         {"max_radius_m": math.nan},
         {"max_time_s": 0},
+        {"initial_radius_m": 31.0},
+        {"radius_step_m": 0},
+        {"tile_size_m": 0},
+        {"stable_exhaustion_cycles": 0},
+        {"max_frontiers": 0},
+        {"max_plan_probes_per_cycle": 0},
         {"search_strategy": "drive_forward_blindly"},
     ],
 )

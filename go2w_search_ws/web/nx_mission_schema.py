@@ -71,6 +71,12 @@ class SearchMissionRequest:
     max_radius_m: float
     max_time_s: float
     schema_version: int = SCHEMA_VERSION
+    initial_radius_m: float = 6.0
+    radius_step_m: float = 6.0
+    tile_size_m: float = 6.0
+    stable_exhaustion_cycles: int = 3
+    max_frontiers: int = 200
+    max_plan_probes_per_cycle: int = 12
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -88,16 +94,49 @@ class SearchMissionRequest:
             raise MissionValidationError("target_classes must not be empty")
         radius = float(self.max_radius_m)
         duration = float(self.max_time_s)
+        initial_radius = float(self.initial_radius_m)
+        radius_step = float(self.radius_step_m)
+        tile_size = float(self.tile_size_m)
         if not math.isfinite(radius) or radius <= 0.0:
             raise MissionValidationError("max_radius_m must be finite and positive")
         if not math.isfinite(duration) or duration <= 0.0:
             raise MissionValidationError("max_time_s must be finite and positive")
+        if not math.isfinite(initial_radius) or initial_radius <= 0.0:
+            raise MissionValidationError(
+                "initial_radius_m must be finite and positive")
+        if initial_radius > radius:
+            raise MissionValidationError(
+                "initial_radius_m must not exceed max_radius_m")
+        if not math.isfinite(radius_step) or radius_step <= 0.0:
+            raise MissionValidationError(
+                "radius_step_m must be finite and positive")
+        if not math.isfinite(tile_size) or tile_size <= 0.0:
+            raise MissionValidationError("tile_size_m must be finite and positive")
+        integer_fields = {
+            "stable_exhaustion_cycles": self.stable_exhaustion_cycles,
+            "max_frontiers": self.max_frontiers,
+            "max_plan_probes_per_cycle": self.max_plan_probes_per_cycle,
+        }
+        normalized_integers = {}
+        for name, value in integer_fields.items():
+            try:
+                integer = int(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise MissionValidationError(f"{name} must be a positive integer") from exc
+            if integer <= 0 or float(value) != float(integer):
+                raise MissionValidationError(f"{name} must be a positive integer")
+            normalized_integers[name] = integer
         if room == "current_room" and self.search_strategy != "frontier_explore":
             raise MissionValidationError("current_room requires frontier_explore")
         object.__setattr__(self, "room", room)
         object.__setattr__(self, "target_classes", targets)
         object.__setattr__(self, "max_radius_m", radius)
         object.__setattr__(self, "max_time_s", duration)
+        object.__setattr__(self, "initial_radius_m", initial_radius)
+        object.__setattr__(self, "radius_step_m", radius_step)
+        object.__setattr__(self, "tile_size_m", tile_size)
+        for name, value in normalized_integers.items():
+            object.__setattr__(self, name, value)
         object.__setattr__(self, "require_photos", bool(self.require_photos))
         object.__setattr__(self, "mark_on_map", bool(self.mark_on_map))
 
@@ -110,8 +149,8 @@ class SearchMissionRequest:
             search_strategy="frontier_explore",
             require_photos=True,
             mark_on_map=True,
-            max_radius_m=6.0,
-            max_time_s=480.0,
+            max_radius_m=30.0,
+            max_time_s=1800.0,
         )
 
     @classmethod
@@ -132,6 +171,14 @@ class SearchMissionRequest:
                 mark_on_map=value.get("mark_on_map") is True,
                 max_radius_m=float(value.get("max_radius_m")),
                 max_time_s=float(value.get("max_time_s")),
+                initial_radius_m=float(value.get("initial_radius_m", 6.0)),
+                radius_step_m=float(value.get("radius_step_m", 6.0)),
+                tile_size_m=float(value.get("tile_size_m", 6.0)),
+                stable_exhaustion_cycles=int(value.get(
+                    "stable_exhaustion_cycles", 3)),
+                max_frontiers=int(value.get("max_frontiers", 200)),
+                max_plan_probes_per_cycle=int(value.get(
+                    "max_plan_probes_per_cycle", 12)),
             )
         except (TypeError, ValueError, OverflowError) as exc:
             if isinstance(exc, MissionValidationError):
@@ -166,10 +213,18 @@ class SearchMissionRequest:
                 require_photos=value.get("require_photos", True) is True,
                 mark_on_map=value.get("mark_on_map", True) is True,
                 max_radius_m=float(value.get(
-                    "max_radius_m", 6.0 if room == "current_room" else 12.0)),
+                    "max_radius_m", 30.0 if room == "current_room" else 12.0)),
                 max_time_s=float(value.get(
                     "max_time_s", value.get(
-                        "max_time", 480.0 if room == "current_room" else 900.0))),
+                        "max_time", 1800.0 if room == "current_room" else 900.0))),
+                initial_radius_m=float(value.get("initial_radius_m", 6.0)),
+                radius_step_m=float(value.get("radius_step_m", 6.0)),
+                tile_size_m=float(value.get("tile_size_m", 6.0)),
+                stable_exhaustion_cycles=int(value.get(
+                    "stable_exhaustion_cycles", 3)),
+                max_frontiers=int(value.get("max_frontiers", 200)),
+                max_plan_probes_per_cycle=int(value.get(
+                    "max_plan_probes_per_cycle", 12)),
             )
         except (TypeError, ValueError, OverflowError) as exc:
             if isinstance(exc, MissionValidationError):
@@ -196,6 +251,15 @@ class SearchMissionRequest:
             params["use_lidar_person_range"] = True
         else:
             params["use_lidar_target_range"] = True
+        if self.room == "current_room":
+            params.update({
+                "initial_radius_m": self.initial_radius_m,
+                "radius_step_m": self.radius_step_m,
+                "tile_size_m": self.tile_size_m,
+                "stable_exhaustion_cycles": self.stable_exhaustion_cycles,
+                "max_frontiers": self.max_frontiers,
+                "max_plan_probes_per_cycle": self.max_plan_probes_per_cycle,
+            })
         return params
 
 
