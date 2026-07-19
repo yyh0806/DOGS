@@ -52,6 +52,11 @@ except Exception:
     ActiveSearchPlanner = None
 
 try:
+    from nx_coverage_metrics import compute_coverage as _compute_coverage
+except Exception:
+    _compute_coverage = None
+
+try:
     from nx_person_localizer import (
         DetectionFrame,
         LaserScanSnapshot,
@@ -1491,6 +1496,46 @@ class RoomSearchOrchestrator:
             unresolved = store.unresolved()
             self._broadcast_person_markers(mission_id, markers)
             exploration_state = exploration.snapshot()
+            # ROI 限定覆盖率 (review #3): mission_origin 圆或 room_polygon
+            with map_lock:
+                final_map = latest_map_box[0]
+            room_polygon = params.get("room_polygon")
+            if room_polygon:
+                coverage_roi = {
+                    "type": "polygon",
+                    "points": [tuple(p) for p in room_polygon],
+                }
+            else:
+                coverage_roi = {
+                    "type": "circle",
+                    "center": [float(mission_origin[0]), float(mission_origin[1])],
+                    "radius": float(max_radius) if max_radius is not None else 6.0,
+                }
+            coverage_inflation = self._positive_float(
+                os.environ.get("GO2W_COVERAGE_INFLATION_M"), 0.3)
+            coverage_metrics = None
+            if _compute_coverage is not None and final_map is not None:
+                try:
+                    coverage_metrics = _compute_coverage(
+                        final_map, roi=coverage_roi,
+                        mission_origin=tuple(mission_origin),
+                        inflation_radius_m=coverage_inflation)
+                except Exception as exc:
+                    logger.warning("coverage computation failed: %s", exc)
+                    coverage_metrics = None
+            if coverage_metrics is None:
+                coverage_metrics = {
+                    "coverage_valid": False,
+                    "roi": coverage_roi,
+                    "free_cells": 0, "occupied_cells": 0,
+                    "unknown_cells": 0, "total_cells": 0,
+                    "explored_ratio": None,
+                    "enclosed_unknown_regions": [],
+                    "map_stamp": None,
+                    "inflation_radius_m": coverage_inflation,
+                }
+            completion_status = self._derive_completion_status(
+                completion_reason, coverage_metrics)
             blocked_frontiers = [
                 {
                     **item,
@@ -1500,6 +1545,7 @@ class RoomSearchOrchestrator:
             ]
             frontier_result = {
                 "completion_reason": completion_reason,
+                "completion_status": completion_status,
                 "waypoints_reached": waypoints_reached,
                 "navigation_attempts": nav_attempts,
                 "frontier_plan_probes": exploration_state["plan_probes"],
@@ -1513,6 +1559,16 @@ class RoomSearchOrchestrator:
                 "time_budget_sec": max_time,
                 "search_radius_m": max_radius,
                 "exploration_state": exploration_state,
+                "coverage_valid": coverage_metrics["coverage_valid"],
+                "explored_ratio": coverage_metrics["explored_ratio"],
+                "roi": coverage_metrics["roi"],
+                "enclosed_unknown_regions": coverage_metrics[
+                    "enclosed_unknown_regions"],
+                "coverage_free_cells": coverage_metrics["free_cells"],
+                "coverage_occupied_cells": coverage_metrics["occupied_cells"],
+                "coverage_unknown_cells": coverage_metrics["unknown_cells"],
+                "coverage_total_cells": coverage_metrics["total_cells"],
+                "map_stamp": coverage_metrics["map_stamp"],
             }
             if unresolved:
                 reason = "no_lidar_range"
@@ -1565,6 +1621,34 @@ class RoomSearchOrchestrator:
                     self._node.destroy_subscription(sub_handle)
                 except Exception as e:
                     logger.debug(f"destroy_subscription 异常 (可忽略): {e}")
+
+    def _derive_completion_status(self, completion_reason, coverage_metrics):
+        """Map completion_reason + coverage into the 4-state report status.
+
+        review #5: 停止信号仍是 frontier 耗尽, 但完成状态必须真实反映覆盖率,
+        不能只塞数值又按 frontier 耗尽宣告成功.
+        """
+        coverage_metrics = coverage_metrics or {}
+        if not coverage_metrics.get("coverage_valid"):
+            return "coverage_unverified"
+        budget_reasons = {
+            "time_budget_exhausted",
+            "distance_budget_exhausted",
+            "planning_budget_exhausted",
+        }
+        if completion_reason in budget_reasons:
+            return "incomplete"
+        threshold = self._positive_float(
+            os.environ.get("GO2W_FRONTIER_COVERAGE_THRESHOLD"), 0.90)
+        ratio = coverage_metrics.get("explored_ratio")
+        enclosed = coverage_metrics.get("enclosed_unknown_regions") or []
+        try:
+            ratio_ok = ratio is not None and float(ratio) >= threshold
+        except (TypeError, ValueError):
+            ratio_ok = False
+        if ratio_ok and not enclosed:
+            return "completed"
+        return "completed_with_gaps"
 
     def _product_search_available(self) -> bool:
         return all((

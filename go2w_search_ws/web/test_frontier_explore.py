@@ -1131,3 +1131,92 @@ def test_en_route_observer_rolls_window_and_runs_until_stop_event(monkeypatch, t
     assert stamps[0] < stamps[-1], (
         f"rolling-window did not drop oldest: stamps[0]={stamps[0]} "
         f"not < stamps[-1]={stamps[-1]} (samples are not fresh; pop(0) failed)")
+
+
+# ============================================================================
+# 测试 5: REPORT 段 ROI coverage + 4-state completion_status (Task 3)
+# ============================================================================
+def test_frontier_explore_report_completed_when_full_coverage(monkeypatch):
+    """全自由 map + ROI → completion_status=completed, explored_ratio=1.0."""
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+    monkeypatch.setattr(
+        orch_module, "select_frontier_candidates", lambda *_a, **_k: [])
+
+    orchestrator = make_orchestrator([], FakeNav())
+    task = FakeTask()
+    orchestrator.run(task)
+
+    assert task.status == "completed"
+    assert task.result["completion_status"] == "completed"
+    assert task.result["coverage_valid"] is True
+    assert task.result["explored_ratio"] == 1.0
+    assert task.result["enclosed_unknown_regions"] == []
+
+
+def test_frontier_explore_report_completed_with_gaps_for_walled_pocket(monkeypatch):
+    """被障碍围死的未知区 → completion_status=completed_with_gaps."""
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+
+    width = height = 7
+    data = []
+    for r in range(height):
+        for c in range(width):
+            if 2 <= r <= 4 and 2 <= c <= 4:
+                data.append(-1)
+            elif 1 <= r <= 5 and 1 <= c <= 5:
+                data.append(100)
+            else:
+                data.append(0)
+    pocket_map = _make_fake_map(width=width, height=height, fill_value=0)
+    pocket_map.data = data
+
+    class PocketNode(FakeNode):
+        def __init__(self):
+            super().__init__(emit_map=False)
+            self._pocket = pocket_map
+
+        def create_subscription(self, msg_type, topic, callback, qos):
+            handle = super().create_subscription(msg_type, topic, callback, qos)
+            if topic == "/map_frontier":
+                def _emit():
+                    time.sleep(0.05)
+                    callback(self._pocket)
+                threading.Thread(target=_emit, daemon=True).start()
+            return handle
+
+    monkeypatch.setattr(orch_module, "_OccupancyGrid", pocket_map.__class__)
+    monkeypatch.setattr(
+        orch_module, "select_frontier_candidates", lambda *_a, **_k: [])
+
+    orchestrator = make_orchestrator([], FakeNav(), node=PocketNode())
+    task = FakeTask()
+    orchestrator.run(task)
+
+    assert task.status == "completed"
+    assert task.result["completion_status"] == "completed_with_gaps"
+    assert len(task.result["enclosed_unknown_regions"]) == 1
+
+
+def test_frontier_explore_report_coverage_unverified_without_map(monkeypatch):
+    """地图不可用 (coverage None) → completion_status=coverage_unverified.
+
+    用 monkeypatch 让 _compute_coverage 返回 None (模拟地图无效 / 几何不可解析)。
+    """
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+    monkeypatch.setattr(
+        orch_module, "select_frontier_candidates", lambda *_a, **_k: [])
+    monkeypatch.setattr(orch_module, "_compute_coverage", lambda *a, **k: None)
+
+    orchestrator = make_orchestrator([], FakeNav())
+    task = FakeTask()
+    orchestrator.run(task)
+
+    assert task.status == "completed"
+    assert task.result["completion_status"] == "coverage_unverified"
+    assert "explored_ratio" in task.result
+    assert task.result["explored_ratio"] is None
