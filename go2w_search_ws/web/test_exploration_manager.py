@@ -204,6 +204,97 @@ def test_current_room_expands_radius_when_local_frontiers_are_exhausted():
     assert manager.snapshot()["active_radius_m"] == pytest.approx(12.0)
 
 
+def test_current_room_expands_after_local_frontiers_become_unreachable():
+    blocked = {
+        "x": 1.0, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 1), "distance": 1.0,
+        "information_gain": 10.0, "score": 10.0,
+    }
+    remote = {
+        "x": 7.0, "y": 0.0, "yaw": 0.0, "size": 9,
+        "center_cell": (0, 7), "distance": 7.0,
+        "information_gain": 9.0, "score": 9.0,
+    }
+
+    def candidates(_map_msg, _pose, _visited, **kwargs):
+        return [dict(remote)] if kwargs.get("max_radius", 0.0) >= 12.0 else [dict(blocked)]
+
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(blocked_x=(1.0, 0.7, 0.4, 0.1)),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=30.0,
+        initial_radius_m=6.0,
+        radius_step_m=6.0,
+        max_failures_per_cell=1,
+        candidate_selector=candidates,
+        reject_map_edge=False,
+    )
+
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    assert manager.snapshot()["last_selection_reason"] == "retry_pending"
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    assert manager.snapshot()["last_selection_reason"] == "search_boundary_expanded"
+    assert manager.snapshot()["active_radius_m"] == pytest.approx(12.0)
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    assert selected is not None
+    assert selected["x"] == pytest.approx(7.0)
+
+
+def test_frontier_inside_goal_tolerance_is_not_selected():
+    near = {
+        "x": 0.09, "y": 0.0, "yaw": 0.0, "size": 100,
+        "center_cell": (0, 0), "distance": 0.09,
+        "information_gain": 100.0, "score": 100.0,
+    }
+    useful = {
+        "x": 1.0, "y": 0.0, "yaw": 0.0, "size": 5,
+        "center_cell": (0, 1), "distance": 1.0,
+        "information_gain": 5.0, "score": 5.0,
+    }
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        candidate_selector=lambda *_a, **_k: [dict(near), dict(useful)],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(1.0)
+    assert manager.navigation_port.probes[0][0] == pytest.approx(1.0)
+
+
+def test_unreachable_frontier_uses_inward_standoff_goal():
+    frontier = {
+        "x": 1.4, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 14), "distance": 1.4,
+        "information_gain": 10.0, "score": 10.0,
+    }
+    nav = _PlannerPort(blocked_x=(1.4,))
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert [probe[0] for probe in nav.probes[:2]] == pytest.approx([1.4, 1.1])
+    assert selected["x"] == pytest.approx(1.1)
+    assert selected["frontier_x"] == pytest.approx(1.4)
+    assert selected["approach_standoff_m"] == pytest.approx(0.3)
+
+
 def test_candidates_in_active_tile_are_exhausted_before_switching_tiles():
     local = {
         "x": 1.0, "y": 1.0, "yaw": 0.0, "size": 2,

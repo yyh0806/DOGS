@@ -71,6 +71,9 @@ class ExplorationManager:
         reject_map_edge: bool = True,
         planning_timeout_s: float = 3.0,
         max_plan_probes: int = 60,
+        min_goal_distance_m: float = 0.35,
+        frontier_standoff_step_m: float = 0.3,
+        max_frontier_standoff_steps: int = 3,
         distance_weight: float = 1.0,
         heading_weight: float = 0.15,
         failure_penalty: float = 1.0,
@@ -122,6 +125,11 @@ class ExplorationManager:
         self.reject_map_edge = bool(reject_map_edge)
         self.planning_timeout_s = max(0.05, float(planning_timeout_s))
         self.max_plan_probes = max(1, int(max_plan_probes))
+        self.min_goal_distance_m = max(0.0, float(min_goal_distance_m))
+        self.frontier_standoff_step_m = max(
+            0.01, float(frontier_standoff_step_m))
+        self.max_frontier_standoff_steps = max(
+            0, int(max_frontier_standoff_steps))
         self.distance_weight = max(0.0, float(distance_weight))
         self.heading_weight = max(0.0, float(heading_weight))
         self.failure_penalty = max(0.0, float(failure_penalty))
@@ -181,10 +189,16 @@ class ExplorationManager:
             candidate for candidate in candidates
             if self._spatial_failures.get(self._candidate_cell(candidate), 0)
             < self.max_failures_per_cell
+            and self._distance_from_pose(candidate, robot_pose)
+            >= self.min_goal_distance_m
         ]
         if not eligible:
             self._current_goal = None
-            self._confirm_exhaustion()
+            if self._can_expand_radius():
+                self._expand_radius()
+                self._last_selection_reason = "search_boundary_expanded"
+            else:
+                self._confirm_exhaustion()
             return None
 
         self._exhaustion_streak = 0
@@ -195,31 +209,44 @@ class ExplorationManager:
         for candidate in eligible:
             if probes_this_cycle >= self.max_plan_probes:
                 break
-            probes_this_cycle += 1
-            self._plan_probes += 1
-            result = self.navigation_port.compute_path_to_pose(
-                candidate["x"], candidate["y"], candidate["yaw"],
-                frame_id="map", timeout=self.planning_timeout_s)
-            if not result.get("ok") or not self._path_respects_room(result):
-                reason = str(result.get("reason") or "unreachable")
-                if result.get("ok"):
-                    reason = "path_leaves_room_polygon"
-                self._record_failure(candidate, reason, "plan")
-                continue
-            chosen = dict(candidate)
-            chosen["path_length"] = float(
-                result.get("path_length", candidate.get("distance", 0.0)))
-            chosen["path_poses"] = int(result.get("poses", 0) or 0)
-            chosen["score"] = score_frontier(
-                chosen,
-                path_length=chosen["path_length"],
-                heading_change=chosen.get("heading_change", 0.0),
-                failure_count=chosen.get("failure_count", 0),
-                distance_weight=self.distance_weight,
-                heading_weight=self.heading_weight,
-                failure_penalty=self.failure_penalty,
-            )
-            reachable.append(chosen)
+            approaches = self._candidate_approaches(candidate, robot_pose)
+            last_reason = "unreachable"
+            attempts_complete = True
+            candidate_reachable = False
+            for approach in approaches:
+                if probes_this_cycle >= self.max_plan_probes:
+                    attempts_complete = False
+                    break
+                probes_this_cycle += 1
+                self._plan_probes += 1
+                result = self.navigation_port.compute_path_to_pose(
+                    approach["x"], approach["y"], approach["yaw"],
+                    frame_id="map", timeout=self.planning_timeout_s)
+                if not result.get("ok") or not self._path_respects_room(result):
+                    last_reason = str(result.get("reason") or "unreachable")
+                    if result.get("ok"):
+                        last_reason = "path_leaves_room_polygon"
+                    continue
+                chosen = dict(approach)
+                chosen["path_length"] = float(
+                    result.get("path_length", approach.get("distance", 0.0)))
+                chosen["path_poses"] = int(result.get("poses", 0) or 0)
+                chosen["score"] = score_frontier(
+                    chosen,
+                    path_length=chosen["path_length"],
+                    heading_change=chosen.get("heading_change", 0.0),
+                    failure_count=chosen.get("failure_count", 0),
+                    distance_weight=self.distance_weight,
+                    heading_weight=self.heading_weight,
+                    failure_penalty=self.failure_penalty,
+                )
+                reachable.append(chosen)
+                candidate_reachable = True
+                break
+            else:
+                attempts_complete = True
+            if not candidate_reachable and attempts_complete:
+                self._record_failure(candidate, last_reason, "plan")
         if not reachable:
             # A per-cycle probe cap prevents planner storms. Remaining spatial
             # candidates are retried on the next selection cycle; the lifetime
@@ -269,6 +296,9 @@ class ExplorationManager:
                 list(tile) for tile in sorted(self._visited_tiles)],
             "exhaustion_streak": self._exhaustion_streak,
             "stable_exhaustion_cycles": self.stable_exhaustion_cycles,
+            "min_goal_distance_m": self.min_goal_distance_m,
+            "frontier_standoff_step_m": self.frontier_standoff_step_m,
+            "max_frontier_standoff_steps": self.max_frontier_standoff_steps,
             "visited_frontiers": [dict(item) for item in self._visited],
             "blacklist": [dict(record) for record in self._blacklist.values()],
             "current_goal": (
@@ -318,6 +348,46 @@ class ExplorationManager:
             int(round(float(candidate["y"]) / bucket)),
             int(round(float(candidate["x"]) / bucket)),
         )
+
+    @staticmethod
+    def _distance_from_pose(candidate: dict, robot_pose) -> float:
+        try:
+            return math.hypot(
+                float(candidate["x"]) - float(robot_pose[0]),
+                float(candidate["y"]) - float(robot_pose[1]),
+            )
+        except (KeyError, TypeError, ValueError, IndexError, OverflowError):
+            return 0.0
+
+    def _candidate_approaches(self, candidate: dict, robot_pose) -> list[dict]:
+        approaches = [dict(candidate)]
+        if self.mode != "current_room" or self.max_frontier_standoff_steps <= 0:
+            return approaches
+        try:
+            robot_x, robot_y = float(robot_pose[0]), float(robot_pose[1])
+            frontier_x = float(candidate["x"])
+            frontier_y = float(candidate["y"])
+        except (KeyError, TypeError, ValueError, IndexError, OverflowError):
+            return approaches
+        distance = math.hypot(frontier_x - robot_x, frontier_y - robot_y)
+        if not math.isfinite(distance) or distance <= 1e-9:
+            return approaches
+        for step in range(1, self.max_frontier_standoff_steps + 1):
+            standoff = step * self.frontier_standoff_step_m
+            remaining = distance - standoff
+            if remaining + 1e-9 < self.min_goal_distance_m:
+                break
+            ratio = remaining / distance
+            approach = dict(candidate)
+            approach.update({
+                "x": robot_x + (frontier_x - robot_x) * ratio,
+                "y": robot_y + (frontier_y - robot_y) * ratio,
+                "frontier_x": frontier_x,
+                "frontier_y": frontier_y,
+                "approach_standoff_m": standoff,
+            })
+            approaches.append(approach)
+        return approaches
 
     def _path_respects_room(self, path_result: dict) -> bool:
         if self.mode != "current_room" or not self.room_polygon:
