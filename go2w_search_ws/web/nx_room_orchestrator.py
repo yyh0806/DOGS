@@ -570,6 +570,9 @@ class RoomSearchOrchestrator:
                 key: params[key] for key in (
                     "max_frontiers", "max_frontier_plan_probes",
                     "max_frontier_rejections", "frontier_planning_timeout",
+                    "max_plan_probes_per_cycle", "initial_radius_m",
+                    "radius_step_m", "tile_size_m",
+                    "stable_exhaustion_cycles",
                 ) if key in params
             }
             params = mission_request.to_task_params()
@@ -1201,8 +1204,8 @@ class RoomSearchOrchestrator:
             sentry_room = self._make_sentry_room("__frontier__")
 
             # ---- 循环: frontier 驱动 Nav2 走 → 每停留点 DETECT ----
-            max_frontiers = self._positive_int(params.get("max_frontiers"), 15)
-            max_time = self._positive_float(params.get("max_time"), 300.0)
+            max_frontiers = self._positive_int(params.get("max_frontiers"), 200)
+            max_time = self._positive_float(params.get("max_time"), 1800.0)
             radius_value = params.get("max_radius_m")
             max_radius = (
                 None if radius_value is None
@@ -1227,9 +1230,19 @@ class RoomSearchOrchestrator:
             planning_timeout = self._positive_float(
                 params.get("frontier_planning_timeout"), 3.0)
             max_plan_probes = self._positive_int(
-                params.get("max_frontier_plan_probes"),
-                max(8, max_frontiers * 4),
+                params.get(
+                    "max_plan_probes_per_cycle",
+                    params.get("max_frontier_plan_probes")),
+                12,
             )
+            initial_radius = self._positive_float(
+                params.get("initial_radius_m"), 6.0)
+            radius_step = self._positive_float(
+                params.get("radius_step_m"), 6.0)
+            tile_size = self._positive_float(
+                params.get("tile_size_m"), 6.0)
+            stable_exhaustion_cycles = self._positive_int(
+                params.get("stable_exhaustion_cycles"), 3)
             mission_deadline = start_time + max_time
             canonical_request = params.get("mission_request") or {}
             exploration_mode = (
@@ -1245,6 +1258,10 @@ class RoomSearchOrchestrator:
                 mode=exploration_mode,
                 room_radius_m=max_radius,
                 room_polygon=params.get("room_polygon"),
+                initial_radius_m=initial_radius,
+                radius_step_m=radius_step,
+                tile_size_m=tile_size,
+                stable_exhaustion_cycles=stable_exhaustion_cycles,
                 max_time_s=max_time,
                 max_distance_m=params.get("max_distance_m"),
                 battery_reserve_percent=self._positive_float(
@@ -1319,10 +1336,6 @@ class RoomSearchOrchestrator:
                 if time.time() >= mission_deadline:
                     completion_reason = "time_budget_exhausted"
                     break
-                if exploration.snapshot()["plan_probes"] >= max_plan_probes:
-                    completion_reason = "planning_budget_exhausted"
-                    break
-
                 if self._check_cancel("FRONTIER_DETECT", "__frontier__"):
                     task.status = "failed"
                     task.result = {"reason": "cancelled"}
@@ -1352,7 +1365,11 @@ class RoomSearchOrchestrator:
                 if target is None:
                     selection_reason = exploration.snapshot().get(
                         "last_selection_reason")
-                    if selection_reason == "retry_pending":
+                    if selection_reason in {
+                            "retry_pending",
+                            "search_boundary_expanded",
+                            "tile_transition_pending",
+                            "stability_confirmation_pending"}:
                         continue
                     completion_reason = {
                         "information_gain_exhausted":
@@ -1500,8 +1517,11 @@ class RoomSearchOrchestrator:
             with map_lock:
                 final_map = latest_map_box[0]
             room_polygon = params.get("room_polygon")
+            active_radius = exploration_state.get("active_radius_m")
+            coverage_radius = (
+                active_radius if active_radius is not None else max_radius)
             coverage_roi = self._build_coverage_roi(
-                room_polygon, mission_origin, max_radius)
+                room_polygon, mission_origin, coverage_radius)
             coverage_inflation = self._positive_float(
                 os.environ.get("GO2W_COVERAGE_INFLATION_M"), 0.3)
             coverage_metrics = None
@@ -1549,7 +1569,17 @@ class RoomSearchOrchestrator:
                     blocked_frontiers,
                     key=lambda item: (item["x"], item["y"])),
                 "time_budget_sec": max_time,
-                "search_radius_m": max_radius,
+                "search_radius_m": coverage_radius,
+                "active_radius_m": active_radius,
+                "max_radius_m": exploration_state.get("max_radius_m"),
+                "radius_step_m": exploration_state.get("radius_step_m"),
+                "tile_size_m": exploration_state.get("tile_size_m"),
+                "active_tile": exploration_state.get("active_tile"),
+                "visited_tiles": exploration_state.get("visited_tiles", []),
+                "exhaustion_streak": exploration_state.get(
+                    "exhaustion_streak", 0),
+                "stable_exhaustion_cycles": exploration_state.get(
+                    "stable_exhaustion_cycles", stable_exhaustion_cycles),
                 "exploration_state": exploration_state,
                 "coverage_valid": coverage_metrics["coverage_valid"],
                 "explored_ratio": coverage_metrics["explored_ratio"],

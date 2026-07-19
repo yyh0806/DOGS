@@ -698,28 +698,142 @@ def test_frontier_explore_checks_time_budget_before_planning(monkeypatch):
     assert task.result["completion_reason"] == "time_budget_exhausted"
 
 
-def test_frontier_explore_planning_budget_does_not_claim_completion(monkeypatch):
+def test_frontier_explore_plan_probe_cap_is_per_cycle_not_mission(monkeypatch):
     if not _ensure_person_deps():
         pytest.skip("frontier deps not importable")
     monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+    blocked = {
+        "x": 1.0, "y": 0.0, "yaw": 0.0, "size": 4, "score": 2.0,
+        "center_cell": (0, 1), "distance": 1.0,
+        "information_gain": 4.0,
+    }
+    reachable = {
+        "x": 2.0, "y": 0.0, "yaw": 0.0, "size": 3, "score": 1.0,
+        "center_cell": (0, 2), "distance": 2.0,
+        "information_gain": 3.0,
+    }
+
+    def candidates(_map, _pose, visited, **_kwargs):
+        return [] if visited else [dict(blocked), dict(reachable)]
+
     monkeypatch.setattr(
-        orch_module, "select_frontier_candidates",
-        lambda *_a, **_k: [
-            {"x": 1.0, "y": 0.0, "yaw": 0.0, "size": 4, "score": 2.0}
-        ])
+        orch_module, "select_frontier_candidates", candidates)
     nav = FakeNav(path_results=[
-        {"ok": False, "reason": "unreachable", "status": 6}
+        {"ok": False, "reason": "unreachable", "status": 6},
+        {"ok": True, "status": 4, "poses": 3, "path_length": 2.0},
     ])
     task = FakeTask()
     task.params["max_frontier_plan_probes"] = 1
+    task.params["max_plan_probes_per_cycle"] = 1
+    task.params["max_frontier_rejections"] = 1
+    task.params["stable_exhaustion_cycles"] = 1
     orchestrator = make_orchestrator([], nav)
 
     orchestrator.run(task)
 
-    assert task.status == "failed"
-    assert task.result["reason"] == "exploration_incomplete"
-    assert task.result["completion_reason"] == "planning_budget_exhausted"
-    assert nav.calls == []
+    assert task.status == "completed"
+    assert task.result["completion_reason"] == "reachable_frontiers_exhausted"
+    assert [call[:2] for call in nav.plan_calls] == [(1.0, 0.0), (2.0, 0.0)]
+    assert [call[:2] for call in nav.calls] == [(2.0, 0.0)]
+    assert task.result["frontier_plan_probes"] == 2
+
+
+def test_frontier_explore_reports_dynamic_radius_and_tiles(monkeypatch):
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+    seen_radii = []
+
+    def candidates(_map, _pose, visited, **kwargs):
+        radius = kwargs.get("max_radius")
+        seen_radii.append(radius)
+        if visited:
+            return []
+        if radius is not None and radius >= 12.0:
+            return [{
+                "x": 8.0, "y": 0.0, "yaw": 0.0, "size": 4,
+                "center_cell": (0, 8), "distance": 8.0,
+                "information_gain": 4.0, "score": 1.0,
+            }]
+        return []
+
+    monkeypatch.setattr(orch_module, "select_frontier_candidates", candidates)
+    task = FakeTask()
+    task.params.update({
+        "room": "__current__",
+        "max_radius_m": 12.0,
+        "initial_radius_m": 6.0,
+        "radius_step_m": 6.0,
+        "tile_size_m": 6.0,
+        "stable_exhaustion_cycles": 1,
+    })
+    orchestrator = make_orchestrator([], FakeNav())
+
+    orchestrator.run(task)
+
+    assert task.status == "completed"
+    assert seen_radii[:2] == [6.0, 12.0]
+    assert task.result["active_radius_m"] == pytest.approx(12.0)
+    assert task.result["max_radius_m"] == pytest.approx(12.0)
+    assert task.result["tile_size_m"] == pytest.approx(6.0)
+    assert [1, 0] in task.result["visited_tiles"]
+
+
+def test_frontier_explore_waits_for_stable_exhaustion(monkeypatch):
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+    calls = []
+
+    def candidates(*_args, **_kwargs):
+        calls.append(1)
+        return []
+
+    monkeypatch.setattr(orch_module, "select_frontier_candidates", candidates)
+    task = FakeTask()
+    task.params.update({
+        "room": "__current__",
+        "max_radius_m": 6.0,
+        "initial_radius_m": 6.0,
+        "stable_exhaustion_cycles": 3,
+    })
+    orchestrator = make_orchestrator([], FakeNav())
+
+    orchestrator.run(task)
+
+    assert task.status == "completed"
+    assert len(calls) == 3
+    assert task.result["exhaustion_streak"] == 3
+
+
+def test_large_room_defaults_do_not_stop_at_fifteen_waypoints(monkeypatch):
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+
+    def candidates(_map, _pose, visited, **_kwargs):
+        if len(visited) >= 16:
+            return []
+        x = float(len(visited) + 1)
+        return [{
+            "x": x, "y": 0.0, "yaw": 0.0, "size": 4,
+            "center_cell": (0, int(x)), "distance": 1.0,
+            "information_gain": 4.0, "score": 1.0,
+        }]
+
+    monkeypatch.setattr(orch_module, "select_frontier_candidates", candidates)
+    from nx_mission_schema import SearchMissionRequest
+    task = FakeTask()
+    task.params = SearchMissionRequest.current_room(
+        ["person"], request_id="large-room-16").to_task_params()
+    task.params["stable_exhaustion_cycles"] = 1
+    orchestrator = make_orchestrator([], FakeNav())
+
+    orchestrator.run(task)
+
+    assert task.status == "completed"
+    assert task.result["waypoints_reached"] == 16
+    assert task.result["completion_reason"] == "reachable_frontiers_exhausted"
 
 
 def test_frontier_explore_waypoint_budget_does_not_claim_completion(monkeypatch):
@@ -941,8 +1055,8 @@ def test_send_goal_timeout_is_40s_not_120s():
         "send_goal_and_wait 应保持 40s 单 goal 超时 (2026-07-15 调整)")
 
 
-def test_frontier_explore_max_time_defaults_300s(monkeypatch):
-    """max_time 默认 300s (_run_frontier_explore 内部默认), 锁定防回归。"""
+def test_frontier_explore_max_time_defaults_1800s(monkeypatch):
+    """大房间探索默认给 30 分钟，同时仍受电量和取消门禁约束。"""
     if not _ensure_person_deps():
         pytest.skip("frontier deps not importable")
     monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
@@ -955,7 +1069,7 @@ def test_frontier_explore_max_time_defaults_300s(monkeypatch):
     orchestrator.run(task)
 
     assert task.status == "completed"
-    assert task.result["time_budget_sec"] == 300
+    assert task.result["time_budget_sec"] == 1800
 
 
 def test_frontier_explore_observes_people_en_route(monkeypatch, tmp_path):
