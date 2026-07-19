@@ -91,7 +91,8 @@ def test_manager_selects_only_reachable_candidate_and_persists_visit():
     assert snapshot["current_goal"] is None
 
 
-def test_blacklist_is_bounded_and_keyed_by_map_revision(monkeypatch):
+def test_blacklist_is_bounded_and_spatial_failures_survive_revision_churn(
+        monkeypatch):
     nav = _PlannerPort(blocked_x=(1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5))
     manager = ExplorationManager(
         navigation_port=nav,
@@ -122,7 +123,7 @@ def test_blacklist_is_bounded_and_keyed_by_map_revision(monkeypatch):
     probes_same_revision = len(nav.probes)
 
     assert manager.choose_next(_two_room_map(2), (2.0, 3.0, 0.0)) is None
-    assert len(nav.probes) > probes_same_revision
+    assert len(nav.probes) == probes_same_revision
 
 
 def test_current_room_policy_rejects_candidate_outside_polygon(monkeypatch):
@@ -166,3 +167,187 @@ def test_budget_status_distinguishes_information_exhaustion_and_safety_limits():
     assert manager.budget_status(battery_percent=80.0) == "time_budget_exhausted"
     now[0] = 100.0
     assert manager.budget_status(battery_percent=20.0) == "battery_reserve_reached"
+
+
+def test_current_room_expands_radius_when_local_frontiers_are_exhausted():
+    seen_radii = []
+
+    def candidates(_map_msg, _pose, _visited, **kwargs):
+        radius = kwargs.get("max_radius")
+        seen_radii.append(radius)
+        if radius is not None and radius >= 12.0:
+            return [{
+                "x": 10.0, "y": 0.0, "yaw": 0.0, "size": 10,
+                "center_cell": (0, 10), "distance": 10.0,
+                "information_gain": 10.0, "score": 1.0,
+            }]
+        return []
+
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=30.0,
+        initial_radius_m=6.0,
+        radius_step_m=6.0,
+        tile_size_m=6.0,
+        stable_exhaustion_cycles=3,
+        candidate_selector=candidates,
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(10.0)
+    assert seen_radii[:2] == [6.0, 12.0]
+    assert manager.snapshot()["active_radius_m"] == pytest.approx(12.0)
+
+
+def test_candidates_in_active_tile_are_exhausted_before_switching_tiles():
+    local = {
+        "x": 1.0, "y": 1.0, "yaw": 0.0, "size": 2,
+        "center_cell": (1, 1), "distance": 1.0,
+        "information_gain": 2.0, "score": 1.0,
+    }
+    remote = {
+        "x": 7.0, "y": 1.0, "yaw": 0.0, "size": 100,
+        "center_cell": (1, 7), "distance": 7.0,
+        "information_gain": 100.0, "score": 50.0,
+    }
+
+    def candidates(_map_msg, _pose, visited, **_kwargs):
+        if visited:
+            return [dict(remote)]
+        return [dict(remote), dict(local)]
+
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=30.0,
+        initial_radius_m=12.0,
+        tile_size_m=6.0,
+        candidate_selector=candidates,
+        reject_map_edge=False,
+    )
+
+    first = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    assert first["x"] == pytest.approx(1.0)
+    assert first["tile"] == [0, 0]
+    manager.mark_visited(first)
+
+    second = manager.choose_next(_two_room_map(), (1.0, 1.0, 0.0))
+    assert second["x"] == pytest.approx(7.0)
+    assert second["tile"] == [1, 0]
+
+
+def test_origin_tile_is_centered_around_mission_start():
+    candidates = [
+        {
+            "x": -1.0, "y": -1.0, "yaw": 0.0, "size": 4,
+            "center_cell": (-1, -1), "distance": 1.4,
+            "information_gain": 4.0, "score": 4.0,
+        },
+        {
+            "x": 1.0, "y": 1.0, "yaw": 0.0, "size": 3,
+            "center_cell": (1, 1), "distance": 1.4,
+            "information_gain": 3.0, "score": 3.0,
+        },
+    ]
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=30.0,
+        initial_radius_m=6.0,
+        tile_size_m=6.0,
+        candidate_selector=lambda *_a, **_k: [dict(c) for c in candidates],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["tile"] == [0, 0]
+    assert len(manager.navigation_port.probes) == 2
+
+
+def test_plan_probe_budget_resets_each_selection_cycle():
+    blocked = {
+        "x": 1.0, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 1), "distance": 1.0,
+        "information_gain": 10.0, "score": 10.0,
+    }
+    reachable = {
+        "x": 2.0, "y": 0.0, "yaw": 0.0, "size": 9,
+        "center_cell": (0, 2), "distance": 2.0,
+        "information_gain": 9.0, "score": 9.0,
+    }
+    nav = _PlannerPort(blocked_x=(1.0,))
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        max_failures_per_cell=1,
+        max_plan_probes=1,
+        candidate_selector=lambda *_a, **_k: [dict(blocked), dict(reachable)],
+        reject_map_edge=False,
+    )
+
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    assert manager.snapshot()["last_selection_reason"] == "retry_pending"
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    assert selected is not None
+    assert selected["x"] == pytest.approx(2.0)
+    assert manager.snapshot()["plan_probes"] == 2
+
+
+def test_same_spatial_frontier_is_bounded_across_rapid_map_revisions():
+    blocked = {
+        "x": 1.0, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 1), "distance": 1.0,
+        "information_gain": 10.0, "score": 10.0,
+    }
+    nav = _PlannerPort(blocked_x=(1.0,))
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        max_failures_per_cell=2,
+        candidate_selector=lambda *_a, **_k: [dict(blocked)],
+        reject_map_edge=False,
+    )
+
+    manager.choose_next(_two_room_map(1), (0.0, 0.0, 0.0))
+    manager.choose_next(_two_room_map(1), (0.0, 0.0, 0.0))
+    probes_before_revision_churn = len(nav.probes)
+    manager.choose_next(_two_room_map(2), (0.0, 0.0, 0.0))
+
+    assert probes_before_revision_churn == 2
+    assert len(nav.probes) == probes_before_revision_churn
+
+
+def test_exhaustion_requires_configured_stable_confirmations():
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        stable_exhaustion_cycles=3,
+        candidate_selector=lambda *_a, **_k: [],
+        reject_map_edge=False,
+    )
+
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    assert manager.snapshot()["last_selection_reason"] == (
+        "stability_confirmation_pending")
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    assert manager.snapshot()["last_selection_reason"] == (
+        "stability_confirmation_pending")
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    snapshot = manager.snapshot()
+    assert snapshot["last_selection_reason"] == "reachable_frontiers_exhausted"
+    assert snapshot["exhaustion_streak"] == 3

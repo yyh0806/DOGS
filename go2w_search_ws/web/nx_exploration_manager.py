@@ -58,6 +58,10 @@ class ExplorationManager:
         mode: str = "current_room",
         room_radius_m: Optional[float] = 6.0,
         room_polygon=None,
+        initial_radius_m: Optional[float] = None,
+        radius_step_m: float = 6.0,
+        tile_size_m: float = 6.0,
+        stable_exhaustion_cycles: int = 1,
         max_time_s: float = 300.0,
         max_distance_m: Optional[float] = None,
         battery_reserve_percent: float = 20.0,
@@ -92,6 +96,19 @@ class ExplorationManager:
         self.room_polygon = (
             [(float(x), float(y)) for x, y in room_polygon]
             if room_polygon else None)
+        if self.room_radius_m is None:
+            self.initial_radius_m = None
+            self._active_radius_m = None
+        else:
+            initial = (
+                self.room_radius_m if initial_radius_m is None
+                else max(0.01, float(initial_radius_m)))
+            self.initial_radius_m = min(initial, self.room_radius_m)
+            self._active_radius_m = self.initial_radius_m
+        self.radius_step_m = max(0.01, float(radius_step_m))
+        self.tile_size_m = max(0.01, float(tile_size_m))
+        self.stable_exhaustion_cycles = max(
+            1, int(stable_exhaustion_cycles))
         self.max_time_s = max(0.01, float(max_time_s))
         self.max_distance_m = (
             None if max_distance_m is None else max(0.01, float(max_distance_m)))
@@ -99,6 +116,8 @@ class ExplorationManager:
             0.0, min(100.0, float(battery_reserve_percent)))
         self.max_failures_per_cell = max(1, int(max_failures_per_cell))
         self.max_blacklist_entries = max(1, int(max_blacklist_entries))
+        self.max_spatial_failure_entries = max(
+            256, self.max_blacklist_entries)
         self.revisit_radius_m = max(0.0, float(revisit_radius_m))
         self.reject_map_edge = bool(reject_map_edge)
         self.planning_timeout_s = max(0.05, float(planning_timeout_s))
@@ -112,7 +131,12 @@ class ExplorationManager:
         self._map_revision: Optional[str] = None
         self._visited: list[dict] = []
         self._blacklist: OrderedDict[tuple, dict] = OrderedDict()
+        self._spatial_failures: OrderedDict[tuple, int] = OrderedDict()
         self._current_goal: Optional[dict] = None
+        self._active_tile: Optional[tuple[int, int]] = (
+            (0, 0) if normalized_mode == "current_room" else None)
+        self._visited_tiles: set[tuple[int, int]] = set()
+        self._exhaustion_streak = 0
         self._distance_m = 0.0
         self._plan_probes = 0
         self._plan_rejections = 0
@@ -136,67 +160,42 @@ class ExplorationManager:
         return None
 
     def choose_next(self, map_msg, robot_pose) -> Optional[dict]:
-        if self.budget_status() is not None or self._plan_probes >= self.max_plan_probes:
-            self._last_selection_reason = (
-                self.budget_status() or "planning_budget_exhausted")
+        if self.budget_status() is not None:
+            self._last_selection_reason = self.budget_status()
             return None
         revision = map_revision(map_msg)
         self._map_revision = revision
-        failures = {
-            key[1]: int(record["failures"])
-            for key, record in self._blacklist.items()
-            if key[0] == revision
-        }
         candidate_selector = self._candidate_selector or select_frontier_candidates
-        candidates = candidate_selector(
-            map_msg,
-            robot_pose,
-            self._visited,
-            revisit_radius=self.revisit_radius_m,
-            origin_pose=self.mission_origin,
-            max_radius=self.room_radius_m,
-            room_polygon=self.room_polygon,
-            reject_map_edge=self.reject_map_edge,
-            failure_counts=failures,
-            distance_weight=self.distance_weight,
-            heading_weight=self.heading_weight,
-            failure_penalty=self.failure_penalty,
-        )
-        # Enforce mission bounds here as well as in the pure planner so a
-        # custom candidate source cannot bypass current-room containment.
-        if self.room_radius_m is not None:
-            candidates = [
-                item for item in candidates
-                if math.hypot(
-                    float(item["x"]) - self.mission_origin[0],
-                    float(item["y"]) - self.mission_origin[1],
-                ) <= self.room_radius_m
-            ]
-        if self.room_polygon:
-            candidates = [
-                item for item in candidates
-                if point_in_polygon(
-                    float(item["x"]), float(item["y"]), self.room_polygon)
-            ]
+        candidates = self._select_candidates(
+            candidate_selector, map_msg, robot_pose)
+        while (not candidates and self._can_expand_radius()):
+            self._expand_radius()
+            candidates = self._select_candidates(
+                candidate_selector, map_msg, robot_pose)
         if not candidates:
-            self._last_selection_reason = "information_gain_exhausted"
             self._current_goal = None
+            self._confirm_exhaustion()
             return None
 
         eligible = [
             candidate for candidate in candidates
-            if failures.get(self._candidate_cell(candidate), 0)
+            if self._spatial_failures.get(self._candidate_cell(candidate), 0)
             < self.max_failures_per_cell
         ]
         if not eligible:
-            self._last_selection_reason = "reachable_frontiers_exhausted"
             self._current_goal = None
+            self._confirm_exhaustion()
             return None
 
+        self._exhaustion_streak = 0
+        eligible = self._prioritize_active_tile(eligible, robot_pose)
+
         reachable = []
+        probes_this_cycle = 0
         for candidate in eligible:
-            if self._plan_probes >= self.max_plan_probes:
+            if probes_this_cycle >= self.max_plan_probes:
                 break
+            probes_this_cycle += 1
             self._plan_probes += 1
             result = self.navigation_port.compute_path_to_pose(
                 candidate["x"], candidate["y"], candidate["yaw"],
@@ -222,17 +221,10 @@ class ExplorationManager:
             )
             reachable.append(chosen)
         if not reachable:
-            current_failures = {
-                key[1]: int(record["failures"])
-                for key, record in self._blacklist.items()
-                if key[0] == revision
-            }
-            self._last_selection_reason = (
-                "reachable_frontiers_exhausted"
-                if all(current_failures.get(self._candidate_cell(item), 0)
-                       >= self.max_failures_per_cell for item in candidates)
-                else "retry_pending"
-            )
+            # A per-cycle probe cap prevents planner storms. Remaining spatial
+            # candidates are retried on the next selection cycle; the lifetime
+            # counter is telemetry only and never terminates a large mission.
+            self._last_selection_reason = "retry_pending"
             self._current_goal = None
             return None
         reachable.sort(key=lambda item: (
@@ -246,7 +238,13 @@ class ExplorationManager:
         if "x" not in target or "y" not in target:
             return
         self._visited.append({"x": float(target["x"]), "y": float(target["y"])})
+        tile = self._tile_key(float(target["x"]), float(target["y"]))
+        self._visited_tiles.add(tile)
         self._distance_m += max(0.0, float(target.get("path_length", 0.0)))
+        # Successful motion changes the planning vantage point. Previously
+        # unreachable spatial cells may now be valid and get one fresh epoch.
+        self._spatial_failures.clear()
+        self._exhaustion_streak = 0
         self._current_goal = None
 
     def mark_navigation_failed(self, reason: str, candidate: Optional[dict] = None) -> None:
@@ -260,6 +258,17 @@ class ExplorationManager:
             "mode": self.mode,
             "mission_origin": list(self.mission_origin),
             "map_revision": self._map_revision,
+            "initial_radius_m": self.initial_radius_m,
+            "active_radius_m": self._active_radius_m,
+            "max_radius_m": self.room_radius_m,
+            "radius_step_m": self.radius_step_m,
+            "tile_size_m": self.tile_size_m,
+            "active_tile": (
+                None if self._active_tile is None else list(self._active_tile)),
+            "visited_tiles": [
+                list(tile) for tile in sorted(self._visited_tiles)],
+            "exhaustion_streak": self._exhaustion_streak,
+            "stable_exhaustion_cycles": self.stable_exhaustion_cycles,
             "visited_frontiers": [dict(item) for item in self._visited],
             "blacklist": [dict(record) for record in self._blacklist.values()],
             "current_goal": (
@@ -274,6 +283,10 @@ class ExplorationManager:
 
     def _record_failure(self, candidate: dict, reason: str, stage: str) -> None:
         cell = self._candidate_cell(candidate)
+        spatial_count = self._spatial_failures.pop(cell, 0) + 1
+        self._spatial_failures[cell] = spatial_count
+        while len(self._spatial_failures) > self.max_spatial_failure_entries:
+            self._spatial_failures.popitem(last=False)
         key = (self._map_revision, cell)
         record = self._blacklist.pop(key, {
             "map_revision": self._map_revision,
@@ -321,3 +334,104 @@ class ExplorationManager:
             if not point_in_polygon(x, y, self.room_polygon):
                 return False
         return True
+
+    def _select_candidates(self, candidate_selector, map_msg, robot_pose):
+        failures = {
+            cell: int(count) for cell, count in self._spatial_failures.items()
+        }
+        candidates = candidate_selector(
+            map_msg,
+            robot_pose,
+            self._visited,
+            revisit_radius=self.revisit_radius_m,
+            origin_pose=self.mission_origin,
+            max_radius=self._active_radius_m,
+            room_polygon=self.room_polygon,
+            reject_map_edge=self.reject_map_edge,
+            failure_counts=failures,
+            distance_weight=self.distance_weight,
+            heading_weight=self.heading_weight,
+            failure_penalty=self.failure_penalty,
+        )
+        # Enforce the active mission bound here too, so custom/test candidate
+        # sources cannot bypass dynamic current-room containment.
+        if self._active_radius_m is not None:
+            candidates = [
+                item for item in candidates
+                if math.hypot(
+                    float(item["x"]) - self.mission_origin[0],
+                    float(item["y"]) - self.mission_origin[1],
+                ) <= self._active_radius_m
+            ]
+        if self.room_polygon:
+            candidates = [
+                item for item in candidates
+                if point_in_polygon(
+                    float(item["x"]), float(item["y"]), self.room_polygon)
+            ]
+        return [dict(item) for item in candidates]
+
+    def _can_expand_radius(self) -> bool:
+        return bool(
+            self.mode == "current_room"
+            and not self.room_polygon
+            and self._active_radius_m is not None
+            and self.room_radius_m is not None
+            and self._active_radius_m + 1e-9 < self.room_radius_m
+        )
+
+    def _expand_radius(self) -> None:
+        if not self._can_expand_radius():
+            return
+        self._active_radius_m = min(
+            self.room_radius_m, self._active_radius_m + self.radius_step_m)
+        self._spatial_failures.clear()
+        self._exhaustion_streak = 0
+
+    def _tile_key(self, x: float, y: float) -> tuple[int, int]:
+        half = self.tile_size_m * 0.5
+        return (
+            int(math.floor((float(x) - self.mission_origin[0] + half) /
+                           self.tile_size_m)),
+            int(math.floor((float(y) - self.mission_origin[1] + half) /
+                           self.tile_size_m)),
+        )
+
+    def _prioritize_active_tile(self, candidates, robot_pose):
+        if self.mode != "current_room" or not candidates:
+            return candidates
+        annotated = []
+        for item in candidates:
+            candidate = dict(item)
+            tile = self._tile_key(candidate["x"], candidate["y"])
+            candidate["tile"] = list(tile)
+            annotated.append(candidate)
+        active = [
+            item for item in annotated
+            if tuple(item["tile"]) == self._active_tile
+        ]
+        if active:
+            return active
+
+        if self._active_tile is not None:
+            self._visited_tiles.add(self._active_tile)
+        try:
+            robot_tile = self._tile_key(robot_pose[0], robot_pose[1])
+        except (TypeError, ValueError, IndexError):
+            robot_tile = (0, 0)
+        tile_keys = {tuple(item["tile"]) for item in annotated}
+        self._active_tile = min(tile_keys, key=lambda tile: (
+            abs(tile[0] - robot_tile[0]) + abs(tile[1] - robot_tile[1]),
+            tile[0], tile[1],
+        ))
+        return [
+            item for item in annotated
+            if tuple(item["tile"]) == self._active_tile
+        ]
+
+    def _confirm_exhaustion(self) -> None:
+        self._exhaustion_streak += 1
+        if self._exhaustion_streak >= self.stable_exhaustion_cycles:
+            self._last_selection_reason = "reachable_frontiers_exhausted"
+        else:
+            self._last_selection_reason = "stability_confirmation_pending"
