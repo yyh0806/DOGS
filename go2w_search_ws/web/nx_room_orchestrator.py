@@ -1368,9 +1368,39 @@ class RoomSearchOrchestrator:
                     return
 
                 nav_attempts += 1
-                result = nav.send_goal_and_wait(
-                    target["x"], target["y"], target.get("yaw", 0.0),
-                    frame_id="map")
+                # En-route observer: 导航期间 best-effort 时间对齐检测, 到达后 drain
+                en_route_interval = self._positive_float(
+                    params.get("en_route_sample_interval"), 0.4)
+                en_route_cap = self._positive_int(
+                    os.environ.get("GO2W_EN_ROUTE_MAX_SAMPLES"), 12)
+                stop_event = threading.Event()
+                en_route_holder = {}
+
+                def _en_route_worker():
+                    try:
+                        en_route_holder["samples"] = self._observe_en_route(
+                            stop_event, target_classes, en_route_interval,
+                            max_samples=en_route_cap)
+                    except Exception as exc:
+                        logger.debug("en-route worker crashed: %s", exc)
+                        en_route_holder["samples"] = []
+
+                en_route_thread = threading.Thread(
+                    target=_en_route_worker, daemon=True,
+                    name=f"en-route-{mission_id}-{iteration}")
+                en_route_thread.start()
+                try:
+                    result = nav.send_goal_and_wait(
+                        target["x"], target["y"], target.get("yaw", 0.0),
+                        frame_id="map")
+                finally:
+                    stop_event.set()
+                    en_route_thread.join(timeout=2.0)
+                en_route_samples = en_route_holder.get("samples") or []
+                if en_route_samples:
+                    self._ingest_en_route_samples(
+                        en_route_samples, store, "__frontier__", require_photos)
+                    self._broadcast_person_markers(mission_id, store.markers())
                 if not result.get("ok"):
                     reason = self._nav_failure_reason(result)
                     if reason in ("no_nav", "cancelled"):
@@ -1596,6 +1626,251 @@ class RoomSearchOrchestrator:
         except Exception as exc:
             logger.warning("restore detection targets failed: %s", exc)
 
+    def _build_observation_bundle(self, snapshot, require_photos):
+        """Read-only: form an observation_sync bundle for one detection snapshot.
+
+        Shared by _observe_people_at_viewpoint (at-viewpoint, after fresh-wait)
+        and _observe_en_route (in-flight worker). Does NOT write to the store.
+        Safe to call from a worker thread: observation_sync carries its own
+        RLock, and node snapshot readers are lock-guarded.
+
+        Returns a dict with bundle/frame_info/frame/scan/pointcloud/robot_pose/
+        source/captured_at/observation_valid/camera_calibration, or None if the
+        bundle cannot be time-aligned within tolerance (caller must drop the
+        sample — never fall back to ad-hoc pose+scan that misaligns in time).
+        """
+        snapshot = snapshot or {}
+        source = str(snapshot.get("source") or "")
+        try:
+            captured_at = float(snapshot.get("timestamp"))
+        except (TypeError, ValueError):
+            captured_at = 0.0
+        frame = snapshot.get("frame")
+        frame_width, frame_height = self._snapshot_frame_size(snapshot, frame)
+        try:
+            calibration = resolve_camera_calibration(
+                source, gimbal_yaw_rad=snapshot.get("gimbal_yaw_rad"))
+        except Exception as exc:
+            logger.warning("camera calibration failed: %s", exc)
+            return None
+        result = {
+            "source": source,
+            "captured_at": captured_at,
+            "observation_valid": frame_width > 0 and frame_height > 0,
+            "camera_calibration": calibration,
+            "frame": frame,
+            "frame_width": frame_width,
+            "frame_height": frame_height,
+        }
+        detections = snapshot.get("detections") or []
+        if not detections:
+            result["bundle"] = None
+            result["detections"] = []
+            return result
+        bundle = None
+        if self._observation_sync is not None:
+            try:
+                if frame is not None:
+                    self._observation_sync.add_frame(
+                        stamp=captured_at, frame=frame)
+                self._observation_sync.add_detection(
+                    stamp=captured_at, detection=snapshot)
+                # Seed live pose + scan into the sync so bundle_for_detection
+                # can time-align them with the detection stamp. The at-viewpoint
+                # caller in nx_web_server has these feeds running on its own
+                # subscriptions; seeding here is idempotent (same stamp just
+                # overwrites) and makes the en-route worker self-contained
+                # (no dependency on external feeders being active mid-flight).
+                live_pose = self._get_live_robot_pose()
+                if live_pose is not None:
+                    px, py, pyaw = live_pose
+                    self._observation_sync.add_pose(
+                        stamp=captured_at, x=px, y=py, yaw=pyaw)
+                live_scan = self._laser_scan_snapshot()
+                if live_scan is not None:
+                    self._observation_sync.add_scan(
+                        stamp=captured_at, scan=live_scan)
+                current_cloud = self._pointcloud_snapshot()
+                cloud_stamp = current_cloud.get("timestamp") if current_cloud else None
+                if cloud_stamp:
+                    self._observation_sync.add_cloud(
+                        stamp=cloud_stamp, cloud=current_cloud.get("cloud"))
+                tolerance = self._positive_float(
+                    os.environ.get("GO2W_OBSERVATION_SYNC_TOLERANCE_SEC"), 0.20)
+                bundle = self._observation_sync.bundle_for_detection(
+                    stamp=captured_at, tolerance=tolerance)
+            except Exception as exc:
+                logger.warning("observation synchronization failed: %s", exc)
+                bundle = None
+        if bundle is None:
+            # 关键: 拿不到对齐 bundle → 返回 None, 调用方丢弃样本
+            # 绝不退化为 "存 pose + 事后读最新 scan" (时间错位)
+            return None
+        pointcloud = bundle.cloud.value if bundle.cloud is not None else None
+        result.update({
+            "bundle": bundle,
+            "scan": bundle.scan.value,
+            "pointcloud": pointcloud,
+            "robot_pose": (bundle.pose.x, bundle.pose.y, bundle.pose.yaw),
+            "capture_stamp": bundle.capture_stamp,
+            "pose_stamp": bundle.pose.stamp,
+            "scan_stamp": bundle.scan.stamp,
+            "pose_delta_s": bundle.pose_delta_s,
+            "scan_delta_s": bundle.scan_delta_s,
+            "localization_quality": "timestamp_interpolated",
+            "detections": detections,
+        })
+        return result
+
+    def _localize_en_route_detections(self, bundle_result, target_classes):
+        """Read-only localize of en-route detections. Only range_lidar kept.
+
+        bearing_only observations are left for the at-viewpoint steady-state
+        sample (they need a second viewpoint to triangulate). Returns a list
+        of localized dicts ready for store.add_observation. Safe from a worker
+        thread: no store writes, no shared mutable state beyond bundle_result.
+        """
+        bundle_result = bundle_result or {}
+        detections = bundle_result.get("detections") or []
+        if not detections or bundle_result.get("bundle") is None:
+            return []
+        scan = bundle_result.get("scan")
+        if scan is None:
+            return []
+        pointcloud = bundle_result.get("pointcloud")
+        robot_x, robot_y, robot_yaw = bundle_result["robot_pose"]
+        calibration = bundle_result["camera_calibration"]
+        frame_width = bundle_result["frame_width"]
+        frame_height = bundle_result["frame_height"]
+        if frame_width <= 0 or frame_height <= 0:
+            return []
+        if localize_target_detection is None:
+            return []
+        frame_info = DetectionFrame(
+            width=frame_width,
+            height=frame_height,
+            camera_hfov_rad=math.radians(calibration["hfov_deg"]),
+            camera_yaw_offset_rad=math.radians(calibration["yaw_offset_deg"]),
+            gimbal_yaw_rad=math.radians(calibration["gimbal_yaw_deg"] or 0.0),
+        )
+        localization = self._localization_health()
+        try:
+            robot_z = float(localization.get("z", 0.0))
+        except (TypeError, ValueError):
+            robot_z = 0.0
+        if not math.isfinite(robot_z):
+            robot_z = 0.0
+        allowed = set(self._normalize_target_classes(target_classes))
+        results = []
+        for det in detections:
+            if det.get("class") not in allowed:
+                continue
+            try:
+                localized = localize_target_detection(
+                    det, frame_info, scan, robot_x, robot_y, robot_yaw,
+                    robot_z=robot_z, pointcloud=pointcloud)
+            except Exception as exc:
+                logger.debug("en-route localize failed: %s", exc)
+                continue
+            if localized.get("position_quality") != "range_lidar":
+                continue
+            localized.update({
+                "robot_x": round(float(robot_x), 3),
+                "robot_y": round(float(robot_y), 3),
+                "robot_yaw": round(float(robot_yaw), 3),
+                "source": "en_route",
+                "detector_source": bundle_result.get("source"),
+                "timestamp": bundle_result.get("capture_stamp", time.time()),
+            })
+            results.append(localized)
+        return results
+
+    def _observe_en_route(self, stop_event, target_classes, sample_interval=0.4,
+                          max_samples=12):
+        """Worker thread: best-effort person detection while navigating.
+
+        Reads ai detection snapshot cache; for each NEW inference frame
+        (deduped by captured_at) forms a time-aligned observation_sync bundle
+        and localizes range_lidar detections. Does NOT write to the store.
+        Returns a bounded list of samples
+        [{localized_list, frame, captured_at, source}, ...] for the main
+        thread to ingest serially after the goal is reached.
+
+        Dedup rule: same captured_at (inference frame stamp) is processed at
+        most once, so a cached frame polled many times during one navigation
+        leg is not copied repeatedly (avoiding the 100x 720p heap pressure
+        flagged in review).
+
+        Termination: returns when (a) ``stop_event`` is set by the caller,
+        (b) the bounded sample queue is full (``len(samples) >= max_samples``),
+        or (c) an internal safety deadline elapses (sample_interval *
+        max_samples * 3, at least 2.0s) — so the worker never hangs the
+        ``join(timeout=2.0)`` in the frontier loop even if stop_event is
+        somehow never set.
+        """
+        samples = []
+        get_snapshot = self._detection_snapshot_getter(target_classes)
+        if get_snapshot is None:
+            return samples
+        interval = max(0.05, float(sample_interval))
+        cap = max(1, int(max_samples))
+        deadline = time.monotonic() + max(2.0, interval * cap * 3)
+        seen_stamps = set()
+        while not stop_event.is_set() and len(samples) < cap:
+            if time.monotonic() >= deadline:
+                break
+            try:
+                snapshot = get_snapshot() or {}
+            except Exception as exc:
+                logger.debug("en-route snapshot read failed: %s", exc)
+                snapshot = {}
+            try:
+                captured_at = float(snapshot.get("timestamp"))
+            except (TypeError, ValueError):
+                captured_at = 0.0
+            if captured_at > 0.0 and captured_at not in seen_stamps:
+                seen_stamps.add(captured_at)
+                try:
+                    bundle_result = self._build_observation_bundle(snapshot, False)
+                except Exception as exc:
+                    logger.debug("en-route bundle build failed: %s", exc)
+                    bundle_result = None
+                if bundle_result is not None and bundle_result.get("bundle") is not None:
+                    localized = self._localize_en_route_detections(
+                        bundle_result, target_classes)
+                    if localized:
+                        samples.append({
+                            "localized_list": localized,
+                            "frame": bundle_result.get("frame"),
+                            "captured_at": captured_at,
+                            "source": bundle_result.get("source"),
+                        })
+            if stop_event.wait(interval):
+                break
+        return samples
+
+    def _ingest_en_route_samples(self, samples, store, room_name, require_photos):
+        """Main thread: serially commit en-route localized samples to the store.
+
+        Called after the worker thread is joined. Each sample carries a list
+        of already-localized range_lidar observations; we only call
+        store.add_observation (the store's own dedup + media policy applies).
+        Returns the number of observations committed.
+        """
+        committed = 0
+        for sample in samples or []:
+            localized_list = sample.get("localized_list") or []
+            frame = sample.get("frame") if require_photos else None
+            room = str(room_name or "__frontier__")
+            for localized in localized_list:
+                localized.setdefault("room", room)
+                try:
+                    store.add_observation(localized, frame=frame)
+                    committed += 1
+                except Exception as exc:
+                    logger.debug("en-route store commit failed: %s", exc)
+        return committed
+
     def _observe_people_at_viewpoint(self, store, room_name: str, view_idx: int,
                                      robot_pose, target_classes: List[str],
                                      require_photos: bool = True,
@@ -1688,54 +1963,56 @@ class RoomSearchOrchestrator:
         if not detections:
             return {**observation_meta, "resolved_count": 0}
 
-        bundle = None
-        if self._observation_sync is not None:
-            try:
-                if frame is not None:
-                    self._observation_sync.add_frame(
-                        stamp=captured_at, frame=frame)
-                self._observation_sync.add_detection(
-                    stamp=captured_at, detection=snapshot)
-                current_cloud = self._pointcloud_snapshot()
-                cloud_stamp = current_cloud.get("timestamp")
-                if cloud_stamp:
-                    self._observation_sync.add_cloud(
-                        stamp=cloud_stamp, cloud=current_cloud)
-                tolerance = self._positive_float(
-                    os.environ.get("GO2W_OBSERVATION_SYNC_TOLERANCE_SEC"),
-                    0.20,
-                )
-                bundle = self._observation_sync.bundle_for_detection(
-                    stamp=captured_at, tolerance=tolerance)
-            except Exception as exc:
-                logger.warning("observation synchronization failed: %s", exc)
-                bundle = None
-            if bundle is None:
-                return {
-                    **observation_meta,
-                    "reason": "unsynchronized_observation",
-                    "capture_stamp": captured_at,
-                    "observation_valid": False,
-                }
-            scan = bundle.scan.value
-            pointcloud = bundle.cloud.value if bundle.cloud is not None else None
-            robot_pose = (bundle.pose.x, bundle.pose.y, bundle.pose.yaw)
-            observation_meta.update({
-                "capture_stamp": bundle.capture_stamp,
-                "pose_stamp": bundle.pose.stamp,
-                "scan_stamp": bundle.scan.stamp,
-                "pose_delta_s": bundle.pose_delta_s,
-                "scan_delta_s": bundle.scan_delta_s,
-                "cloud_stamp": (
-                    bundle.cloud.stamp if bundle.cloud is not None else None),
-                "cloud_delta_s": bundle.cloud_delta_s,
-                "localization_quality": "timestamp_interpolated",
-            })
-        else:
+        # Test-protected fall-back: when observation_sync is not injected
+        # (e.g. Windows dev tests, or older NX runs without the sync layer),
+        # use the legacy ad-hoc path: read scan + pointcloud directly. The
+        # en-route worker never enters this branch because it requires
+        # observation_sync (see _build_observation_bundle → None handling).
+        if self._observation_sync is None:
             scan = self._laser_scan_snapshot()
             if scan is None:
                 return None
             pointcloud = self._pointcloud_snapshot()
+        else:
+            bundle_result = self._build_observation_bundle(
+                snapshot, require_photos)
+            if bundle_result is None:
+                return {
+                    "source": source,
+                    "observation_valid": False,
+                    "reason": "unsynchronized_observation",
+                    "capture_stamp": captured_at,
+                }
+            observation_meta = {
+                "source": bundle_result["source"],
+                "observation_valid": bundle_result["observation_valid"],
+                "camera_calibration": bundle_result["camera_calibration"],
+            }
+            if bundle_result.get("bundle") is None:
+                # No detection or empty detections: bundle constructor returns
+                # a no-detection result; behave as the legacy "no detections"
+                # path.
+                return {**observation_meta, "resolved_count": 0}
+            observation_meta.update({
+                "capture_stamp": bundle_result["capture_stamp"],
+                "pose_stamp": bundle_result["pose_stamp"],
+                "scan_stamp": bundle_result["scan_stamp"],
+                "pose_delta_s": bundle_result["pose_delta_s"],
+                "scan_delta_s": bundle_result["scan_delta_s"],
+                "cloud_stamp": (
+                    bundle_result["bundle"].cloud.stamp
+                    if bundle_result["bundle"].cloud is not None else None),
+                "cloud_delta_s": bundle_result["bundle"].cloud_delta_s,
+                "localization_quality": bundle_result["localization_quality"],
+            })
+            scan = bundle_result["scan"]
+            pointcloud = bundle_result["pointcloud"]
+            robot_pose = bundle_result["robot_pose"]
+            frame = bundle_result["frame"]
+            frame_width = bundle_result["frame_width"]
+            frame_height = bundle_result["frame_height"]
+            calibration = bundle_result["camera_calibration"]
+            detections = bundle_result["detections"]
 
         if frame_width <= 0 or frame_height <= 0:
             if require_photos:

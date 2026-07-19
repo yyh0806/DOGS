@@ -228,13 +228,21 @@ def _ensure_person_deps():
     return deps_ok
 
 
-def make_orchestrator(events, nav, node=None, ai_engine=None):
-    orchestrator = RoomSearchOrchestrator(
+def make_orchestrator(events, nav, node=None, ai_engine=None, with_observation_sync=False):
+    kwargs = dict(
         node=node or FakeNode(emit_map=True),
         ai_engine=ai_engine or FakeAi(),
         ws_broadcast_fn=events.append,
         rooms_yaml_path=str(Path(__file__).parent / "_nonexistent_rooms.yaml"),
     )
+    if with_observation_sync:
+        # En-route worker requires observation_sync to time-align pose/scan/
+        # detection into a single bundle. Tests that exercise en-route set
+        # this flag; legacy at-viewpoint tests keep the None path (preserves
+        # the historical fall-back test coverage).
+        from nx_observation_sync import ObservationSynchronizer
+        kwargs["observation_sync"] = ObservationSynchronizer()
+    orchestrator = RoomSearchOrchestrator(**kwargs)
     orchestrator._nav = nav
     orchestrator._static_root = Path(__file__).resolve().parent
     return orchestrator
@@ -914,3 +922,135 @@ def test_select_next_frontier_alpha_negative_falls_back(monkeypatch):
     result = select_next_frontier(None, (0.0, 0.0, 0.0), [])
     assert result is not None
     assert abs(result["score"] - 1.5) < 1e-6  # 回退 1.0
+
+
+# ============================================================================
+# 测试 4: budget 锁定 + en-route observer (Task 1: 导航期间连续 YOLO 标人)
+# ============================================================================
+def test_send_goal_timeout_is_40s_not_120s():
+    """2026-07-15 实测: 单 goal 超时从 120s 调到 40s。锁定防回归。"""
+    import inspect
+    from nx_navigation_gateway import MissionNavigationPort
+    source = inspect.getsource(MissionNavigationPort.send_goal_and_wait)
+    assert "timeout=40.0" in source, (
+        "send_goal_and_wait 应保持 40s 单 goal 超时 (2026-07-15 调整)")
+
+
+def test_frontier_explore_max_time_defaults_300s(monkeypatch):
+    """max_time 默认 300s (_run_frontier_explore 内部默认), 锁定防回归。"""
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+    monkeypatch.setattr(
+        orch_module, "select_frontier_candidates", lambda *_a, **_k: [])
+    orchestrator = make_orchestrator([], FakeNav())
+    task = FakeTask()
+    task.params.pop("max_time", None)  # 用默认值
+
+    orchestrator.run(task)
+
+    assert task.status == "completed"
+    assert task.result["time_budget_sec"] == 300
+
+
+def test_frontier_explore_observes_people_en_route(monkeypatch, tmp_path):
+    """导航期间 observer 应采到 FakeAi 缓存里的人, 到达后 ingest 进 store。
+
+    FakeNav.send_goal_and_wait 阻塞 0.3s 模拟导航耗时, 期间 observer 线程
+    每 0.05s 读一次 detection snapshot。用 monkeypatch spy _ingest_en_route_samples
+    验证 en-route 路径独立于到点稳态采样被真的走通 (不污染生产类计数器)。
+    """
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+
+    def candidates(_map, _pose, visited, **_kwargs):
+        if visited:
+            return []
+        return [{"x": 1.0, "y": 0.0, "yaw": 0.0, "size": 4, "score": 2.0}]
+    monkeypatch.setattr(orch_module, "select_frontier_candidates", candidates)
+
+    class SlowNav(FakeNav):
+        def send_goal_and_wait(self, x, y, yaw, frame_id="map"):
+            time.sleep(0.3)  # 让 observer 线程有机会采样
+            return super().send_goal_and_wait(x, y, yaw, frame_id=frame_id)
+
+    orch = make_orchestrator([], SlowNav(), ai_engine=FakeAi(),
+                              with_observation_sync=True)
+    orch._static_root = tmp_path
+    task = FakeTask()
+    # max_frontiers=2: 1st frontier reached, 2nd iter queries candidates with
+    # visited=[{x:1.0}] → [] → target=None → break → completion_reason=
+    # "reachable_frontiers_exhausted" → completed. With max_frontiers=1 the
+    # loop exits with "waypoint_budget_exhausted" → exploration_incomplete.
+    task.params["max_frontiers"] = 2
+    task.params["en_route_sample_interval"] = 0.05  # 快速采样
+
+    # spy: 替换 ingest 方法, 不碰生产类属性
+    ingest_calls = []
+    real_ingest = orch._ingest_en_route_samples if hasattr(
+        orch, "_ingest_en_route_samples") else None
+
+    def _spy(samples, store, room_name, require_photos):
+        ingest_calls.append(len(samples))
+        if real_ingest is not None:
+            return real_ingest(samples, store, room_name, require_photos)
+        return 0
+    monkeypatch.setattr(orch, "_ingest_en_route_samples", _spy)
+
+    orch.run(task)
+
+    assert task.status == "completed"
+    assert sum(ingest_calls) >= 1, (
+        "en-route ingest 未触发 — observer 路径未走通 (spy 应捕获 ≥1 个 sample)")
+
+
+def test_en_route_observer_dedups_by_capture_stamp(monkeypatch, tmp_path):
+    """同一推理帧 (captured_at 相同) 不应被 observer 重复入队。"""
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+
+    fixed_stamp = time.time()
+    class StickyAi(FakeAi):
+        def get_person_detection_snapshot(self):
+            snap = super().get_person_detection_snapshot()
+            snap["timestamp"] = fixed_stamp  # 同一帧时间戳不变
+            return snap
+
+    orch = make_orchestrator([], FakeNav(), ai_engine=StickyAi(),
+                              with_observation_sync=True)
+    orch._static_root = tmp_path
+    stop_event = threading.Event()
+    # 跑 0.3s, sample_interval=0.05 → 约 6 次循环, 但同帧只入队 1 次
+    samples = orch._observe_en_route(
+        stop_event, ["person"], sample_interval=0.05, max_samples=12)
+    stop_event.set()
+    # 即使循环多次, captured_at 去重后 samples 里同一 stamp 最多 1 个
+    stamps = [s["captured_at"] for s in samples]
+    assert len(stamps) == len(set(stamps)), "同帧被重复入队 (去重失效)"
+
+
+def test_en_route_observer_bounded_queue(monkeypatch, tmp_path):
+    """worker queue 不超过 max_samples (防 100 张 frame 堆积)。"""
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+
+    class FreshStampAi(FakeAi):
+        def __init__(self):
+            self._n = 0
+        def get_person_detection_snapshot(self):
+            self._n += 1
+            snap = super().get_person_detection_snapshot()
+            snap["timestamp"] = time.time() + self._n  # 每次新 stamp
+            return snap
+
+    orch = make_orchestrator([], FakeNav(), ai_engine=FreshStampAi(),
+                              with_observation_sync=True)
+    orch._static_root = tmp_path
+    stop_event = threading.Event()
+    samples = orch._observe_en_route(
+        stop_event, ["person"], sample_interval=0.02, max_samples=4)
+    stop_event.set()
+    assert len(samples) <= 4, f"bounded queue 失效: {len(samples)} > 4"
