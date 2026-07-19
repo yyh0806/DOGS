@@ -1133,6 +1133,43 @@ def test_en_route_observer_rolls_window_and_runs_until_stop_event(monkeypatch, t
         f"not < stamps[-1]={stamps[-1]} (samples are not fresh; pop(0) failed)")
 
 
+def test_build_observation_bundle_feeds_pointcloud_dataclass(monkeypatch, tmp_path):
+    """I1 regression: en-route bundle must carry pointcloud depth evidence.
+
+    `_pointcloud_snapshot()` returns a PointCloudSnapshot dataclass (no
+    timestamp field). `_build_observation_bundle` should feed it into the
+    sync with `stamp=time.time()` (the honest read time), NOT skip the
+    feed. Asserts `bundle_result["bundle"].cloud is not None` when a real
+    PointCloudSnapshot is available.
+    """
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    from nx_person_localizer import PointCloudSnapshot
+
+    monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+    orch = make_orchestrator([], FakeNav(), ai_engine=FakeAi(),
+                              with_observation_sync=True)
+    orch._static_root = tmp_path
+
+    fake_cloud = PointCloudSnapshot(
+        points=[[0.5, 0.0, 0.5], [0.6, 0.0, 0.6], [0.7, 0.0, 0.7]],
+        frame_id="base_link",
+    )
+    monkeypatch.setattr(orch, "_pointcloud_snapshot", lambda: fake_cloud)
+
+    snapshot = FakeAi().get_person_detection_snapshot()
+    bundle_result = orch._build_observation_bundle(snapshot, False)
+
+    assert bundle_result is not None, "bundle build returned None"
+    bundle = bundle_result.get("bundle")
+    assert bundle is not None, "bundle_for_detection returned None"
+    assert bundle.cloud is not None, (
+        "PointCloudSnapshot was not fed into observation_sync (I1 regression: "
+        "cloud depth evidence lost)")
+    assert bundle.cloud.value is fake_cloud, (
+        f"expected the fed PointCloudSnapshot back, got {bundle.cloud.value!r}")
+
+
 # ============================================================================
 # 测试 5: REPORT 段 ROI coverage + 4-state completion_status (Task 3)
 # ============================================================================

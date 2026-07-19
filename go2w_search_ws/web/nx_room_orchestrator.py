@@ -1802,10 +1802,16 @@ class RoomSearchOrchestrator:
                         self._observation_sync.add_scan(
                             stamp=scan_stamp, scan=live_scan)
                 # Cloud: PointCloudSnapshot is a frozen dataclass with only
-                # `points` and `frame_id` — NO timestamp field. Cloud is
-                # optional in the bundle (bundle_for_detection only requires
-                # pose+scan), and we cannot time-align it without a stamp, so
-                # skip add_cloud rather than fabricate a fake stamp.
+                # `points` and `frame_id` — NO timestamp field. We feed it
+                # into the sync with the current wall-clock stamp, which is
+                # the honest stamp for a just-read snapshot (the dataclass
+                # carries no stamp of its own, so time.time() reflects when
+                # the orchestrator read it; this is NOT stamp fabrication,
+                # which v1 did with the detection's captured_at).
+                current_cloud = self._pointcloud_snapshot()
+                if current_cloud is not None:
+                    self._observation_sync.add_cloud(
+                        stamp=time.time(), cloud=current_cloud)
                 tolerance = self._positive_float(
                     os.environ.get("GO2W_OBSERVATION_SYNC_TOLERANCE_SEC"), 0.20)
                 bundle = self._observation_sync.bundle_for_detection(
@@ -1942,38 +1948,45 @@ class RoomSearchOrchestrator:
             if deadline is not None and time.monotonic() >= deadline:
                 break
             try:
-                snapshot = get_snapshot() or {}
-            except Exception as exc:
-                logger.debug("en-route snapshot read failed: %s", exc)
-                snapshot = {}
-            try:
-                captured_at = float(snapshot.get("timestamp"))
-            except (TypeError, ValueError):
-                captured_at = 0.0
-            if captured_at > 0.0 and captured_at not in seen_stamps:
-                seen_stamps.add(captured_at)
                 try:
-                    bundle_result = self._build_observation_bundle(snapshot, False)
+                    snapshot = get_snapshot() or {}
                 except Exception as exc:
-                    logger.debug("en-route bundle build failed: %s", exc)
-                    bundle_result = None
-                if bundle_result is not None and bundle_result.get("bundle") is not None:
-                    localized = self._localize_en_route_detections(
-                        bundle_result, target_classes)
-                    if localized:
-                        # Rolling window: drop oldest when full, keep looping.
-                        # Newer samples reflect the robot's current position
-                        # better than stale samples captured at leg start.
-                        if len(samples) >= cap:
-                            samples.pop(0)
-                        samples.append({
-                            "localized_list": localized,
-                            "frame": bundle_result.get("frame"),
-                            "captured_at": captured_at,
-                            "source": bundle_result.get("source"),
-                        })
-            if stop_event.wait(interval):
-                break
+                    logger.debug("en-route snapshot read failed: %s", exc)
+                    snapshot = {}
+                try:
+                    captured_at = float(snapshot.get("timestamp"))
+                except (TypeError, ValueError):
+                    captured_at = 0.0
+                if captured_at > 0.0 and captured_at not in seen_stamps:
+                    seen_stamps.add(captured_at)
+                    try:
+                        bundle_result = self._build_observation_bundle(snapshot, False)
+                    except Exception as exc:
+                        logger.debug("en-route bundle build failed: %s", exc)
+                        bundle_result = None
+                    if bundle_result is not None and bundle_result.get("bundle") is not None:
+                        localized = self._localize_en_route_detections(
+                            bundle_result, target_classes)
+                        if localized:
+                            # Rolling window: drop oldest when full, keep looping.
+                            # Newer samples reflect the robot's current position
+                            # better than stale samples captured at leg start.
+                            if len(samples) >= cap:
+                                samples.pop(0)
+                            samples.append({
+                                "localized_list": localized,
+                                "frame": bundle_result.get("frame"),
+                                "captured_at": captured_at,
+                                "source": bundle_result.get("source"),
+                            })
+                if stop_event.wait(interval):
+                    break
+            except Exception:
+                # Last-resort net: keep the worker alive across iterations
+                # even if an unexpected exception escapes the per-operation
+                # handlers above. Do NOT re-raise — the daemon thread must
+                # stay alive so the main loop can keep collecting samples.
+                logger.exception("en-route observer iteration failed")
         return samples
 
     def _ingest_en_route_samples(self, samples, store, room_name, require_photos):
