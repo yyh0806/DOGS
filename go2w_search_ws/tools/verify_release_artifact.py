@@ -22,7 +22,7 @@ _SERVICE_MAP = {
         "go2w-motion.service",
     ],
     "web": ["go2w-web.service"],
-    "nav": ["go2w-slam-nav.service"],
+    "nav": ["go2w-sensor.service", "go2w-slam-nav.service"],
     "sensor": ["go2w-sensor.service"],
     "all": [
         "go2w-sport-gateway.service",

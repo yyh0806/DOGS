@@ -129,6 +129,20 @@ def test_valid_content_addressed_artifact_is_accepted(tmp_path):
     assert summary.file_count == len(_REQUIRED_PAYLOAD_FILES) + 1
 
 
+def test_nav_artifact_requires_sensor_and_slam_services(tmp_path):
+    from verify_release_artifact import verify_artifact
+
+    path, _digest = _artifact(
+        tmp_path,
+        subsystem="nav",
+        services=["go2w-sensor.service", "go2w-slam-nav.service"],
+    )
+
+    summary = verify_artifact(path)
+    assert summary.required_services == (
+        "go2w-sensor.service", "go2w-slam-nav.service")
+
+
 @pytest.mark.parametrize(
     "kwargs, message",
     [
