@@ -958,7 +958,7 @@ class NxWebNode(Node):
             status_schema < 4 or motion_release_id == RELEASE_ID)
         parked = (
             drive_session == "parked"
-            and physical_mode == "joint_lock"
+            and physical_mode in {"joint_lock", "wheel_balance", "wheel_locomotion"}
             and actual_motion == "stopped"
             and wheels_stopped)
         drive_ready = (
@@ -2638,6 +2638,30 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
             time.sleep(0.5)
 
 
+def _spin_loop_yielding(node):
+    """GIL-yielding spin: spin_once + sleep 替代 rclpy.spin, 避免订阅频繁时
+    wait_for_ready busy 持有 GIL 饿死 HTTP/arbiter 线程 (nav2 goal 超时根因)。
+
+    rclpy.spin 内部循环 spin_once(timeout_sec=0), 订阅 (/imu 200Hz /dog_state 10Hz
+    /scan 10Hz /points_nav 10Hz /localization 30Hz) 频繁时 wait_for_ready 立即
+    ready → 不阻塞 → busy 持有 GIL → HTTP handler 调 arbiter.start_point_goal
+    抢不到 GIL → nav2 goal 发不出 → 超时。
+
+    每 spin_once 后 time.sleep(0.001) 强制释放 GIL (Python sleep 释放 GIL),
+    arbiter 在 HTTP 线程能拿 GIL 执行 nav2 action client 调用。1000Hz spin
+    足够覆盖 /imu 200Hz + 其他订阅, callback 不丢。
+
+    若 sleep(1ms) 仍不解 (callback execute 重持 GIL), 再做进程拆分。
+    """
+    while rclpy.ok():
+        try:
+            rclpy.spin_once(node, timeout_sec=0)
+        except Exception as exc:
+            logger.warning("spin_once 异常, 退出 spin 线程: %s", exc)
+            break
+        time.sleep(0.001)  # 强制 yield GIL, 解 busy 饿死
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -2745,7 +2769,11 @@ def main():
     # Humble's rclpy wait-set cannot be mutated while an executor is waiting.
     # PointNav and RoomSearch both create ActionClients, so start spin only
     # after every ROS entity has been constructed.
-    spin_th = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    # 2026-07-19 spin 改 spin_once+sleep 循环 (替代 rclpy.spin):
+    # rclpy.spin 内部 spin_once(timeout_sec=0) busy 持有 GIL → arbiter 饿死 →
+    # nav2 goal 超时。spin_once+sleep(1ms) 强制 yield GIL, 解饿死。见上方
+    # _spin_loop_yielding 注释。若仍不解再做进程拆分。
+    spin_th = threading.Thread(target=_spin_loop_yielding, args=(node,), daemon=True)
     spin_th.start()
 
     host = node.host

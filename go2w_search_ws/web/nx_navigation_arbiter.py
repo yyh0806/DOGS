@@ -110,7 +110,11 @@ class NavigationArbiter:
                     "reason": "drive_session_feedback_error",
                     "message": str(exc),
                 }
-            if state.get("drive_session") == "active":
+            if state.get("drive_session") in ("active", "nav_active"):
+                # "nav_active" = nav 已激活 (motion_machine 用此值表示 nav owner 激活态),
+                # 语义等同 "active": 已激活需零速 handoff, 不应走 wait_drive_parked。
+                # 之前只认 "active" → nav_active 被当作未激活 → handoff=False →
+                # wait_drive_parked 等 parked 永不满足 → drive_session_not_parked。
                 handoff = True
                 try:
                     self._robot.stop_move()
@@ -143,7 +147,7 @@ class NavigationArbiter:
                         )
                     except (TypeError, ValueError, OverflowError):
                         stopped = False
-                    if (session == "active"
+                    if (session in ("active", "nav_active")
                             and state.get("sport_mode") in (1, 3)
                             and stopped):
                         break
