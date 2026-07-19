@@ -1,6 +1,7 @@
 """Contracts for persistent unknown-floor mapping and frontier navigation."""
 
 from pathlib import Path
+import re
 import xml.etree.ElementTree as ET
 
 
@@ -12,8 +13,13 @@ FUSER = ROOT / "src/go2w_bridge/go2w_bridge/map_odom_fuser.py"
 MAP_PADDING = ROOT / "src/go2w_bridge/go2w_bridge/map_padding_bridge.py"
 BRINGUP = ROOT / "docker/bringup_slam_nav2.sh"
 SERVICE = ROOT / "docker/go2w-slam-nav.service"
+SENSOR_SERVICE = ROOT / "docker/go2w-sensor.service"
+DEPLOY = ROOT / "docker/deploy_release.sh"
 SAFE_REPLAN_BT = (
     ROOT / "src/go2w_nav/behavior_trees/navigate_to_pose_dynamic_safe.xml"
+)
+SAFE_THROUGH_POSES_BT = (
+    ROOT / "src/go2w_nav/behavior_trees/navigate_through_poses_dynamic_safe.xml"
 )
 
 
@@ -33,7 +39,14 @@ def test_online_slam_consumes_the_existing_mid360_scan_once():
     assert '("map", "/map_frontier_raw")' in launch
     assert '("pose", "/slam_pose")' in launch
     assert "scan_topic: /scan_mid360" in params
-    assert "transform_publish_period: 0.05" in params
+    for setting, value in (
+        ("transform_publish_period", "0.0"),
+        ("use_scan_matching", "false"),
+        ("do_loop_closing", "false"),
+    ):
+        assert re.search(
+            rf"^\s+{setting}:\s*{value}\s*(?:#.*)?$", params, re.M
+        )
 
 
 def test_slam_is_the_only_persistent_frontier_map_source():
@@ -48,7 +61,7 @@ def test_slam_is_the_only_persistent_frontier_map_source():
     assert 'declare_parameter("output_topic", "/map_frontier")' in padding
 
 
-def test_fuser_can_yield_map_tf_ownership_and_publish_slam_pose():
+def test_fuser_defaults_to_lio_owned_map_tf_and_keeps_slam_optional():
     source = FUSER.read_text(encoding="utf-8")
 
     assert 'declare_parameter("publish_map_to_odom", True)' in source
@@ -76,7 +89,9 @@ def test_fuser_can_yield_map_tf_ownership_and_publish_slam_pose():
 def test_global_costmap_uses_persistent_slam_map_plus_live_obstacles():
     section = _global_costmap_section()
 
-    assert "rolling_window: false" in section
+    assert "rolling_window: true" in section
+    assert float(re.search(r"^\s+width:\s*([0-9.]+)", section, re.M).group(1)) >= 50
+    assert float(re.search(r"^\s+height:\s*([0-9.]+)", section, re.M).group(1)) >= 50
     assert 'plugins: ["static_layer", "obstacle_layer", "inflation_layer"]' in section
     assert "static_layer:" in section
     assert 'map_topic: "/map_frontier"' in section
@@ -114,16 +129,40 @@ def test_nav2_periodically_replans_and_retries_without_motion_recovery():
         assert unsafe_motion_recovery not in tags
     assert "navigate_w_replanning_only_if_goal_is_updated.xml" not in params
     assert "navigate_to_pose_dynamic_safe.xml" in launch
-    assert "default_nav_to_pose_bt_xml" in launch
+    assert "'default_nav_to_pose_bt_xml': safe_dynamic_replan_bt" in launch
+    behavior = params.split("behavior_server:", 1)[1].split(
+        "waypoint_follower:", 1
+    )[0]
+    assert 'behavior_plugins: ["wait"]' in behavior
     assert "update_frequency: 2.0" in _global_costmap_section()
+
+
+def test_nav2_through_poses_navigator_uses_wait_only_recovery_tree():
+    tree = ET.parse(SAFE_THROUGH_POSES_BT).getroot()
+    tags = [node.tag for node in tree.iter()]
+    launch = (ROOT / "src/go2w_nav/launch/nav2_3d.launch.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert tags.count("RemovePassedGoals") == 1
+    assert tags.count("ComputePathThroughPoses") == 1
+    assert tags.count("FollowPath") == 1
+    assert tags.count("Wait") == 1
+    for unsafe_motion_recovery in ("Spin", "BackUp", "DriveOnHeading"):
+        assert unsafe_motion_recovery not in tags
+    assert "navigate_through_poses_dynamic_safe.xml" in launch
+    assert (
+        "'default_nav_through_poses_bt_xml': safe_dynamic_through_poses_bt"
+        in launch
+    )
 
 
 def test_bringup_starts_one_slam_owner_before_nav2_and_stops_it_cleanly():
     script = BRINGUP.read_text(encoding="utf-8")
     service = SERVICE.read_text(encoding="utf-8")
 
-    assert "-p publish_map_to_odom:=false" in script
-    assert "-p use_slam_pose:=true" in script
+    assert "-p publish_map_to_odom:=true" in script
+    assert "-p use_slam_pose:=false" in script
     assert "start_transient slam-online" in script
     assert "ros2 launch go2w_nav slam_online.launch.py" in script
     assert "start_transient map-padding" in script
@@ -143,6 +182,27 @@ def test_bringup_starts_one_slam_owner_before_nav2_and_stops_it_cleanly():
     )
     assert "map-padding.service" in service
     assert "slam-online.service" in service
+
+
+def test_navigation_uses_one_persistent_bounded_sensor_instance():
+    script = BRINGUP.read_text(encoding="utf-8")
+    nav_service = SERVICE.read_text(encoding="utf-8")
+    sensor_service = SENSOR_SERVICE.read_text(encoding="utf-8")
+    deploy = DEPLOY.read_text(encoding="utf-8")
+
+    assert "-p publish_imu:=false" in sensor_service
+    assert "-p publish_scan:=false" in sensor_service
+    assert "-p publish_odom:=true" in sensor_service
+    assert "-p publish_odom_tf:=false" in sensor_service
+    assert "-p odom_topic:=/wheel_odom" in sensor_service
+    assert "start_transient wheel-odom" not in script
+    assert script.count("nx_sensor_node.py") == 0
+    assert "for svc in livox-mid360-driver go2w-motion go2w-web go2w-sensor" in script
+    assert "Wants=go2w-sensor.service" in nav_service
+    assert "After=go2w-sensor.service" in nav_service
+    assert "Conflicts=go2w-sensor.service" not in nav_service
+    assert "wheel-odom.service" not in nav_service
+    assert "disable go2w-sensor.service" not in deploy
 
 
 def test_slam_pose_correction_drives_continuous_map_localization():

@@ -104,10 +104,10 @@ subsystem="$(read_manifest subsystem)"
 case "$subsystem" in
   motion) services="go2w-safety-observer.service go2w-motion.service" ;;
   web) services="go2w-web.service" ;;
-  nav) services="go2w-slam-nav.service" ;;
+  nav) services="go2w-sensor.service go2w-slam-nav.service" ;;
   sensor) services="go2w-sensor.service" ;;
-  # Nav bringup replaces the full sensor service with a bounded wheel/IMU
-  # publisher, so it must be the final restart and retain odom/TF ownership.
+  # The bounded sensor keeps wheel feedback alive; Nav remains the sole owner
+  # of /odom and the odom->base_link transform.
   all) services="go2w-safety-observer.service go2w-motion.service go2w-sensor.service go2w-web.service go2w-slam-nav.service" ;;
   *) echo "invalid subsystem in manifest" >&2; exit 1 ;;
 esac
@@ -342,7 +342,7 @@ control_env="${6:-}"
 case "$subsystem" in
   motion) services="go2w-safety-observer.service go2w-motion.service" ;;
   web) services="go2w-web.service" ;;
-  nav) services="go2w-slam-nav.service" ;;
+  nav) services="go2w-sensor.service go2w-slam-nav.service" ;;
   sensor) services="go2w-sensor.service" ;;
   all) services="go2w-safety-observer.service go2w-motion.service go2w-sensor.service go2w-web.service go2w-slam-nav.service" ;;
   *) echo "invalid subsystem in remote transaction" >&2; exit 1 ;;
@@ -387,10 +387,10 @@ if [ "$subsystem" = "nav" ] || [ "$subsystem" = "all" ]; then
   rollback_units="go2w-slam-nav.service costmap-bridge.service livox-mid360-watchdog.service livox-mid360-driver.service livox-mid360-net.service $services"
 fi
 if [ "$subsystem" = "nav" ]; then
-  managed_units="go2w-slam-nav.service costmap-bridge.service livox-mid360-net.service livox-mid360-driver.service livox-mid360-watchdog.service"
+  managed_units="go2w-sensor.service go2w-slam-nav.service costmap-bridge.service livox-mid360-net.service livox-mid360-driver.service livox-mid360-watchdog.service"
   active_state_units="go2w-slam-nav.service costmap-bridge.service livox-mid360-net.service livox-mid360-driver.service livox-mid360-watchdog.service go2w-sensor.service"
-  restart_units="livox-mid360-net.service livox-mid360-driver.service livox-mid360-watchdog.service go2w-slam-nav.service"
-  enable_state_units="$services go2w-sensor.service"
+  restart_units="livox-mid360-net.service livox-mid360-driver.service livox-mid360-watchdog.service go2w-sensor.service go2w-slam-nav.service"
+  enable_state_units="$services"
 fi
 if [ "$subsystem" = "web" ]; then
   managed_units="go2w-web.service costmap-bridge.service"
@@ -404,7 +404,7 @@ if [ "$subsystem" = "sensor" ]; then
 fi
 if [ "$subsystem" = "all" ]; then
   restart_units="go2w-safety-observer.service go2w-motion.service go2w-sensor.service go2w-web.service livox-mid360-net.service livox-mid360-driver.service livox-mid360-watchdog.service go2w-slam-nav.service"
-  enable_services="go2w-sport-gateway.service go2w-safety-observer.service go2w-motion.service go2w-web.service go2w-slam-nav.service"
+  enable_services="go2w-sport-gateway.service go2w-safety-observer.service go2w-motion.service go2w-web.service go2w-sensor.service go2w-slam-nav.service"
   enable_state_units="go2w-sport-gateway.service $services"
 fi
 if [ "$subsystem" = "motion" ]; then
@@ -765,9 +765,6 @@ if [ "$subsystem" = "all" ]; then
     --output "$base/validation/${release_id}-perception-preflight.json"
 fi
 
-if [ "$subsystem" = "nav" ] || [ "$subsystem" = "all" ]; then
-  sudo -n systemctl disable go2w-sensor.service >/dev/null
-fi
 sudo -n systemctl enable $enable_services >/dev/null
 sudo -n rm -rf "$system_backup"
 system_backup=""

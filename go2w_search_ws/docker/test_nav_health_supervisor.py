@@ -111,7 +111,8 @@ def test_bringup_uses_single_supervisor_for_all_ros_health_gates():
     main_path = source[source.index(marker):]
     assert "nav_health_supervisor.py" in main_path
     assert 'python3 "$NAV_HEALTH_GATE"' in main_path
-    assert main_path.index("nav_health_supervisor.py") < main_path.index("start_transient wheel-odom")
+    assert "start_transient wheel-odom" not in main_path
+    assert main_path.index("nav_health_supervisor.py") < main_path.index("wait_hz /wheel_odom")
     executable = "\n".join(
         line for line in main_path.splitlines()
         if not line.lstrip().startswith(("#", "echo "))

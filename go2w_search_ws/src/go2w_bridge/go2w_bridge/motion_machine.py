@@ -189,7 +189,13 @@ class Go2WMotionMachine:
             if not self._telemetry_is_fresh():
                 self._fault = "telemetry_stale"
                 return []
-            if self._physical_mode is not PhysicalMode.JOINT_LOCK:
+            # 2026-07-18 治本: 允许 wheel_balance/wheel_locomotion 直接激活 (Go2-W 轮式
+            # 常态是站立 wheel_balance, 原 only JOINT_LOCK 致狗站立时 START_NAV 拒
+            # not_parked_mode → session 卡 parked → velocity_authorized=False → cmd_vel
+            # 锁 → 狗不动 → nav2 "No valid trajectories" abort). ACTIVATING + wheel 下一
+            # 帧自动转 NAV/MANUAL_ACTIVE (:449-453 已支持 wheel→active), BalanceStand
+            # effect 对已站立的狗无害 (保持 wheel_balance).
+            if self._physical_mode not in (PhysicalMode.JOINT_LOCK, *self.WHEEL_MODES):
                 self._fault = "not_parked_mode"
                 return []
             if intent is MotionIntent.START_NAV and not scan_fresh:
@@ -208,8 +214,20 @@ class Go2WMotionMachine:
 
         if intent is MotionIntent.PARK:
             if self._session is SessionState.PARKED:
+                # 2026-07-18 治本死角: PARKED 但 physical_mode≠joint_lock (导航到达后
+                # 遥控器调动/开机残留 wheel_balance) 时, 原幂等 return[] 致 activatable
+                # 永卡 False (drive_session_not_activatable), 只能 restart motion. 改为
+                # 重新走 STOPPING→PARKING→StandUp 把狗拉回 joint_lock (物理模式漂移重 park).
+                # joint_lock 时保持原幂等 (正常停稳态).
+                if self._physical_mode is PhysicalMode.JOINT_LOCK:
+                    self._fault = None
+                    return []
+                self._session = SessionState.STOPPING
                 self._fault = None
-                return []
+                transition_id = self._begin_transition("Park")
+                return [self._effect(
+                    "MoveZero", transition_id=transition_id,
+                    reason="parked_mode_drift_repark")]
             # v0.6 (2026-07-17): ESTOP/FAULT/PARKING 态 park 视为幂等——狗已停或已故障,
             # park 是多余请求但不该叠加 park_not_allowed fault 锁死状态机 (v0.5 实测:
             # nav 完成后 ESTOP/FAULT 残留时收到 PARK -> 不在允许集合 -> park_not_allowed
@@ -263,6 +281,20 @@ class Go2WMotionMachine:
                     self._session = SessionState.PARKED
                     self._owner = None
                     self._fault = None
+                # 2026-07-18 治本: FAULT + wheel_balance + telemetry fresh + stopped
+                # → 重新 STOPPING→PARKING→StandUp→joint_lock→PARKED. telemetry_stale
+                # 瞬态 fault (slam-nav restart stop wheel-odom 致 /wheel_feedback 断)
+                # 恢复后自愈, 不卡 FAULT 致 park 块 (session=boot_hold) 不触发 → nav2 慢.
+                # blocking is None 保证非 telemetry_stale/robot_error 等真故障才自愈.
+                elif (blocking is None
+                        and self._physical_mode in self.WHEEL_MODES
+                        and self._actual_motion is ActualMotionState.STOPPED):
+                    self._session = SessionState.STOPPING
+                    self._fault = None
+                    transition_id = self._begin_transition("Park")
+                    return [self._effect(
+                        "MoveZero", transition_id=transition_id,
+                        reason="fault_wheel_recovery_repark")]
             return []
         # BOOT_HOLD is observation-only. A process restart must never promote
         # a wheel mode into StandUp merely because wheel feedback reached zero;

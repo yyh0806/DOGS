@@ -152,6 +152,17 @@ def _new_localization_node(web, *, timeout=1.0, max_tilt_deg=10.0):
     node._localization_stamp = {"sec": 0, "nanosec": 0}
     node._localization_valid = False
     node._localization_reason = "not_received"
+    node._odom_x = 0.0
+    node._odom_y = 0.0
+    node._odom_z = 0.0
+    node._odom_yaw = 0.0
+    node._odom_count = 0
+    node._odom_received_monotonic = None
+    node._odom_frame_id = ""
+    node._odom_child_frame_id = ""
+    node._odom_stamp = {"sec": 0, "nanosec": 0}
+    node._odom_valid = False
+    node._odom_reason = "not_received"
     return node
 
 
@@ -222,6 +233,37 @@ def test_valid_localization_quaternion_becomes_map_yaw(monkeypatch):
     assert health["y"] == pytest.approx(-1.25)
     assert health["yaw"] == pytest.approx(1.2)
     assert health["age_sec"] == pytest.approx(0.25)
+
+
+def test_lio_odometry_is_exposed_as_diagnostic_pose_without_replacing_map_pose(
+    monkeypatch,
+):
+    web = _load_web_server(monkeypatch)
+    node = _new_localization_node(web)
+    now = {"value": 200.0}
+    monkeypatch.setattr(web.time, "monotonic", lambda: now["value"])
+    node._on_localization_pose(_localization_message(x=8.37, y=-1.44, yaw=2.70))
+
+    odom = _localization_message(
+        x=11.17,
+        y=5.39,
+        yaw=1.76,
+        frame_id="odom",
+    )
+    node._on_lio_odometry(odom)
+    now["value"] = 200.2
+
+    localization = node.get_localization_health()
+    diagnostic = node.get_odometry_snapshot()
+    assert localization["x"] == pytest.approx(8.37)
+    assert localization["y"] == pytest.approx(-1.44)
+    assert diagnostic["healthy"] is True
+    assert diagnostic["frame_id"] == "odom"
+    assert diagnostic["child_frame_id"] == "base_link"
+    assert diagnostic["x"] == pytest.approx(11.17)
+    assert diagnostic["y"] == pytest.approx(5.39)
+    assert diagnostic["yaw"] == pytest.approx(1.76)
+    assert diagnostic["age_sec"] == pytest.approx(0.2)
 
 
 @pytest.mark.parametrize(
@@ -930,6 +972,14 @@ def test_point_goal_distance_guard_rejects_remote_or_invalid_targets(monkeypatch
     )
 
 
+def test_point_goal_default_radius_covers_twenty_metre_goal_tolerance(monkeypatch):
+    web = _load_web_server(monkeypatch)
+    localization = {"healthy": True, "x": -0.2, "y": 0.0}
+
+    assert web.POINT_GOAL_MAX_DISTANCE >= 20.2
+    assert web._point_goal_within_local_radius(20.0, 0.0, localization)
+
+
 def test_task_manager_cancel_keeps_worker_owner_until_room_action_drains(monkeypatch):
     web = _load_web_server(monkeypatch)
 
@@ -1097,13 +1147,28 @@ def test_web_uses_validated_map_frame_localization_pose():
 
     assert "from nx_point_nav import PointNavigationController" in server
     assert "'/localization_pose', self._on_localization_pose, 10" in server
-    assert "'/odom', self._on_odom, 10" not in server
+    assert "'/odom', self._on_lio_odometry, 10" in server
     assert "def _on_localization_pose" in server
+    assert "def _on_lio_odometry" in server
+    assert "def get_odometry_snapshot" in server
+    assert '"odometry": self.get_odometry_snapshot()' in server
     assert "header.frame_id" in server
     assert "child_frame_id" in server
     assert "_map_yaw" in server
     assert "def get_localization_health" in server
     assert "localization_timeout" in server
+
+
+def test_panel_pose_header_uses_fresh_status_instead_of_backlogged_slam_frames():
+    panel = read("web/static/panel.html")
+    slam_branch = panel.split("data.type === 'slam'", 1)[1].split(
+        "data.type === 'nav_goal'", 1
+    )[0]
+
+    assert "function updatePoseInfo(localization, odometry" in panel
+    assert "updatePoseInfo(data.localization, data.odometry)" in panel
+    assert "updatePoseInfo(d.localization, d.odometry)" in panel
+    assert "poseInfo" not in slam_branch
 
 
 def test_map_consumers_use_localization_yaw_not_raw_imu_yaw():

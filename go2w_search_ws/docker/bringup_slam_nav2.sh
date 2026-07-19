@@ -36,6 +36,7 @@ IMU_MIN_HZ="${IMU_MIN_HZ:-50}"      # /livox/imu 断流阈值 (MID360 标称 200
 LIDAR_MIN_HZ="${LIDAR_MIN_HZ:-5}"   # /livox/lidar 最低 Hz
 SCAN_MIN_HZ="${SCAN_MIN_HZ:-3}"     # raw MID360 output; watchdog additionally enforces max age
 ODOM_MIN_HZ="${ODOM_MIN_HZ:-5}"     # /Odometry (FastLIO) 最低 Hz
+WHEEL_ODOM_MIN_HZ="${WHEEL_ODOM_MIN_HZ:-10}" # diagnostic-only wheel odom liveness gate
 NAV_HEALTH_STATE="${NAV_HEALTH_STATE:-/tmp/go2w-nav-health-${UID}.json}"
 NAV_HEALTH_GATE="$RUNTIME_ROOT/tools/nav_health_gate.py"
 
@@ -273,7 +274,7 @@ wait_motion_ready() {
   log "等 go2w-motion lease + scan gate ready (最长 ${timeout_s}s)..."
   ros_env
   local deadline=$((SECONDS + timeout_s))
-  local sample="" compact="" api_compact="" remaining_s query_s battery_soc battery_ok
+  local sample="" compact="" api_compact="" remaining_s query_s battery_soc battery_ok parked_triggered=0
   while :; do
     remaining_s=$((deadline - SECONDS))
     (( remaining_s > 0 )) || break
@@ -319,6 +320,33 @@ wait_motion_ready() {
       return 0
     fi
     [ -n "$compact" ] || compact="$api_compact"
+    # 2026-07-18 治本 v2: 读 supervisor snapshot 的 dog_state (长驻 rclpy 订阅,
+    # discovery 已完成, 可靠). 原用 web /api/status + ros2 echo --no-daemon 的 compact,
+    # 但 motion restart / 整机重启 web DDS 订阅断连 (motion 字段 None) + echo 新
+    # participant discovery 6s 超时 → compact 拿不到 physical_mode → park 块不触发
+    # → motion 卡 BOOT_HOLD → slam-nav 循环 restart (17:12 实测 supervisor snapshot
+    # 有完整 session/physical_mode 但 park 块 grep 空). nav_health_supervisor.py 长驻
+    # 订阅 /dog_state 存 latest_strings, snapshot 的 dog_state 字段是完整 JSON.
+    # 幂等: parked_triggered 只发一次; park 失败由 wait_motion_ready 超时 die 兜底.
+    local dog_json=""
+    if [[ -n "$NAV_HEALTH_STATE" && -f "$NAV_HEALTH_STATE" ]]; then
+      dog_json=$(python3 -c "import json,sys; d=json.load(open('$NAV_HEALTH_STATE')); sys.stdout.write(d.get('dog_state') or '')" 2>/dev/null || true)
+    fi
+    [[ -n "$dog_json" ]] || dog_json="$compact"
+    if (( dbg_count++ < 5 )); then
+      log "park_dbg#${dbg_count} trig=$parked_triggered djson_len=${#dog_json} navex=$([[ -f "$NAV_HEALTH_STATE" ]] && echo Y || echo N) wb=$(printf '%s' "$dog_json" | grep -c wheel_balance) bh=$(printf '%s' "$dog_json" | grep -c boot_hold) compact_len=${#compact}"
+    fi
+    if (( parked_triggered == 0 )) \
+        && { [[ "$dog_json" == *'"physical_mode":"wheel_balance"'* \
+              || "$dog_json" == *'"physical_mode":"wheel_locomotion"'* ]]; } \
+        && { [[ "$dog_json" == *'"session":"boot_hold"'* ]] \
+             || [[ "$dog_json" == *'"drive_session_phase":"boot_hold"'* ]] \
+             || [[ "$dog_json" == *'"drive_session":"startup"'* ]]; }; then
+      log "BOOT_HOLD + wheel mode 检测到 (supervisor snapshot), 显式发 PARK intent (/cmd_pose stand)"
+      timeout 8 ros2 topic pub /cmd_pose std_msgs/String \
+        "{data: stand}" --once >/dev/null 2>&1 || true
+      parked_triggered=1
+    fi
     remaining_s=$((deadline - SECONDS))
     (( remaining_s > 0 )) || break
     sleep 1
@@ -456,9 +484,39 @@ wait_action() {
 wait_motion_ready() {
   local timeout_s=$1
   log "等 go2w-motion canonical PARKED + SDK/scan ready (最长 ${timeout_s}s)..."
-  health_gate "$timeout_s" --dog-ready \
-    || die "go2w-motion ${timeout_s}s 未就绪"
-  ok "go2w-motion SDK ready + canonical PARKED + scan fresh"
+  # 2026-07-18 治本: 狗在 wheel_balance 时 motion 卡 BOOT_HOLD (设计 observation-only
+  # 不自动 park, test_explicit_park_from_boot_hold_is_the_only_startup_standup_path 守护).
+  # health_gate --dog-ready 永远等不到 (dog_ready 要求 physical_mode=joint_lock).
+  # 循环检测 wheel_balance + session=boot_hold → 显式 pub /cmd_pose stand (PARK intent)
+  # 让 motion 走 STOPPING→PARKING→StandUp→joint_lock→PARKED. 数据源用 supervisor snapshot
+  # 的 dog_state (nav_health_supervisor 长驻订阅可靠, 不依赖 web DDS 断连或 echo
+  # --no-daemon discovery 6s 超时, 17:12/17:19 实测 supervisor 有完整 state 但 park 块
+  # 没触发, 因原版 health_gate 无循环). 幂等: parked_triggered 只发一次.
+  local parked_triggered=0 dbg_count=0 deadline=$((SECONDS + timeout_s)) dog_json
+  while (( SECONDS < deadline )); do
+    dog_json=""
+    if [[ -n "$NAV_HEALTH_STATE" && -f "$NAV_HEALTH_STATE" ]]; then
+      dog_json=$(python3 -c "import json,sys; d=json.load(open('$NAV_HEALTH_STATE')); sys.stdout.write(d.get('dog_state') or '')" 2>/dev/null || true)
+    fi
+    (( dbg_count++ < 5 )) && log "park_dbg#${dbg_count} trig=$parked_triggered djson_len=${#dog_json} wb=$(printf '%s' "$dog_json" | grep -c wheel_balance) bh=$(printf '%s' "$dog_json" | grep -c boot_hold)"
+    if (( parked_triggered == 0 )) \
+        && { [[ "$dog_json" == *'"physical_mode":"wheel_balance"'* \
+              || "$dog_json" == *'"physical_mode":"wheel_locomotion"'* ]]; } \
+        && { [[ "$dog_json" == *'"session":"boot_hold"'* ]] \
+             || [[ "$dog_json" == *'"session":"parked"'* ]] \
+             || [[ "$dog_json" == *'"drive_session_phase":"boot_hold"'* ]] \
+             || [[ "$dog_json" == *'"drive_session":"startup"'* ]]; }; then
+      log "BOOT_HOLD/PARKED + wheel mode 检测到 (supervisor snapshot), 显式发 PARK intent (/cmd_pose stand) 把狗 park 回 joint_lock"
+      timeout 8 ros2 topic pub /cmd_pose std_msgs/String "{data: stand}" --once >/dev/null 2>&1 || true
+      parked_triggered=1
+    fi
+    if health_gate 2 --dog-ready 2>/dev/null; then
+      ok "go2w-motion SDK ready + canonical PARKED + scan fresh (park_triggered=$parked_triggered)"
+      return 0
+    fi
+    sleep 1
+  done
+  die "go2w-motion ${timeout_s}s 未就绪 (需 canonical PARKED; park_triggered=$parked_triggered dog_json_len=${#dog_json})"
 }
 
 check_tf_topology() {
@@ -486,13 +544,10 @@ main() {
 
   # 1. systemd 永久服务健康 (只检查, 不重启 — 重启会断 lease 狗可能摔)
   log "检查 systemd 永久服务..."
-  for svc in livox-mid360-driver go2w-motion go2w-web; do
+  for svc in livox-mid360-driver go2w-motion go2w-web go2w-sensor; do
     systemctl is-active --quiet "$svc" || die "$svc 未运行, 先 systemctl start $svc"
   done
-  ok "MID360 driver + motion + web ready"
-  # Primary mode: MID360 fuser exclusively owns /odom and odom->base_link.
-  # go2w-sensor remains an explicit fallback, but must not publish concurrently.
-  sudo systemctl stop go2w-sensor.service
+  ok "MID360 driver + motion + web + bounded sensor feedback ready"
 
   rm -f "$NAV_HEALTH_STATE"
   log "启动单一长驻导航健康监督器..."
@@ -506,15 +561,10 @@ main() {
   [ -s "$NAV_HEALTH_STATE" ] \
     || die "导航健康监督器未生成状态快照"
 
-  # The lowstate/SportState reader remains required for motion feedback and
-  # wheel diagnostics. Its /wheel_odom output never owns navigation pose:
-  # BalanceStand rotates/slips wheels while the chassis can remain stationary.
-  sudo systemctl stop wheel-odom-test.service 2>/dev/null || true
-  log "启动 dog motion feedback + diagnostic /wheel_odom..."
-  start_transient wheel-odom \
-    "source /opt/ros/humble/setup.bash && /usr/bin/python3 -u $BRIDGE_RUNTIME/nx_sensor_node.py --ros-args -p publish_imu:=false -p publish_scan:=false -p publish_odom:=true -p publish_odom_tf:=false -p odom_topic:=/wheel_odom" \
-    "$RUNTIME_ROOT"
-  wait_hz /wheel_odom 20 30
+  # go2w-sensor.service is the sole lowstate/SportState reader. It preserves
+  # /wheel_feedback and diagnostic /wheel_odom, but publishes neither /odom
+  # nor odom->base_link. Wheel integration is never a navigation pose source.
+  wait_hz /wheel_odom "$WHEEL_ODOM_MIN_HZ" 30
 
   # FAST_LIO is the only physical-pose source. Wheel integration cannot be a
   # fallback on Go2W because balancing motion produces false displacement.
@@ -563,7 +613,7 @@ main() {
   else
     log "启动 map_odom_fuser (C1 根治 + 倾斜共轭 pitch=${BODY_TO_BASE_PITCH}rad, transient unit=map-odom-fuser)..."
     start_transient map-odom-fuser \
-      "source /opt/ros/humble/setup.bash && source $FASTLIO_WS/install/setup.bash && python3 $BRIDGE_RUNTIME/map_odom_fuser.py --ros-args -p body_to_base_pitch:=$BODY_TO_BASE_PITCH -p publish_map_to_odom:=true" \
+      "source /opt/ros/humble/setup.bash && source $FASTLIO_WS/install/setup.bash && python3 $BRIDGE_RUNTIME/map_odom_fuser.py --ros-args -p body_to_base_pitch:=$BODY_TO_BASE_PITCH -p publish_map_to_odom:=true -p use_slam_pose:=false" \
       "$RUNTIME_ROOT"
   fi
   wait_hz /odom "$ODOM_MIN_HZ" 30
@@ -578,8 +628,8 @@ main() {
     "source /opt/ros/humble/setup.bash && python3 $BRIDGE_RUNTIME/map_padding_bridge.py --ros-args -p padding_m:=2.0" \
     "$RUNTIME_ROOT"
 
-  # Persistent SLAM is the single map->odom owner and raw frontier-map source.
-  # Its first padded map must exist before Nav2 configures the static costmap.
+  # Persistent SLAM is a raw frontier-map source only.  FAST_LIO/fuser owns
+  # map->odom so false scan matches cannot move the physical navigation frame.
   log "启动 persistent online SLAM (/scan_mid360 -> /map_frontier_raw)..."
   start_transient slam-online \
     "source /opt/ros/humble/setup.bash && source $GO2W_WS/install/setup.bash && ros2 launch go2w_nav slam_online.launch.py" \
@@ -591,7 +641,7 @@ main() {
     --check-margin 0.5 --timeout 15 \
     || die "robot is outside /map_frontier or too close to its boundary"
   # Motion is ready only after its MID360 watchdog has accepted fresh scans.
-  wait_motion_ready 45
+  wait_motion_ready 200
 
   # 5. Nav2 3D (已起则跳过)
   if systemctl is-active --quiet nav2-3d 2>/dev/null; then

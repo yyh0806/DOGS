@@ -49,9 +49,9 @@ def test_livox_network_service_uses_detected_interface_and_retries():
 def test_livox_driver_waits_for_valid_wall_clock_before_rate_limiter_starts():
     service = read("docker/livox-mid360-driver.service")
 
-    assert "date +%%s" in service
-    assert "1704067200" in service  # 2024-01-01, rejects the NX 1970 boot clock
-    assert "MID360 startup blocked: system clock is not valid" in service
+    assert "timedatectl show -p NTPSynchronized --value" in service
+    assert '" = "yes"' in service
+    assert "NTP not synchronized in 300s" in service
     assert (
         "Environment=FASTRTPS_DEFAULT_PROFILES_FILE="
         "/home/nx/go2w/current/payload/docker/fastdds_udp.xml"
@@ -260,7 +260,7 @@ def test_slam_nav_requires_live_mid360_observations_before_starting_nav2():
     assert 'SCAN_MIN_HZ="${SCAN_MIN_HZ:-3}"' in script
     assert 'wait_hz /mid360/points_nav "$SCAN_MIN_HZ" 30' in main
     assert 'wait_hz /scan_mid360 "$SCAN_MIN_HZ" 30' not in main
-    assert main.index('wait_motion_ready 45') < main.index(
+    assert main.index('wait_motion_ready 200') < main.index(
         "启动 Nav2 3D"
     )
 

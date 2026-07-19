@@ -199,10 +199,13 @@ class MapOdomFuser(Node):
         self.declare_parameter("max_lio_speed", 3.0)
         self.declare_parameter("lio_jump_slack", 0.5)
         self.declare_parameter("max_abs_position", 10000.0)
-        self.declare_parameter("max_lio_age_sec", 2.0)  # 放宽容差: livox 已改 host time (偏移~0), 留余量容忍 FastLIO 处理抖动; 见 memory livox-host-time-clock-rootcause
+        self.declare_parameter("max_lio_age_sec", 0.35)
         self.declare_parameter("max_lio_future_skew_sec", 0.05)
         self.declare_parameter("max_slam_tf_age_sec", 0.5)
         self.declare_parameter("max_slam_tf_future_skew_sec", 0.3)
+        # FAST_LIO is the commissioned physical pose source.  Keep the safe
+        # defaults LIO-owned so a false 2D scan match cannot rotate/translate
+        # the navigation frame by metres during an out-and-back run.
         self.declare_parameter("publish_map_to_odom", True)
         self.declare_parameter("use_slam_pose", False)
 
@@ -415,8 +418,9 @@ class MapOdomFuser(Node):
             )
             self._pending_slam_map_base = None
         values = _mat_to_tf(planar)
-        # The age gate above proves this is a current physical estimate.  Stamp
-        # it at callback time so tf2 can combine it with wall-clock Nav2 goals.
+        # The age gate above proves this is a current physical estimate. Stamp
+        # it at callback time; future-dating TF makes plan and odometry samples
+        # describe different instants and can produce impossible trajectories.
         output_stamp = now.to_msg()
         identity = TransformStamped()
         identity.header.stamp = output_stamp

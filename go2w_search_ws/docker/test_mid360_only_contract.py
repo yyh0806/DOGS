@@ -261,25 +261,36 @@ def test_fastlio_backbone_owns_live_pose_and_wheel_callback_cannot_publish_pose(
     fuser = FUSER.read_text(encoding="utf-8")
     sensor = (BRIDGE / "nx_sensor_node.py").read_text(encoding="utf-8")
     bringup = BRINGUP.read_text(encoding="utf-8")
+    sensor_service = (ROOT / "docker/go2w-sensor.service").read_text(
+        encoding="utf-8"
+    )
     assert "'/wheel_odom'" in fuser
-    assert "publish_odom_tf:=false" in bringup
-    assert "publish_scan:=false" in bringup
-    assert "wait_hz /wheel_odom 20 30" in bringup
+    assert "publish_odom_tf:=false" in sensor_service
+    assert "publish_scan:=false" in sensor_service
+    assert 'WHEEL_ODOM_MIN_HZ="${WHEEL_ODOM_MIN_HZ:-10}"' in bringup
+    assert 'wait_hz /wheel_odom "$WHEEL_ODOM_MIN_HZ" 30' in bringup
     assert "odom_topic" in sensor and "publish_odom_tf" in sensor
 
 
-def test_active_navigation_chain_has_no_builtin_sensor_dependency():
+def test_active_navigation_chain_uses_bounded_builtin_sensor_feedback():
     bringup = BRINGUP.read_text(encoding="utf-8")
     service = SERVICE.read_text(encoding="utf-8")
+    sensor_service = (ROOT / "docker/go2w-sensor.service").read_text(
+        encoding="utf-8"
+    )
     params = PARAMS.read_text(encoding="utf-8")
 
-    assert "for svc in livox-mid360-driver go2w-sensor" not in bringup
-    assert "systemctl stop go2w-sensor.service" in bringup
-    assert "Conflicts=go2w-sensor.service" in service
+    assert "for svc in livox-mid360-driver go2w-motion go2w-web go2w-sensor" in bringup
+    assert "systemctl stop go2w-sensor.service" not in bringup
+    assert "start_transient wheel-odom" not in bringup
+    assert "publish_odom_tf:=false" in sensor_service
+    assert "odom_topic:=/wheel_odom" in sensor_service
+    assert "Conflicts=go2w-sensor.service" not in service
+    assert "Wants=go2w-sensor.service" in service
     assert "After=go2w-sensor.service" in service
     assert "wait_hz /mid360/points_nav" in bringup
     assert "wait_hz /scan_mid360" not in bringup
-    assert "wait_motion_ready 45" in bringup
+    assert "wait_motion_ready 200" in bringup
     assert "topic: /mid360/points_nav" not in params
     assert params.count("topic: /scan_mid360") == 2
     assert params.count('data_type: "LaserScan"') == 2
@@ -302,7 +313,14 @@ def test_point_navigation_planning_failure_cannot_trigger_motion_recovery():
     for unsafe_motion_recovery in ("<Spin", "<BackUp", "<DriveOnHeading"):
         assert unsafe_motion_recovery not in tree
     assert "min_vel_x: 0.0" in params
-    assert "min_velocity: [0.0, 0.0, -0.15]" in params
+    assert "max_vel_x: 0.6" in params
+    assert "max_vel_theta: 0.5" in params
+    assert "max_velocity: [0.6, 0.0, 0.5]" in params
+    assert "min_velocity: [0.0, 0.0, -0.5]" in params
+    behavior = params.split("behavior_server:", 1)[1].split(
+        "waypoint_follower:", 1
+    )[0]
+    assert 'behavior_plugins: ["wait"]' in behavior
 
 
 def test_motion_readiness_prefers_local_status_and_bounds_dds_fallback():

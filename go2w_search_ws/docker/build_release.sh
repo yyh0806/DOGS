@@ -14,7 +14,7 @@ fi
 case "$SUBSYSTEM" in
   motion) REQUIRED_SERVICES="go2w-sport-gateway.service,go2w-safety-observer.service,go2w-motion.service" ;;
   web) REQUIRED_SERVICES="go2w-web.service" ;;
-  nav) REQUIRED_SERVICES="go2w-slam-nav.service" ;;
+  nav) REQUIRED_SERVICES="go2w-sensor.service,go2w-slam-nav.service" ;;
   sensor) REQUIRED_SERVICES="go2w-sensor.service" ;;
   all) REQUIRED_SERVICES="go2w-sport-gateway.service,go2w-safety-observer.service,go2w-motion.service,go2w-web.service,go2w-slam-nav.service,go2w-sensor.service" ;;
   *) echo "usage: $0 {motion|web|nav|sensor|all} [artifact.tar.gz]" >&2; exit 2 ;;
@@ -108,6 +108,7 @@ copy_validation_tools() {
   copy_path "tools/nav2_preflight.py"
   copy_path "tools/wait_lifecycle_active.py"
   copy_path "tools/nav2_benchmark.py"
+  copy_path "tools/nav_shuttle.py"
   copy_path "tools/capture_map_pose.py"
   copy_path "tools/perception_preflight.py"
   copy_path "tools/sport_gateway_bootstrap_preflight.py"

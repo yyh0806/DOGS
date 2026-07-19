@@ -79,6 +79,31 @@ def test_open_space_scan_stays_fresh_and_allows_pure_turn():
     assert watchdog.nav_guard_reason() is None
 
 
+def test_repeated_pure_turn_direction_flips_latch_oscillation_guard():
+    clock = [10.0]
+    watchdog = ScanFreshnessWatchdog(
+        timeout=1.8,
+        clock=lambda: clock[0],
+        pure_turn_clearance=0.35,
+        turn_flip_window=3.0,
+        max_turn_flips=3,
+    )
+    assert watchdog.observe_scan(_scan(distance=2.0)) is True
+
+    for angular in (0.2, -0.2, 0.2):
+        assert watchdog.filter_nav_velocity((0.0, 0.0, angular)) == (
+            0.0, 0.0, angular
+        )
+        clock[0] += 0.2
+    assert watchdog.filter_nav_velocity((0.0, 0.0, -0.2)) == (
+        0.0, 0.0, 0.0
+    )
+    assert watchdog.nav_guard_reason() == "pure_turn_oscillation"
+
+    watchdog.reset_nav_guard()
+    assert watchdog.nav_guard_reason() is None
+
+
 def test_turn_creep_compensation_never_creates_reverse_velocity():
     result = compensate_pure_turn_creep(
         (0.0, 0.0, 0.12), gain=1.0, maximum=0.15,

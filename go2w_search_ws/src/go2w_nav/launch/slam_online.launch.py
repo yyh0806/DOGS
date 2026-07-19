@@ -1,11 +1,11 @@
 """Persistent online SLAM for unknown-floor frontier exploration.
 
 The calibrated ``mid360_nav_bridge`` is the single owner of
-``/scan_mid360``. This launch only starts SLAM Toolbox, which owns the
-``map -> odom`` TF edge and publishes the persistent ``/map_frontier_raw``
-grid. ``map_padding_bridge`` adds an unknown border and republishes it as
-``/map_frontier`` for Nav2.
-``map_odom_fuser`` must therefore run with ``publish_map_to_odom:=false``.
+``/scan_mid360``. This launch only starts SLAM Toolbox as the persistent
+``/map_frontier_raw`` grid source. ``map_padding_bridge`` adds an unknown
+border and republishes it as ``/map_frontier`` for Nav2. FAST_LIO and
+``map_odom_fuser`` retain ownership of ``map -> odom`` so an erroneous 2D
+scan match cannot corrupt the physical navigation frame.
 """
 
 import os

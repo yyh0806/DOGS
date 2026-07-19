@@ -3,12 +3,9 @@ Description=Go2W persistent SLAM, Nav2 and exploration bringup
 Wants=network-online.target go2w-web.service
 Wants=costmap-bridge.service
 Wants=go2w-motion.service
+Wants=go2w-sensor.service
 Wants=livox-mid360-driver.service
 Wants=livox-mid360-watchdog.service
-# The navigation stack owns the bounded /wheel_odom publisher.  When both
-# units are enabled in the same boot transaction, this ordering makes Nav win
-# the conflict and prevents two /odom or odom->base_link publishers.
-Conflicts=go2w-sensor.service
 After=network-online.target go2w-web.service
 After=livox-mid360-driver.service go2w-motion.service
 After=go2w-sensor.service
@@ -23,7 +20,7 @@ Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 Environment=ROS_DOMAIN_ID=0
 WorkingDirectory=/home/nx/go2w/current/payload
 ExecStart=/bin/bash /home/nx/go2w/current/payload/docker/bringup_slam_nav2.sh --no-shm
-ExecStopPost=-+/usr/bin/systemctl stop nav2-3d.service slam-online.service mid360-nav-bridge.service map-odom-fuser.service fastlio.service wheel-odom.service map-padding.service nav-health-supervisor.service
+ExecStopPost=-+/usr/bin/systemctl stop nav2-3d.service slam-online.service mid360-nav-bridge.service map-odom-fuser.service fastlio.service map-padding.service nav-health-supervisor.service
 RemainAfterExit=yes
 Restart=on-failure
 RestartSec=10

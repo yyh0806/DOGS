@@ -162,18 +162,23 @@ def test_limits_openblas_threads_before_importing_numpy():
     assert assignments_before_numpy.get("OPENBLAS_NUM_THREADS") == "1"
 
 
-def test_global_costmap_uses_the_growing_slam_map_instead_of_a_fixed_window():
-    """Unknown-floor goals must not fall out of a fixed rolling window."""
+def test_global_costmap_keeps_a_fifty_metre_window_over_the_growing_slam_map():
+    """Both endpoints must remain inside the costmap throughout a 20 m leg."""
     params = (ROOT / "src/go2w_nav/config/nav2_params_3d.yaml").read_text(
         encoding="utf-8"
     )
     global_section = params.split("global_costmap:", 1)[1].split(
         "planner_server:", 1
     )[0]
-    assert re.search(r"^\s+rolling_window:\s*false\s*$", global_section, re.M)
+    assert re.search(r"^\s+rolling_window:\s*true\s*(?:#.*)?$", global_section, re.M)
     assert re.search(r'^\s+map_topic:\s*["\']?/map_frontier["\']?\s*$',
                      global_section, re.M)
-    assert not re.search(r"^\s+(?:width|height):", global_section, re.M)
+    for dimension in ("width", "height"):
+        match = re.search(
+            rf"^\s+{dimension}:\s*([0-9.]+)", global_section, re.M
+        )
+        assert match is not None
+        assert float(match.group(1)) >= 50.0
 
 
 def _costmap_sections(params):
@@ -369,7 +374,8 @@ def test_nav2_uses_bounded_tf_tolerances_and_distinct_lifecycle_manager():
     )
 
     assert "transform_tolerance: 3.5" not in params
-    assert params.count("transform_tolerance: 0.5") == 4
+    # FollowPath, both costmaps, the persistent static layer, and wait behavior.
+    assert params.count("transform_tolerance: 0.5") == 5
     assert "'autostart': 'false'" in launch
     assert "name='go2w_lifecycle_manager_navigation'" in launch
     assert "name='lifecycle_manager_navigation'" not in launch
@@ -418,37 +424,30 @@ def test_velocity_smoother_is_configured_and_lifecycle_managed():
     assert 'feedback: "OPEN_LOOP"' in params
 
 
-def test_nav_recovery_is_limited_to_fastlio_safe_angular_motion():
-    """角速度统一 0.1 rad/s (设计文档 2026-07-10 spec §启动与持久化).
-
-    实机实测: 0.1 rad/s 旋转 59° FastLIO 平移 0.21m 稳定; 0.2 rad/s 即配准发散.
-    故 DWB / velocity_smoother / behavior_server 最大角速度 = 0.1, 恢复最小 = 0.05,
-    角加速度 = 0.2 rad/s². 详见 specs/2026-07-10-fastlio-tilt-conjugation-design.md.
-    """
+def test_nav_controller_and_smoother_share_one_forward_only_envelope():
+    """DWB must never sample commands that the motion boundary changes."""
     params = (ROOT / "src/go2w_nav/config/nav2_params_3d.yaml").read_text(
         encoding="utf-8"
     )
 
-    # DWB controller
-    assert "max_vel_theta: 0.15" in params
+    assert "min_vel_x: 0.0" in params
+    assert "max_vel_x: 0.6" in params
+    assert "max_vel_theta: 0.5" in params
     assert "min_speed_theta: 0.15" in params
-    # At 10 Hz this reaches the 0.15 rad/s wheel deadband in one cycle.
-    assert "acc_lim_theta: 1.5" in params
+    assert "acc_lim_theta: 1.0" in params
     assert "decel_lim_theta: -1.5" in params
-    # progress checker (室内低速, 20s 允许 0.2m)
     assert "required_movement_radius: 0.1" in params
-    assert "movement_time_allowance: 30.0" in params
-    assert "max_vel_x: 0.3" in params
-    # velocity_smoother (z=角速度 0.1, 角加速度 0.2)
-    assert "max_velocity: [0.3, 0.0, 0.15]" in params
-    # Autonomous goals behind the robot rotate first; reverse remains manual-only.
-    assert "min_velocity: [0.0, 0.0, -0.15]" in params
-    assert "max_accel: [0.5, 0.0, 1.5]" in params
+    assert "movement_time_allowance: 60.0" in params
+    assert "max_velocity: [0.6, 0.0, 0.5]" in params
+    assert "min_velocity: [0.0, 0.0, -0.5]" in params
+    assert "max_accel: [1.2, 0.0, 1.0]" in params
     assert "max_decel: [-1.0, 0.0, -1.5]" in params
-    # behavior_server (恢复旋转)
-    assert "max_rotational_vel: 0.15" in params
-    assert "min_rotational_vel: 0.15" in params
-    assert "rotational_acc_lim: 1.5" in params
+    behavior = params.split("behavior_server:", 1)[1].split(
+        "waypoint_follower:", 1
+    )[0]
+    assert 'behavior_plugins: ["wait"]' in behavior
+    for motion_behavior in ("spin:", "backup:", "drive_on_heading:"):
+        assert motion_behavior not in behavior
 
 
 def test_point_goal_is_position_only_and_costmap_display_contracts():
@@ -460,7 +459,7 @@ def test_point_goal_is_position_only_and_costmap_display_contracts():
     )[0]
 
     assert "RotateToGoal" not in controller
-    assert controller.count("xy_goal_tolerance: 0.10") == 2
+    assert controller.count("xy_goal_tolerance: 0.20") == 2
     assert controller.count("yaw_goal_tolerance: 3.14") == 2
     assert "stateful: false" in controller
     for section in _costmap_sections(params):
@@ -536,13 +535,13 @@ def test_global_planner_uses_orientation_independent_turning_envelope():
     assert inflation >= radius + 0.15
 
 
-def test_dwb_keeps_in_place_turns_and_skips_go2w_wheel_deadband():
+def test_dwb_samples_forward_only_low_speed_approaches():
     params = (ROOT / "src/go2w_nav/config/nav2_params_3d.yaml").read_text(
         encoding="utf-8"
     )
 
     assert "min_vel_x: 0.0" in params
-    assert "min_speed_xy: 0.22" in params
+    assert "min_speed_xy: 0.05" in params
 
 
 def test_negative_twenty_degree_body_to_base_pitch_points_lidar_x_down():
@@ -631,6 +630,7 @@ def test_fastlio_stamp_directly_drives_leveled_tf_and_odometry():
     assert assignments["odom.header.stamp"] == "output_stamp"
     assert assignments["localization.header.stamp"] == "output_stamp"
     source = ast.unparse(callback)
+    assert "50000000" not in source
     assert "self._broadcaster.sendTransform([identity, base_tf])" in source
     assert "self._odom_pub.publish(odom)" in source
     assert "self._pose_pub.publish(localization)" in source

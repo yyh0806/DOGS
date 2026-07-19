@@ -99,12 +99,12 @@ logger = logging.getLogger("go2w.nx_web")
 
 try:
     POINT_GOAL_MAX_DISTANCE = float(
-        os.environ.get("GO2W_POINT_GOAL_MAX_DISTANCE", "20.0")
+        os.environ.get("GO2W_POINT_GOAL_MAX_DISTANCE", "20.5")
     )
 except (TypeError, ValueError):
-    POINT_GOAL_MAX_DISTANCE = 20.0
+    POINT_GOAL_MAX_DISTANCE = 20.5
 if not math.isfinite(POINT_GOAL_MAX_DISTANCE) or POINT_GOAL_MAX_DISTANCE <= 0.0:
-    POINT_GOAL_MAX_DISTANCE = 20.0
+    POINT_GOAL_MAX_DISTANCE = 20.5
 
 
 def _point_goal_within_local_radius(x, y, localization, max_distance=None):
@@ -474,6 +474,11 @@ class NxWebNode(Node):
             qos_profile_sensor_data)
         self._localization_sub = self.create_subscription(
             Odometry, '/localization_pose', self._on_localization_pose, 10)
+        # Diagnostic-only pose from the dog-mounted MID360 LIO.  Navigation
+        # continues to use /localization_pose in map; exposing /odom lets the
+        # operator distinguish LIO motion from SLAM map correction.
+        self._lio_odometry_sub = self.create_subscription(
+            Odometry, '/odom', self._on_lio_odometry, 10)
 
         # ---- 订阅缓存 (Lock 保护, H2.2) ----
         self._lock = threading.RLock()
@@ -522,12 +527,23 @@ class NxWebNode(Node):
         self._localization_stamp = {"sec": 0, "nanosec": 0}
         self._localization_valid = False
         self._localization_reason = "not_received"
+        self._odom_x = 0.0
+        self._odom_y = 0.0
+        self._odom_z = 0.0
+        self._odom_yaw = 0.0
+        self._odom_count = 0
+        self._odom_received_monotonic = None
+        self._odom_frame_id = ""
+        self._odom_child_frame_id = ""
+        self._odom_stamp = {"sec": 0, "nanosec": 0}
+        self._odom_valid = False
+        self._odom_reason = "not_received"
         self._last_state_t = 0.0         # 最近一次 /dog_state 时间 (判 connected)
 
         self.get_logger().info(
             "NxWebNode 就绪: 发 /cmd_vel /cmd_pose, "
             "订阅 /dog_state /livox/imu /scan_mid360 "
-            "/mid360/points_nav /localization_pose")
+            "/mid360/points_nav /localization_pose /odom(diagnostic)")
 
     # ---- ROS2 回调 (在 spin 线程内执行) ----
     def _on_dog_state(self, msg: String):
@@ -747,6 +763,95 @@ class NxWebNode(Node):
             synchronizer.add_pose(
                 stamp=source_stamp, x=x, y=y, yaw=yaw)
 
+    def _on_lio_odometry(self, msg: Odometry):
+        """Cache the planar MID360 LIO pose for operator diagnostics only."""
+        header = getattr(msg, "header", None)
+        frame_id = str(getattr(header, "frame_id", ""))
+        child_frame_id = str(getattr(msg, "child_frame_id", ""))
+        stamp = getattr(header, "stamp", None)
+        reason = None
+        if frame_id != "odom":
+            reason = "invalid_frame"
+        elif child_frame_id != "base_link":
+            reason = "invalid_child_frame"
+        try:
+            pose = msg.pose.pose
+            values = tuple(float(value) for value in (
+                pose.position.x,
+                pose.position.y,
+                pose.position.z,
+                pose.orientation.x,
+                pose.orientation.y,
+                pose.orientation.z,
+                pose.orientation.w,
+            ))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            values = ()
+            reason = reason or "nonfinite_pose"
+        if values and not all(math.isfinite(value) for value in values):
+            reason = reason or "nonfinite_pose"
+
+        yaw = 0.0
+        if reason is None:
+            x, y, z, qx, qy, qz, qw = values
+            norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+            if not math.isfinite(norm) or norm <= 1e-12:
+                reason = "invalid_quaternion"
+            else:
+                qx, qy, qz, qw = (
+                    component / norm for component in (qx, qy, qz, qw)
+                )
+                yaw = math.atan2(
+                    2.0 * (qw * qz + qx * qy),
+                    1.0 - 2.0 * (qy * qy + qz * qz),
+                )
+
+        with self._lock:
+            self._odom_count += 1
+            self._odom_received_monotonic = time.monotonic()
+            self._odom_frame_id = frame_id
+            self._odom_child_frame_id = child_frame_id
+            self._odom_stamp = {
+                "sec": int(getattr(stamp, "sec", 0)),
+                "nanosec": int(getattr(stamp, "nanosec", 0)),
+            }
+            self._odom_valid = reason is None
+            self._odom_reason = reason or "ok"
+            if reason is None:
+                self._odom_x = x
+                self._odom_y = y
+                self._odom_z = z
+                self._odom_yaw = yaw
+
+    def get_odometry_snapshot(self):
+        """Return raw LIO odometry without using it as the navigation pose."""
+        with self._lock:
+            received = self._odom_received_monotonic
+            snapshot = {
+                "frame_id": self._odom_frame_id,
+                "child_frame_id": self._odom_child_frame_id,
+                "stamp": dict(self._odom_stamp),
+                "x": self._odom_x,
+                "y": self._odom_y,
+                "z": self._odom_z,
+                "yaw": self._odom_yaw,
+                "count": self._odom_count,
+                "healthy": bool(self._odom_valid),
+                "reason": str(self._odom_reason),
+            }
+        age_sec = None if received is None else time.monotonic() - received
+        if snapshot["healthy"] and (
+            age_sec is None
+            or not math.isfinite(age_sec)
+            or age_sec < 0.0
+            or age_sec > self.localization_timeout
+        ):
+            snapshot["healthy"] = False
+            snapshot["reason"] = "stale"
+        snapshot["age_sec"] = age_sec
+        snapshot["timeout_sec"] = self.localization_timeout
+        return snapshot
+
     def get_localization_health(self):
         """Return a thread-safe map-localization snapshot and reception age."""
         with self._lock:
@@ -848,6 +953,7 @@ class NxWebNode(Node):
                     "robot_velocity": [self._dog_vx, self._dog_vy, self._dog_vyaw],
                 },
                 "localization": localization,
+                "odometry": self.get_odometry_snapshot(),
                 "navigation": navigation,
                 "services": self._collect_nav2_services(),
             }
@@ -1986,6 +2092,7 @@ def create_server(host, port, static_dir, mission_root=None):
                     "stats": robot.stats if robot else {},
                     "tasks": task_mgr.get_state() if task_mgr else {},
                     "localization": snap.get("localization", {}),
+                    "odometry": snap.get("odometry", {}),
                     "navigation": snap.get("navigation", {}),
                     "services": snap.get("services", {}),
                     "point_nav": point_nav.get_state() if point_nav else {},
@@ -2624,7 +2731,8 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
                                      "connected": connected},
                           "dog_state": dog_state,
                           "tasks": task_manager.get_state() if task_manager else {},
-                          "localization": localization,
+                           "localization": localization,
+                           "odometry": nx_node.get_odometry_snapshot(),
                            "navigation": navigation,
                            "services": nx_node._collect_nav2_services(),
                            "point_nav": point_nav.get_state() if point_nav else {},

@@ -1,0 +1,31 @@
+<!--
+  Replan through an ordered pose list without autonomous recovery motion.
+
+  The stock Humble NavigateThroughPoses tree requires Spin and BackUp during
+  bt_navigator activation. Go2W wheel-mode turns can creep translationally, so
+  failures are handled only by clearing the global costmap, holding zero for
+  one second, and retrying a bounded number of times.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="4" name="BoundedThroughPosesRefresh">
+      <PipelineSequence name="NavigateThroughPosesWithSafeDynamicReplanning">
+        <RateController hz="2.0">
+          <ReactiveSequence>
+            <RemovePassedGoals input_goals="{goals}" output_goals="{goals}"
+                               radius="0.7"/>
+            <ComputePathThroughPoses goals="{goals}" path="{path}"
+                                     planner_id="GridBased"/>
+          </ReactiveSequence>
+        </RateController>
+        <FollowPath path="{path}" controller_id="FollowPath"
+                    goal_checker_id="general_goal_checker"/>
+      </PipelineSequence>
+      <Sequence name="RefreshGlobalCostmapWithoutMotion">
+        <ClearEntireCostmap name="ClearGlobalCostmap"
+                            service_name="global_costmap/clear_entirely_global_costmap"/>
+        <Wait wait_duration="1"/>
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

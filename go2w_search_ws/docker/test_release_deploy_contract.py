@@ -456,7 +456,7 @@ def test_nav_transaction_never_restores_or_restarts_motion_boundary():
         "go2w-motion.service",
     ):
         assert forbidden not in nav_branch
-    assert 'managed_units="go2w-slam-nav.service' in nav_branch
+    assert 'managed_units="go2w-sensor.service go2w-slam-nav.service' in nav_branch
     assert 'active_state_units="go2w-slam-nav.service' in nav_branch
 
 
@@ -514,9 +514,9 @@ def test_successful_deploy_enables_manifest_services_before_commit():
     assert (
         'enable_services="go2w-sport-gateway.service '
         'go2w-safety-observer.service go2w-motion.service go2w-web.service '
-        'go2w-slam-nav.service"' in source
+        'go2w-sensor.service go2w-slam-nav.service"' in source
     )
-    assert 'systemctl disable go2w-sensor.service' in source
+    assert 'systemctl disable go2w-sensor.service' not in source
 
 
 def test_atomic_release_installs_costmap_companion_from_current_payload():
@@ -576,11 +576,11 @@ def test_atomic_release_contains_mid360_boot_runtime():
 def test_nav_and_web_restart_rules_never_include_motion():
     source = text("deploy_release.sh")
     assert 'web) services="go2w-web.service"' in source
-    assert 'nav) services="go2w-slam-nav.service"' in source
+    assert 'nav) services="go2w-sensor.service go2w-slam-nav.service"' in source
     assert 'sensor) services="go2w-sensor.service"' in source
 
 
-def test_full_restart_leaves_navigation_as_final_odom_owner():
+def test_full_restart_keeps_sensor_feedback_and_single_nav_odom_owner():
     deploy = text("deploy_release.sh")
     service_line = next(
         line for line in deploy.splitlines()
@@ -592,24 +592,25 @@ def test_full_restart_leaves_navigation_as_final_odom_owner():
     assert service_line.rstrip().endswith("go2w-slam-nav.service\" ;;")
 
     nav_unit = text("go2w-slam-nav.service")
+    sensor_unit = text("go2w-sensor.service")
+    assert "Wants=go2w-sensor.service" in nav_unit
     assert "After=go2w-sensor.service" in nav_unit
+    assert "Conflicts=go2w-sensor.service" not in nav_unit
+    assert "publish_odom_tf:=false" in sensor_unit
+    assert "odom_topic:=/wheel_odom" in sensor_unit
 
     bringup = text("bringup_slam_nav2.sh")
-    stop_full_sensor = bringup.index(
-        "sudo systemctl stop go2w-sensor.service")
-    start_bounded_sensor = bringup.index("start_transient wheel-odom")
-    assert stop_full_sensor < start_bounded_sensor
+    assert "sudo systemctl stop go2w-sensor.service" not in bringup
+    assert "start_transient wheel-odom" not in bringup
 
 
-def test_nav_owned_wheel_odom_inherits_commissioned_dog_interface_and_release():
+def test_persistent_wheel_odom_inherits_commissioned_dog_interface_and_release():
     nav_unit = text("go2w-slam-nav.service")
-    bringup = text("bringup_slam_nav2.sh")
+    sensor_unit = text("go2w-sensor.service")
 
     assert "EnvironmentFile=-/etc/go2w/hardware.env" in nav_unit
-    assert 'Environment=DOG_INTERFACE=$DOG_INTERFACE' in bringup
-    assert 'Environment=GO2W_RELEASE_ID=$GO2W_RELEASE_ID' in bringup
-    assert 'DOG_INTERFACE is missing from /etc/go2w/hardware.env' in bringup
-    assert 'GO2W_RELEASE_ID is missing from /etc/go2w/release.env' in bringup
+    assert "EnvironmentFile=-/etc/go2w/hardware.env" in sensor_unit
+    assert "EnvironmentFile=-/etc/go2w/release.env" in sensor_unit
 
 
 def test_nav_transient_units_do_not_depend_on_login_user_environment():
@@ -625,7 +626,7 @@ def test_nav_restart_applies_current_mid360_units_before_nav():
     assert (
         'restart_units="livox-mid360-net.service '
         'livox-mid360-driver.service livox-mid360-watchdog.service '
-        'go2w-slam-nav.service"' in source
+        'go2w-sensor.service go2w-slam-nav.service"' in source
     )
     assert (
         'restart_units="go2w-safety-observer.service go2w-motion.service '

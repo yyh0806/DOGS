@@ -39,6 +39,11 @@ def generate_launch_description():
         'behavior_trees',
         'navigate_to_pose_dynamic_safe.xml',
     )
+    safe_dynamic_through_poses_bt = os.path.join(
+        go2w_nav_dir,
+        'behavior_trees',
+        'navigate_through_poses_dynamic_safe.xml',
+    )
 
     params_file = LaunchConfiguration('params_file')
     use_sim_time = LaunchConfiguration('use_sim_time')
@@ -51,6 +56,7 @@ def generate_launch_description():
                 'use_sim_time': use_sim_time,
                 'autostart': 'false',
                 'default_nav_to_pose_bt_xml': safe_dynamic_replan_bt,
+                'default_nav_through_poses_bt_xml': safe_dynamic_through_poses_bt,
             },
             convert_types=True,
         ),

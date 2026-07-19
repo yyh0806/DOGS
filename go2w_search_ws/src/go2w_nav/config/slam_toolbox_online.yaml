@@ -22,8 +22,9 @@ slam_toolbox:
     map_frame: map          # Nav2 global_costmap.global_frame + orchestrator goal frame
     base_frame: base_link
     scan_topic: /scan_mid360   # MID360 经 pointcloud_to_laserscan 压的 2D scan
-    # SLAM is the only map->odom owner in persistent exploration mode.
-    transform_publish_period: 0.05
+    # FAST_LIO/fuser owns map->odom.  SLAM Toolbox may build the grid but must
+    # never inject scan-matching corrections into the navigation TF chain.
+    transform_publish_period: 0.0
 
     # ============================================================
     # ⚠️ 头号风险 (决策 4): QoS 匹配 pointcloud_to_laserscan 发布端
@@ -34,7 +35,7 @@ slam_toolbox:
     # 修复: 显式设 false, 切回 RELIABLE。
     use_sensor_data_qos: false
 
-    use_scan_matching: true
+    use_scan_matching: false
     use_scan_barycenter: true
 
     # ============================================================
@@ -58,7 +59,7 @@ slam_toolbox:
     link_match_minimum_response_fine: 0.1
     link_scan_maximum_distance: 1.5
     loop_search_maximum_distance: 3.0
-    do_loop_closing: true
+    do_loop_closing: false
     loop_match_minimum_chain_size: 3
     loop_match_maximum_variance_coarse: 3.0
     loop_match_minimum_response_coarse: 0.35
