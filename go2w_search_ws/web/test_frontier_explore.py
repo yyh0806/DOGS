@@ -1220,3 +1220,46 @@ def test_frontier_explore_report_coverage_unverified_without_map(monkeypatch):
     assert task.result["completion_status"] == "coverage_unverified"
     assert "explored_ratio" in task.result
     assert task.result["explored_ratio"] is None
+
+
+def test_frontier_explore_invalid_room_polygon_falls_back_to_circle(monkeypatch):
+    """REPORT 段畸形的 room_polygon 必须静默回退到 circle ROI.
+
+    验证 Finding 1 的防御性回退: _build_coverage_roi 在输入为非列表 / 元素
+    不合法 / 元素数量越界 / 含 NaN 等情况下都不得抛出, 必须返回 circle ROI。
+    REPORT 段 (建 coverage_roi 时) 用此 helper, 因此 helper 行为即覆盖该路径。
+    """
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+    monkeypatch.setattr(
+        orch_module, "select_frontier_candidates", lambda *_a, **_k: [])
+
+    orchestrator = make_orchestrator([], FakeNav())
+
+    # 直接单元测试 helper: 每种非法输入都回退到 circle
+    roi = orchestrator._build_coverage_roi(
+        room_polygon="not-a-list",
+        mission_origin=(1.0, 2.0),
+        max_radius=5.0)
+    assert roi["type"] == "circle"
+    assert roi["center"] == [1.0, 2.0]
+    assert roi["radius"] == 5.0
+
+    # 过短 / 过长
+    assert orchestrator._build_coverage_roi(
+        [(0, 0), (1, 1)], (0, 0), None)["type"] == "circle"
+    assert orchestrator._build_coverage_roi(
+        [(0, 0)] * 101, (0, 0), None)["type"] == "circle"
+
+    # 元素非 pair / 非数值 / 非有限
+    assert orchestrator._build_coverage_roi(
+        [(0, 0), (1, "x"), (2, 2)], (0, 0), None)["type"] == "circle"
+    assert orchestrator._build_coverage_roi(
+        [(0, 0), (float("nan"), 1), (2, 2)], (0, 0), None)["type"] == "circle"
+
+    # 合法 polygon 应原样返回
+    valid = orchestrator._build_coverage_roi(
+        [(0, 0), (1, 0), (1, 1), (0, 1)], (0, 0), None)
+    assert valid["type"] == "polygon"
+    assert valid["points"] == [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]

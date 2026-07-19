@@ -1500,17 +1500,8 @@ class RoomSearchOrchestrator:
             with map_lock:
                 final_map = latest_map_box[0]
             room_polygon = params.get("room_polygon")
-            if room_polygon:
-                coverage_roi = {
-                    "type": "polygon",
-                    "points": [tuple(p) for p in room_polygon],
-                }
-            else:
-                coverage_roi = {
-                    "type": "circle",
-                    "center": [float(mission_origin[0]), float(mission_origin[1])],
-                    "radius": float(max_radius) if max_radius is not None else 6.0,
-                }
+            coverage_roi = self._build_coverage_roi(
+                room_polygon, mission_origin, max_radius)
             coverage_inflation = self._positive_float(
                 os.environ.get("GO2W_COVERAGE_INFLATION_M"), 0.3)
             coverage_metrics = None
@@ -1521,7 +1512,8 @@ class RoomSearchOrchestrator:
                         mission_origin=tuple(mission_origin),
                         inflation_radius_m=coverage_inflation)
                 except Exception as exc:
-                    logger.warning("coverage computation failed: %s", exc)
+                    logger.warning("coverage computation failed: %s", type(exc).__name__)
+                    logger.debug("coverage computation exception", exc_info=True)
                     coverage_metrics = None
             if coverage_metrics is None:
                 coverage_metrics = {
@@ -2469,6 +2461,44 @@ class RoomSearchOrchestrator:
         if not math.isfinite(parsed) or parsed <= 0.0:
             return float(default)
         return parsed
+
+    def _build_coverage_roi(self, room_polygon, mission_origin, max_radius):
+        """Build the coverage ROI dict, preferring a validated room_polygon and
+        falling back to a mission_origin-centered circle on any validation
+        failure. Never raises — REPORT must not abort on a bad polygon.
+        """
+        reason = None
+        if not isinstance(room_polygon, list):
+            reason = "not_list"
+        elif not (3 <= len(room_polygon) <= 100):
+            reason = "length_out_of_range"
+        else:
+            points = []
+            for p in room_polygon:
+                if not (isinstance(p, (list, tuple)) and len(p) == 2):
+                    reason = "point_not_pair"
+                    break
+                try:
+                    a, b = float(p[0]), float(p[1])
+                except (TypeError, ValueError):
+                    reason = "point_not_numeric"
+                    break
+                if not (math.isfinite(a) and math.isfinite(b)):
+                    reason = "point_not_finite"
+                    break
+                points.append((a, b))
+            if reason is None:
+                return {
+                    "type": "polygon",
+                    "points": points,
+                }
+        logger.warning(
+            "invalid room_polygon, falling back to circle ROI: %s", reason)
+        return {
+            "type": "circle",
+            "center": [float(mission_origin[0]), float(mission_origin[1])],
+            "radius": float(max_radius) if max_radius is not None else 6.0,
+        }
 
     def _coverage_threshold(self, value, default: float) -> float:
         try:

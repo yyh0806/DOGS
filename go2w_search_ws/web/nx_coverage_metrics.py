@@ -105,6 +105,8 @@ def _in_roi(row, col, resolution, origin_x, origin_y, origin_yaw, roi):
 def _point_in_polygon(x, y, polygon):
     inside = False
     n = len(polygon)
+    if n > 256:  # DoS guard: real room polygons are far smaller; conservatively reject huge inputs
+        return False
     if n < 3:
         return False
     j = n - 1
