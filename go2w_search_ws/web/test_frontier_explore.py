@@ -116,13 +116,18 @@ class FakeNode:
     def get_scan_snapshot(self):
         ranges = [0.0] * 360
         ranges[180] = 2.0
+        # Fresh timestamp per call: simulates a live LiDAR stream. Required
+        # because _build_observation_bundle now self-feeds the scan into
+        # observation_sync with the scan's OWN stamp (审核 #1: real-stamp
+        # self-feed), and bundle_for_detection time-aligns within 0.20s
+        # tolerance — a fixed stale stamp would (correctly) be dropped.
         return {
             "ranges": ranges,
             "angle_min": -math.pi,
             "angle_increment": math.pi / 180.0,
             "range_min": 0.15,
             "range_max": 10.0,
-            "timestamp": self._scan_timestamp,
+            "timestamp": time.time(),
         }
 
     def create_subscription(self, msg_type, topic, callback, qos):
@@ -1022,9 +1027,12 @@ def test_en_route_observer_dedups_by_capture_stamp(monkeypatch, tmp_path):
                               with_observation_sync=True)
     orch._static_root = tmp_path
     stop_event = threading.Event()
-    # 跑 0.3s, sample_interval=0.05 → 约 6 次循环, 但同帧只入队 1 次
+    # max_duration_s=0.3: synchronous call self-terminates (production callers
+    # pass None and rely on stop_event being set after send_goal_and_wait).
+    # sample_interval=0.05 → ~6 iterations, but same stamp dedups to 1 sample.
     samples = orch._observe_en_route(
-        stop_event, ["person"], sample_interval=0.05, max_samples=12)
+        stop_event, ["person"], sample_interval=0.05, max_samples=12,
+        max_duration_s=0.3)
     stop_event.set()
     # 即使循环多次, captured_at 去重后 samples 里同一 stamp 最多 1 个
     stamps = [s["captured_at"] for s in samples]
@@ -1043,14 +1051,83 @@ def test_en_route_observer_bounded_queue(monkeypatch, tmp_path):
         def get_person_detection_snapshot(self):
             self._n += 1
             snap = super().get_person_detection_snapshot()
-            snap["timestamp"] = time.time() + self._n  # 每次新 stamp
+            # Fresh near-now stamp (strictly increasing) so that real-stamp
+            # self-feed in _build_observation_bundle stays inside tolerance
+            # and the bundle succeeds. Older code faked captured_at for the
+            # pose/scan stamp; Fix 2 requires a real timestamp.
+            snap["timestamp"] = time.time() + self._n * 0.01
             return snap
 
     orch = make_orchestrator([], FakeNav(), ai_engine=FreshStampAi(),
                               with_observation_sync=True)
     orch._static_root = tmp_path
     stop_event = threading.Event()
+    # max_duration_s=0.3: synchronous self-terminate. Production callers
+    # pass None and rely on stop_event from the frontier loop.
     samples = orch._observe_en_route(
-        stop_event, ["person"], sample_interval=0.02, max_samples=4)
+        stop_event, ["person"], sample_interval=0.02, max_samples=4,
+        max_duration_s=0.3)
     stop_event.set()
     assert len(samples) <= 4, f"bounded queue 失效: {len(samples)} > 4"
+
+
+def test_en_route_observer_rolls_window_and_runs_until_stop_event(monkeypatch, tmp_path):
+    """Regression: rolling window + runs until stop_event (production path).
+
+    Spawn _observe_en_route with max_duration_s=None (production default).
+    Fresh stamps each call → samples roll when full. Main thread sleeps 0.3s,
+    sets stop_event, joins. Asserts (a) len(samples) == cap (held, not grown),
+    (b) the 1st captured_at < the last (proves pop(0) + new arrival happened).
+    Locks production semantics against early-termination regression.
+    """
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+
+    class FreshStampAi(FakeAi):
+        def __init__(self):
+            self._n = 0
+        def get_person_detection_snapshot(self):
+            self._n += 1
+            snap = super().get_person_detection_snapshot()
+            # Fresh, strictly-increasing stamp within ~0.1s of wall clock so
+            # that real-stamp self-feed (pose@time.time, scan@scan_stamp)
+            # stays inside bundle_for_detection tolerance (0.20s). Older
+            # future-stamp variants (time.time()+n) were unaligned by >1s.
+            snap["timestamp"] = time.time() + self._n * 0.01
+            return snap
+
+    orch = make_orchestrator([], FakeNav(), ai_engine=FreshStampAi(),
+                              with_observation_sync=True)
+    orch._static_root = tmp_path
+    stop_event = threading.Event()
+    samples = []
+    worker_error = []
+
+    def _worker():
+        try:
+            samples.extend(orch._observe_en_route(
+                stop_event, ["person"], sample_interval=0.05, max_samples=3,
+                max_duration_s=None))
+        except Exception as exc:  # pragma: no cover - surface unexpected failures
+            worker_error.append(exc)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    # Let the worker run long enough to overflow cap=3 many times over.
+    time.sleep(0.3)
+    stop_event.set()
+    t.join(timeout=2.0)
+
+    assert not worker_error, f"worker crashed: {worker_error}"
+    assert not t.is_alive(), "worker did not terminate after stop_event.set()"
+    # Cap held: rolling window never grows beyond max_samples.
+    assert len(samples) == 3, (
+        f"expected cap=3 held under rolling, got {len(samples)} "
+        "(rolling-window regression: worker terminated early or overgrew cap)")
+    # Rolling proof: oldest was dropped, newest kept → monotonic increase.
+    stamps = [s["captured_at"] for s in samples]
+    assert len(stamps) == len(set(stamps)), "dedup regressed"
+    assert stamps[0] < stamps[-1], (
+        f"rolling-window did not drop oldest: stamps[0]={stamps[0]} "
+        f"not < stamps[-1]={stamps[-1]} (samples are not fresh; pop(0) failed)")

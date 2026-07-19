@@ -1675,26 +1675,61 @@ class RoomSearchOrchestrator:
                         stamp=captured_at, frame=frame)
                 self._observation_sync.add_detection(
                     stamp=captured_at, detection=snapshot)
-                # Seed live pose + scan into the sync so bundle_for_detection
-                # can time-align them with the detection stamp. The at-viewpoint
-                # caller in nx_web_server has these feeds running on its own
-                # subscriptions; seeding here is idempotent (same stamp just
-                # overwrites) and makes the en-route worker self-contained
-                # (no dependency on external feeders being active mid-flight).
+                # Self-feed pose+scan into the sync using REAL stamps so that
+                # bundle_for_detection can time-align them with the detection's
+                # captured_at. CRITICAL: do NOT fake captured_at as the pose/
+                # scan stamp — on a moving robot the current pose != the pose
+                # at captured_at (an older inference frame). ObservationSynchronizer
+                # ._pose_at returns exact-stamp matches first, so a faked entry
+                # would shadow the real interpolated pose from nx_web_server's
+                # subscription feeds and misalign the person's map coordinate.
+                #
+                # pose: current wall clock for the current pose (≈ now).
+                # scan: the scan snapshot's own timestamp (from the sensor).
+                # If captured_at is too stale (outside tolerance of all real
+                # samples), bundle_for_detection returns None and the caller
+                # drops the sample — which is the CORRECT behavior for a stale
+                # frame.审核 #1: 移动中时间对齐检测, 不漏标 + 不误标。
                 live_pose = self._get_live_robot_pose()
                 if live_pose is not None:
                     px, py, pyaw = live_pose
                     self._observation_sync.add_pose(
-                        stamp=captured_at, x=px, y=py, yaw=pyaw)
-                live_scan = self._laser_scan_snapshot()
+                        stamp=time.time(), x=px, y=py, yaw=pyaw)
+                # Scan: fetch the raw dict from the node first so we can
+                # self-feed with the scan's OWN timestamp (审核 #1: real-stamp
+                # self-feed, not the detection's captured_at). _laser_scan_snapshot
+                # wraps the data in a LaserScanSnapshot dataclass that drops the
+                # timestamp, so we read the node snapshot directly here.
+                live_scan = None
+                scan_stamp = None
+                if self._node is not None:
+                    _get_scan = getattr(self._node, "get_scan_snapshot", None)
+                    if callable(_get_scan):
+                        try:
+                            raw_scan = _get_scan() or {}
+                            scan_stamp = raw_scan.get("timestamp")
+                            if scan_stamp is not None:
+                                try:
+                                    scan_stamp = float(scan_stamp)
+                                except (TypeError, ValueError):
+                                    scan_stamp = None
+                            live_scan = self._laser_scan_snapshot()
+                        except Exception as exc:
+                            logger.debug("en-route scan snapshot failed: %s", exc)
+                            live_scan = None
                 if live_scan is not None:
-                    self._observation_sync.add_scan(
-                        stamp=captured_at, scan=live_scan)
-                current_cloud = self._pointcloud_snapshot()
-                cloud_stamp = current_cloud.get("timestamp") if current_cloud else None
-                if cloud_stamp:
-                    self._observation_sync.add_cloud(
-                        stamp=cloud_stamp, cloud=current_cloud.get("cloud"))
+                    if scan_stamp is None or not math.isfinite(scan_stamp):
+                        # No usable stamp from the node → cannot safely
+                        # time-align; drop the scan rather than fake a stamp.
+                        pass
+                    else:
+                        self._observation_sync.add_scan(
+                            stamp=scan_stamp, scan=live_scan)
+                # Cloud: PointCloudSnapshot is a frozen dataclass with only
+                # `points` and `frame_id` — NO timestamp field. Cloud is
+                # optional in the bundle (bundle_for_detection only requires
+                # pose+scan), and we cannot time-align it without a stamp, so
+                # skip add_cloud rather than fabricate a fake stamp.
                 tolerance = self._positive_float(
                     os.environ.get("GO2W_OBSERVATION_SYNC_TOLERANCE_SEC"), 0.20)
                 bundle = self._observation_sync.bundle_for_detection(
@@ -1786,7 +1821,7 @@ class RoomSearchOrchestrator:
         return results
 
     def _observe_en_route(self, stop_event, target_classes, sample_interval=0.4,
-                          max_samples=12):
+                          max_samples=12, max_duration_s=None):
         """Worker thread: best-effort person detection while navigating.
 
         Reads ai detection snapshot cache; for each NEW inference frame
@@ -1801,12 +1836,20 @@ class RoomSearchOrchestrator:
         leg is not copied repeatedly (avoiding the 100x 720p heap pressure
         flagged in review).
 
-        Termination: returns when (a) ``stop_event`` is set by the caller,
-        (b) the bounded sample queue is full (``len(samples) >= max_samples``),
-        or (c) an internal safety deadline elapses (sample_interval *
-        max_samples * 3, at least 2.0s) — so the worker never hangs the
-        ``join(timeout=2.0)`` in the frontier loop even if stop_event is
-        somehow never set.
+        Termination: rolling window — the loop runs until ``stop_event`` is
+        set OR ``max_duration_s`` elapses (if not None). The sample list is
+        capped at ``max_samples``; when full, the OLDEST sample is dropped
+        (pop(0)) and the loop CONTINUES, so the most recent ``max_samples``
+        observations are always kept. This is critical for production: a
+        single Nav2 goal can run up to 40s — terminating after the first
+        ``max_samples`` (~4.8s at interval=0.4, cap=12) would miss the
+        remaining ~35s of detection opportunities.
+
+        ``max_duration_s``: optional safety deadline. Production callers
+        pass None (loop until stop_event is set by the frontier loop after
+        send_goal_and_wait returns). Synchronous unit-test callers pass a
+        small value so the call self-terminates without depending on
+        stop_event.
         """
         samples = []
         get_snapshot = self._detection_snapshot_getter(target_classes)
@@ -1814,10 +1857,13 @@ class RoomSearchOrchestrator:
             return samples
         interval = max(0.05, float(sample_interval))
         cap = max(1, int(max_samples))
-        deadline = time.monotonic() + max(2.0, interval * cap * 3)
+        if max_duration_s is not None:
+            deadline = time.monotonic() + float(max_duration_s)
+        else:
+            deadline = None
         seen_stamps = set()
-        while not stop_event.is_set() and len(samples) < cap:
-            if time.monotonic() >= deadline:
+        while not stop_event.is_set():
+            if deadline is not None and time.monotonic() >= deadline:
                 break
             try:
                 snapshot = get_snapshot() or {}
@@ -1839,6 +1885,11 @@ class RoomSearchOrchestrator:
                     localized = self._localize_en_route_detections(
                         bundle_result, target_classes)
                     if localized:
+                        # Rolling window: drop oldest when full, keep looping.
+                        # Newer samples reflect the robot's current position
+                        # better than stale samples captured at leg start.
+                        if len(samples) >= cap:
+                            samples.pop(0)
                         samples.append({
                             "localized_list": localized,
                             "frame": bundle_result.get("frame"),
