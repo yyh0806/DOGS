@@ -1542,6 +1542,10 @@ class RoomSearchOrchestrator:
                     "free_cells": 0, "occupied_cells": 0,
                     "unknown_cells": 0, "total_cells": 0,
                     "explored_ratio": None,
+                    "exterior_unknown_cells": 0,
+                    "interior_unknown_cells": 0,
+                    "bounded_total_cells": 0,
+                    "bounded_explored_ratio": None,
                     "enclosed_unknown_regions": [],
                     "map_stamp": None,
                     "inflation_radius_m": coverage_inflation,
@@ -1583,6 +1587,8 @@ class RoomSearchOrchestrator:
                 "exploration_state": exploration_state,
                 "coverage_valid": coverage_metrics["coverage_valid"],
                 "explored_ratio": coverage_metrics["explored_ratio"],
+                "bounded_explored_ratio": coverage_metrics.get(
+                    "bounded_explored_ratio"),
                 "roi": coverage_metrics["roi"],
                 "enclosed_unknown_regions": coverage_metrics[
                     "enclosed_unknown_regions"],
@@ -1590,6 +1596,12 @@ class RoomSearchOrchestrator:
                 "coverage_occupied_cells": coverage_metrics["occupied_cells"],
                 "coverage_unknown_cells": coverage_metrics["unknown_cells"],
                 "coverage_total_cells": coverage_metrics["total_cells"],
+                "coverage_exterior_unknown_cells": coverage_metrics.get(
+                    "exterior_unknown_cells", 0),
+                "coverage_interior_unknown_cells": coverage_metrics.get(
+                    "interior_unknown_cells", 0),
+                "coverage_bounded_total_cells": coverage_metrics.get(
+                    "bounded_total_cells", coverage_metrics["total_cells"]),
                 "map_stamp": coverage_metrics["map_stamp"],
             }
             if unresolved:
@@ -1662,7 +1674,9 @@ class RoomSearchOrchestrator:
             return "incomplete"
         threshold = self._positive_float(
             os.environ.get("GO2W_FRONTIER_COVERAGE_THRESHOLD"), 0.90)
-        ratio = coverage_metrics.get("explored_ratio")
+        ratio = coverage_metrics.get("bounded_explored_ratio")
+        if ratio is None:
+            ratio = coverage_metrics.get("explored_ratio")
         enclosed = coverage_metrics.get("enclosed_unknown_regions") or []
         try:
             ratio_ok = ratio is not None and float(ratio) >= threshold

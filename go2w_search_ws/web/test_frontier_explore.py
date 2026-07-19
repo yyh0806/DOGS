@@ -1306,6 +1306,21 @@ def test_frontier_explore_report_completed_when_full_coverage(monkeypatch):
     assert task.result["enclosed_unknown_regions"] == []
 
 
+def test_completion_status_prefers_bounded_room_coverage():
+    """地图外未知 padding 不应压低已闭合房间的完成状态。"""
+    orchestrator = make_orchestrator([], FakeNav())
+    status = orchestrator._derive_completion_status(
+        "reachable_frontiers_exhausted",
+        {
+            "coverage_valid": True,
+            "explored_ratio": 0.2,
+            "bounded_explored_ratio": 1.0,
+            "enclosed_unknown_regions": [],
+        },
+    )
+    assert status == "completed"
+
+
 def test_frontier_explore_report_completed_with_gaps_for_walled_pocket(monkeypatch):
     """被障碍围死的未知区 → completion_status=completed_with_gaps."""
     if not _ensure_person_deps():

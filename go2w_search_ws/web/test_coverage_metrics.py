@@ -3,6 +3,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 WEB_DIR = Path(__file__).resolve().parent
 if str(WEB_DIR) not in sys.path:
     sys.path.insert(0, str(WEB_DIR))
@@ -130,3 +132,52 @@ def test_compute_coverage_explored_ratio_rounded():
     roi = {"type": "circle", "center": [0.1, 0.1], "radius": 1.0}
     result = compute_coverage(msg, roi=roi)
     assert result["explored_ratio"] == 0.75
+
+
+def test_bounded_coverage_excludes_unknown_outside_closed_room():
+    """墙外未知区域属于房间外部，不能把大房间完成率拉低。"""
+    width = height = 11
+    data = [-1] * (width * height)
+    for row in range(3, 8):
+        for col in range(3, 8):
+            is_wall = row in {3, 7} or col in {3, 7}
+            data[row * width + col] = 100 if is_wall else 0
+    msg = _map(data, width, height, resolution=1.0)
+    roi = {"type": "circle", "center": [5.5, 5.5], "radius": 8.0}
+
+    result = compute_coverage(
+        msg, roi=roi, mission_origin=(5.5, 5.5, 0.0),
+        inflation_radius_m=0.0)
+
+    assert result["explored_ratio"] < 0.5
+    assert result["bounded_explored_ratio"] == pytest.approx(1.0)
+    assert result["exterior_unknown_cells"] > 0
+    assert result["interior_unknown_cells"] == 0
+
+
+def test_bounded_coverage_counts_enclosed_unknown_pocket_inside_room():
+    """墙内且被障碍围住的未知洞保留为 gap，并降低有界覆盖率。"""
+    width = height = 11
+    data = [-1] * (width * height)
+    for row in range(2, 9):
+        for col in range(2, 9):
+            outer_wall = row in {2, 8} or col in {2, 8}
+            data[row * width + col] = 100 if outer_wall else 0
+    # 内部障碍环包住一个未知 cell。
+    for row in range(4, 7):
+        for col in range(4, 7):
+            data[row * width + col] = -1 if (row, col) == (5, 5) else 100
+    msg = _map(data, width, height, resolution=1.0)
+    roi = {"type": "circle", "center": [5.5, 5.5], "radius": 8.0}
+
+    result = compute_coverage(
+        msg, roi=roi, mission_origin=(3.5, 3.5, 0.0),
+        inflation_radius_m=0.0)
+
+    assert result["exterior_unknown_cells"] > 0
+    assert result["interior_unknown_cells"] == 1
+    assert result["bounded_explored_ratio"] < 1.0
+    assert result["bounded_explored_ratio"] == pytest.approx(
+        (result["free_cells"] + result["occupied_cells"])
+        / result["bounded_total_cells"], abs=1e-6)
+    assert result["enclosed_unknown_regions"][0]["cell_count"] == 1

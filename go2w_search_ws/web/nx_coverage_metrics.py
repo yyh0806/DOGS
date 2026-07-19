@@ -149,6 +149,10 @@ def compute_coverage(map_msg, roi=None, mission_origin=None,
       - roi: echo of the ROI used (for the report)
       - free_cells/occupied_cells/unknown_cells/total_cells: ROI-bounded counts
       - explored_ratio: (free+occupied)/total in [0,1], None if total=0
+      - exterior_unknown_cells: unknown components touching the ROI/map edge
+      - interior_unknown_cells: unknown components contained inside inferred bounds
+      - bounded_total_cells: free+occupied+interior_unknown_cells
+      - bounded_explored_ratio: explored cells / bounded_total_cells
       - enclosed_unknown_regions: connected unknown regions inside ROI that
         neither border reachable_free (after inflation) nor touch the ROI/map
         boundary. Each entry: {min_x,min_y,max_x,max_y,cell_count} world frame.
@@ -188,10 +192,13 @@ def compute_coverage(map_msg, roi=None, mission_origin=None,
     coverage_valid = (roi is not None) and (total > 0)
     explored_ratio = ((free + occupied) / total) if total > 0 else None
 
-    enclosed = _enclosed_unknown_regions(
+    enclosed, exterior_unknown, interior_unknown = _classify_unknown_regions(
         unknown_cells_roi, free_cells_roi, occupied_cells_roi,
         width, height, inflation_cells, mission_origin,
         resolution, origin_x, origin_y, origin_yaw, roi)
+    bounded_total = free + occupied + interior_unknown
+    bounded_explored_ratio = (
+        (free + occupied) / bounded_total if bounded_total > 0 else None)
 
     roi_echo = (
         {"type": "whole_map"} if roi is None
@@ -207,18 +214,27 @@ def compute_coverage(map_msg, roi=None, mission_origin=None,
         "unknown_cells": unknown,
         "total_cells": total,
         "explored_ratio": (round(explored_ratio, 6) if explored_ratio is not None else None),
+        "exterior_unknown_cells": exterior_unknown,
+        "interior_unknown_cells": interior_unknown,
+        "bounded_total_cells": bounded_total,
+        "bounded_explored_ratio": (
+            round(bounded_explored_ratio, 6)
+            if bounded_explored_ratio is not None else None),
         "enclosed_unknown_regions": enclosed,
         "map_stamp": map_stamp,
         "inflation_radius_m": _finite_float(inflation_radius_m, 0.0),
     }
 
 
-def _enclosed_unknown_regions(unknown_cells, free_cells, occupied_cells,
+def _classify_unknown_regions(unknown_cells, free_cells, occupied_cells,
                               width, height, inflation_cells, mission_origin,
                               resolution, origin_x, origin_y, origin_yaw, roi):
-    """Connected unknown regions that are enclosed (review #4 corrected rule).
+    """Classify unknown components and report genuinely enclosed gaps.
 
-    A region is enclosed iff:
+    A component touching the ROI/map edge is exterior to the currently inferred
+    room bounds and is excluded from bounded coverage.  Every other component
+    is interior and remains in the bounded denominator.  An interior component
+    is additionally reported as an enclosed gap iff:
       - all its cells are inside ROI (already true by construction), AND
       - none of its cells borders a reachable_free cell (free cell reachable
         from mission_origin after obstacle inflation), AND
@@ -227,7 +243,7 @@ def _enclosed_unknown_regions(unknown_cells, free_cells, occupied_cells,
     a boundary may be wall interior / building exterior / padding — not reported.
     """
     if not unknown_cells:
-        return []
+        return [], 0, 0
 
     # 1. forbidden = inflated obstacles; passable_free = free not forbidden
     forbidden = set(occupied_cells)
@@ -257,6 +273,8 @@ def _enclosed_unknown_regions(unknown_cells, free_cells, occupied_cells,
     # 3. connected components of unknown; check enclosure
     visited = set()
     enclosed = []
+    exterior_unknown = 0
+    interior_unknown = 0
     cos_yaw = math.cos(origin_yaw)
     sin_yaw = math.sin(origin_yaw)
     for seed in unknown_cells:
@@ -283,7 +301,11 @@ def _enclosed_unknown_regions(unknown_cells, free_cells, occupied_cells,
                 if neighbor in unknown_cells and neighbor not in visited:
                     visited.add(neighbor)
                     queue.append(neighbor)
-        if borders_reachable or touches_boundary:
+        if touches_boundary:
+            exterior_unknown += len(component)
+            continue
+        interior_unknown += len(component)
+        if borders_reachable:
             continue
         min_row = min(c[0] for c in component)
         max_row = max(c[0] for c in component)
@@ -307,7 +329,7 @@ def _enclosed_unknown_regions(unknown_cells, free_cells, occupied_cells,
             "cell_count": len(component),
         })
     enclosed.sort(key=lambda z: (z["min_x"], z["min_y"]))
-    return enclosed
+    return enclosed, exterior_unknown, interior_unknown
 
 
 def _cell_touches_boundary_or_roi_edge(row, col, width, height, resolution,
