@@ -1,8 +1,9 @@
 # 封闭区域 Frontier 探索（标人副产品）
 
 > 日期: 2026-07-19
-> 状态: 设计待审
+> 状态: 设计待审（v2: 吸收实现计划审核意见 6 条；ROI 覆盖率 / enclosed_unknown / completion 四态 / best-effort 标人）
 > 取代: 早期"饱和驱动主动找人"构想（目标错位，已弃）
+> Tech Stack: Python ≥ 3.10（NX 部署机 3.10.12；非 3.12）
 
 ## 目标
 
@@ -54,30 +55,47 @@ loop:
 - `max_failures_per_cell` 次失败后该 cell 不再被选
 - `max_plan_probes` / `max_blacklist_entries` 防止预算耗尽在死胡同
 
-### 覆盖率度量（成功验证）
+### 覆盖率度量（ROI 内成功验证）
 
-REPORT 阶段扫一遍最终 occupancy grid，分别计数 free cell（值 `0`）、occupied cell（值 `100`）、unknown cell（值 `-1`），计算 `explored_ratio = (free + occupied) / (free + occupied + unknown)`。
+REPORT 阶段扫一遍最终 occupancy grid，但**只在任务 ROI 内**计数 free cell（值 `0`）、occupied cell（值 `100`）、unknown cell（值 `-1`），计算 `explored_ratio = (free + occupied) / (free + occupied + unknown)`。
 
-frontier 耗尽时，剩余的 unknown 都是被障碍物完全围死的不可达区域（没有 free 邻居，否则会有 frontier），因此 `explored_ratio` 自然接近 1.0。这些不可达死角的大致位置（连通 unknown 区域的 bounding box）写入 `mission_report`，作为"已知未覆盖"信息呈现给用户，而非失败。
+**ROI 定义**：`mission_origin` 为圆心 + `max_radius_m`（current_room 默认 6.0m）的圆；命名房间用 `room_polygon`。**必须限定 ROI**——`/map_frontier` 被 `map_padding_bridge.py` 在四周加了 2m unknown padding，整图统计会把 padding 灌进分母（实测整图覆盖率仅 ~31.66%），不代表任务覆盖。
+
+**enclosed_unknown_regions**（取代旧名 `dead_zones`，审核 #4）：ROI 内的连通 unknown 区域，且满足全部三条：(a) 不接任何"可达 free cell"（从 mission_origin 对膨胀后 free space 做 flood-fill 得到）；(b) 不接触 ROI 边界；(c) 不接触地图边界。接触 ROI/地图边界的 unknown 可能是墙体内部/建筑外/padding，**不报告**。每个区域输出 world-frame bounding box `{min_x, min_y, max_x, max_y, cell_count}`。
+
+地图不可用或 ROI 为空时，`compute_coverage` 返回 `None`，`completion_status="coverage_unverified"`——**不伪装 0.0**。
 
 ### 终止判据（极简）
 
 主判据：`reachable_frontiers_exhausted`（无前沿可达）。封闭区域 frontier 单调减到 0，等价于所有可达区域被覆盖。
 兜底：时间预算 `max_time_s`、距离预算 `max_distance_m`、电量预留 `battery_reserve_percent`（全部 `ExplorationManager` 已有）。
 
-不使用：覆盖率阈值**触发停止**（停止信号是 frontier 耗尽，不是覆盖率达标）、找人饱和判据、最少 viewpoint 数。覆盖率只用于 REPORT 阶段的成功验证。
+不使用：覆盖率阈值**触发停止**（停止信号是 frontier 耗尽，不是覆盖率达标）、找人饱和判据、最少 viewpoint 数。
+
+**`completion_status` 四态**（REPORT 输出，停止信号与完成状态分离，审核 #5）：
+
+| 条件 | status |
+|---|---|
+| 地图不可用 / ROI 无效 | `coverage_unverified` |
+| 时间/距离/规划预算耗尽退出 | `incomplete` |
+| frontier 耗尽 AND ROI 覆盖率 ≥ 阈值 AND 无 enclosed | `completed` |
+| frontier 耗尽 AND (覆盖率 < 阈值 OR 有 enclosed) | `completed_with_gaps` |
+
+阈值默认 `0.90`（旧 0.95 因 padding 灌水实测不可达，已下调；env `GO2W_FRONTIER_COVERAGE_THRESHOLD` 可配）。覆盖率只用于 REPORT 阶段的完成状态判定，不触发停止。
 
 ### YOLO 标人（副产品）
 
 - **触发**：移动中（导航期间周期采样）+ 到点（每次到达 frontier 后）。
-- **流程**：读 `ai_engine` detection snapshot → 取当前 `robot_pose` → 调 `nx_person_localizer.localize_target_detection`（bbox bearing × LaserScan range → map 坐标）→ `TargetMissionStore` 空间去重（0.7m 合并）+ 照片 artifact → `ws_broadcast` 发 `person_markers`。
+- **流程（到点）**：等新鲜帧 → 复用 `observation_sync.bundle_for_detection(captured_at)` 时间对齐 → `localize_target_detection` → `TargetMissionStore.add_observation`（range_lidar）/ `add_unresolved_observation`（bearing_only）。
+- **流程（移动中 / en-route）**：**复用同一个 bundle 路径**（不事后读最新 scan，避免时间错位，审核 #1）；worker 线程按 detection 帧 `captured_at` 去重（同帧只处理一次），bounded queue ≤12（防 100 张 720p 堆积，审核 #2）；只收 `range_lidar`，bearing_only 留到点稳态；worker **不写 store**，主线程 join 后串行 ingest。
 - **关键约束**：标人结果**不进入 viewpoint 打分**，不改路径。
+- **不保证 recall**：背后/遮挡的人可能漏标；本方案是"沿途可见人员 best-effort 标注"，不是"室内所有人无漏"。云台多角度扫描作为可选 stretch（见非目标）。
 
 ## 7/15 实测遗留的实机改进点
 
 来自 `voice-search-e2e-test-2026-07-15`：
 
-1. **移动中连续检测**（取代到点单次采样）—— 现状 `_run_frontier_explore` 在 `send_goal_and_wait` 期间不检测，狗经过的人会漏。改成导航期间开 observer 周期采样（`Δd=0.5m` 或 `τ=0.4s`），到达后 join。
+1. **移动中连续检测**（取代到点单次采样）—— 现状 `_run_frontier_explore` 在 `send_goal_and_wait` 期间不检测，狗经过的人会漏。改成导航期间开 observer 周期采样（`τ=0.4s`，env 可配），**复用 observation_sync bundle 时间对齐**，capture_stamp 去重 + bounded queue，到达后 join + 串行 ingest。
 2. **预算参数调整** —— `max_time=180s` 太短，调到合理值（如 `300s`，可配置）。
 3. **单 goal 超时调整** —— `send_goal_and_wait` 内部 `120s` 太长，调短（如 `60s`），到不了就 fail 换下一个 frontier。
 4. **`parked_state_lost` 恢复** —— motion 层问题（非本方案范围），但搜索层要能容忍 pose 临时丢失、等 pose 恢复后再继续。
@@ -117,14 +135,14 @@ frontier 耗尽时，剩余的 unknown 都是被障碍物完全围死的不可�
 
 实机验收：
 - 起点位姿 → 探索完整个封闭区域 → frontier 耗尽退出
-- 全程 YOLO 标记可见的人，无漏标（移动中采样生效）
-- 预算合理（不因 180s 太短提前退出）
+- 全程 YOLO best-effort 标记沿途可见的人（en-route + 到点；不保证 recall，背后/遮挡的人可能漏）
+- 预算合理（默认 300s，不因预算太短提前退出）
 - pose 临时丢失时能恢复继续，不 EMERGENCY
 
 ## 成功判据
 
-1. **全屋覆盖**：封闭区域内所有可达 free space 都被探索到。验证指标 `explored_ratio ≥ 0.95`。剩余 ≤5% 为被障碍物围死的不可达死角，需在 `mission_report` 列出大致位置（bounding box），不算失败。退出原因是 frontier 耗尽，不是预算耗尽。
+1. **全屋覆盖（ROI 内）**：ROI 内所有可达 free space 都被探索到。验证指标 `explored_ratio ≥ 0.90`（ROI 内，非整图；旧 0.95 因 `/map_frontier` 2m padding 灌水实测不可达，已下调）。剩余 enclosed_unknown_regions 在 `mission_report` 列出 world-frame bounding box，不算失败。退出原因是 frontier 耗尽，`completion_status ∈ {completed, completed_with_gaps}`；预算耗尽则 `incomplete`；地图缺失则 `coverage_unverified`。
 2. 内部障碍物后的区域通过 frontier 绕行覆盖，或被黑名单合理跳过（不卡死、不无限重试）。
-3. 移动中经过的人被标注到 map（不是只标到点的）。
+3. 移动中经过的人被 best-effort 标注到 map（不止标到点的）；**不保证 recall**，背后/遮挡的人可能漏。
 4. 整个探索过程中狗不发 `/cmd_vel`，所有移动走 Nav2 goal pose。
-5. frontier 耗尽时正常 REPORT，输出 mission_report。
+5. frontier 耗尽时正常 REPORT，输出含 `completion_status` + coverage 的 mission_report。
