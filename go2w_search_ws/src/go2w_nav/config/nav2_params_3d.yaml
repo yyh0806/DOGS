@@ -269,8 +269,11 @@ global_costmap:
           raytrace_min_range: 0.15
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.75
+        # Global A* should retain only the hard robot-corner envelope plus
+        # roughly one 5 cm cell. The local controller keeps the wider 0.71 m
+        # live-obstacle gradient, so it remains the final clearance authority.
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.60
       always_send_full_costmap: true
 
 planner_server:
@@ -282,7 +285,10 @@ planner_server:
       # extract its gradient path while dynamically replanning. Smac 2D uses
       # a complete cost-aware A* search and does not have that extraction step.
       plugin: "nav2_smac_planner/SmacPlanner2D"
-      tolerance: 0.5
+      # Exploration and clicked goals must terminate at the requested free
+      # cell. A 0.5 m tolerated endpoint previously accepted goals whose
+      # requested cell was cost 253, then drove to the nearest free edge.
+      tolerance: 1.0e-10
       downsample_costmap: false
       downsampling_factor: 1
       allow_unknown: true

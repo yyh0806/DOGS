@@ -39,14 +39,18 @@ def clear_obstacles_visible_in_scan(
     endpoint_margin=0.2,
     no_return_min_run=7,
     no_return_clear_range=1.0,
+    visibility_neighbor_bins=1,
     occupied_threshold=65,
 ):
-    """Clear stale occupied cells traversed by current finite laser rays.
+    """Clear stale occupied cells that a supported laser sector sees through.
 
     Unknown cells stay unknown and a margin before every measured endpoint is
     preserved.  A healthy scan may also clear a short range inside a broad,
     contiguous positive-infinity sector.  Isolated no-return bins and an
-    all-infinite/unhealthy scan can never erase persistent occupancy.
+    all-infinite/unhealthy scan can never erase persistent occupancy.  Each
+    cell is checked against neighbouring beams so a single beam through a
+    narrow gap cannot erase a wall, while scan-smear between ray centrelines
+    is removed completely.
     """
     if width <= 0 or height <= 0 or len(data) != width * height:
         raise ValueError("occupancy data shape is invalid")
@@ -58,11 +62,14 @@ def clear_obstacles_visible_in_scan(
         raise ValueError("no_return_min_run must be positive")
     if not math.isfinite(no_return_clear_range) or no_return_clear_range <= 0.0:
         raise ValueError("no_return_clear_range must be finite and positive")
+    if int(visibility_neighbor_bins) < 0:
+        raise ValueError("visibility_neighbor_bins must be non-negative")
+    if not ranges or not math.isfinite(angle_increment) or angle_increment == 0.0:
+        return list(data), 0
     cleaned = list(data)
     cleared = set()
     map_cosine = math.cos(origin_yaw)
     map_sine = math.sin(origin_yaw)
-    step = max(0.01, resolution * 0.5)
     measurements = [float(value) for value in ranges]
     scan_is_healthy = any(
         math.isfinite(value) and range_min <= value <= range_max
@@ -91,36 +98,74 @@ def clear_obstacles_visible_in_scan(
             if runs[0][1] + len(measurements) - runs[-1][0] >= minimum_run:
                 no_return_indices.update(range(runs[0][0], runs[0][1]))
                 no_return_indices.update(range(runs[-1][0], runs[-1][1]))
+    clear_limits = []
     for index, measured_range in enumerate(measurements):
         if math.isfinite(measured_range):
             if measured_range < range_min or measured_range > range_max:
+                clear_limits.append(None)
                 continue
             clear_limit = measured_range - endpoint_margin
         elif index in no_return_indices:
             clear_limit = min(float(range_max), float(no_return_clear_range))
         else:
+            clear_limits.append(None)
             continue
         if clear_limit <= range_min:
+            clear_limits.append(None)
             continue
-        ray_yaw = robot_yaw + angle_min + index * angle_increment
-        ray_cosine = math.cos(ray_yaw)
-        ray_sine = math.sin(ray_yaw)
-        distance = max(float(range_min), step)
-        while distance <= clear_limit + 1e-9:
-            world_x = robot_x + distance * ray_cosine
-            world_y = robot_y + distance * ray_sine
-            dx = world_x - origin_x
-            dy = world_y - origin_y
-            local_x = map_cosine * dx + map_sine * dy
-            local_y = -map_sine * dx + map_cosine * dy
-            cell_x = int(math.floor(local_x / resolution + 1e-9))
-            cell_y = int(math.floor(local_y / resolution + 1e-9))
-            if 0 <= cell_x < width and 0 <= cell_y < height:
-                cell = cell_y * width + cell_x
-                if int(cleaned[cell]) >= occupied_threshold:
-                    cleaned[cell] = 0
-                    cleared.add(cell)
-            distance += step
+        clear_limits.append(clear_limit)
+
+    beam_count = len(measurements)
+    angular_span = abs(angle_increment) * beam_count
+    wraps = angular_span >= 2.0 * math.pi - abs(angle_increment) * 2.0
+    neighbor_bins = int(visibility_neighbor_bins)
+    half_cell_diagonal = resolution / math.sqrt(2.0)
+    for cell, occupancy in enumerate(data):
+        if int(occupancy) < occupied_threshold:
+            continue
+        cell_x = cell % width
+        cell_y = cell // width
+        local_x = (cell_x + 0.5) * resolution
+        local_y = (cell_y + 0.5) * resolution
+        world_x = origin_x + map_cosine * local_x - map_sine * local_y
+        world_y = origin_y + map_sine * local_x + map_cosine * local_y
+        dx = world_x - robot_x
+        dy = world_y - robot_y
+        distance = math.hypot(dx, dy)
+        if not math.isfinite(distance) or distance < range_min:
+            continue
+        relative_angle = math.atan2(dy, dx) - robot_yaw
+        relative_angle = math.atan2(
+            math.sin(relative_angle), math.cos(relative_angle))
+        raw_index = (relative_angle - angle_min) / angle_increment
+        nearest = int(round(raw_index))
+        if wraps:
+            nearest %= beam_count
+        else:
+            nearest = min(beam_count - 1, max(0, nearest))
+        beam_angle = angle_min + nearest * angle_increment
+        angular_error = abs(math.atan2(
+            math.sin(relative_angle - beam_angle),
+            math.cos(relative_angle - beam_angle),
+        ))
+        cell_angle = math.asin(min(1.0, half_cell_diagonal / distance))
+        if angular_error > abs(angle_increment) * 0.5 + cell_angle + 1e-9:
+            continue
+        support = []
+        for offset in range(-neighbor_bins, neighbor_bins + 1):
+            support_index = nearest + offset
+            if wraps:
+                support_index %= beam_count
+            elif support_index < 0 or support_index >= beam_count:
+                continue
+            limit = clear_limits[support_index]
+            if limit is None:
+                support = []
+                break
+            support.append(float(limit))
+        if support and distance <= min(support) + 1e-9:
+            cleaned[cell] = 0
+            cleared.add(cell)
     return cleaned, len(cleared)
 
 
@@ -217,6 +262,7 @@ class MapPaddingBridge(Node):
         self.declare_parameter("dynamic_clearing_endpoint_margin", 0.2)
         self.declare_parameter("dynamic_clearing_no_return_min_run", 7)
         self.declare_parameter("dynamic_clearing_no_return_range", 1.0)
+        self.declare_parameter("dynamic_clearing_visibility_neighbor_bins", 1)
         input_topic = str(self.get_parameter("input_topic").value)
         output_topic = str(self.get_parameter("output_topic").value)
         scan_topic = str(self.get_parameter("scan_topic").value)
@@ -237,6 +283,10 @@ class MapPaddingBridge(Node):
         self._dynamic_clearing_no_return_range = float(
             self.get_parameter("dynamic_clearing_no_return_range").value
         )
+        self._dynamic_clearing_visibility_neighbor_bins = int(
+            self.get_parameter(
+                "dynamic_clearing_visibility_neighbor_bins").value
+        )
         if not math.isfinite(self._padding_m) or self._padding_m <= 0.0:
             raise ValueError("padding_m must be finite and greater than zero")
         if (
@@ -256,6 +306,9 @@ class MapPaddingBridge(Node):
             or self._dynamic_clearing_no_return_range <= 0.0
         ):
             raise ValueError("dynamic_clearing_no_return_range must be positive")
+        if self._dynamic_clearing_visibility_neighbor_bins < 0:
+            raise ValueError(
+                "dynamic_clearing_visibility_neighbor_bins must be non-negative")
 
         qos = _transient_map_qos()
         self._publisher = self.create_publisher(OccupancyGrid, output_topic, qos)
@@ -325,6 +378,8 @@ class MapPaddingBridge(Node):
             endpoint_margin=self._dynamic_clearing_endpoint_margin,
             no_return_min_run=self._dynamic_clearing_no_return_min_run,
             no_return_clear_range=self._dynamic_clearing_no_return_range,
+            visibility_neighbor_bins=(
+                self._dynamic_clearing_visibility_neighbor_bins),
         )
 
     def _on_map(self, source):

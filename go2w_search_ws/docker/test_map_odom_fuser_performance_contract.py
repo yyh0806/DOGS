@@ -193,6 +193,29 @@ def _costmap_plugins(section):
     return [item.strip().strip("\"") for item in plugin_match.group(1).split(",")]
 
 
+def test_global_inflation_is_smaller_than_local_but_covers_robot_corner():
+    params = (ROOT / "src/go2w_nav/config/nav2_params_3d.yaml").read_text(
+        encoding="utf-8"
+    )
+    local_section, global_section = _costmap_sections(params)
+
+    def value(section, name):
+        match = re.search(rf"^\s+{name}:\s*([0-9.]+)", section, re.M)
+        assert match is not None
+        return float(match.group(1))
+
+    local_radius = value(local_section, "inflation_radius")
+    global_radius = value(global_section, "inflation_radius")
+    global_scaling = value(global_section, "cost_scaling_factor")
+
+    # The padded 0.90 x 0.64 m footprint has a 0.552 m corner radius.
+    # Keep one 5 cm cell of global margin, but let the local controller own
+    # the larger soft-clearance envelope around live obstacles.
+    assert global_radius == pytest.approx(0.60)
+    assert 0.552 + 0.04 <= global_radius < local_radius
+    assert global_scaling == pytest.approx(4.0)
+
+
 def test_costmaps_use_temporally_stable_mid360_scan_for_marking_and_clearing():
     params = (ROOT / "src/go2w_nav/config/nav2_params_3d.yaml").read_text(
         encoding="utf-8"

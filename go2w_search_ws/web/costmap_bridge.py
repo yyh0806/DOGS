@@ -38,6 +38,28 @@ def _downsample_values(values, width, height, step):
     return output
 
 
+def _extract_occupied_points(
+        values, width, height, resolution, origin_x, origin_y,
+        occupied_threshold=65, max_points=5000):
+    """Return a bounded, evenly sampled persistent SLAM wall point cloud."""
+
+    occupied = []
+    for row in range(int(height)):
+        offset = row * int(width)
+        for col in range(int(width)):
+            if int(values[offset + col]) < int(occupied_threshold):
+                continue
+            occupied.append([
+                float(origin_x) + (col + 0.5) * float(resolution),
+                float(origin_y) + (row + 0.5) * float(resolution),
+            ])
+    limit = max(1, int(max_points))
+    if len(occupied) <= limit:
+        return occupied
+    count = len(occupied)
+    return [occupied[int(index * count / limit)] for index in range(limit)]
+
+
 class CostmapBridge(Node):
     def __init__(self):
         super().__init__('costmap_bridge')
@@ -54,6 +76,11 @@ class CostmapBridge(Node):
         self.create_subscription(
             OccupancyGrid, '/global_costmap/costmap',
             lambda msg: self._cb(msg, '/tmp/costmap_global.json'), qos)
+        # Persistent SLAM walls are a display-only layer. Keeping them
+        # separate from Nav2's live red costmap prevents old map artefacts
+        # from becoming navigation authority while retaining room geometry.
+        self.create_subscription(
+            OccupancyGrid, '/map_frontier', self._map_cb, qos)
         # plan (nav2 规划路径, 前端 polyline 显示狗要走的路线)
         plan_qos = QoSProfile(
             depth=1, reliability=ReliabilityPolicy.RELIABLE,
@@ -62,6 +89,7 @@ class CostmapBridge(Node):
         self.get_logger().info(
             'costmap_bridge: /local_costmap->costmap_lite.json (避障,默认) + '
             '/global_costmap->costmap_global.json (规划,切换) + '
+            '/map_frontier->map_frontier_walls.json (持久墙体) + '
             '/plan->plan_lite.json (路线 polyline)')
 
     def _cb(self, msg, out_path):
@@ -85,6 +113,25 @@ class CostmapBridge(Node):
                 json.dump(out, f)
         except Exception as e:
             self.get_logger().warning(f'写 {out_path} 失败: {e}', throttle_duration_sec=5.0)
+
+    def _map_cb(self, msg):
+        info = msg.info
+        points = _extract_occupied_points(
+            msg.data, info.width, info.height, info.resolution,
+            info.origin.position.x, info.origin.position.y,
+            occupied_threshold=65, max_points=5000)
+        out = {
+            'points': points,
+            'resolution': float(info.resolution),
+            'frame_id': str(msg.header.frame_id or 'map'),
+        }
+        try:
+            with open('/tmp/map_frontier_walls.json', 'w') as f:
+                json.dump(out, f)
+        except Exception as e:
+            self.get_logger().warning(
+                f'写 /tmp/map_frontier_walls.json 失败: {e}',
+                throttle_duration_sec=5.0)
 
     def _plan_cb(self, msg):
         """nav2 /plan (nav_msgs/Path) -> [[x,y],...] 抽稀写 plan_lite.json, 前端画 polyline."""

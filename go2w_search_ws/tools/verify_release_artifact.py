@@ -74,6 +74,7 @@ _REQUIRED_PAYLOAD_FILES = frozenset({
     "web/nx_navigation_gateway.py",
     "web/nx_observation_sync.py",
     "web/nx_exploration_manager.py",
+    "web/nx_visibility_coverage.py",
     "web/nx_person_localizer.py",
     "web/nx_person_mission.py",
     "web/nx_point_nav.py",

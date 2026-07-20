@@ -24,6 +24,10 @@ def test_dynamic_replanning_uses_smac_2d_instead_of_navfn_path_extraction():
     assert grid["max_on_approach_iterations"] >= 1_000
     assert grid["max_planning_time"] >= 1.0
     assert grid["cost_travel_multiplier"] >= 1.0
+    # A tolerated endpoint can make ComputePath report success even when the
+    # requested pose itself is inside an inscribed/lethal costmap cell.  Room
+    # exploration needs the requested cell to be the reachable endpoint.
+    assert grid["tolerance"] <= 0.05
     assert "use_astar" not in grid
 
 

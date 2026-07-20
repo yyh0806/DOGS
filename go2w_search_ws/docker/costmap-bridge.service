@@ -14,6 +14,7 @@ Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 Environment=ROS_DOMAIN_ID=0
 Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/nx/go2w/current/payload/docker/fastdds_udp.xml
 ExecStartPre=/usr/bin/rm -f /tmp/costmap_lite.json
+ExecStartPre=/usr/bin/rm -f /tmp/map_frontier_walls.json
 ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/nx/go2w/current/payload/install/setup.bash && exec python3 -u /home/nx/go2w/current/payload/web/costmap_bridge.py'
 Restart=always
 RestartSec=2

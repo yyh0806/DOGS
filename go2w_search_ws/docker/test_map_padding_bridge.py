@@ -70,6 +70,69 @@ def test_live_finite_scan_clears_only_stale_occupied_cells_before_endpoint():
     assert count == 2
 
 
+def test_neighboring_finite_beams_clear_scan_smear_between_ray_centrelines():
+    clear = _load_helpers()["clear_obstacles_visible_in_scan"]
+    data = [0] * (80 * 80)
+    # At 1 m range this cell is between the 0.0 and 0.1 rad ray-centrelines.
+    ghost_x = 1.0 * math.cos(0.05)
+    ghost_y = 1.0 * math.sin(0.05)
+    data[_cell_index(ghost_x, ghost_y, origin=-4.0, width=80)] = 100
+
+    cleaned, count = clear(
+        data=data,
+        width=80,
+        height=80,
+        resolution=0.1,
+        origin_x=-4.0,
+        origin_y=-4.0,
+        origin_yaw=0.0,
+        robot_x=0.0,
+        robot_y=0.0,
+        robot_yaw=0.0,
+        angle_min=-0.1,
+        angle_increment=0.1,
+        ranges=[6.0, 6.0, 6.0, 6.0],
+        range_min=0.2,
+        range_max=8.0,
+        endpoint_margin=0.2,
+        visibility_neighbor_bins=1,
+    )
+
+    assert cleaned[_cell_index(ghost_x, ghost_y, origin=-4.0, width=80)] == 0
+    assert count == 1
+
+
+def test_single_long_gap_between_short_beams_cannot_erase_a_wall_cell():
+    clear = _load_helpers()["clear_obstacles_visible_in_scan"]
+    data = [0] * (80 * 80)
+    wall_x = 1.0 * math.cos(0.0)
+    wall_y = 1.0 * math.sin(0.0)
+    data[_cell_index(wall_x, wall_y, origin=-4.0, width=80)] = 100
+
+    cleaned, count = clear(
+        data=data,
+        width=80,
+        height=80,
+        resolution=0.1,
+        origin_x=-4.0,
+        origin_y=-4.0,
+        origin_yaw=0.0,
+        robot_x=0.0,
+        robot_y=0.0,
+        robot_yaw=0.0,
+        angle_min=-0.1,
+        angle_increment=0.1,
+        ranges=[1.05, 6.0, 1.05],
+        range_min=0.2,
+        range_max=8.0,
+        endpoint_margin=0.2,
+        visibility_neighbor_bins=1,
+    )
+
+    assert cleaned[_cell_index(wall_x, wall_y, origin=-4.0, width=80)] == 100
+    assert count == 0
+
+
 def test_live_scan_never_marks_unknown_free_or_clears_without_a_finite_hit():
     clear = _load_helpers()["clear_obstacles_visible_in_scan"]
     data = [-1] * (40 * 40)

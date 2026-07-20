@@ -41,6 +41,7 @@ Environment=GO2W_LOCATE_MODE=hybrid
 Environment=GO2W_LOCATE_THREADS=4
 Environment=GO2W_LOCATE_TIMEOUT=120
 Environment=GO2W_YOLO_MODEL=/home/nx/go2w_ws/models/yolov8x-worldv2.pt
+Environment=GO2W_ULTRALYTICS_WEIGHTS_DIR=/home/nx/go2w_ws/models
 # Atomic deployment writes the detected dog NIC, NX address, panel origins,
 # and installed YOLO-World model path here.  Keep it after bundled defaults.
 EnvironmentFile=-/etc/go2w/hardware.env
