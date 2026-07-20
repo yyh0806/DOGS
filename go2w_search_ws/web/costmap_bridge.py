@@ -24,14 +24,31 @@ from nav_msgs.msg import OccupancyGrid, Path
 
 
 def _downsample_values(values, width, height, step):
-    """Max-pool occupancy blocks so thin lethal obstacles are never skipped."""
+    """Max-pool occupancy blocks so thin lethal obstacles are never skipped.
+
+    Bounds the grid up front: the double loop is O(w*h), so capping only the
+    output (or the step) cannot stop a runaway OccupancyGrid (config error or
+    a rogue DDS publisher) from pinning the single-threaded callback spin.
+    """
+    try:
+        w, h = int(width), int(height)
+    except (TypeError, ValueError):
+        return []
+    if w <= 0 or h <= 0:
+        return []
+    if w * h > 10_000_000:  # 3160x3160 ≈ 100m×100m @ 3cm; past any real costmap
+        import logging
+        logging.getLogger("go2w.costmap_bridge").warning(
+            "costmap grid %dx%d exceeds 10M cells, skipping downsample", w, h)
+        return []
+    step = max(1, int(step))
     output = []
-    for y0 in range(0, height, step):
-        for x0 in range(0, width, step):
+    for y0 in range(0, h, step):
+        for x0 in range(0, w, step):
             block = [
-                int(values[y * width + x])
-                for y in range(y0, min(y0 + step, height))
-                for x in range(x0, min(x0 + step, width))
+                int(values[y * w + x])
+                for y in range(y0, min(y0 + step, h))
+                for x in range(x0, min(x0 + step, w))
             ]
             known = [value for value in block if value >= 0]
             output.append(max(known) if known else -1)
@@ -41,12 +58,27 @@ def _downsample_values(values, width, height, step):
 def _extract_occupied_points(
         values, width, height, resolution, origin_x, origin_y,
         occupied_threshold=65, max_points=5000):
-    """Return a bounded, evenly sampled persistent SLAM wall point cloud."""
+    """Return a bounded, evenly sampled persistent SLAM wall point cloud.
 
+    Bounds the grid up front: the double loop is O(w*h), so capping only the
+    output sample count cannot stop a runaway OccupancyGrid from pinning the
+    single-threaded callback spin.
+    """
+    try:
+        w, h = int(width), int(height)
+    except (TypeError, ValueError):
+        return []
+    if w <= 0 or h <= 0:
+        return []
+    if w * h > 10_000_000:
+        import logging
+        logging.getLogger("go2w.costmap_bridge").warning(
+            "costmap grid %dx%d exceeds 10M cells, skipping extraction", w, h)
+        return []
     occupied = []
-    for row in range(int(height)):
-        offset = row * int(width)
-        for col in range(int(width)):
+    for row in range(h):
+        offset = row * w
+        for col in range(w):
             if int(values[offset + col]) < int(occupied_threshold):
                 continue
             occupied.append([
