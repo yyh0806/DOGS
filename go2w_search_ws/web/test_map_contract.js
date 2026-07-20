@@ -13,12 +13,15 @@ class FakeContext {
   }
   setTransform() {}
   fillRect(x, y, w, h) { this.ops.push({ type: 'fillRect', x, y, w, h, fillStyle: this.fillStyle }); }
+  clearRect(x, y, w, h) { this.ops.push({ type: 'clearRect', x, y, w, h }); }
+  drawImage(image, ...args) { this.ops.push({ type: 'drawImage', image, args }); }
   strokeRect(x, y, w, h) { this.ops.push({ type: 'strokeRect', x, y, w, h, strokeStyle: this.strokeStyle }); }
   beginPath() {}
   moveTo(x, y) { this.ops.push({ type: 'moveTo', x, y }); }
   lineTo(x, y) { this.ops.push({ type: 'lineTo', x, y }); }
   stroke() { this.ops.push({ type: 'stroke', strokeStyle: this.strokeStyle, lineWidth: this.lineWidth }); }
-  fill() { this.ops.push({ type: 'fill', fillStyle: this.fillStyle, strokeStyle: this.strokeStyle }); }
+  fill(rule) { this.ops.push({ type: 'fill', fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, rule }); }
+  rect(x, y, w, h) { this.ops.push({ type: 'rect', x, y, w, h }); }
   arc(x, y, r) { this.ops.push({ type: 'arc', x, y, r }); }
   translate() {}
   rotate() {}
@@ -60,6 +63,12 @@ function loadMapClass() {
   const source = fs.readFileSync(path.join(__dirname, 'static', 'map.js'), 'utf8');
   const context = {
     window: { devicePixelRatio: 1 },
+    document: {
+      createElement(tag) {
+        assert.strictEqual(tag, 'canvas');
+        return new FakeCanvas(new FakeContext());
+      },
+    },
     console,
   };
   vm.createContext(context);
@@ -373,6 +382,25 @@ function testCostmapIsRenderedBelowGoalAndRobotOverlays() {
   assert(robotDraw > goalDraw, 'robot marker must be above costmap and goal');
 }
 
+function testPersistentSlamWallsRenderSeparatelyFromLiveCostmap() {
+  const { map, ctx } = createMap();
+  map.update({
+    occupancy_map: {
+      points: [[1.0, 2.0], [1.1, 2.0]],
+      resolution: 0.1,
+    },
+  });
+
+  map._draw();
+
+  assert.strictEqual(map.slam.wallPoints.length, 2);
+  assert(
+    ctx.ops.some(op => op.type === 'fillRect'
+      && op.fillStyle === 'rgba(207,216,220,0.82)'),
+    'persistent SLAM walls should remain visible outside the local costmap',
+  );
+}
+
 function testRoomSearchCoverageAndViewpointsRenderOnMap() {
   const { map, ctx } = createMap();
   map.update({
@@ -410,6 +438,86 @@ function testRoomSearchCoverageAndViewpointsRenderOnMap() {
   );
 }
 
+function testFrontierCoverageRendersWithoutCalibratedRoomRectangle() {
+  const { map, ctx } = createMap();
+  map.update({
+    room_search: {
+      phase: 'FRONTIER_DETECT',
+      room: '__frontier__',
+      observed_cells: [{ x: 0.25, y: 0.25 }, { x: 0.75, y: 0.25 }],
+      coverage_cell_size_m: 0.5,
+      coverage_ratio: 0.2,
+      adaptive_step_m: 6.0,
+    },
+  });
+
+  map._draw();
+
+  assert(
+    ctx.ops.some(op => op.type === 'drawImage' && op.image === map._fogCanvas),
+    'expected the cached search fog layer to be composited once per frame',
+  );
+  const revealedCells = map._fogCtx.ops.filter(op => op.type === 'clearRect').slice(1);
+  assert.strictEqual(revealedCells.length, 2,
+    `expected two observed cells to be revealed, got ${JSON.stringify(revealedCells)}`);
+  assert.strictEqual(map.slam.roomSearch.coverageCellSizeM, 0.5);
+  assert.strictEqual(map.slam.roomSearch.adaptiveStepM, 6.0);
+}
+
+function testSearchCoverageUsesFogMaskWithObservedCellsCutOut() {
+  const { map, ctx } = createMap();
+  map.update({
+    room_search: {
+      phase: 'ACTIVE_SEARCH',
+      observed_cells: [{ x: 0.25, y: 0.25 }, { x: 0.75, y: 0.25 }],
+      coverage_cell_size_m: 0.5,
+      coverage_ratio: 0.2,
+    },
+  });
+
+  map._draw();
+
+  const fog = map._fogCtx.ops.find(
+    op => op.type === 'fillRect' && op.fillStyle === 'rgba(3,10,18,0.86)',
+  );
+  assert(fog, 'expected a high-contrast cached search fog overlay');
+  assert(
+    map._fogCtx.ops.filter(op => op.type === 'clearRect').length >= 3,
+    'expected one canvas clear plus two observed-cell cut-outs',
+  );
+  assert.strictEqual(map._fogBuildCount, 1);
+
+  map._draw();
+  assert.strictEqual(map._fogBuildCount, 1,
+    'unchanged fog must be reused instead of rebuilding thousands of cells at 60 FPS');
+
+  map.update({ room_search: { observed_cells: [
+    { x: 0.25, y: 0.25 }, { x: 0.75, y: 0.25 }, { x: 1.25, y: 0.25 },
+  ] } });
+  map._draw();
+  assert.strictEqual(map._fogBuildCount, 2, 'new coverage must invalidate the fog cache');
+}
+
+function testPartialSearchProgressDoesNotEraseAccumulatedFogCoverage() {
+  const { map } = createMap();
+  map.update({
+    room_search: {
+      phase: 'FRONTIER_DETECT',
+      observed_cells: [{ x: 0.25, y: 0.25 }],
+      coverage_cell_size_m: 0.5,
+      coverage_ratio: 0.2,
+    },
+  });
+  map.update({ room_search: { phase: 'NAVIGATING', current_wp: 2 } });
+
+  assert.strictEqual(map.slam.roomSearch.observedCells.length, 1,
+    'phase-only progress must retain cumulative observed cells');
+  assert.strictEqual(map.slam.roomSearch.observedCells[0].x, 0.25);
+  assert.strictEqual(map.slam.roomSearch.observedCells[0].y, 0.25);
+  assert.strictEqual(map.slam.roomSearch.coverageRatio, 0.2);
+  assert.strictEqual(map.slam.roomSearch.coverageCellSizeM, 0.5);
+}
+
 function testPanelForwardsSearchRoomProgressIntoMap() {
   const panel = fs.readFileSync(path.join(__dirname, 'static', 'panel.html'), 'utf8');
   const branch = panel.indexOf("data.type === 'search_room'");
@@ -417,6 +525,34 @@ function testPanelForwardsSearchRoomProgressIntoMap() {
   assert(
     panel.indexOf('room_search: data.data', branch) > branch,
     'search_room progress must be forwarded to the map renderer',
+  );
+}
+
+function testStatusPollingRefreshesRoomSearchWhenWebSocketStateIsDropped() {
+  const panel = fs.readFileSync(path.join(__dirname, 'static', 'panel.html'), 'utf8');
+  const helper = panel.indexOf('function applyRoomNavigationState(roomNav)');
+  assert(helper >= 0, 'room navigation state should have one shared renderer');
+  const poll = panel.indexOf('// 状态轮询');
+  assert(poll >= 0, 'status polling block missing');
+  assert(
+    panel.indexOf('applyRoomNavigationState(d.room_nav)', poll) > poll,
+    'HTTP status polling must refresh room-search mask when WebSocket updates are dropped',
+  );
+}
+
+function testPanelFiltersDetectionResultsBelowEightyPercent() {
+  const panel = fs.readFileSync(path.join(__dirname, 'static', 'panel.html'), 'utf8');
+  assert(
+    panel.includes('const DETECTION_MIN_CONFIDENCE = 0.8;'),
+    'panel detection threshold must be 0.8',
+  );
+  assert(
+    panel.includes('function filterDetectionResults(detections)'),
+    'panel should share one confidence filter across result views',
+  );
+  assert(
+    panel.includes('target_markers: filterDetectionResults(markers)'),
+    'map markers must exclude low-confidence detections',
   );
 }
 
@@ -449,7 +585,13 @@ testPersonMarkerHitWinsOverGoalSelection();
 testNavigationGoalIsPartOfBoundsAndRendersReticle();
 testNullGoalIsRejectedAndServerUnavailableUsesFailureColor();
 testCostmapIsRenderedBelowGoalAndRobotOverlays();
+testPersistentSlamWallsRenderSeparatelyFromLiveCostmap();
 testRoomSearchCoverageAndViewpointsRenderOnMap();
+testFrontierCoverageRendersWithoutCalibratedRoomRectangle();
+testSearchCoverageUsesFogMaskWithObservedCellsCutOut();
+testPartialSearchProgressDoesNotEraseAccumulatedFogCoverage();
 testPanelForwardsSearchRoomProgressIntoMap();
+testStatusPollingRefreshesRoomSearchWhenWebSocketStateIsDropped();
+testPanelFiltersDetectionResultsBelowEightyPercent();
 testPanelForwardsGenericTargetMarkerEventsIntoMap();
 console.log('map contract tests passed');

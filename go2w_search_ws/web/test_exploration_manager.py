@@ -45,8 +45,9 @@ def _two_room_map(revision=1):
 
 
 class _PlannerPort:
-    def __init__(self, blocked_x=()):
+    def __init__(self, blocked_x=(), origin=(0.0, 0.0)):
         self.blocked_x = tuple(blocked_x)
+        self.origin = tuple(float(value) for value in origin)
         self.probes = []
 
     def compute_path_to_pose(self, x, y, yaw, frame_id="map", timeout=3.0):
@@ -55,8 +56,67 @@ class _PlannerPort:
             return {"ok": False, "reason": "blocked"}
         return {
             "ok": True,
-            "path_length": math.hypot(x - 2.0, y - 3.0),
+            "path_length": math.hypot(
+                x - self.origin[0], y - self.origin[1]),
             "poses": 4,
+        }
+
+
+class _VisibilityTracker:
+    def __init__(
+            self, *, adaptive_step_m=6.0, scene_complexity=0.0,
+            gains=None, coverage_candidates=None, lidar_candidates=None,
+            coverage_ratio=0.25):
+        self.adaptive_step_m = float(adaptive_step_m)
+        self.scene_complexity = float(scene_complexity)
+        self.gains = dict(gains or {})
+        self._coverage_candidates = list(coverage_candidates or [])
+        self._lidar_candidates = list(lidar_candidates or [])
+        self.coverage_ratio = float(coverage_ratio)
+        self.observations = []
+
+    def observe(self, map_msg, robot_pose, scan_snapshot):
+        self.observations.append((map_msg, tuple(robot_pose), scan_snapshot))
+        return self.snapshot(map_msg)
+
+    def rank_candidates(self, _map_msg, robot_pose, candidates):
+        ranked = []
+        for source in candidates:
+            candidate = dict(source)
+            gain = float(self.gains.get(float(candidate["x"]), 0.0))
+            candidate.update({
+                "base_information_gain": float(
+                    candidate.get("information_gain", candidate.get("size", 0.0))),
+                "visual_gain": gain,
+                "information_gain": gain,
+                "adaptive_step_m": self.adaptive_step_m,
+                "scene_complexity": self.scene_complexity,
+                "forward_clearance_m": self.adaptive_step_m,
+                "heading_change": abs(math.atan2(
+                    math.sin(float(candidate["yaw"]) - float(robot_pose[2])),
+                    math.cos(float(candidate["yaw"]) - float(robot_pose[2])),
+                )),
+            })
+            ranked.append(candidate)
+        return ranked
+
+    def coverage_candidates(
+            self, _map_msg, _robot_pose, _visited, *, limit=32):
+        return [dict(item) for item in self._coverage_candidates[:limit]]
+
+    def lidar_candidates(self, _robot_pose, _visited, *, limit=16):
+        return [dict(item) for item in self._lidar_candidates[:limit]]
+
+    def snapshot(self, _map_msg=None):
+        return {
+            "observed_cells": [{"x": 0.25, "y": 0.25}],
+            "visual_coverage_ratio": self.coverage_ratio,
+            "coverage_cell_size_m": 0.5,
+            "visual_range_m": 8.0,
+            "scan_usable": True,
+            "forward_clearance_m": self.adaptive_step_m,
+            "scene_complexity": self.scene_complexity,
+            "adaptive_step_m": self.adaptive_step_m,
         }
 
 
@@ -70,7 +130,7 @@ def test_score_uses_path_information_heading_and_failure_count():
 
 
 def test_manager_selects_only_reachable_candidate_and_persists_visit():
-    nav = _PlannerPort(blocked_x=(1.5,))
+    nav = _PlannerPort(blocked_x=(1.5,), origin=(2.0, 3.0))
     manager = ExplorationManager(
         navigation_port=nav,
         mission_origin=(2.0, 3.0, 0.0),
@@ -91,9 +151,189 @@ def test_manager_selects_only_reachable_candidate_and_persists_visit():
     assert snapshot["current_goal"] is None
 
 
+def test_current_room_prefers_nearest_reachable_frontier_over_distant_large_cluster():
+    candidates = [
+        {
+            "x": 5.0, "y": 0.0, "yaw": 0.0, "size": 100,
+            "center_cell": (0, 50), "distance": 5.0,
+            "information_gain": 100.0,
+        },
+        {
+            "x": 1.5, "y": 0.0, "yaw": 0.0, "size": 5,
+            "center_cell": (0, 15), "distance": 1.5,
+            "information_gain": 5.0,
+        },
+    ]
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=8.0,
+        initial_radius_m=8.0,
+        tile_size_m=16.0,
+        candidate_selector=lambda *_a, **_k: [dict(item) for item in candidates],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(1.5)
+
+
+def test_plan_endpoint_must_reach_candidate_instead_of_stopping_beside_obstacle():
+    class ApproximatePlanner:
+        def compute_path_to_pose(
+                self, x, y, yaw, frame_id="map", timeout=3.0):
+            return {
+                "ok": True,
+                "path_length": 1.0,
+                "poses": 4,
+                "goal_error_m": 0.65,
+            }
+
+    frontier = {
+        "x": 1.2, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 12), "distance": 1.2,
+        "information_gain": 10.0,
+    }
+    manager = ExplorationManager(
+        navigation_port=ApproximatePlanner(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        max_failures_per_cell=1,
+        max_goal_endpoint_error_m=0.25,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    assert manager.snapshot()["blacklist"][0]["last_reason"] == (
+        "plan_endpoint_mismatch")
+
+
+def test_default_endpoint_tolerance_rejects_a_twenty_centimetre_approximation():
+    """Regression: field goals in cost 253 cells ended 0.20 m away."""
+
+    class ApproximatePlanner:
+        def compute_path_to_pose(
+                self, x, y, yaw, frame_id="map", timeout=3.0):
+            return {
+                "ok": True,
+                "path_length": 1.0,
+                "poses": 4,
+                "goal_error_m": 0.20,
+            }
+
+    frontier = {
+        "x": 1.2, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 12), "distance": 1.2,
+        "information_gain": 10.0,
+    }
+    manager = ExplorationManager(
+        navigation_port=ApproximatePlanner(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        max_failures_per_cell=1,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    assert manager.snapshot()["blacklist"][0]["last_reason"] == (
+        "plan_endpoint_mismatch")
+
+
+def test_dynamic_obstacle_revalidation_cancels_goal_after_sustained_failure():
+    class DynamicPlanner:
+        def __init__(self):
+            self.responses = [
+                {"ok": True, "path_length": 1.2, "poses": 4,
+                 "goal_error_m": 0.0},
+                {"ok": False, "reason": "unreachable"},
+                {"ok": False, "reason": "unreachable"},
+            ]
+
+        def compute_path_to_pose(
+                self, x, y, yaw, frame_id="map", timeout=3.0):
+            return self.responses.pop(0)
+
+    frontier = {
+        "x": 1.2, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 12), "distance": 1.2,
+        "information_gain": 10.0,
+    }
+    manager = ExplorationManager(
+        navigation_port=DynamicPlanner(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        goal_revalidation_failures=2,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is not None
+
+    first = manager.revalidate_current_goal()
+    second = manager.revalidate_current_goal()
+
+    assert first["ok"] is True
+    assert first["goal_revalidation_failures"] == 1
+    assert second["ok"] is False
+    assert second["reason"] == "goal_became_unreachable"
+
+
+def test_transient_revalidation_timeouts_do_not_cancel_an_active_goal():
+    class BusyPlanner:
+        def __init__(self):
+            self.responses = [
+                {"ok": True, "path_length": 1.2, "poses": 4,
+                 "goal_error_m": 0.0},
+                {"ok": False, "reason": "plan_timeout"},
+                {"ok": False, "reason": "plan_timeout"},
+            ]
+
+        def compute_path_to_pose(
+                self, x, y, yaw, frame_id="map", timeout=3.0):
+            return self.responses.pop(0)
+
+    frontier = {
+        "x": 1.2, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 12), "distance": 1.2,
+        "information_gain": 10.0,
+    }
+    manager = ExplorationManager(
+        navigation_port=BusyPlanner(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        goal_revalidation_failures=2,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is not None
+
+    first = manager.revalidate_current_goal()
+    second = manager.revalidate_current_goal()
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert second["reason"] == "goal_revalidation_inconclusive"
+    assert second["goal_revalidation_failures"] == 0
+
+
 def test_blacklist_is_bounded_and_spatial_failures_survive_revision_churn(
         monkeypatch):
-    nav = _PlannerPort(blocked_x=(1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5))
+    nav = _PlannerPort(
+        blocked_x=(1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5),
+        origin=(2.0, 3.0),
+    )
     manager = ExplorationManager(
         navigation_port=nav,
         mission_origin=(2.0, 3.0, 0.0),
@@ -167,6 +407,58 @@ def test_budget_status_distinguishes_information_exhaustion_and_safety_limits():
     assert manager.budget_status(battery_percent=80.0) == "time_budget_exhausted"
     now[0] = 100.0
     assert manager.budget_status(battery_percent=20.0) == "battery_reserve_reached"
+
+
+def test_manager_passes_frontier_spacing_to_candidate_selector():
+    seen = []
+
+    def candidates(_map_msg, _pose, _visited, **kwargs):
+        seen.append(kwargs.get("frontier_spacing_m"))
+        return []
+
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        frontier_spacing_m=0.8,
+        candidate_selector=candidates,
+        reject_map_edge=False,
+    )
+
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    assert seen == [pytest.approx(0.8)]
+    assert manager.snapshot()["frontier_spacing_m"] == pytest.approx(0.8)
+
+
+def test_manager_supports_legacy_candidate_selector_without_spacing_keyword():
+    calls = []
+
+    def legacy_candidates(
+            map_msg, robot_pose, visited, *, revisit_radius, origin_pose,
+            max_radius, room_polygon, reject_map_edge, failure_counts,
+            distance_weight, heading_weight, failure_penalty):
+        del (
+            map_msg, robot_pose, visited, revisit_radius, origin_pose,
+            max_radius, room_polygon, reject_map_edge, failure_counts,
+            distance_weight, heading_weight, failure_penalty,
+        )
+        calls.append(1)
+        return []
+
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        candidate_selector=legacy_candidates,
+        reject_map_edge=False,
+    )
+
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    assert calls == [1]
 
 
 def test_current_room_expands_radius_when_local_frontiers_are_exhausted():
@@ -269,6 +561,154 @@ def test_frontier_inside_goal_tolerance_is_not_selected():
     assert manager.navigation_port.probes[0][0] == pytest.approx(1.0)
 
 
+def test_only_frontier_inside_goal_tolerance_uses_outward_probe():
+    frontier = {
+        "x": 0.05, "y": 0.0, "yaw": 0.0, "size": 324,
+        "center_cell": (121, 132), "distance": 0.05,
+        "information_gain": 324.0, "score": 324.0,
+    }
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert manager.navigation_port.probes[0][0] == pytest.approx(1.2)
+    assert selected["x"] == pytest.approx(1.2)
+    assert selected["frontier_x"] == pytest.approx(0.05)
+    assert selected["approach_lookahead_m"] == pytest.approx(1.15)
+    assert manager.snapshot()["last_selection_reason"] is None
+
+
+def test_near_frontier_uses_outward_probe_to_escape_tiny_initial_map():
+    frontier = {
+        "x": 0.45, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 9), "distance": 0.45,
+        "information_gain": 10.0, "score": 10.0,
+    }
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert manager.navigation_port.probes[0][0] == pytest.approx(1.2)
+    assert selected["x"] == pytest.approx(1.2)
+    assert selected["frontier_x"] == pytest.approx(0.45)
+    assert selected["approach_lookahead_m"] == pytest.approx(0.75)
+
+
+def test_zero_progress_planner_path_is_rejected_as_false_reachability():
+    class ZeroProgressPlanner:
+        def __init__(self):
+            self.probes = []
+
+        def compute_path_to_pose(
+                self, x, y, yaw, frame_id="map", timeout=3.0):
+            self.probes.append((x, y, yaw, frame_id, timeout))
+            return {"ok": True, "path_length": 0.0, "poses": 1}
+
+    frontier = {
+        "x": 0.45, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 9), "distance": 0.45,
+        "information_gain": 10.0, "score": 10.0,
+    }
+    nav = ZeroProgressPlanner()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        max_failures_per_cell=1,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    snapshot = manager.snapshot()
+    assert nav.probes[0][0] == pytest.approx(1.2)
+    assert snapshot["blacklist"][0]["last_reason"] == "degenerate_plan"
+
+
+def test_excessive_detour_plan_is_rejected_before_navigation():
+    class DetourPlanner:
+        def __init__(self):
+            self.probes = []
+
+        def compute_path_to_pose(
+                self, x, y, yaw, frame_id="map", timeout=3.0):
+            self.probes.append((x, y, yaw, frame_id, timeout))
+            return {"ok": True, "path_length": 8.47, "poses": 158}
+
+    frontier = {
+        "x": -0.84, "y": -0.83, "yaw": -2.37, "size": 10,
+        "center_cell": (10, 10), "distance": 1.18,
+        "information_gain": 10.0, "score": 10.0,
+    }
+    manager = ExplorationManager(
+        navigation_port=DetourPlanner(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        max_failures_per_cell=1,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    snapshot = manager.snapshot()
+    assert snapshot["blacklist"][0]["last_reason"] == "excessive_plan_detour"
+    assert snapshot["max_path_stretch_ratio"] == pytest.approx(3.0)
+    assert snapshot["max_path_detour_m"] == pytest.approx(1.5)
+
+
+def test_navigation_progress_guard_latches_after_repeated_motion_away_from_goal():
+    frontier = {
+        "x": 1.2, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 12), "distance": 1.2,
+        "information_gain": 10.0, "score": 10.0,
+    }
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    assert selected is not None
+
+    assert manager.observe_navigation_pose((0.0, 0.0, 0.0))["ok"] is True
+    first = manager.observe_navigation_pose((-1.0, 0.0, 0.0))
+    second = manager.observe_navigation_pose((-1.0, 0.0, 0.0))
+    third = manager.observe_navigation_pose((-1.0, 0.0, 0.0))
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert third["ok"] is False
+    assert third["reason"] == "navigation_diverging"
+    assert third["distance_to_goal_m"] == pytest.approx(2.2)
+    assert third["allowed_distance_m"] == pytest.approx(1.8)
+
+
 def test_unreachable_frontier_uses_inward_standoff_goal():
     frontier = {
         "x": 1.4, "y": 0.0, "yaw": 0.0, "size": 10,
@@ -293,6 +733,94 @@ def test_unreachable_frontier_uses_inward_standoff_goal():
     assert selected["x"] == pytest.approx(1.1)
     assert selected["frontier_x"] == pytest.approx(1.4)
     assert selected["approach_standoff_m"] == pytest.approx(0.3)
+
+
+def test_reachable_frontier_prefers_farthest_inward_standoff():
+    frontier = {
+        "x": 2.0, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 20), "distance": 2.0,
+        "information_gain": 10.0, "score": 10.0,
+        "prefer_standoff": True,
+    }
+    nav = _PlannerPort()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert nav.probes[0][0] == pytest.approx(1.1)
+    assert selected["x"] == pytest.approx(1.1)
+    assert selected["frontier_x"] == pytest.approx(2.0)
+    assert selected["approach_standoff_m"] == pytest.approx(0.9)
+
+
+def test_large_initial_turn_uses_heading_aligned_staging_probe():
+    frontier = {
+        "x": -2.0, "y": 0.0, "yaw": math.pi, "size": 10,
+        "center_cell": (0, -20), "distance": 2.0,
+        "information_gain": 10.0, "score": 10.0,
+        "heading_change": math.pi,
+        "prefer_standoff": True,
+    }
+    nav = _PlannerPort()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert nav.probes[0][0] == pytest.approx(0.8)
+    assert nav.probes[0][1] == pytest.approx(0.0)
+    assert nav.probes[0][2] == pytest.approx(0.0)
+    assert selected["x"] == pytest.approx(0.8)
+    assert selected["y"] == pytest.approx(0.0)
+    assert selected["frontier_x"] == pytest.approx(-2.0)
+    assert selected["approach_staging_m"] == pytest.approx(0.8)
+    assert selected["staging_for_heading_change_rad"] == pytest.approx(math.pi)
+
+
+def test_turn_staging_is_transition_not_completed_frontier():
+    frontier = {
+        "x": -2.0, "y": 0.0, "yaw": math.pi, "size": 10,
+        "center_cell": (0, -20), "distance": 2.0,
+        "information_gain": 10.0, "score": 10.0,
+        "heading_change": math.pi,
+        "prefer_standoff": True,
+    }
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    staging = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    assert staging["approach_staging_m"] == pytest.approx(0.8)
+    manager.mark_visited(staging)
+
+    assert manager.snapshot()["visited_frontiers"] == []
+    target = manager.choose_next(_two_room_map(), (0.8, 0.0, 0.0))
+    assert target is not None
+    assert "approach_staging_m" not in target
+    assert target["x"] < 0.0
 
 
 def test_candidates_in_active_tile_are_exhausted_before_switching_tiles():
@@ -361,7 +889,44 @@ def test_origin_tile_is_centered_around_mission_start():
 
     assert selected is not None
     assert selected["tile"] == [0, 0]
-    assert len(manager.navigation_port.probes) == 2
+    assert len(manager.navigation_port.probes) == 1
+
+
+def test_ranked_reachable_candidate_starts_without_probing_every_alternative():
+    candidates = [
+        {
+            "x": 1.0, "y": 0.0, "yaw": 0.0, "size": 8,
+            "center_cell": (0, 10), "distance": 1.0,
+            "information_gain": 8.0,
+        },
+        {
+            "x": 2.0, "y": 0.0, "yaw": 0.0, "size": 7,
+            "center_cell": (0, 20), "distance": 2.0,
+            "information_gain": 7.0,
+        },
+        {
+            "x": 3.0, "y": 0.0, "yaw": 0.0, "size": 6,
+            "center_cell": (0, 30), "distance": 3.0,
+            "information_gain": 6.0,
+        },
+    ]
+    nav = _PlannerPort()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=8.0,
+        initial_radius_m=8.0,
+        tile_size_m=16.0,
+        candidate_selector=lambda *_a, **_k: [dict(item) for item in candidates],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(1.0)
+    assert len(nav.probes) == 1
 
 
 def test_plan_probe_budget_resets_each_selection_cycle():
@@ -420,6 +985,64 @@ def test_same_spatial_frontier_is_bounded_across_rapid_map_revisions():
     assert len(nav.probes) == probes_before_revision_churn
 
 
+def test_same_world_frontier_is_bounded_when_grid_origin_shifts():
+    """Growing SLAM maps may reindex a fixed world point every revision."""
+    nav = _PlannerPort(blocked_x=(1.0,))
+    calls = [0]
+
+    def candidates(_map_msg, _pose, _visited, **_kwargs):
+        calls[0] += 1
+        return [{
+            "x": 1.0, "y": 0.0, "yaw": 0.0, "size": 10,
+            "center_cell": (100, 100 + calls[0]),
+            "distance": 1.0, "information_gain": 10.0, "score": 10.0,
+        }]
+
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        max_failures_per_cell=1,
+        candidate_selector=candidates,
+        reject_map_edge=False,
+    )
+
+    assert manager.choose_next(_two_room_map(1), (0.0, 0.0, 0.0)) is None
+    probes_after_first_rejection = len(nav.probes)
+    assert manager.choose_next(_two_room_map(2), (0.0, 0.0, 0.0)) is None
+
+    assert probes_after_first_rejection == 1
+    assert len(nav.probes) == probes_after_first_rejection
+
+
+def test_small_world_drift_cannot_cross_spatial_failure_bucket_boundary():
+    nav = _PlannerPort(blocked_x=(1.25,))
+    calls = [0]
+
+    def candidates(_map_msg, _pose, _visited, **_kwargs):
+        calls[0] += 1
+        x = 1.24 if calls[0] == 1 else 1.26
+        return [{
+            "x": x, "y": 0.0, "yaw": 0.0, "size": 10,
+            "center_cell": (100, 100 + calls[0]),
+            "distance": x, "information_gain": 10.0, "score": 10.0,
+        }]
+
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        max_failures_per_cell=1,
+        candidate_selector=candidates,
+        reject_map_edge=False,
+    )
+
+    assert manager.choose_next(_two_room_map(1), (0.0, 0.0, 0.0)) is None
+    assert manager.choose_next(_two_room_map(2), (0.0, 0.0, 0.0)) is None
+
+    assert len(nav.probes) == 1
+
+
 def test_exhaustion_requires_configured_stable_confirmations():
     manager = ExplorationManager(
         navigation_port=_PlannerPort(),
@@ -442,3 +1065,430 @@ def test_exhaustion_requires_configured_stable_confirmations():
     snapshot = manager.snapshot()
     assert snapshot["last_selection_reason"] == "reachable_frontiers_exhausted"
     assert snapshot["exhaustion_streak"] == 3
+
+
+@pytest.mark.parametrize(("adaptive_step_m", "expected_x"), [
+    (6.0, 6.0),
+    (1.5, 1.5),
+])
+def test_visibility_profile_adapts_long_frontier_step_to_scene(
+        adaptive_step_m, expected_x):
+    tracker = _VisibilityTracker(
+        adaptive_step_m=adaptive_step_m,
+        scene_complexity=0.0 if adaptive_step_m > 2.0 else 0.8,
+        gains={9.0: 50.0},
+    )
+    frontier = {
+        "x": 9.0, "y": 0.0, "yaw": 0.0, "size": 50,
+        "center_cell": (0, 90), "distance": 9.0,
+        "information_gain": 50.0,
+    }
+    nav = _PlannerPort()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=12.0,
+        initial_radius_m=12.0,
+        tile_size_m=20.0,
+        visibility_tracker=tracker,
+        max_frontier_standoff_steps=0,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(expected_x)
+    assert selected["frontier_x"] == pytest.approx(9.0)
+    assert selected["approach_adaptive_m"] == pytest.approx(adaptive_step_m)
+    assert nav.probes[0][0] == pytest.approx(expected_x)
+
+
+def test_near_frontier_looks_ahead_to_lidar_confirmed_safe_step():
+    tracker = _VisibilityTracker(
+        adaptive_step_m=6.0,
+        scene_complexity=0.05,
+        gains={1.2: 20.0},
+    )
+    frontier = {
+        "x": 1.2, "y": 0.0, "yaw": 0.0, "size": 20,
+        "center_cell": (0, 12), "distance": 1.2,
+        "information_gain": 20.0, "score": 20.0,
+        "prefer_standoff": True,
+    }
+    nav = _PlannerPort()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=12.0,
+        initial_radius_m=12.0,
+        tile_size_m=20.0,
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert nav.probes[0][0] == pytest.approx(6.0)
+    assert selected["x"] == pytest.approx(6.0)
+    assert selected["frontier_x"] == pytest.approx(1.2)
+    assert selected["approach_lidar_lookahead_m"] == pytest.approx(4.8)
+
+
+def test_open_corridor_does_not_fall_back_to_tiny_goal_when_lookahead_is_blocked():
+    tracker = _VisibilityTracker(
+        adaptive_step_m=6.0,
+        scene_complexity=0.05,
+        gains={1.2: 20.0},
+    )
+    frontier = {
+        "x": 1.2, "y": 0.0, "yaw": 0.0, "size": 20,
+        "center_cell": (0, 12), "distance": 1.2,
+        "information_gain": 20.0, "score": 20.0,
+        "prefer_standoff": True,
+    }
+    nav = _PlannerPort(blocked_x=(6.0,))
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=12.0,
+        initial_radius_m=12.0,
+        tile_size_m=20.0,
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is None
+    assert [probe[0] for probe in nav.probes] == [pytest.approx(6.0)]
+
+
+def test_lidar_fallback_prevents_false_exhaustion_with_collapsed_map_coverage():
+    lidar_goal = {
+        "x": 7.0, "y": 0.0, "yaw": 0.0, "size": 50,
+        "center_cell": (0, 14), "distance": 7.0,
+        "information_gain": 50.0, "visual_gain": 50,
+        "coverage_candidate": True, "lidar_candidate": True,
+        "prefer_standoff": False, "adaptive_step_m": 7.0,
+        "scene_complexity": 0.0, "forward_clearance_m": 8.0,
+        "path_clearance_m": 8.0, "heading_change": 0.0,
+    }
+    tracker = _VisibilityTracker(
+        coverage_ratio=1.0,
+        coverage_candidates=[],
+        lidar_candidates=[lidar_goal],
+    )
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=12.0,
+        initial_radius_m=12.0,
+        tile_size_m=20.0,
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(7.0)
+    assert selected["lidar_candidate"] is True
+    assert manager.snapshot()["last_selection_reason"] is None
+
+
+def test_lidar_fallback_prefers_long_open_corridor_over_short_side_step():
+    """Distance cost must not turn safe LiDAR fallback back into small steps."""
+    candidates = [
+        {
+            "x": 3.4, "y": 0.0, "yaw": math.pi / 2.0, "size": 205,
+            "center_cell": (0, 7), "distance": 3.4,
+            "information_gain": 71.75, "visual_gain": 205,
+            "coverage_candidate": True, "lidar_candidate": True,
+            "prefer_standoff": False, "adaptive_step_m": 3.4,
+            "scene_complexity": 1.0, "forward_clearance_m": 5.1,
+            "path_clearance_m": 5.1, "heading_change": math.pi / 2.0,
+        },
+        {
+            "x": 7.389, "y": 0.0, "yaw": 0.0, "size": 205,
+            "center_cell": (0, 15), "distance": 7.389,
+            "information_gain": 71.75, "visual_gain": 205,
+            "coverage_candidate": True, "lidar_candidate": True,
+            "prefer_standoff": False, "adaptive_step_m": 7.389,
+            "scene_complexity": 0.0, "forward_clearance_m": 7.989,
+            "path_clearance_m": 7.989, "heading_change": 0.0,
+        },
+    ]
+    tracker = _VisibilityTracker(
+        coverage_ratio=1.0,
+        coverage_candidates=[],
+        lidar_candidates=candidates,
+    )
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=12.0,
+        initial_radius_m=12.0,
+        tile_size_m=20.0,
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(7.389)
+    assert selected["lidar_progress_bonus"] > 0.0
+
+
+def test_open_lidar_corridor_skips_short_turn_staging_for_long_lookahead():
+    """Open-factory frontiers must not become repeated 0.8 m staging goals."""
+    tracker = _VisibilityTracker(
+        adaptive_step_m=6.0,
+        scene_complexity=0.05,
+        gains={-1.2: 20.0},
+    )
+    frontier = {
+        "x": -1.2, "y": 0.0, "yaw": math.pi, "size": 20,
+        "center_cell": (0, -12), "distance": 1.2,
+        "information_gain": 20.0, "score": 20.0,
+        "prefer_standoff": True,
+    }
+    nav = _PlannerPort()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=12.0,
+        initial_radius_m=12.0,
+        tile_size_m=20.0,
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert nav.probes[0][0] == pytest.approx(-6.0)
+    assert selected["x"] == pytest.approx(-6.0)
+    assert selected["approach_lidar_lookahead_m"] == pytest.approx(4.8)
+    assert "approach_staging_m" not in selected
+
+
+def test_visual_gain_prioritizes_unobserved_viewpoint():
+    tracker = _VisibilityTracker(
+        adaptive_step_m=8.0,
+        gains={1.0: 0.0, 2.0: 20.0},
+    )
+    candidates = [
+        {
+            "x": 1.0, "y": 0.0, "yaw": 0.0, "size": 100,
+            "center_cell": (0, 10), "distance": 1.0,
+            "information_gain": 100.0,
+        },
+        {
+            "x": 2.0, "y": 0.0, "yaw": 0.0, "size": 1,
+            "center_cell": (0, 20), "distance": 2.0,
+            "information_gain": 1.0,
+        },
+    ]
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        tile_size_m=20.0,
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(c) for c in candidates],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(2.0)
+    assert selected["visual_gain"] == pytest.approx(20.0)
+
+
+def test_already_observed_frontier_is_dropped_when_new_visual_coverage_exists():
+    class BaseGainTracker(_VisibilityTracker):
+        def rank_candidates(self, _map_msg, _robot_pose, candidates):
+            ranked = []
+            for source in candidates:
+                item = dict(source)
+                gain = 0.0 if item["x"] == 1.0 else 2.0
+                item.update({
+                    "visual_gain": gain,
+                    "information_gain": float(item["size"]) + gain * 0.35,
+                    "adaptive_step_m": 1.0,
+                    "scene_complexity": 1.0,
+                    "forward_clearance_m": 1.0,
+                    "path_clearance_m": 1.0,
+                    "heading_change": 0.0,
+                })
+                ranked.append(item)
+            return ranked
+
+    candidates = [
+        {
+            "x": 1.0, "y": 0.0, "yaw": 0.0, "size": 100,
+            "center_cell": (0, 10), "distance": 1.0,
+            "information_gain": 100.0,
+        },
+        {
+            "x": 2.0, "y": 0.0, "yaw": 0.0, "size": 1,
+            "center_cell": (0, 20), "distance": 2.0,
+            "information_gain": 1.0,
+        },
+    ]
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        tile_size_m=20.0,
+        visibility_tracker=BaseGainTracker(),
+        candidate_selector=lambda *_a, **_k: [dict(c) for c in candidates],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected.get("frontier_x", selected["x"]) == pytest.approx(2.0)
+
+
+def test_frontier_goal_inside_already_visited_viewpoint_radius_is_not_revisited():
+    frontier = {
+        "x": 1.1, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 11), "distance": 1.1,
+        "information_gain": 10.0, "prefer_standoff": True,
+    }
+    nav = _PlannerPort()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        revisit_radius_m=1.0,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+    manager.mark_visited({"x": 1.0, "y": 0.0, "path_length": 1.0})
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is None
+    assert nav.probes == []
+
+
+def test_open_space_heading_penalty_avoids_unnecessary_back_and_forth():
+    tracker = _VisibilityTracker(
+        adaptive_step_m=8.0,
+        scene_complexity=0.0,
+        gains={4.0: 10.0, -4.0: 11.0},
+    )
+    candidates = [
+        {
+            "x": 4.0, "y": 0.0, "yaw": 0.0, "size": 10,
+            "center_cell": (0, 40), "distance": 4.0,
+            "information_gain": 10.0,
+        },
+        {
+            "x": -4.0, "y": 0.0, "yaw": math.pi, "size": 11,
+            "center_cell": (0, -40), "distance": 4.0,
+            "information_gain": 11.0,
+        },
+    ]
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        tile_size_m=20.0,
+        visibility_tracker=tracker,
+        heading_weight=0.0,
+        open_space_heading_weight=1.0,
+        max_frontier_standoff_steps=0,
+        candidate_selector=lambda *_a, **_k: [dict(c) for c in candidates],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(4.0)
+
+
+def test_visual_coverage_candidate_prevents_false_frontier_exhaustion():
+    coverage_candidate = {
+        "x": 2.0, "y": 0.0, "yaw": math.pi / 2.0, "size": 30,
+        "center_cell": (0, 20), "distance": 2.0,
+        "information_gain": 10.0, "visual_gain": 30,
+        "adaptive_step_m": 4.0, "scene_complexity": 0.2,
+        "coverage_candidate": True,
+    }
+    tracker = _VisibilityTracker(
+        adaptive_step_m=4.0,
+        coverage_candidates=[coverage_candidate],
+        coverage_ratio=0.25,
+    )
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        tile_size_m=20.0,
+        visibility_tracker=tracker,
+        visual_coverage_threshold=0.9,
+        candidate_selector=lambda *_a, **_k: [],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["coverage_candidate"] is True
+    assert manager.snapshot()["last_selection_reason"] is None
+
+
+def test_visibility_snapshot_and_observation_are_exposed_for_frontend():
+    tracker = _VisibilityTracker(adaptive_step_m=5.0, scene_complexity=0.1)
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [],
+        reject_map_edge=False,
+    )
+    scan = {"ranges": [8.0], "age_sec": 0.0}
+
+    observed = manager.observe_environment(
+        _two_room_map(), (0.0, 0.0, 0.0), scan)
+    snapshot = manager.snapshot()
+
+    assert len(tracker.observations) == 1
+    assert observed["adaptive_step_m"] == pytest.approx(5.0)
+    assert snapshot["visibility"]["observed_cells"] == [
+        {"x": 0.25, "y": 0.25}
+    ]

@@ -54,6 +54,30 @@ _TABLE_TERMS = (
     "餐桌",
 )
 
+# 物品词典 (spec §2.2): NLU 扫描中文文本 → 英文 YOLO-World 类名.
+# 与 nx_mission_schema._ALIASES 对称 (两处各加一行, 新词立即可检).
+_OBJECT_TERM_ALIASES = {
+    "椅子": "chair", "座椅": "chair", "凳子": "chair",
+    "沙发": "couch", "床": "bed", "电视": "tv",
+    "冰箱": "refrigerator", "微波炉": "microwave", "烤箱": "oven",
+    "笔记本": "laptop", "杯子": "cup", "瓶子": "bottle",
+    "书": "book", "钟": "clock", "花瓶": "vase",
+    "绿植": "potted plant", "盆栽": "potted plant",
+    "背包": "backpack", "碗": "bowl", "键盘": "keyboard",
+}
+
+# "所有物体"展开 (spec §2.4): 室内家具电器大件, 不含食物/动物/室外
+_ALL_OBJECTS_TERMS = ("所有物体", "全部物体", "所有东西", "全部东西")
+_ALL_OBJECTS_CLASSES = (
+    "person", "chair", "couch", "dining table", "bed", "tv",
+    "laptop", "refrigerator", "microwave", "oven", "book",
+    "clock", "vase", "potted plant", "backpack", "bottle",
+    "cup", "bowl",
+)
+
+_TABLE_CHAIR_TERMS = ("桌椅", "桌子和椅子", "桌子椅子", "餐桌椅")
+_CHAIR_TERMS = ("所有椅子", "全部椅子", "椅子", "座椅", "凳子")
+
 _MARK_TERMS = (
     "标注",
     "标记",
@@ -128,6 +152,19 @@ def _terms_re(terms: tuple[str, ...]) -> str:
 _CURRENT_ROOM_TERMS_RE = f"(?:{_terms_re(_CURRENT_ROOM_TERMS)})"
 _KNOWN_ROOM_TERMS_RE = f"(?:{_terms_re(_KNOWN_ROOM_TERMS)})"
 
+# 运动指令触发词 (spec §1.1): 用完整词避免"搜索前面房间"误触发前进
+_MOVE_FORWARD_TERMS = ("前进", "向前走", "往前走", "直走")
+_MOVE_BACKWARD_TERMS = ("后退", "向后走", "往后走", "倒退")
+_MOVE_LEFT_TERMS = ("左转", "向左转", "左转弯", "往左转")
+_MOVE_RIGHT_TERMS = ("右转", "向右转", "右转弯", "往右转")
+
+_MOVE_DEFAULT_DISTANCE_M = 1.0
+_MOVE_DEFAULT_ANGLE_DEG = 90.0
+_MOVE_MAX_DISTANCE_M = 20.0
+
+_CN_DIGIT = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+             "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
 
 def parse_product_command(text: str) -> dict | None:
     """Parse product-grade room/person search commands.
@@ -141,12 +178,27 @@ def parse_product_command(text: str) -> dict | None:
     if _contains_any(normalized, _NEGATION_TERMS):
         return None
 
+    move = _parse_move_command(normalized)
+    if move is not None:
+        return _move_command_result(move)
+
     if _is_current_room_person_search(normalized):
         return _command_result(_CURRENT_ROOM)
 
     if _is_current_room_target_search(normalized, _TABLE_TERMS):
         return _command_result(
             _CURRENT_ROOM, target_class="dining table", target_label="所有桌子")
+
+    if (_contains_any(normalized, _CURRENT_ROOM_TERMS)
+            and (_contains_any(normalized, _SEARCH_TERMS)
+                 or _contains_any(normalized, _MARK_TERMS))):
+        obj_targets = _extract_current_room_objects(normalized)
+        if obj_targets is not None:
+            target_classes, label = obj_targets
+            # 单纯桌子已由上面 table 路径捕获; 这里处理椅/桌椅组合/物体/任意物品
+            if target_classes != ("dining table",):
+                return _multi_target_command_result(
+                    _CURRENT_ROOM, target_classes, label)
 
     named_room = _extract_named_room(normalized)
     if named_room:
@@ -234,24 +286,29 @@ def build_search_mission(room: str, target_class: str) -> SearchMissionRequest:
          "search_strategy": strategy},
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
+    request_id = f"command-{hashlib.sha256(seed).hexdigest()[:24]}"
+    if room == _CURRENT_ROOM:
+        return SearchMissionRequest.current_room(
+            (target_class,), request_id=request_id)
     return SearchMissionRequest(
-        request_id=f"command-{hashlib.sha256(seed).hexdigest()[:24]}",
+        request_id=request_id,
         room=canonical_room,
         target_classes=(target_class,),
         search_strategy=strategy,
         require_photos=True,
         mark_on_map=True,
-        max_radius_m=30.0 if room == _CURRENT_ROOM else 12.0,
+        max_radius_m=12.0,
         # 2026-07-15 实测: 180s 预算太短, 狗探索 3-4 frontier 就 time_budget_exhausted,
         # 卡住的 goal 没来得及超时 abort. 提到 480s 给多 frontier + 单 goal 超时留余量.
-        max_time_s=1800.0 if room == _CURRENT_ROOM else 900.0,
+        max_time_s=900.0,
     )
 
 
 def _normalize_text(text: str) -> str:
     if not isinstance(text, str):
         return ""
-    return re.sub(r"[\s，。！？、,.!?；;：:]+", "", text)
+    # 保留英文小数点 (运动指令 "后退1.5米" 需要, spec §1.1); 中文句号仍去除
+    return re.sub(r"[\s，。！？、,!?；;：:]+", "", text)
 
 
 def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
@@ -369,3 +426,169 @@ def _finite_float(value) -> float | None:
     if not math.isfinite(parsed):
         return None
     return parsed
+
+
+def _parse_chinese_number(text: str) -> float | None:
+    """解析中文/阿拉伯数字。
+
+    支持: 1, 1.5, 一, 两, 半, 十, 十二, 二十, 二十三, 四十五, 一百。
+    用于运动指令的距离/角度数值抽取 (spec §1.1)。
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        return float(text)
+    if text == "半":
+        return 0.5
+    if text in ("一百", "壹百"):
+        return 100.0
+    if text == "十":
+        return 10.0
+    if text.startswith("十") and len(text) == 2 and text[1] in _CN_DIGIT:
+        return float(10 + _CN_DIGIT[text[1]])
+    if len(text) == 2 and text[0] in _CN_DIGIT and text[1] == "十":
+        return float(_CN_DIGIT[text[0]] * 10)
+    if (len(text) == 3 and text[0] in _CN_DIGIT
+            and text[1] == "十" and text[2] in _CN_DIGIT):
+        return float(_CN_DIGIT[text[0]] * 10 + _CN_DIGIT[text[2]])
+    if len(text) == 1 and text in _CN_DIGIT:
+        return float(_CN_DIGIT[text])
+    return None
+
+
+def _extract_amount(text: str, unit_chars: tuple[str, ...]) -> float | None:
+    """从文本抽 "数字+单位" 的数值。
+
+    unit_chars=("米","公尺") 抽距离; ("度","°","圈") 抽角度 (圈=360°)。
+    """
+    unit_alt = "|".join(re.escape(u) for u in unit_chars)
+    m = re.search(rf"([\d.]+|[零一二两三四五六七八九十百半]+)\s*({unit_alt})", text)
+    if not m:
+        return None
+    raw, unit = m.group(1), m.group(2)
+    value = _parse_chinese_number(raw)
+    if value is None:
+        return None
+    if unit == "圈":
+        value *= 360.0
+    return value
+
+
+def _detect_move_direction(text: str) -> str | None:
+    if _contains_any(text, _MOVE_FORWARD_TERMS):
+        return "forward"
+    if _contains_any(text, _MOVE_BACKWARD_TERMS):
+        return "backward"
+    if _contains_any(text, _MOVE_LEFT_TERMS):
+        return "left"
+    if _contains_any(text, _MOVE_RIGHT_TERMS):
+        return "right"
+    return None
+
+
+def _parse_move_command(text: str) -> dict | None:
+    """解析运动指令 → {mode, direction, distance_m|angle_deg, clamped}。
+
+    mode=linear 走 nav2 (前进/后退), mode=angular 走 cmd_vel+odom (左/右转)。
+    距离上限 20m (截断标 clamped=True), 角度无上限。
+    """
+    direction = _detect_move_direction(text)
+    if direction is None:
+        return None
+    if direction in ("forward", "backward"):
+        amount = _extract_amount(text, ("米", "公尺")) or _MOVE_DEFAULT_DISTANCE_M
+        clamped = False
+        if amount > _MOVE_MAX_DISTANCE_M:
+            amount = _MOVE_MAX_DISTANCE_M
+            clamped = True
+        return {"mode": "linear", "direction": direction,
+                "distance_m": amount, "clamped": clamped}
+    amount = _extract_amount(text, ("度", "°", "圈")) or _MOVE_DEFAULT_ANGLE_DEG
+    return {"mode": "angular", "direction": direction,
+            "angle_deg": amount, "clamped": False}
+
+
+def _move_command_result(move: dict) -> dict:
+    params = {"mode": move["mode"], "direction": move["direction"],
+              "clamped": move["clamped"]}
+    if move["mode"] == "linear":
+        params["distance_m"] = move["distance_m"]
+    else:
+        params["angle_deg"] = move["angle_deg"]
+    dir_cn = {"forward": "前进", "backward": "后退",
+              "left": "左转", "right": "右转"}[move["direction"]]
+    amount = move.get("distance_m", move.get("angle_deg"))
+    unit = "米" if move["mode"] == "linear" else "度"
+    return {
+        "response": f"{dir_cn}{amount}{unit}",
+        "tasks": [{"type": "move_relative", "priority": 5, "params": params}],
+    }
+
+
+def _extract_current_room_objects(text: str) -> tuple[tuple[str, ...], str] | None:
+    """从"搜索这个房间的X"抽取目标类清单 (spec §2.1/2.3/2.4).
+
+    返回 (target_classes, label) 或 None. 顺序:
+    所有物体 → 桌椅组合 → 桌/椅/任意词典物品(可组合).
+    单纯"桌子"由调用方先行捕获, 这里不单独返回 ("dining table",).
+    """
+    if _contains_any(text, _ALL_OBJECTS_TERMS):
+        return (tuple(_ALL_OBJECTS_CLASSES), "所有物体")
+    if _contains_any(text, _TABLE_CHAIR_TERMS):
+        return (("dining table", "chair"), "桌椅")
+    found: list[str] = []
+    label_parts: list[str] = []
+    if _contains_any(text, _TABLE_TERMS):
+        found.append("dining table")
+        label_parts.append("桌子")
+    if _contains_any(text, _CHAIR_TERMS):
+        found.append("chair")
+        label_parts.append("椅子")
+    for cn, en in _OBJECT_TERM_ALIASES.items():
+        if cn in text and en not in found:
+            found.append(en)
+            label_parts.append(cn)
+    if not found:
+        return None
+    seen: set[str] = set()
+    unique = [c for c in found if not (c in seen or seen.add(c))]
+    return (tuple(unique), "、".join(label_parts))
+
+
+def _multi_target_command_result(
+    room: str, target_classes: tuple[str, ...], label: str
+) -> dict:
+    """构造多类 search_room 任务 (spec §2.3)."""
+    canonical_room = "current_room" if room == _CURRENT_ROOM else str(room)
+    strategy = "frontier_explore" if room == _CURRENT_ROOM else "next_best_view"
+    targets = tuple(target_classes)
+    seed = json.dumps(
+        {"room": canonical_room, "target_classes": list(targets),
+         "search_strategy": strategy},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    request_id = f"command-{hashlib.sha256(seed).hexdigest()[:24]}"
+    if room == _CURRENT_ROOM:
+        mission = SearchMissionRequest.current_room(targets, request_id=request_id)
+    else:
+        mission = SearchMissionRequest(
+            request_id=request_id,
+            room=canonical_room,
+            target_classes=targets,
+            search_strategy=strategy,
+            require_photos=True,
+            mark_on_map=True,
+            max_radius_m=12.0,
+            max_time_s=900.0,
+        )
+    params = mission.to_task_params()
+    if room != _CURRENT_ROOM:
+        params.pop("max_radius_m", None)
+        params.pop("max_time", None)
+    response = (f"搜索当前房间并标注{label}" if room == _CURRENT_ROOM
+                else f"搜索{room}并标注{label}")
+    return {
+        "response": response,
+        "tasks": [{"type": "search_room", "priority": 8, "params": params}],
+    }

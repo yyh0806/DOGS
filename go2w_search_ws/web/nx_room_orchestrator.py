@@ -38,6 +38,7 @@ import uuid
 from nx_mission_schema import MissionValidationError, SearchMissionRequest
 from nx_camera_calibration import resolve_camera_calibration
 from nx_exploration_manager import ExplorationManager
+from nx_visibility_coverage import VisibilityCoverageTracker
 from nx_frontier_planner import (
     find_frontier_clusters as _planner_find_frontier_clusters,
     select_frontier_candidates as _planner_select_frontier_candidates,
@@ -593,12 +594,19 @@ class RoomSearchOrchestrator:
             if getattr(task, "status", None) == "cancelled":
                 self._cancelled = True
                 return
+            begin_mission = getattr(self._nav, "begin_mission", None)
+            if callable(begin_mission):
+                begin_mission()
             self._cancelled = False
             self._current_mission_id = mission_id
             self._current_room_name = room_query
             self._current_total_wp = 0
             self._current_wp_idx = 0
             self._current_targets_found = 0
+            # A completed mission report is a static mask snapshot.  Keeping
+            # it while a new mission is live makes status broadcasts replace
+            # the new incremental mask with the old one on every heartbeat.
+            self._last_report = None
 
         # ---- frontier 探索: 无预建图模式, 绕过 RoomMap/SELECT_ROOM ----
         # plan 2026-07-03 §3.3.3: 分发前移到 run() 入口, 不进 SELECT_ROOM/RoomMap 路径
@@ -1241,6 +1249,8 @@ class RoomSearchOrchestrator:
                 params.get("radius_step_m"), 6.0)
             tile_size = self._positive_float(
                 params.get("tile_size_m"), 6.0)
+            frontier_spacing = self._positive_float(
+                params.get("frontier_spacing_m"), 1.5)
             stable_exhaustion_cycles = self._positive_int(
                 params.get("stable_exhaustion_cycles"), 3)
             mission_deadline = start_time + max_time
@@ -1251,6 +1261,41 @@ class RoomSearchOrchestrator:
                 or params.get("room") in {"__current__", "current_room"}
                 else "whole_floor"
             )
+            visibility_setting = params.get("visibility_aware_exploration")
+            visibility_enabled = (
+                exploration_mode == "current_room"
+                if visibility_setting is None
+                else not self._param_explicitly_false(visibility_setting)
+            )
+            visibility_tracker = None
+            visual_coverage_threshold = self._coverage_threshold(
+                params.get("visual_coverage_threshold"), 0.9)
+            if visibility_enabled:
+                camera_source = str(
+                    params.get("camera_source") or "c13_vis")
+                camera_calibration = resolve_camera_calibration(camera_source)
+                visibility_tracker = VisibilityCoverageTracker(
+                    camera_hfov_rad=math.radians(
+                        camera_calibration["hfov_deg"]),
+                    camera_yaw_offset_rad=math.radians(
+                        camera_calibration["effective_yaw_offset_deg"]),
+                    visual_range_m=self._positive_float(
+                        params.get("visual_range_m"), 8.0),
+                    coverage_cell_size_m=self._positive_float(
+                        params.get("coverage_cell_size_m"), 0.5),
+                    min_step_m=self._positive_float(
+                        params.get("min_exploration_step_m"), 1.0),
+                    max_step_m=self._positive_float(
+                        params.get("max_exploration_step_m"), 8.0),
+                    max_scan_age_sec=self._positive_float(
+                        params.get("max_visibility_scan_age_sec"), 1.0),
+                    visual_gain_weight=self._positive_float(
+                        params.get("visual_gain_weight"), 0.35),
+                    path_corridor_half_width_m=self._positive_float(
+                        params.get("path_corridor_half_width_m"), 0.45),
+                    obstacle_standoff_m=self._positive_float(
+                        params.get("exploration_obstacle_standoff_m"), 0.6),
+                )
             exploration = ExplorationManager(
                 navigation_port=nav,
                 mission_origin=mission_origin,
@@ -1261,6 +1306,7 @@ class RoomSearchOrchestrator:
                 initial_radius_m=initial_radius,
                 radius_step_m=radius_step,
                 tile_size_m=tile_size,
+                frontier_spacing_m=frontier_spacing,
                 stable_exhaustion_cycles=stable_exhaustion_cycles,
                 max_time_s=max_time,
                 max_distance_m=params.get("max_distance_m"),
@@ -1273,6 +1319,26 @@ class RoomSearchOrchestrator:
                     "reject_rolling_map_edge", True)),
                 planning_timeout_s=planning_timeout,
                 max_plan_probes=max_plan_probes,
+                max_path_stretch_ratio=self._positive_float(
+                    params.get("max_frontier_path_stretch_ratio"), 3.0),
+                max_goal_endpoint_error_m=self._positive_float(
+                    params.get("max_goal_endpoint_error_m"), 0.05),
+                goal_revalidation_failures=self._positive_int(
+                    params.get("goal_revalidation_failures"), 2),
+                max_path_detour_m=self._positive_float(
+                    params.get("max_frontier_path_detour_m"), 1.5),
+                max_navigation_distance_ratio=self._positive_float(
+                    params.get("max_navigation_distance_ratio"), 1.5),
+                max_navigation_distance_increase_m=self._positive_float(
+                    params.get("max_navigation_distance_increase_m"), 0.5),
+                navigation_divergence_samples=self._positive_int(
+                    params.get("navigation_divergence_samples"), 3),
+                visibility_tracker=visibility_tracker,
+                visual_coverage_threshold=visual_coverage_threshold,
+                coverage_candidate_limit=self._positive_int(
+                    params.get("coverage_candidate_limit"), 32),
+                open_space_heading_weight=self._positive_float(
+                    params.get("open_space_heading_weight"), 1.0),
                 candidate_selector=lambda *args, **kwargs: (
                     select_frontier_candidates(*args, **kwargs)),
             )
@@ -1283,9 +1349,18 @@ class RoomSearchOrchestrator:
             # Observe at the start pose before asking for a frontier. A fully
             # mapped room can legitimately have zero frontiers while a person
             # is already visible from the command location.
+            with map_lock:
+                initial_map = latest_map_box[0]
+            if initial_map is not None:
+                exploration.observe_environment(
+                    initial_map,
+                    mission_origin,
+                    self._visibility_scan_snapshot(),
+                )
             self._phase("DETECT", progress=0.0, room="__frontier__",
                         current_wp=0, total_wp=max_frontiers,
-                        info="initial_viewpoint")
+                        info="initial_viewpoint",
+                        **self._exploration_live_fields(exploration))
             unresolved_before_observation = len(store.unresolved())
             initial_observed = self._observe_people_at_viewpoint(
                 store, "__frontier__", -1, mission_origin,
@@ -1356,11 +1431,18 @@ class RoomSearchOrchestrator:
                     task.result = {"reason": "no_pose"}
                     return
 
+                exploration.observe_environment(
+                    map_msg,
+                    robot_pose,
+                    self._visibility_scan_snapshot(),
+                )
+
                 progress = float(iteration) / float(max(1, max_frontiers))
                 self._phase(
                     "FRONTIER_DETECT", progress=progress,
                     room="__frontier__", current_wp=iteration,
-                    total_wp=max_frontiers, info="reachability_preflight")
+                    total_wp=max_frontiers, info="reachability_preflight",
+                    **self._exploration_live_fields(exploration))
                 target = exploration.choose_next(map_msg, robot_pose)
                 if target is None:
                     selection_reason = exploration.snapshot().get(
@@ -1383,7 +1465,9 @@ class RoomSearchOrchestrator:
                 # NAVIGATING: 发 Nav2 goal
                 self._phase("NAVIGATING", progress=progress,
                             room="__frontier__", current_wp=iteration,
-                            total_wp=max_frontiers)
+                            total_wp=max_frontiers,
+                            **self._exploration_live_fields(
+                                exploration, target))
                 if self._check_cancel("NAVIGATING", "__frontier__"):
                     task.status = "failed"
                     task.result = {"reason": "cancelled"}
@@ -1397,6 +1481,7 @@ class RoomSearchOrchestrator:
                     os.environ.get("GO2W_EN_ROUTE_MAX_SAMPLES"), 12)
                 stop_event = threading.Event()
                 en_route_holder = {}
+                progress_holder = {}
 
                 def _en_route_worker():
                     try:
@@ -1410,7 +1495,23 @@ class RoomSearchOrchestrator:
                 en_route_thread = threading.Thread(
                     target=_en_route_worker, daemon=True,
                     name=f"en-route-{mission_id}-{iteration}")
+                progress_thread = threading.Thread(
+                    target=self._monitor_frontier_navigation_progress,
+                    args=(
+                        stop_event,
+                        exploration,
+                        nav,
+                        progress_holder,
+                        self._positive_float(
+                            params.get("navigation_progress_interval"), 0.1),
+                        self._positive_float(
+                            params.get("goal_revalidation_interval"), 1.0),
+                    ),
+                    daemon=True,
+                    name=f"frontier-progress-{mission_id}-{iteration}",
+                )
                 en_route_thread.start()
+                progress_thread.start()
                 try:
                     result = nav.send_goal_and_wait(
                         target["x"], target["y"], target.get("yaw", 0.0),
@@ -1418,6 +1519,15 @@ class RoomSearchOrchestrator:
                 finally:
                     stop_event.set()
                     en_route_thread.join(timeout=2.0)
+                    progress_thread.join(timeout=2.0)
+                progress_failure = progress_holder.get("failure")
+                if progress_failure:
+                    result = {
+                        "ok": False,
+                        "reason": str(progress_failure.get("reason") or
+                                      "navigation_progress_guard"),
+                        "progress_guard": dict(progress_failure),
+                    }
                 en_route_samples = en_route_holder.get("samples") or []
                 if en_route_samples:
                     self._ingest_en_route_samples(
@@ -1436,7 +1546,8 @@ class RoomSearchOrchestrator:
                     self._phase("FRONTIER_DETECT", progress=progress,
                                 room="__frontier__", current_wp=iteration,
                                 total_wp=max_frontiers,
-                                warning=f"frontier {iteration} skipped ({reason})")
+                                warning=f"frontier {iteration} skipped ({reason})",
+                                **self._exploration_live_fields(exploration))
                     continue
 
                 exploration.mark_visited(target)
@@ -1446,7 +1557,8 @@ class RoomSearchOrchestrator:
                 self._phase("DETECT",
                             progress=float(iteration + 1) / float(max(1, max_frontiers)),
                             room="__frontier__", current_wp=iteration,
-                            total_wp=max_frontiers)
+                            total_wp=max_frontiers,
+                            **self._exploration_live_fields(exploration))
                 if self._check_cancel("DETECT", "__frontier__"):
                     task.status = "failed"
                     task.result = {"reason": "cancelled"}
@@ -1460,6 +1572,15 @@ class RoomSearchOrchestrator:
                     task.status = "failed"
                     task.result = {"reason": "no_pose"}
                     return
+
+                with map_lock:
+                    observation_map = latest_map_box[0]
+                if observation_map is not None:
+                    exploration.observe_environment(
+                        observation_map,
+                        observe_pose,
+                        self._visibility_scan_snapshot(),
+                    )
 
                 unresolved_before_observation = len(store.unresolved())
                 observed = self._observe_people_at_viewpoint(
@@ -1513,6 +1634,8 @@ class RoomSearchOrchestrator:
             unresolved = store.unresolved()
             self._broadcast_person_markers(mission_id, markers)
             exploration_state = exploration.snapshot()
+            visibility_state = dict(
+                exploration_state.get("visibility") or {})
             # ROI 限定覆盖率 (review #3): mission_origin 圆或 room_polygon
             with map_lock:
                 final_map = latest_map_box[0]
@@ -1584,6 +1707,28 @@ class RoomSearchOrchestrator:
                     "exhaustion_streak", 0),
                 "stable_exhaustion_cycles": exploration_state.get(
                     "stable_exhaustion_cycles", stable_exhaustion_cycles),
+                "observed_cells": visibility_state.get(
+                    "observed_cells", []),
+                "visited_viewpoints": exploration_state.get(
+                    "visited_frontiers", []),
+                "coverage_ratio": visibility_state.get(
+                    "visual_coverage_ratio", 0.0),
+                "visual_coverage_ratio": visibility_state.get(
+                    "visual_coverage_ratio", 0.0),
+                "coverage_threshold": exploration_state.get(
+                    "visual_coverage_threshold", visual_coverage_threshold),
+                "coverage_cell_size_m": visibility_state.get(
+                    "coverage_cell_size_m", 0.5),
+                "visual_range_m": visibility_state.get(
+                    "visual_range_m", 0.0),
+                "scan_usable": visibility_state.get(
+                    "scan_usable", False),
+                "forward_clearance_m": visibility_state.get(
+                    "forward_clearance_m"),
+                "scene_complexity": visibility_state.get(
+                    "scene_complexity"),
+                "adaptive_step_m": visibility_state.get(
+                    "adaptive_step_m"),
                 "exploration_state": exploration_state,
                 "coverage_valid": coverage_metrics["coverage_valid"],
                 "explored_ratio": coverage_metrics["explored_ratio"],
@@ -1674,9 +1819,16 @@ class RoomSearchOrchestrator:
             return "incomplete"
         threshold = self._positive_float(
             os.environ.get("GO2W_FRONTIER_COVERAGE_THRESHOLD"), 0.90)
-        ratio = coverage_metrics.get("bounded_explored_ratio")
-        if ratio is None:
+        roi = coverage_metrics.get("roi") or {}
+        if str(roi.get("type") or "").lower() == "circle":
+            # A dynamic current-room circle is the search contract, not map
+            # padding. Unknown components touching its edge are still real,
+            # unexplored room until motion discovers a physical boundary.
             ratio = coverage_metrics.get("explored_ratio")
+        else:
+            ratio = coverage_metrics.get("bounded_explored_ratio")
+            if ratio is None:
+                ratio = coverage_metrics.get("explored_ratio")
         enclosed = coverage_metrics.get("enclosed_unknown_regions") or []
         try:
             ratio_ok = ratio is not None and float(ratio) >= threshold
@@ -1684,6 +1836,14 @@ class RoomSearchOrchestrator:
             ratio_ok = False
         if ratio_ok and not enclosed:
             return "completed"
+        if str(roi.get("type") or "").lower() == "circle" and not ratio_ok:
+            try:
+                exterior_unknown = int(
+                    coverage_metrics.get("exterior_unknown_cells", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                exterior_unknown = 1
+            if exterior_unknown > 0:
+                return "incomplete"
         return "completed_with_gaps"
 
     def _product_search_available(self) -> bool:
@@ -1945,6 +2105,64 @@ class RoomSearchOrchestrator:
             })
             results.append(localized)
         return results
+
+    def _monitor_frontier_navigation_progress(
+            self, stop_event, exploration, nav, holder, sample_interval=0.1,
+            path_revalidation_interval=1.0):
+        """Cancel a leg after divergence or a freshly blocked goal."""
+
+        interval = max(0.05, float(sample_interval))
+        revalidation_interval = max(
+            interval, float(path_revalidation_interval))
+        next_revalidation = time.monotonic() + revalidation_interval
+        while not stop_event.wait(interval):
+            pose = self._get_live_robot_pose()
+            if pose is not None:
+                try:
+                    observation = exploration.observe_navigation_pose(pose)
+                except Exception as exc:
+                    logger.debug("frontier progress observation failed: %s", exc)
+                    observation = {"ok": True, "reason": "observation_failed"}
+                if not observation.get("ok", True):
+                    holder["failure"] = dict(observation)
+                    logger.warning(
+                        "frontier navigation progress guard cancelling goal: %s",
+                        observation,
+                    )
+                    try:
+                        nav.cancel_current(str(
+                            observation.get("reason")
+                            or "navigation_progress_guard"))
+                    except Exception as exc:
+                        logger.warning(
+                            "frontier progress guard cancel failed: %s", exc)
+                    return
+            if time.monotonic() < next_revalidation:
+                continue
+            next_revalidation = time.monotonic() + revalidation_interval
+            validator = getattr(exploration, "revalidate_current_goal", None)
+            if not callable(validator):
+                continue
+            try:
+                viability = dict(validator() or {})
+            except Exception as exc:
+                logger.debug("frontier goal revalidation failed: %s", exc)
+                continue
+            if viability.get("ok", True):
+                continue
+            holder["failure"] = viability
+            logger.warning(
+                "frontier goal became unreachable; cancelling: %s",
+                viability,
+            )
+            try:
+                nav.cancel_current(str(
+                    viability.get("reason")
+                    or "goal_became_unreachable"))
+            except Exception as exc:
+                logger.warning(
+                    "frontier goal revalidation cancel failed: %s", exc)
+            return
 
     def _observe_en_route(self, stop_event, target_classes, sample_interval=0.4,
                           max_samples=12, max_duration_s=None):
@@ -2360,6 +2578,44 @@ class RoomSearchOrchestrator:
             logger.warning(f"get_scan_snapshot failed: {e}")
             return None
 
+    def _visibility_scan_snapshot(self):
+        """Return raw, timestamped LaserScan geometry for coverage planning."""
+
+        if self._node is None:
+            return None
+        getter = getattr(self._node, "get_scan_snapshot", None)
+        if not callable(getter):
+            return None
+        try:
+            data = dict(getter() or {})
+            ranges = list(data.get("ranges") or [])
+            timestamp = float(data.get("timestamp"))
+            age_sec = (
+                float(data.get("age_sec"))
+                if data.get("age_sec") is not None
+                else time.time() - timestamp
+            )
+            angle_increment = float(data.get("angle_increment", 0.0))
+            if (
+                    not ranges
+                    or not math.isfinite(timestamp) or timestamp <= 0.0
+                    or not math.isfinite(age_sec) or age_sec < 0.0
+                    or not math.isfinite(angle_increment)
+                    or angle_increment <= 0.0):
+                return None
+            return {
+                "ranges": ranges,
+                "angle_min": float(data.get("angle_min", 0.0)),
+                "angle_increment": angle_increment,
+                "range_min": float(data.get("range_min", 0.15)),
+                "range_max": float(data.get("range_max", 10.0)),
+                "timestamp": timestamp,
+                "age_sec": age_sec,
+            }
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.debug("visibility scan snapshot unavailable: %s", exc)
+            return None
+
     def _pointcloud_snapshot(self):
         """Return a fresh base_link MID360 cloud for optional height evidence."""
         if self._node is None or PointCloudSnapshot is None:
@@ -2653,6 +2909,45 @@ class RoomSearchOrchestrator:
         except Exception:
             return None
 
+    def _exploration_live_fields(self, exploration, target=None) -> dict:
+        """Flatten bounded exploration state into the front-end contract."""
+
+        snapshot = exploration.snapshot()
+        visibility = dict(snapshot.get("visibility") or {})
+        current = target or snapshot.get("current_goal")
+        candidates = []
+        if isinstance(current, dict):
+            try:
+                candidates.append({
+                    "x": float(current["x"]),
+                    "y": float(current["y"]),
+                })
+            except (KeyError, TypeError, ValueError, OverflowError):
+                candidates = []
+        return {
+            "candidate_viewpoints": candidates,
+            "visited_viewpoints": list(
+                snapshot.get("visited_frontiers") or []),
+            "observed_cells": list(
+                visibility.get("observed_cells") or []),
+            "coverage_ratio": visibility.get(
+                "visual_coverage_ratio", 0.0),
+            "visual_coverage_ratio": visibility.get(
+                "visual_coverage_ratio", 0.0),
+            "coverage_threshold": snapshot.get(
+                "visual_coverage_threshold", 0.9),
+            "coverage_cell_size_m": visibility.get(
+                "coverage_cell_size_m", 0.5),
+            "visual_range_m": visibility.get("visual_range_m", 0.0),
+            "scan_usable": visibility.get("scan_usable", False),
+            "forward_clearance_m": visibility.get(
+                "forward_clearance_m"),
+            "scene_complexity": visibility.get("scene_complexity"),
+            "adaptive_step_m": visibility.get("adaptive_step_m"),
+            "active_radius_m": snapshot.get("active_radius_m"),
+            "active_tile": snapshot.get("active_tile"),
+        }
+
     def _phase(self, phase: str, **extra) -> None:
         """推送状态机进度: ws_broadcast({"type":"search_room","data":{phase, ...}})。
         spec §5 实现要点 2: 每阶段切换 ws_broadcast。
@@ -2845,7 +3140,7 @@ class RoomSearchOrchestrator:
         nav = self._nav
         if nav is not None:
             try:
-                nav.cancel_current()
+                nav.cancel_current("mission_cancel")
             except Exception as e:
                 logger.warning(f"nav.cancel_current 异常: {e}")
         logger.info(f"RoomSearchOrchestrator.cancel 已调 (mission={self._current_mission_id})")

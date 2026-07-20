@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import deque
+import inspect
 import math
 import os
 from typing import Callable, Iterable, Mapping, Optional
@@ -12,14 +14,27 @@ _NEIGHBORS_8 = (
     (0, -1), (0, 1),
     (1, -1), (1, 0), (1, 1),
 )
-
-
 def _finite_float(value, default=0.0) -> float:
     try:
         result = float(value)
     except (TypeError, ValueError, OverflowError):
         return float(default)
     return result if math.isfinite(result) else float(default)
+
+
+def callable_accepts_keyword(callback: Callable, keyword: str) -> bool:
+    """Return whether a callback supports one keyword or arbitrary kwargs."""
+    try:
+        parameters = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        return True
+    return (
+        keyword in parameters
+        or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    )
 
 
 def _map_geometry(map_msg):
@@ -55,12 +70,99 @@ def _map_geometry(map_msg):
     return resolution, width, height, data, origin_x, origin_y, origin_yaw
 
 
+def _reachable_free_cells(
+    data,
+    width: int,
+    height: int,
+    resolution: float,
+    origin_x: float,
+    origin_y: float,
+    origin_yaw: float,
+    robot_x: float,
+    robot_y: float,
+    seed_search_radius_m: float = 1.0,
+) -> list[int]:
+    """Return the known-free component containing the robot.
+
+    Localization and occupancy grids are asynchronous, so the robot cell can
+    briefly be unknown or occupied. In that case use the nearest known-free
+    seed within a small physical radius instead of admitting remote islands.
+    Four-connected flood fill is deliberately conservative around diagonal
+    obstacle corners; Nav2 remains the final reachability authority.
+    """
+
+    dx = float(robot_x) - origin_x
+    dy = float(robot_y) - origin_y
+    cos_yaw = math.cos(origin_yaw)
+    sin_yaw = math.sin(origin_yaw)
+    local_x = cos_yaw * dx + sin_yaw * dy
+    local_y = -sin_yaw * dx + cos_yaw * dy
+    seed_col = int(math.floor(local_x / resolution))
+    seed_row = int(math.floor(local_y / resolution))
+
+    def is_free(row, col):
+        return (
+            0 <= row < height
+            and 0 <= col < width
+            and data[row * width + col] == 0
+        )
+
+    seed = None
+    if is_free(seed_row, seed_col):
+        seed = (seed_row, seed_col)
+    else:
+        radius_cells = max(
+            0, int(math.ceil(max(0.0, seed_search_radius_m) / resolution)))
+        best = None
+        for row in range(seed_row - radius_cells, seed_row + radius_cells + 1):
+            for col in range(seed_col - radius_cells, seed_col + radius_cells + 1):
+                if not is_free(row, col):
+                    continue
+                cell_dx = (col + 0.5) * resolution - local_x
+                cell_dy = (row + 0.5) * resolution - local_y
+                distance_sq = cell_dx * cell_dx + cell_dy * cell_dy
+                if distance_sq > seed_search_radius_m * seed_search_radius_m:
+                    continue
+                key = (distance_sq, row, col)
+                if best is None or key < best:
+                    best = key
+                    seed = (row, col)
+    if seed is None:
+        return []
+
+    seed_index = seed[0] * width + seed[1]
+    discovered = bytearray(width * height)
+    discovered[seed_index] = 1
+    reachable = []
+    queue = deque([seed_index])
+    while queue:
+        index = queue.popleft()
+        reachable.append(index)
+        row, col = divmod(index, width)
+        neighbors = []
+        if row > 0:
+            neighbors.append(index - width)
+        if col > 0:
+            neighbors.append(index - 1)
+        if col + 1 < width:
+            neighbors.append(index + 1)
+        if row + 1 < height:
+            neighbors.append(index + width)
+        for neighbor in neighbors:
+            if not discovered[neighbor] and data[neighbor] == 0:
+                discovered[neighbor] = 1
+                queue.append(neighbor)
+    return reachable
+
+
 def find_frontier_clusters(
     map_msg,
     robot_pose,
     visited,
     min_cluster_size: int = 3,
     revisit_radius: float = 1.0,
+    frontier_spacing_m: float = 1.5,
+    max_candidates_per_cluster: int = 64,
 ) -> list[dict]:
     """Return connected free cells bordering unknown occupancy cells.
 
@@ -79,37 +181,47 @@ def find_frontier_clusters(
     except (TypeError, IndexError):
         robot_x = robot_y = 0.0
 
-    def value(row, col):
-        if row < 0 or row >= height or col < 0 or col >= width:
-            return None
-        return data[row * width + col]
-
-    frontier_cells = []
-    for row in range(height):
-        for col in range(width):
-            if data[row * width + col] != 0:
-                continue
-            if any(value(row + dr, col + dc) == -1
-                   for dr, dc in _NEIGHBORS_8):
-                frontier_cells.append((row, col))
-    if not frontier_cells:
+    reachable_free = _reachable_free_cells(
+        data, width, height, resolution,
+        origin_x, origin_y, origin_yaw, robot_x, robot_y)
+    cell_count = width * height
+    frontier_mask = bytearray(cell_count)
+    frontier_count = 0
+    for index in reachable_free:
+        row, col = divmod(index, width)
+        is_frontier = False
+        for dr, dc in _NEIGHBORS_8:
+            neighbor_row = row + dr
+            neighbor_col = col + dc
+            if (0 <= neighbor_row < height and 0 <= neighbor_col < width
+                    and data[neighbor_row * width + neighbor_col] == -1):
+                is_frontier = True
+                break
+        if is_frontier:
+            frontier_mask[index] = 1
+            frontier_count += 1
+    if frontier_count == 0:
         return []
 
-    frontier_set = set(frontier_cells)
-    consumed = set()
     components = []
-    for seed in frontier_cells:
-        if seed in consumed:
+    for seed in range(cell_count):
+        if not frontier_mask[seed]:
             continue
         queue = [seed]
-        consumed.add(seed)
+        frontier_mask[seed] = 0
         component = []
-        for row, col in queue:
-            component.append((row, col))
+        for index in queue:
+            component.append(index)
+            row, col = divmod(index, width)
             for dr, dc in _NEIGHBORS_8:
-                neighbor = (row + dr, col + dc)
-                if neighbor in frontier_set and neighbor not in consumed:
-                    consumed.add(neighbor)
+                neighbor_row = row + dr
+                neighbor_col = col + dc
+                if not (0 <= neighbor_row < height
+                        and 0 <= neighbor_col < width):
+                    continue
+                neighbor = neighbor_row * width + neighbor_col
+                if frontier_mask[neighbor]:
+                    frontier_mask[neighbor] = 0
                     queue.append(neighbor)
         if len(component) >= max(1, int(min_cluster_size)):
             components.append(component)
@@ -126,37 +238,92 @@ def find_frontier_clusters(
             origin_y + sin_yaw * local_x + cos_yaw * local_y,
         )
 
+    spacing = _finite_float(frontier_spacing_m, 1.5)
+    if spacing <= 0.0:
+        spacing = 1.5
+    candidate_limit = max(1, int(max_candidates_per_cluster))
+    revisit_distance = max(0.0, _finite_float(revisit_radius))
+    visited_points = [
+        (_finite_float(item.get("x")), _finite_float(item.get("y")))
+        for item in (visited or [])
+        if isinstance(item, dict)
+    ]
+
     result = []
+    component_mask = bytearray(cell_count)
     for component in components:
-        representative = min(
-            component,
-            key=lambda cell: (
-                (cell_world(cell)[0] - robot_x) ** 2
-                + (cell_world(cell)[1] - robot_y) ** 2,
-                cell[0], cell[1],
-            ),
-        )
-        world_x, world_y = cell_world(representative)
-        if any(
-            math.hypot(
-                world_x - _finite_float(item.get("x")),
-                world_y - _finite_float(item.get("y")),
-            ) < max(0.0, float(revisit_radius))
-            for item in (visited or [])
-            if isinstance(item, dict)
-        ):
-            continue
-        result.append({
-            "center_cell": representative,
-            "center_world": (world_x, world_y),
-            "size": len(component),
-            "information_gain": float(len(component)),
-            "distance": math.hypot(world_x - robot_x, world_y - robot_y),
-            "touches_map_edge": any(
-                row <= 1 or col <= 1 or row >= height - 2 or col >= width - 2
-                for row, col in component
-            ),
-        })
+        # Reduce a potentially huge/noisy component to one representative per
+        # spacing-sized grid bucket in O(N). Sorting every frontier cell and
+        # rescanning the whole component for every selected candidate caused
+        # multi-second stalls on large valid occupancy grids.
+        bucket_cells = max(1, int(math.ceil(spacing / resolution)))
+        bucket_representatives = {}
+        for index in component:
+            component_mask[index] = 1
+            row, col = divmod(index, width)
+            cell = (row, col)
+            key = (row // bucket_cells, col // bucket_cells)
+            world_x, world_y = cell_world(cell)
+            rank = (
+                (world_x - robot_x) ** 2 + (world_y - robot_y) ** 2,
+                row, col,
+            )
+            current = bucket_representatives.get(key)
+            if current is None or rank < current[0]:
+                bucket_representatives[key] = (rank, index)
+        ordered = [
+            item[1] for item in sorted(
+                bucket_representatives.values(), key=lambda item: item[0])
+        ]
+        support_radius_cells = int(math.ceil(spacing / resolution))
+        support_radius_sq = (spacing / resolution) ** 2
+        selected_cells = []
+        for representative_index in ordered:
+            rep_row, rep_col = divmod(representative_index, width)
+            representative = (rep_row, rep_col)
+            world_x, world_y = cell_world(representative)
+            if any(
+                ((rep_row - row) ** 2 + (rep_col - col) ** 2)
+                * resolution * resolution < spacing * spacing
+                for row, col in selected_cells
+            ):
+                continue
+            if any(math.hypot(world_x - vx, world_y - vy) < revisit_distance
+                   for vx, vy in visited_points):
+                continue
+            support_count = 0
+            touches_map_edge = False
+            for row in range(
+                    max(0, rep_row - support_radius_cells),
+                    min(height, rep_row + support_radius_cells + 1)):
+                dr_sq = (row - rep_row) ** 2
+                for col in range(
+                        max(0, rep_col - support_radius_cells),
+                        min(width, rep_col + support_radius_cells + 1)):
+                    if dr_sq + (col - rep_col) ** 2 > support_radius_sq:
+                        continue
+                    if not component_mask[row * width + col]:
+                        continue
+                    support_count += 1
+                    touches_map_edge = bool(
+                        touches_map_edge
+                        or row <= 1 or col <= 1
+                        or row >= height - 2 or col >= width - 2)
+            selected_cells.append(representative)
+            result.append({
+                "center_cell": representative,
+                "center_world": (world_x, world_y),
+                "size": support_count,
+                "cluster_size": len(component),
+                "information_gain": float(support_count),
+                "distance": math.hypot(
+                    world_x - robot_x, world_y - robot_y),
+                "touches_map_edge": touches_map_edge,
+            })
+            if len(selected_cells) >= candidate_limit:
+                break
+        for index in component:
+            component_mask[index] = 0
     return result
 
 
@@ -219,6 +386,8 @@ def select_frontier_candidates(
     failure_counts: Optional[Mapping] = None,
     path_lengths: Optional[Mapping] = None,
     cluster_finder: Callable = find_frontier_clusters,
+    frontier_spacing_m: float = 1.5,
+    max_candidates_per_cluster: int = 64,
     distance_weight: Optional[float] = None,
     heading_weight: float = 0.0,
     failure_penalty: float = 1.0,
@@ -229,8 +398,15 @@ def select_frontier_candidates(
     information-gain (b) remain special cases of the configurable weights.
     """
 
+    cluster_kwargs = {}
+    if callable_accepts_keyword(cluster_finder, "frontier_spacing_m"):
+        cluster_kwargs["frontier_spacing_m"] = frontier_spacing_m
+    if callable_accepts_keyword(cluster_finder, "max_candidates_per_cluster"):
+        cluster_kwargs["max_candidates_per_cluster"] = (
+            max_candidates_per_cluster)
     clusters = cluster_finder(
-        map_msg, robot_pose, visited, min_cluster_size, revisit_radius)
+        map_msg, robot_pose, visited, min_cluster_size, revisit_radius,
+        **cluster_kwargs)
     if reject_map_edge:
         clusters = [item for item in clusters if not item.get("touches_map_edge")]
     try:
@@ -282,6 +458,7 @@ def select_frontier_candidates(
             "distance": _finite_float(cluster["distance"]),
             "center_cell": cell,
             "touches_map_edge": bool(cluster.get("touches_map_edge")),
+            "prefer_standoff": True,
             "heading_change": heading_change,
             "failure_count": failure_count,
         }
@@ -311,4 +488,3 @@ def select_next_frontier(map_msg, robot_pose, visited, **kwargs):
 
 # Compatibility name used by older tests and offline scripts.
 _find_frontier_clusters = find_frontier_clusters
-

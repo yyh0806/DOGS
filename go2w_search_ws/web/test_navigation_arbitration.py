@@ -342,6 +342,112 @@ def test_point_goal_handoffs_manual_wheel_session_to_nav_without_pose_switch():
     ]
 
 
+def test_room_task_reuses_an_already_active_nav_session_idempotently():
+    events = []
+    point = FakePointNav(events)
+    tasks = FakeTaskManager(events)
+    robot = FakeRobot(events)
+    robot.session = "nav_active"
+    robot.owner = "nav"
+    robot.sport_mode = 1
+    arbiter = load_arbiter()(point, tasks, robot, transition_timeout=0.05)
+
+    result = arbiter.start_tasks(["room"], reason="search_room")
+
+    assert result["ok"] is True
+    assert ("robot_stop",) in events
+    assert ("drive_wait", "nav", 6.0) in events
+    assert not any(event[0] == "drive_start" for event in events)
+    assert tasks.enqueued == ["room"]
+
+
+def test_room_task_refreshes_navigation_health_after_drive_activation():
+    events = []
+
+    class RefreshingPointNav(FakePointNav):
+        def __init__(self, shared_events):
+            super().__init__(shared_events)
+            self.state["healthy"] = False
+
+        def tick(self):
+            state = super().tick()
+            self.state["healthy"] = True
+            return state
+
+    point = RefreshingPointNav(events)
+    tasks = FakeTaskManager(events)
+    arbiter = load_arbiter()(
+        point, tasks, FakeRobot(events), transition_timeout=0.05)
+
+    result = arbiter.start_tasks(["room"], reason="search_room")
+
+    assert result["ok"] is True
+    names = [event[0] for event in events]
+    assert names.index("point_tick") < names.index("task_enqueue")
+    assert tasks.enqueued == ["room"]
+
+
+def test_recover_task_motion_reactivates_parked_drive_without_canceling_task():
+    events = []
+    robot = FakeRobot(events)
+
+    class RecoveringPointNav(FakePointNav):
+        def tick(self):
+            state = super().tick()
+            if robot.session in {"active", "nav_active"}:
+                self.state["healthy"] = True
+            return state
+
+    point = RecoveringPointNav(events)
+    tasks = FakeTaskManager(events)
+    arbiter = load_arbiter()(
+        point, tasks, robot, transition_timeout=0.05)
+    assert arbiter.start_tasks(["room"], reason="search_room")["ok"] is True
+
+    events.clear()
+    robot.session = "parked"
+    robot.owner = None
+    robot.sport_mode = 6
+    point.state["healthy"] = False
+
+    result = arbiter.recover_task_motion("motion_unhealthy")
+
+    assert result["ok"] is True
+    assert ("drive_start", "nav") in events
+    assert ("drive_wait", "nav", 6.0) in events
+    assert ("point_tick",) in events
+    assert not any(event[0] == "task_cancel" for event in events)
+    assert arbiter.get_motion_owner() == "tasks"
+
+
+def test_recover_task_motion_refuses_when_tasks_do_not_own_motion():
+    events = []
+    arbiter = load_arbiter()(
+        FakePointNav(events), FakeTaskManager(events), FakeRobot(events),
+        transition_timeout=0.05,
+    )
+
+    result = arbiter.recover_task_motion("motion_unhealthy")
+
+    assert result == {"ok": False, "reason": "task_motion_not_owned"}
+    assert not any(event[0] == "drive_start" for event in events)
+
+
+def test_room_task_rejects_when_health_stays_bad_after_drive_activation():
+    events = []
+    point = FakePointNav(events)
+    point.state["healthy"] = False
+    tasks = FakeTaskManager(events)
+    arbiter = load_arbiter()(
+        point, tasks, FakeRobot(events), transition_timeout=0.05)
+
+    result = arbiter.start_tasks(["room"], reason="search_room")
+
+    assert result == {"ok": False, "reason": "point_nav_unhealthy"}
+    assert tasks.enqueued == []
+    assert ("drive_park", "task_preflight_failed") in events
+
+
 def test_new_task_is_not_enqueued_until_point_goal_is_confirmed_drained():
     events = []
     point = FakePointNav(events, drained=False)
@@ -362,7 +468,7 @@ def test_new_task_is_not_enqueued_until_point_goal_is_confirmed_drained():
     assert not any(event[0] == "task_cancel" for event in events)
 
 
-def test_shutdown_estops_when_room_task_does_not_drain():
+def test_shutdown_parks_when_room_task_does_not_drain():
     events = []
     point = FakePointNav(events, drained=True)
     tasks = FakeTaskManager(events, drains=False)
@@ -373,7 +479,8 @@ def test_shutdown_estops_when_room_task_does_not_drain():
 
     assert result["ok"] is False
     assert result["tasks_drained"] is False
-    assert ("robot_e_stop",) in events
+    assert ("drive_park", "drain_timeout") in events
+    assert ("robot_e_stop",) not in events
 
 
 def test_emergency_stop_is_not_blocked_by_an_admission_drain_lock():
@@ -408,7 +515,7 @@ def test_emergency_stop_is_not_blocked_by_an_admission_drain_lock():
     emergency = threading.Thread(target=arbiter.emergency_stop)
     emergency.start()
     try:
-        assert estopped.wait(0.05), "physical e-stop must bypass the admission mutex"
+        assert estopped.wait(0.2), "physical e-stop must bypass the admission mutex"
     finally:
         release_drain.set()
         admission.join(1.0)

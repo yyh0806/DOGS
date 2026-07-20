@@ -249,14 +249,25 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
       <span class="quick-btn" onclick="quickCmd('后退一米')">后退</span>
       <span class="quick-btn" onclick="quickCmd('左转90度')">左转</span>
       <span class="quick-btn" onclick="quickCmd('右转90度')">右转</span>
+      <span class="quick-btn" onclick="quickCmd('前进')">前进1米</span>
+      <span class="quick-btn" onclick="quickCmd('后退')">后退1米</span>
+      <span class="quick-btn" onclick="quickCmd('左转')">左转90°</span>
+      <span class="quick-btn" onclick="quickCmd('右转')">右转90°</span>
       <span class="quick-btn" onclick="quickCmd('停下来')">停止</span>
       <span class="quick-btn" onclick="quickCmd('返回起点')">返回</span>
       <span class="quick-btn" style="background:#1976d2;color:#fff;" title="一键测端到端: NLU → search_room task (无需麦克风)" onclick="quickCmd('去搜索这个房间，把所有人标注出来')">🎤 房间搜人</span>
+      <span class="quick-btn" style="background:#2e7d32;color:#fff;" title="直接 /api/search_room 绕过 NLU: 搜人" onclick="searchRoom(['person'])">搜人</span>
+      <span class="quick-btn" style="background:#2e7d32;color:#fff;" title="搜桌椅 (多类)" onclick="searchRoom(['dining table','chair'])">搜桌椅</span>
+      <span class="quick-btn" style="background:#2e7d32;color:#fff;" title="搜所有物体 (18 类室内清单)" onclick="searchRoom('all_objects')">搜物体</span>
     </div>
   </div>
   <div class="action-row">
     <div class="ctrl-group">
+      <button class="btn primary" style="background:#2e7d32;" onclick="searchRoom()" title="搜索当前房间: frontier 探索全屋 + YOLO best-effort 标注可见人员 (v2, 直接 /api/search_room 不经 NLU)">🔍 搜索房间</button>
       <button class="btn" onclick="stand()">站立</button>
+      <button class="btn" id="confirmStandBtn" onclick="confirmStand()" disabled>确认站立</button>
+      <button class="btn" id="balanceBtn" onclick="enterBalance()" disabled>进入平衡</button>
+      <button class="btn" id="confirmBalanceBtn" onclick="confirmBalance()" disabled>确认平衡</button>
       <button class="btn primary" onclick="activateDog()" title="激活狗进入轮式可导航态 (parked→active); 进入轮式平衡时轮子可能小幅移动, 请确保场地空旷">激活</button>
       <!-- 2026-07-18 删急停按钮: 用户要求去掉 (导航取消误判为急停); 急停改用遥控器或键盘(空格已取消). eStop() 函数保留备用. -->
     </div>
@@ -292,6 +303,16 @@ let latestDetectionsBySource = {};
 let latestLocateResult = null, latestLocateTs = 0;
 const LOCATE_TTL_MS = 30000;  // locate worker 后台 ~5-21s/帧异步推; TTL 30s 防 worker 挂了残留陈旧框
 const _LOCATE_GENERIC = new Set(['', 'object', 'objects']);  // CLI grounding 无 class 时的泛化占位
+const DETECTION_MIN_CONFIDENCE = 0.8;
+function filterDetectionResults(detections) {
+  if (!Array.isArray(detections)) return [];
+  return detections.filter(detection => {
+    const confidence = Number(detection && (
+      detection.confidence ?? detection.score ?? detection.probability ?? 0
+    ));
+    return Number.isFinite(confidence) && confidence >= DETECTION_MIN_CONFIDENCE;
+  });
+}
 function _isGenericClass(s) { return _LOCATE_GENERIC.has((s || '').toLowerCase()); }
 const DETECTION_VIEWS = {
   c13_vis: { overlayId: 'detectOverlay', imgId: 'videoImg' },
@@ -467,6 +488,35 @@ function applyNavState(state, source = 'ws') {
 function applyNavStateForEpoch(state, source, epoch) {
   if (epoch !== navConnectionEpoch) return false;
   return applyNavState(state, source);
+}
+
+function applyRoomNavigationState(roomNav) {
+  if (!map || !roomNav || typeof roomNav !== 'object') return false;
+  const report = roomNav.last_report && typeof roomNav.last_report === 'object'
+    ? roomNav.last_report : null;
+  const markers = Array.isArray(roomNav.target_markers)
+    ? roomNav.target_markers
+    : (report && Array.isArray(report.detections) ? report.detections : []);
+  const roomSearch = report ? {
+    mission_id: report.mission_id,
+    phase: report.status === 'completed' ? 'DONE' : String(report.status || '').toUpperCase(),
+    room: report.room,
+    room_area: report.area,
+    observed_cells: report.observed_cells,
+    visited_viewpoints: report.visited_viewpoints,
+    coverage_ratio: report.coverage_ratio,
+    coverage_threshold: report.coverage_threshold,
+    visual_range_m: report.visual_range_m,
+    coverage_cell_size_m: report.coverage_cell_size_m,
+    adaptive_step_m: report.adaptive_step_m,
+    scene_complexity: report.scene_complexity,
+    forward_clearance_m: report.forward_clearance_m,
+  } : (roomNav.search_state || {});
+  map.update({
+    target_markers: filterDetectionResults(markers),
+    room_search: roomSearch,
+  });
+  return true;
 }
 
 /** 地图点选 → map-frame NavigateToPose；目标朝向默认指向点击位置。 */
@@ -683,6 +733,27 @@ function sendCmd() {
   controlFetch('/api/command', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
 }
 function quickCmd(text) { document.getElementById('cmdInput').value = text; sendCmd(); }
+// 搜索当前房间 (v2 frontier 探索 + YOLO 标人): 直接调 /api/search_room, 绕过 NLU 解析 (比 🎤 quick-btn 更可靠)
+function searchRoom(targetClasses) {
+  let tc = targetClasses || ['person'];
+  if (tc === 'all_objects') {
+    tc = ['person','chair','couch','dining table','bed','tv','laptop','refrigerator','microwave','oven','book','clock','vase','potted plant','backpack','bottle','cup','bowl'];
+  }
+  controlFetch('/api/search_room', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ room: 'current_room', target_classes: tc })
+  }).then(r => r.json()).then(d => {
+    const el = document.getElementById('taskCount');
+    if (d.ok) {
+      if (el) el.textContent = '房间搜索已启动 (frontier 探索)';
+      console.log('search_room admitted:', d.mission_request && d.mission_request.request_id);
+    } else {
+      if (el) el.textContent = '搜索启动失败: ' + (d.reason || '未知');
+      console.warn('search_room rejected:', d);
+    }
+  }).catch(e => console.warn('search_room error:', e));
+}
 
 // ---- 语音输入 (浏览器 Web Speech API: PC 本地识别后发给 NX, 走 /api/command → parse_product_command) ----
 // 对抗性设计:
@@ -858,6 +929,7 @@ function taskHTML(t) {
 function updateDetList(dets) {
   const el = document.getElementById('detList');
   if (!el) return;
+  dets = filterDetectionResults(dets);
   if (Array.isArray(dets) && dets.some(d => d && (d.crop_url || d.frame_url))) {
     updateDetectionListRich(dets);
     return;
@@ -919,6 +991,7 @@ function safeSnapshotUrl(url) {
 function updateDetectionListRich(dets) {
   const el = document.getElementById('detList');
   if (!el) return;
+  dets = filterDetectionResults(dets);
   if (!Array.isArray(dets) || !dets.length) {
     el.innerHTML = '<div class="det-empty">无检测</div>';
     return;
@@ -973,9 +1046,14 @@ function updateDetectionBadge() {
 
 function detectionStreamFromPayload(payload, source) {
   if (payload && Array.isArray(payload.streams)) {
-    return payload.streams.find(s => String(s.source || '') === source) || { source, detections: [] };
+    const stream = payload.streams.find(s => String(s.source || '') === source);
+    return stream
+      ? { ...stream, detections: filterDetectionResults(stream.detections) }
+      : { source, detections: [] };
   }
-  const all = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.detections) ? payload.detections : []);
+  const all = filterDetectionResults(
+    Array.isArray(payload) ? payload : (payload && payload.detections),
+  );
   const hasSource = all.some(d => d && d.source);
   const dets = source && hasSource ? all.filter(d => String(d.source || '') === source) : all;
   return {
@@ -991,7 +1069,7 @@ function renderDetectionOverlay(payload, source = 'c13_vis') {
   const overlay = document.getElementById(view.overlayId);
   if (!overlay) return;
   const stream = detectionStreamFromPayload(payload, source);
-  const dets = Array.isArray(stream.detections) ? stream.detections : [];
+  const dets = filterDetectionResults(stream.detections);
   latestDetectionsBySource[source] = dets;
   latestDetections = Object.values(latestDetectionsBySource).flat();
   overlay.innerHTML = '';
@@ -1046,14 +1124,14 @@ function renderDetectionStreams(payload) {
     if (view) renderedOverlays.add(view.overlayId);
   }
   latestDetections = Array.isArray(payload && payload.detections)
-    ? payload.detections
+    ? filterDetectionResults(payload.detections)
     : Object.values(latestDetectionsBySource).flat();
   updateDetectionBadge();
 }
 
 function collectLocateBoxes(result) {
   if (!result) return [];
-  const dets = Array.isArray(result.detections) ? result.detections : [];
+  const dets = filterDetectionResults(result.detections);
   const boxes = dets
     .filter(d => Array.isArray(d.bbox) && d.bbox.length >= 4)
     .map(d => {
@@ -1068,7 +1146,8 @@ function collectLocateBoxes(result) {
       };
     });
   if (boxes.length) return boxes;
-  if (Array.isArray(result.bbox) && result.bbox.length >= 4) {
+  if (Array.isArray(result.bbox) && result.bbox.length >= 4
+      && filterDetectionResults([result]).length) {
     return [{
       bbox: result.bbox,
       label: result.label || result.target || 'object',
@@ -1205,6 +1284,7 @@ function connectWS() {
     fetch('/api/status').then(r => r.json()).then(d => {
       if (d.navigation) applyNavigationReadiness(d.navigation);
       if (d.point_nav) applyNavStateForEpoch(d.point_nav, 'status', socketEpoch);
+      if (d.room_nav) applyRoomNavigationState(d.room_nav);
       updatePoseInfo(d.localization, d.odometry);
     }).catch(() => {});
   };
@@ -1247,13 +1327,15 @@ function connectWS() {
         }
       } else if (data.type === 'detections') {
         const payload = data.data || {};
-        const dets = Array.isArray(payload.detections) ? payload.detections : [];
+        const dets = filterDetectionResults(payload.detections);
         renderDetectionStreams(payload);
         updateDetectionListRich(dets);
       } else if (data.type === 'costmap') {
         if (map) map.update({ costmap: data.data });
       } else if (data.type === 'costmap_global') {
         if (map) map.update({ costmap_global: data.data });
+      } else if (data.type === 'occupancy_map') {
+        if (map) map.update({ occupancy_map: data.data });
       } else if (data.type === 'plan') {
         if (map) map.update({ plan: data.data });
       } else if (data.type === 'slam') {
@@ -1278,25 +1360,7 @@ function connectWS() {
           }
         }
         if (data.point_nav) applyNavStateForEpoch(data.point_nav, 'ws', socketEpoch);
-        if (data.room_nav && map) {
-          const roomNav = data.room_nav;
-          const report = roomNav.last_report && typeof roomNav.last_report === 'object'
-            ? roomNav.last_report : null;
-          const markers = Array.isArray(roomNav.target_markers)
-            ? roomNav.target_markers
-            : (report && Array.isArray(report.detections) ? report.detections : []);
-          const roomSearch = report ? {
-            phase: report.status === 'completed' ? 'DONE' : String(report.status || '').toUpperCase(),
-            room: report.room,
-            room_area: report.area,
-            observed_cells: report.observed_cells,
-            visited_viewpoints: report.visited_viewpoints,
-            coverage_ratio: report.coverage_ratio,
-            coverage_threshold: report.coverage_threshold,
-            visual_range_m: report.visual_range_m,
-          } : (roomNav.search_state || {});
-          map.update({ target_markers: markers, room_search: roomSearch });
-        }
+        if (data.room_nav) applyRoomNavigationState(data.room_nav);
         if (data.det_list) updateDetList(data.det_list);
       } else if (data.type === 'tasks') {
         updateTasks(data.data);
@@ -1318,7 +1382,9 @@ function connectWS() {
         // 搜索发现目标 → 在地图标记 (detMarks 已在 slam 里)
         if (data.data && data.data.found) console.log('[搜索发现]', data.data.found);
       } else if (data.type === 'target_markers' || data.type === 'person_markers') {
-        const markers = data.data && Array.isArray(data.data.markers) ? data.data.markers : [];
+        const markers = filterDetectionResults(
+          data.data && Array.isArray(data.data.markers) ? data.data.markers : [],
+        );
         if (map) map.update({ target_markers: markers });
         updateDetList(markers);
       } else if (data.type === 'search_room') {
@@ -1326,10 +1392,11 @@ function connectWS() {
         console.log('[房间搜索]', data.data || {});
       } else if (data.type === 'mission_report') {
         const report = data.data || {};
-        const detections = Array.isArray(report.detections) ? report.detections : [];
+        const detections = filterDetectionResults(report.detections);
         if (map) map.update({
           target_markers: detections,
           room_search: {
+            mission_id: report.mission_id,
             phase: report.status === 'completed' ? 'DONE' : String(report.status || 'REPORT').toUpperCase(),
             room: report.room,
             room_area: report.area,
@@ -1338,6 +1405,10 @@ function connectWS() {
             coverage_ratio: report.coverage_ratio,
             coverage_threshold: report.coverage_threshold,
             visual_range_m: report.visual_range_m,
+            coverage_cell_size_m: report.coverage_cell_size_m,
+            adaptive_step_m: report.adaptive_step_m,
+            scene_complexity: report.scene_complexity,
+            forward_clearance_m: report.forward_clearance_m,
           },
         });
         updateDetList(detections);
@@ -1374,6 +1445,7 @@ setInterval(() => {
     if (d.tasks) updateTasks(d.tasks);
     if (d.navigation) applyNavigationReadiness(d.navigation);
     if (d.point_nav) applyNavStateForEpoch(d.point_nav, 'status', statusEpoch);
+    if (d.room_nav) applyRoomNavigationState(d.room_nav);
     updatePoseInfo(d.localization, d.odometry);
     document.getElementById('nxDot').className = 'status-dot on';
   }).catch(() => {

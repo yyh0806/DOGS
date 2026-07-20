@@ -10,20 +10,52 @@ from uuid import uuid4
 
 
 SCHEMA_VERSION = 1
+CURRENT_ROOM_MAX_RADIUS_M = 120.0
+CURRENT_ROOM_MAX_TIME_S = 7200.0
+CURRENT_ROOM_INITIAL_RADIUS_M = 16.0
+CURRENT_ROOM_RADIUS_STEP_M = 16.0
+CURRENT_ROOM_TILE_SIZE_M = 16.0
+CURRENT_ROOM_MAX_FRONTIERS = 1000
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,128}$")
 _TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$")
 _ROOM_RE = re.compile(r"^[A-Za-z0-9_\-\u4e00-\u9fff]{1,64}$")
 _STRATEGIES = frozenset({"frontier_explore", "next_best_view"})
 _ALIASES = {
+    # 人
     "人": "person",
     "人员": "person",
     "所有人": "person",
     "person": "person",
     "people": "person",
+    # 桌
     "桌子": "dining table",
     "餐桌": "dining table",
+    "所有桌子": "dining table",
     "table": "dining table",
     "dining table": "dining table",
+    # 椅
+    "椅子": "chair",
+    "座椅": "chair",
+    "凳子": "chair",
+    "所有椅子": "chair",
+    "chair": "chair",
+    # 室内家具电器 (spec §2.2, YOLO-World 开放词汇, 新词立即可检)
+    "沙发": "couch", "couch": "couch",
+    "床": "bed", "bed": "bed",
+    "电视": "tv", "tv": "tv",
+    "冰箱": "refrigerator", "refrigerator": "refrigerator",
+    "微波炉": "microwave", "microwave": "microwave",
+    "烤箱": "oven", "oven": "oven",
+    "笔记本": "laptop", "laptop": "laptop",
+    "杯子": "cup", "cup": "cup",
+    "瓶子": "bottle", "bottle": "bottle",
+    "书": "book", "book": "book",
+    "钟": "clock", "clock": "clock",
+    "花瓶": "vase", "vase": "vase",
+    "绿植": "potted plant", "盆栽": "potted plant", "potted plant": "potted plant",
+    "背包": "backpack", "backpack": "backpack",
+    "碗": "bowl", "bowl": "bowl",
+    "键盘": "keyboard", "keyboard": "keyboard",
 }
 
 
@@ -60,6 +92,57 @@ def canonicalize_search_tasks(tasks: object) -> list[dict]:
     }]
 
 
+_MOVE_MODES = frozenset({"linear", "angular"})
+_MOVE_DIRECTIONS = frozenset({"forward", "backward", "left", "right"})
+
+
+def canonicalize_move_tasks(tasks: object) -> list[dict]:
+    """Validate exactly one move_relative task and return its canonical shape."""
+    if not isinstance(tasks, list) or len(tasks) != 1:
+        raise MissionValidationError(
+            "exactly one move_relative task is required")
+    task = tasks[0]
+    if not isinstance(task, Mapping) or task.get("type") != "move_relative":
+        raise MissionValidationError("task type must be move_relative")
+    raw = task.get("params", {})
+    if not isinstance(raw, Mapping):
+        raise MissionValidationError("move params must be an object")
+    mode = str(raw.get("mode", ""))
+    direction = str(raw.get("direction", ""))
+    if mode not in _MOVE_MODES:
+        raise MissionValidationError("invalid move mode")
+    if direction not in _MOVE_DIRECTIONS:
+        raise MissionValidationError("invalid move direction")
+    params: dict = {"mode": mode, "direction": direction,
+                    "clamped": bool(raw.get("clamped", False))}
+    if mode == "linear":
+        distance = _finite_or_raise(raw.get("distance_m"), "distance_m")
+        if distance <= 0.0:
+            raise MissionValidationError("distance_m must be positive")
+        params["distance_m"] = distance
+    else:
+        angle = _finite_or_raise(raw.get("angle_deg"), "angle_deg")
+        if angle <= 0.0:
+            raise MissionValidationError("angle_deg must be positive")
+        params["angle_deg"] = angle
+    try:
+        priority = int(task.get("priority", 5))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise MissionValidationError("invalid task priority") from exc
+    priority = max(0, min(10, priority))
+    return [{"type": "move_relative", "priority": priority, "params": params}]
+
+
+def _finite_or_raise(value, name: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise MissionValidationError(f"{name} must be a finite number") from exc
+    if not math.isfinite(parsed):
+        raise MissionValidationError(f"{name} must be a finite number")
+    return parsed
+
+
 @dataclass(frozen=True)
 class SearchMissionRequest:
     request_id: str
@@ -74,6 +157,7 @@ class SearchMissionRequest:
     initial_radius_m: float = 6.0
     radius_step_m: float = 6.0
     tile_size_m: float = 6.0
+    frontier_spacing_m: float = 1.5
     stable_exhaustion_cycles: int = 3
     max_frontiers: int = 200
     max_plan_probes_per_cycle: int = 12
@@ -97,6 +181,7 @@ class SearchMissionRequest:
         initial_radius = float(self.initial_radius_m)
         radius_step = float(self.radius_step_m)
         tile_size = float(self.tile_size_m)
+        frontier_spacing = float(self.frontier_spacing_m)
         if not math.isfinite(radius) or radius <= 0.0:
             raise MissionValidationError("max_radius_m must be finite and positive")
         if not math.isfinite(duration) or duration <= 0.0:
@@ -112,6 +197,9 @@ class SearchMissionRequest:
                 "radius_step_m must be finite and positive")
         if not math.isfinite(tile_size) or tile_size <= 0.0:
             raise MissionValidationError("tile_size_m must be finite and positive")
+        if not math.isfinite(frontier_spacing) or frontier_spacing <= 0.0:
+            raise MissionValidationError(
+                "frontier_spacing_m must be finite and positive")
         integer_fields = {
             "stable_exhaustion_cycles": self.stable_exhaustion_cycles,
             "max_frontiers": self.max_frontiers,
@@ -135,6 +223,7 @@ class SearchMissionRequest:
         object.__setattr__(self, "initial_radius_m", initial_radius)
         object.__setattr__(self, "radius_step_m", radius_step)
         object.__setattr__(self, "tile_size_m", tile_size)
+        object.__setattr__(self, "frontier_spacing_m", frontier_spacing)
         for name, value in normalized_integers.items():
             object.__setattr__(self, name, value)
         object.__setattr__(self, "require_photos", bool(self.require_photos))
@@ -149,8 +238,12 @@ class SearchMissionRequest:
             search_strategy="frontier_explore",
             require_photos=True,
             mark_on_map=True,
-            max_radius_m=30.0,
-            max_time_s=1800.0,
+            max_radius_m=CURRENT_ROOM_MAX_RADIUS_M,
+            max_time_s=CURRENT_ROOM_MAX_TIME_S,
+            initial_radius_m=CURRENT_ROOM_INITIAL_RADIUS_M,
+            radius_step_m=CURRENT_ROOM_RADIUS_STEP_M,
+            tile_size_m=CURRENT_ROOM_TILE_SIZE_M,
+            max_frontiers=CURRENT_ROOM_MAX_FRONTIERS,
         )
 
     @classmethod
@@ -160,23 +253,35 @@ class SearchMissionRequest:
         targets = value.get("target_classes")
         if not isinstance(targets, (list, tuple)):
             raise MissionValidationError("target_classes must be a list")
+        room = str(value.get("room", ""))
+        current_room = room == "current_room"
         try:
             return cls(
                 schema_version=int(value.get("schema_version", SCHEMA_VERSION)),
                 request_id=str(value.get("request_id", "")),
-                room=str(value.get("room", "")),
+                room=room,
                 target_classes=tuple(targets),
                 search_strategy=str(value.get("search_strategy", "")),
                 require_photos=value.get("require_photos") is True,
                 mark_on_map=value.get("mark_on_map") is True,
                 max_radius_m=float(value.get("max_radius_m")),
                 max_time_s=float(value.get("max_time_s")),
-                initial_radius_m=float(value.get("initial_radius_m", 6.0)),
-                radius_step_m=float(value.get("radius_step_m", 6.0)),
-                tile_size_m=float(value.get("tile_size_m", 6.0)),
+                initial_radius_m=float(value.get(
+                    "initial_radius_m",
+                    CURRENT_ROOM_INITIAL_RADIUS_M if current_room else 6.0)),
+                radius_step_m=float(value.get(
+                    "radius_step_m",
+                    CURRENT_ROOM_RADIUS_STEP_M if current_room else 6.0)),
+                tile_size_m=float(value.get(
+                    "tile_size_m",
+                    CURRENT_ROOM_TILE_SIZE_M if current_room else 6.0)),
+                frontier_spacing_m=float(value.get(
+                    "frontier_spacing_m", 1.5)),
                 stable_exhaustion_cycles=int(value.get(
                     "stable_exhaustion_cycles", 3)),
-                max_frontiers=int(value.get("max_frontiers", 200)),
+                max_frontiers=int(value.get(
+                    "max_frontiers",
+                    CURRENT_ROOM_MAX_FRONTIERS if current_room else 200)),
                 max_plan_probes_per_cycle=int(value.get(
                     "max_plan_probes_per_cycle", 12)),
             )
@@ -213,16 +318,28 @@ class SearchMissionRequest:
                 require_photos=value.get("require_photos", True) is True,
                 mark_on_map=value.get("mark_on_map", True) is True,
                 max_radius_m=float(value.get(
-                    "max_radius_m", 30.0 if room == "current_room" else 12.0)),
+                    "max_radius_m", CURRENT_ROOM_MAX_RADIUS_M
+                    if room == "current_room" else 12.0)),
                 max_time_s=float(value.get(
                     "max_time_s", value.get(
-                        "max_time", 1800.0 if room == "current_room" else 900.0))),
-                initial_radius_m=float(value.get("initial_radius_m", 6.0)),
-                radius_step_m=float(value.get("radius_step_m", 6.0)),
-                tile_size_m=float(value.get("tile_size_m", 6.0)),
+                        "max_time", CURRENT_ROOM_MAX_TIME_S
+                        if room == "current_room" else 900.0))),
+                initial_radius_m=float(value.get(
+                    "initial_radius_m", CURRENT_ROOM_INITIAL_RADIUS_M
+                    if room == "current_room" else 6.0)),
+                radius_step_m=float(value.get(
+                    "radius_step_m", CURRENT_ROOM_RADIUS_STEP_M
+                    if room == "current_room" else 6.0)),
+                tile_size_m=float(value.get(
+                    "tile_size_m", CURRENT_ROOM_TILE_SIZE_M
+                    if room == "current_room" else 6.0)),
+                frontier_spacing_m=float(value.get(
+                    "frontier_spacing_m", 1.5)),
                 stable_exhaustion_cycles=int(value.get(
                     "stable_exhaustion_cycles", 3)),
-                max_frontiers=int(value.get("max_frontiers", 200)),
+                max_frontiers=int(value.get(
+                    "max_frontiers", CURRENT_ROOM_MAX_FRONTIERS
+                    if room == "current_room" else 200)),
                 max_plan_probes_per_cycle=int(value.get(
                     "max_plan_probes_per_cycle", 12)),
             )
@@ -256,6 +373,7 @@ class SearchMissionRequest:
                 "initial_radius_m": self.initial_radius_m,
                 "radius_step_m": self.radius_step_m,
                 "tile_size_m": self.tile_size_m,
+                "frontier_spacing_m": self.frontier_spacing_m,
                 "stable_exhaustion_cycles": self.stable_exhaustion_cycles,
                 "max_frontiers": self.max_frontiers,
                 "max_plan_probes_per_cycle": self.max_plan_probes_per_cycle,
@@ -265,6 +383,6 @@ class SearchMissionRequest:
 
 __all__ = [
     "MissionValidationError", "SCHEMA_VERSION", "SearchMissionRequest",
-    "canonicalize_search_tasks",
+    "canonicalize_search_tasks", "canonicalize_move_tasks",
     "normalize_target_class",
 ]

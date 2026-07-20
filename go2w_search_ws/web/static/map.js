@@ -27,14 +27,16 @@ class Go2WMap {
     // 地图状态
     this.slam = {
       robotX: 0, robotY: 0, robotYaw: 0,
-      trail: [], mapPoints: [], lidarMapPoints: [], scanPoints: [],
+      trail: [], mapPoints: [], lidarMapPoints: [], wallPoints: [], scanPoints: [],
       detMarks: [], waypoints: [], currentWP: -1,
       targetMarkers: [],
       personMarkers: [], // compatibility alias for older panel/tests
       roomSearch: {
-        phase: '', room: '', roomArea: null,
+        missionId: '', phase: '', room: '', roomArea: null,
         candidateViewpoints: [], visitedViewpoints: [], observedCells: [],
         coverageRatio: 0, coverageThreshold: 0.9, visualRangeM: 0,
+        coverageCellSizeM: 0.5, adaptiveStepM: 0,
+        sceneComplexity: 1, forwardClearanceM: 0,
       },
       slamSource: '',
       costmap: null,
@@ -43,6 +45,11 @@ class Go2WMap {
       plan: null,            // 2026-07-18 nav2 /plan 规划路线 {pts:[[x,y],...]}
     };
     this._cmDirty = false; this._cmCanvas = null; this._cmCtx = null;
+    // The visibility mask may contain thousands of cells.  Build it only when
+    // coverage or the world-to-screen transform changes; the 60 FPS loop then
+    // composites a single cached bitmap.
+    this._fogCanvas = null; this._fogCtx = null; this._fogCacheKey = '';
+    this._fogCoverageRevision = 0; this._fogBuildCount = 0;
     this._showGlobalCostmap = false;  // 2026-07-18 切换 local(避障)/global(规划) costmap 显示
     this._lidarCells = new Map();
     // 用户选区 (世界坐标), 由 panel.html 设置 (表单输入时也同步显示)
@@ -80,6 +87,12 @@ class Go2WMap {
     if (data.map) {
       this.slam.mapPoints = data.map.length > 2000 ? data.map.slice(-2000) : data.map;
     }
+    if (data.occupancy_map !== undefined) {
+      const occupancy = data.occupancy_map || {};
+      this.slam.wallPoints = Array.isArray(occupancy.points)
+        ? occupancy.points.slice(-5000) : [];
+      this.slam.wallResolution = Number(occupancy.resolution) || 0.05;
+    }
     if (data.scan) this.slam.scanPoints = data.scan;
     if (data.slam_source !== undefined) this.slam.slamSource = data.slam_source;
     if (data.costmap) {
@@ -103,11 +116,27 @@ class Go2WMap {
 
   _updateRoomSearch(progress) {
     const src = progress && typeof progress === 'object' ? progress : {};
+    const has = key => Object.prototype.hasOwnProperty.call(src, key);
+    if (has('observed_cells') || has('room_area') || has('coverage_cell_size_m')) {
+      this._fogCoverageRevision += 1;
+    }
+    const previous = this.slam.roomSearch || {};
+    const incomingMissionId = has('mission_id') ? String(src.mission_id || '') : '';
+    const missionChanged = !!incomingMissionId
+      && incomingMissionId !== String(previous.missionId || '');
+    const base = missionChanged ? {
+      missionId: incomingMissionId,
+      phase: '', room: '', roomArea: null,
+      candidateViewpoints: [], visitedViewpoints: [], observedCells: [],
+      coverageRatio: 0, coverageThreshold: 0.9, visualRangeM: 0,
+      coverageCellSizeM: 0.5, adaptiveStepM: 0,
+      sceneComplexity: 1, forwardClearanceM: 0,
+    } : previous;
     const finitePointList = value => Array.isArray(value)
       ? value.map(point => ({ x: Number(point && point.x), y: Number(point && point.y) }))
         .filter(point => Number.isFinite(point.x) && Number.isFinite(point.y))
       : [];
-    const area = src.room_area && typeof src.room_area === 'object'
+    const area = has('room_area') && src.room_area && typeof src.room_area === 'object'
       ? {
           origin_x: Number(src.room_area.origin_x),
           origin_y: Number(src.room_area.origin_y),
@@ -116,20 +145,35 @@ class Go2WMap {
           spacing: Number(src.room_area.spacing || 1),
         }
       : null;
-    const validArea = area && Number.isFinite(area.origin_x) && Number.isFinite(area.origin_y)
+    const parsedArea = area && Number.isFinite(area.origin_x) && Number.isFinite(area.origin_y)
       && Number.isFinite(area.width) && Number.isFinite(area.height)
       && area.width > 0 && area.height > 0 ? area : null;
     const finiteOr = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
     this.slam.roomSearch = {
-      phase: String(src.phase || ''),
-      room: String(src.room || ''),
-      roomArea: validArea,
-      candidateViewpoints: finitePointList(src.candidate_viewpoints),
-      visitedViewpoints: finitePointList(src.visited_viewpoints),
-      observedCells: finitePointList(src.observed_cells),
-      coverageRatio: Math.max(0, Math.min(1, finiteOr(src.coverage_ratio, 0))),
-      coverageThreshold: Math.max(0, Math.min(1, finiteOr(src.coverage_threshold, 0.9))),
-      visualRangeM: Math.max(0, finiteOr(src.visual_range_m, 0)),
+      missionId: incomingMissionId || String(base.missionId || ''),
+      phase: has('phase') ? String(src.phase || '') : String(base.phase || ''),
+      room: has('room') ? String(src.room || '') : String(base.room || ''),
+      roomArea: has('room_area') ? parsedArea : (base.roomArea || null),
+      candidateViewpoints: has('candidate_viewpoints')
+        ? finitePointList(src.candidate_viewpoints) : (base.candidateViewpoints || []),
+      visitedViewpoints: has('visited_viewpoints')
+        ? finitePointList(src.visited_viewpoints) : (base.visitedViewpoints || []),
+      observedCells: has('observed_cells')
+        ? finitePointList(src.observed_cells) : (base.observedCells || []),
+      coverageRatio: Math.max(0, Math.min(1, has('coverage_ratio')
+        ? finiteOr(src.coverage_ratio, 0) : finiteOr(base.coverageRatio, 0))),
+      coverageThreshold: Math.max(0, Math.min(1, has('coverage_threshold')
+        ? finiteOr(src.coverage_threshold, 0.9) : finiteOr(base.coverageThreshold, 0.9))),
+      visualRangeM: Math.max(0, has('visual_range_m')
+        ? finiteOr(src.visual_range_m, 0) : finiteOr(base.visualRangeM, 0)),
+      coverageCellSizeM: Math.max(0.1, has('coverage_cell_size_m')
+        ? finiteOr(src.coverage_cell_size_m, 0.5) : finiteOr(base.coverageCellSizeM, 0.5)),
+      adaptiveStepM: Math.max(0, has('adaptive_step_m')
+        ? finiteOr(src.adaptive_step_m, 0) : finiteOr(base.adaptiveStepM, 0)),
+      sceneComplexity: Math.max(0, Math.min(1, has('scene_complexity')
+        ? finiteOr(src.scene_complexity, 1) : finiteOr(base.sceneComplexity, 1))),
+      forwardClearanceM: Math.max(0, has('forward_clearance_m')
+        ? finiteOr(src.forward_clearance_m, 0) : finiteOr(base.forwardClearanceM, 0)),
     };
   }
 
@@ -296,6 +340,61 @@ class Go2WMap {
     this._cmDirty = false;
   }
 
+  _renderSearchFog(roomSearch, roomArea, coverageCellWorld, toX, toY, W, H) {
+    const observedCells = roomSearch.observedCells || [];
+    if (!roomSearch.phase && !observedCells.length) return false;
+    const areaKey = roomArea
+      ? [roomArea.origin_x, roomArea.origin_y, roomArea.width, roomArea.height].join(',')
+      : 'viewport';
+    const cacheKey = [
+      W, H, this._fogCoverageRevision, areaKey, coverageCellWorld,
+      this._tf.scale.toFixed(5), toX(0).toFixed(2), toY(0).toFixed(2),
+    ].join('|');
+
+    if (!this._fogCanvas) {
+      this._fogCanvas = document.createElement('canvas');
+      this._fogCtx = this._fogCanvas.getContext('2d');
+    }
+    if (cacheKey !== this._fogCacheKey) {
+      if (this._fogCanvas.width !== W || this._fogCanvas.height !== H) {
+        this._fogCanvas.width = W;
+        this._fogCanvas.height = H;
+      }
+      const fogCtx = this._fogCtx;
+      fogCtx.setTransform(1, 0, 0, 1, 0, 0);
+      fogCtx.clearRect(0, 0, W, H);
+      fogCtx.fillStyle = 'rgba(3,10,18,0.86)';
+      if (roomArea) {
+        fogCtx.fillRect(
+          toX(roomArea.origin_x),
+          toY(roomArea.origin_y + roomArea.height),
+          roomArea.width * this._tf.scale,
+          roomArea.height * this._tf.scale,
+        );
+      } else {
+        fogCtx.fillRect(0, 0, W, H);
+      }
+
+      // Slight overlap removes hairline seams between adjacent coverage cells.
+      const maskCellPx = Math.max(1, coverageCellWorld * this._tf.scale + 0.75);
+      fogCtx.fillStyle = 'rgba(0,230,118,0.10)';
+      for (const point of observedCells) {
+        if (roomArea && (
+          point.x < roomArea.origin_x || point.x > roomArea.origin_x + roomArea.width
+          || point.y < roomArea.origin_y || point.y > roomArea.origin_y + roomArea.height
+        )) continue;
+        const x = toX(point.x) - maskCellPx / 2;
+        const y = toY(point.y) - maskCellPx / 2;
+        fogCtx.clearRect(x, y, maskCellPx, maskCellPx);
+        fogCtx.fillRect(x, y, maskCellPx, maskCellPx);
+      }
+      this._fogCacheKey = cacheKey;
+      this._fogBuildCount += 1;
+    }
+    this.ctx.drawImage(this._fogCanvas, 0, 0, W, H);
+    return true;
+  }
+
   // ---- 世界↔屏幕坐标变换 ----
   _computeTransform() {
     const SCAN_RANGE = 8.0;
@@ -321,6 +420,7 @@ class Go2WMap {
     }
     for (const p of s.mapPoints) include(p[0], p[1]);
     for (const p of s.lidarMapPoints) include(p[0], p[1]);
+    for (const p of s.wallPoints) include(p[0], p[1]);
     for (const p of s.scanPoints) include(p[0], p[1]);
     for (const t of s.trail) include(t[0], t[1]);
     for (const wp of s.waypoints) include(wp.x, wp.y);
@@ -453,6 +553,22 @@ class Go2WMap {
     for (let gx = gMin; gx <= gMax; gx++) ctx.fillText(gx + 'm', toX(gx) + 2, toY(0) - 2);
     for (let gy = gMin; gy <= gMax; gy++) if (gy !== 0) ctx.fillText(gy + 'm', toX(0) + 2, toY(gy) - 2);
 
+    // Persistent /map_frontier geometry. This display-only wall layer is
+    // intentionally distinct from Nav2's live red/blue costmap authority.
+    if (s.wallPoints.length) {
+      const wallPx = Math.max(1.5, Math.min(
+        4, (Number(s.wallResolution) || 0.05) * this._tf.scale + 0.75));
+      ctx.fillStyle = 'rgba(207,216,220,0.82)';
+      for (const point of s.wallPoints) {
+        ctx.fillRect(
+          toX(point[0]) - wallPx / 2,
+          toY(point[1]) - wallPx / 2,
+          wallPx,
+          wallPx,
+        );
+      }
+    }
+
     // 0. nav2 local_costmap 层 (离屏 canvas 预渲染, drawImage 一次, 不卡 60fps)
     if (s.costmap) {
       if (this._cmDirty) this._renderCostmap();
@@ -511,14 +627,18 @@ class Go2WMap {
     // 3. 产品房间搜索: 已观察覆盖、房间边界、候选/已访问视点
     const roomSearch = s.roomSearch || {};
     const roomArea = roomSearch.roomArea;
+    const coverageCellWorld = Number.isFinite(roomSearch.coverageCellSizeM)
+      && roomSearch.coverageCellSizeM > 0
+      ? roomSearch.coverageCellSizeM
+      : (roomArea && Number.isFinite(roomArea.spacing) && roomArea.spacing > 0
+        ? Math.min(roomArea.spacing, 1.0) : 0.5);
+    // Search fog uses the server's obstacle-aware C13 visibility cells as its
+    // source of truth.  It is cached offscreen so coverage growth does not
+    // turn into thousands of path operations on every animation frame.
+    this._renderSearchFog(
+      roomSearch, roomArea, coverageCellWorld, toX, toY, W, H,
+    );
     if (roomArea) {
-      const cellWorld = Number.isFinite(roomArea.spacing) && roomArea.spacing > 0
-        ? Math.min(roomArea.spacing, 1.0) : 0.5;
-      const cellPx = Math.max(3, cellWorld * this._tf.scale);
-      ctx.fillStyle = 'rgba(0,230,118,0.16)';
-      for (const point of roomSearch.observedCells || []) {
-        ctx.fillRect(toX(point.x) - cellPx / 2, toY(point.y) - cellPx / 2, cellPx, cellPx);
-      }
       ctx.strokeStyle = '#7e57c2'; ctx.lineWidth = 2;
       ctx.setLineDash([8, 4]);
       ctx.strokeRect(
@@ -534,6 +654,14 @@ class Go2WMap {
         `${roomSearch.room || '房间'} · ${roomSearch.phase || 'SEARCH'} · 覆盖 ${pct}%`,
         toX(roomArea.origin_x) + 4,
         toY(roomArea.origin_y + roomArea.height) + 13,
+      );
+    } else if (roomSearch.phase) {
+      ctx.fillStyle = '#b39ddb'; ctx.font = '10px sans-serif';
+      const pct = Math.round((roomSearch.coverageRatio || 0) * 100);
+      ctx.fillText(
+        `${roomSearch.phase} · 覆盖 ${pct}% · 步长 ${(roomSearch.adaptiveStepM || 0).toFixed(1)}m`,
+        12,
+        18,
       );
     }
     ctx.fillStyle = 'rgba(255,235,59,0.9)';

@@ -161,8 +161,12 @@ class FakeNav:
     def __init__(self, results=None, path_results=None):
         self.calls = []
         self.plan_calls = []
+        self.begin_mission_calls = 0
         self._results = list(results or [])
         self._path_results = list(path_results or [])
+
+    def begin_mission(self):
+        self.begin_mission_calls += 1
 
     def wait_for_server(self, timeout=2.0):
         return True
@@ -182,7 +186,7 @@ class FakeNav:
             return self._results.pop(0)
         return {"ok": True, "status": 4}
 
-    def cancel_current(self):
+    def cancel_current(self, reason="mission_cancel"):
         return True
 
 
@@ -309,6 +313,100 @@ def _make_half_unknown_map():
     return msg
 
 
+def _make_grid(width, height, data, resolution=0.1):
+    """Build an OccupancyGrid-shaped object for pure planner tests."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        info=SimpleNamespace(
+            resolution=float(resolution),
+            width=int(width),
+            height=int(height),
+            origin=SimpleNamespace(
+                position=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                orientation=SimpleNamespace(
+                    x=0.0, y=0.0, z=0.0, w=1.0),
+            ),
+        ),
+        data=list(data),
+    )
+
+
+def test_long_connected_frontier_keeps_unvisited_goal_candidates():
+    """Visiting one point must not suppress a room-sized frontier boundary."""
+    from nx_frontier_planner import find_frontier_clusters
+
+    width, height = 40, 30
+    data = [
+        0 if col < 20 else -1
+        for row in range(height)
+        for col in range(width)
+    ]
+    grid = _make_grid(width, height, data)
+    robot_pose = (0.5, 1.5, 0.0)
+
+    baseline = find_frontier_clusters(
+        grid, robot_pose, [], min_cluster_size=3,
+        revisit_radius=0.5, frontier_spacing_m=0.6)
+
+    assert len(baseline) >= 3
+    visited = [{
+        "x": baseline[0]["center_world"][0],
+        "y": baseline[0]["center_world"][1],
+    }]
+    remaining = find_frontier_clusters(
+        grid, robot_pose, visited, min_cluster_size=3,
+        revisit_radius=0.5, frontier_spacing_m=0.6)
+
+    assert remaining
+    assert max(item["center_world"][1] for item in remaining) > 2.0
+
+
+def test_frontier_extraction_ignores_disconnected_free_island():
+    """Only the robot's reachable known-free component may create goals."""
+    from nx_frontier_planner import find_frontier_clusters
+
+    width, height = 60, 30
+    data = [-1] * (width * height)
+    for row in range(5, 20):
+        for col in range(5, 20):
+            data[row * width + col] = 0
+        for col in range(40, 55):
+            data[row * width + col] = 0
+    grid = _make_grid(width, height, data)
+
+    candidates = find_frontier_clusters(
+        grid, (1.0, 1.0, 0.0), [], min_cluster_size=1,
+        revisit_radius=0.2, frontier_spacing_m=0.5)
+
+    assert candidates
+    assert all(item["center_world"][0] < 3.0 for item in candidates)
+
+
+def test_noisy_large_frontier_selection_stays_within_cpu_budget():
+    """A valid noisy map must not turn local gain into an O(K*N) stall."""
+    from nx_frontier_planner import find_frontier_clusters
+
+    width = height = 1000
+    data = [
+        -1 if row % 2 == 0 and col % 2 == 0 else 0
+        for row in range(height)
+        for col in range(width)
+    ]
+    grid = _make_grid(width, height, data, resolution=0.05)
+    started = time.perf_counter()
+
+    candidates = find_frontier_clusters(
+        grid, (25.075, 25.025, 0.0), [], min_cluster_size=3,
+        revisit_radius=1.0, frontier_spacing_m=1.5,
+        max_candidates_per_cluster=64)
+
+    elapsed = time.perf_counter() - started
+    assert candidates
+    assert len(candidates) <= 64
+    assert elapsed < 5.0
+
+
 def test_find_frontier_clusters_detects_boundary():
     """_find_frontier_clusters 在 左自由/右未知 grid 上返回非空簇, 每个簇含 4 字段。"""
     from nx_room_orchestrator import _find_frontier_clusters
@@ -345,6 +443,16 @@ def test_frontier_cluster_goal_uses_nearest_reachable_cell_not_giant_centroid():
     assert clusters[0]["center_cell"] == (0, 4)
     assert clusters[0]["center_world"] == pytest.approx((0.45, 0.05))
     assert clusters[0]["distance"] == pytest.approx(math.hypot(0.45, 0.05))
+
+
+def test_occupancy_frontier_candidates_request_safe_standoff():
+    candidates = select_frontier_candidates(
+        _make_half_unknown_map(), (0.0, 0.0, 0.0), [],
+        min_cluster_size=3, revisit_radius=1.0,
+    )
+
+    assert candidates
+    assert all(candidate["prefer_standoff"] is True for candidate in candidates)
 
 
 def test_frontier_cell_center_respects_rotated_map_origin():
@@ -416,6 +524,7 @@ def test_run_frontier_explore_dispatches_on_strategy(tmp_path, monkeypatch):
     assert task.result is not None
     assert task.result["waypoints_visited"] == 0
     assert task.result["targets_found"] == 1
+    assert nav.begin_mission_calls == 1
     # phase 推送应包含 INIT_SLAM / FRONTIER_DETECT / REPORT
     phases = [e["data"]["phase"] for e in events if e.get("type") == "search_room"]
     assert "INIT_SLAM" in phases
@@ -465,6 +574,89 @@ def test_frontier_explore_zero_frontiers_finalize_report(monkeypatch):
     assert task.result["room"] == "__frontier__"
     # search_area 空 dict (哨兵 Room)
     assert task.result["area"] == {}
+
+
+def test_current_room_frontier_explore_feeds_lidar_c13_visibility_to_state(
+        monkeypatch):
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(
+        orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+    created = []
+
+    class RecordingVisibilityTracker:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
+            self.observations = []
+            created.append(self)
+
+        def observe(self, map_msg, robot_pose, scan_snapshot):
+            self.observations.append((map_msg, tuple(robot_pose), scan_snapshot))
+            return self.snapshot(map_msg)
+
+        def rank_candidates(self, _map_msg, _robot_pose, candidates):
+            return list(candidates)
+
+        def coverage_candidates(
+                self, _map_msg, _robot_pose, _visited, *, limit=32):
+            del limit
+            return []
+
+        def snapshot(self, _map_msg=None):
+            return {
+                "observed_cells": [{"x": 0.25, "y": 0.25}],
+                "visual_coverage_ratio": 1.0,
+                "coverage_cell_size_m": 0.5,
+                "visual_range_m": 8.0,
+                "scan_usable": True,
+                "forward_clearance_m": 7.5,
+                "scene_complexity": 0.05,
+                "adaptive_step_m": 5.6,
+            }
+
+    monkeypatch.setattr(
+        orch_module, "VisibilityCoverageTracker", RecordingVisibilityTracker)
+    events = []
+    task = FakeTask()
+    task.params.update({
+        "room": "__current__",
+        "max_radius_m": 6.0,
+        "initial_radius_m": 6.0,
+        "stable_exhaustion_cycles": 1,
+    })
+    orchestrator = make_orchestrator(events, FakeNav())
+
+    orchestrator.run(task)
+
+    assert task.status == "completed"
+    assert len(created) == 1
+    tracker = created[0]
+    assert tracker.kwargs["camera_hfov_rad"] == pytest.approx(
+        math.radians(77.4))
+    assert tracker.kwargs["visual_range_m"] == pytest.approx(8.0)
+    assert tracker.observations
+    scan = tracker.observations[0][2]
+    assert scan["age_sec"] >= 0.0
+    assert task.result["visual_coverage_ratio"] == pytest.approx(1.0)
+    assert task.result["adaptive_step_m"] == pytest.approx(5.6)
+    live_states = [
+        event["data"] for event in events
+        if event.get("type") == "search_room"
+        and event.get("data", {}).get("observed_cells")
+    ]
+    assert live_states
+    assert live_states[-1]["coverage_cell_size_m"] == pytest.approx(0.5)
+
+
+def test_visibility_scan_snapshot_preserves_sensor_geometry_and_freshness():
+    orchestrator = make_orchestrator([], FakeNav(), node=FakeNode())
+
+    snapshot = orchestrator._visibility_scan_snapshot()
+
+    assert len(snapshot["ranges"]) == 360
+    assert snapshot["angle_min"] == pytest.approx(-math.pi)
+    assert snapshot["angle_increment"] == pytest.approx(math.pi / 180.0)
+    assert 0.0 <= snapshot["age_sec"] < 1.0
 
 
 def test_frontier_table_target_is_used_for_detection_and_restored(monkeypatch):
@@ -521,6 +713,36 @@ def test_frontier_explore_cancel_mid_loop(monkeypatch):
 
     assert task.status == "failed"
     assert task.result["reason"] == "cancelled"
+
+
+def test_new_frontier_mission_does_not_publish_previous_mask(monkeypatch):
+    """Live coverage must not alternate with the preceding mission report."""
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+
+    monkeypatch.setattr(
+        orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+
+    events = []
+    states_during_init = []
+    orchestrator = make_orchestrator(events, FakeNav())
+    orchestrator._last_report = {
+        "mission_id": "previous-mission",
+        "observed_cells": [{"x": -9.0, "y": -9.0}],
+    }
+
+    def capture_new_mission_state(data):
+        events.append(data)
+        if (data.get("type") == "search_room"
+                and data.get("data", {}).get("phase") == "INIT_SLAM"):
+            states_during_init.append(orchestrator.get_navigation_state())
+            orchestrator.cancel()
+
+    orchestrator._ws = capture_new_mission_state
+    orchestrator.run(FakeTask())
+
+    assert states_during_init
+    assert states_during_init[0]["last_report"] is None
 
 
 def test_frontier_explore_fails_when_occupancy_grid_unavailable():
@@ -615,8 +837,30 @@ def test_select_frontier_candidates_returns_deterministic_score_order(monkeypatc
     assert [candidate["x"] for candidate in candidates] == [5.0, 2.0, 1.0]
 
 
-def test_frontier_explore_preflights_and_skips_unreachable_candidate(monkeypatch):
-    """A high-score blocked frontier must never be sent as a motion goal."""
+def test_select_frontier_candidates_supports_legacy_cluster_callback_signature():
+    from nx_frontier_planner import select_frontier_candidates as select
+
+    def legacy_cluster_finder(
+            map_msg, robot_pose, visited, min_cluster_size, revisit_radius):
+        del map_msg, robot_pose, visited, min_cluster_size, revisit_radius
+        return [{
+            "center_cell": (1, 2),
+            "center_world": (2.0, 1.0),
+            "size": 5,
+            "distance": math.sqrt(5.0),
+        }]
+
+    candidates = select(
+        None, (0.0, 0.0, 0.0), [],
+        cluster_finder=legacy_cluster_finder,
+        frontier_spacing_m=0.8)
+
+    assert len(candidates) == 1
+    assert candidates[0]["x"] == pytest.approx(2.0)
+
+
+def test_frontier_explore_starts_nearest_reachable_candidate_without_probe_sweep(monkeypatch):
+    """Nearest reachable frontier starts without probing a farther alternative."""
     if not _ensure_person_deps():
         pytest.skip("frontier deps not importable")
     monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
@@ -630,7 +874,6 @@ def test_frontier_explore_preflights_and_skips_unreachable_candidate(monkeypatch
 
     monkeypatch.setattr(orch_module, "select_frontier_candidates", candidates)
     nav = FakeNav(path_results=[
-        {"ok": False, "reason": "unreachable", "status": 6},
         {"ok": True, "status": 4, "poses": 12, "path_length": 2.4},
     ])
     task = FakeTask()
@@ -639,10 +882,10 @@ def test_frontier_explore_preflights_and_skips_unreachable_candidate(monkeypatch
     orchestrator.run(task)
 
     assert task.status == "completed"
-    assert [call[:2] for call in nav.plan_calls] == [(3.0, 0.0), (0.0, 2.0)]
+    assert [call[:2] for call in nav.plan_calls] == [(0.0, 2.0)]
     assert [call[:2] for call in nav.calls] == [(0.0, 2.0)]
     assert task.result["completion_reason"] == "reachable_frontiers_exhausted"
-    assert task.result["frontier_plan_rejections"] == 1
+    assert task.result["frontier_plan_rejections"] == 0
     assert task.result["waypoints_reached"] == 1
 
 
@@ -743,10 +986,12 @@ def test_frontier_explore_reports_dynamic_radius_and_tiles(monkeypatch):
         pytest.skip("frontier deps not importable")
     monkeypatch.setattr(orch_module, "_OccupancyGrid", _make_fake_map().__class__)
     seen_radii = []
+    seen_spacings = []
 
     def candidates(_map, _pose, visited, **kwargs):
         radius = kwargs.get("max_radius")
         seen_radii.append(radius)
+        seen_spacings.append(kwargs.get("frontier_spacing_m"))
         if visited:
             return []
         if radius is not None and radius >= 12.0:
@@ -765,7 +1010,9 @@ def test_frontier_explore_reports_dynamic_radius_and_tiles(monkeypatch):
         "initial_radius_m": 6.0,
         "radius_step_m": 6.0,
         "tile_size_m": 6.0,
+        "frontier_spacing_m": 0.8,
         "stable_exhaustion_cycles": 1,
+        "visibility_aware_exploration": False,
     })
     orchestrator = make_orchestrator([], FakeNav())
 
@@ -776,6 +1023,9 @@ def test_frontier_explore_reports_dynamic_radius_and_tiles(monkeypatch):
     assert task.result["active_radius_m"] == pytest.approx(12.0)
     assert task.result["max_radius_m"] == pytest.approx(12.0)
     assert task.result["tile_size_m"] == pytest.approx(6.0)
+    assert seen_spacings and all(
+        spacing == pytest.approx(0.8) for spacing in seen_spacings)
+    assert task.result["exploration_state"]["frontier_spacing_m"] == pytest.approx(0.8)
     assert [1, 0] in task.result["visited_tiles"]
 
 
@@ -796,6 +1046,7 @@ def test_frontier_explore_waits_for_stable_exhaustion(monkeypatch):
         "max_radius_m": 6.0,
         "initial_radius_m": 6.0,
         "stable_exhaustion_cycles": 3,
+        "visibility_aware_exploration": False,
     })
     orchestrator = make_orchestrator([], FakeNav())
 
@@ -1153,6 +1404,74 @@ def test_en_route_observer_dedups_by_capture_stamp(monkeypatch, tmp_path):
     assert len(stamps) == len(set(stamps)), "同帧被重复入队 (去重失效)"
 
 
+def test_frontier_progress_monitor_cancels_a_diverging_navigation():
+    orch = make_orchestrator([], FakeNav())
+    stop_event = threading.Event()
+    holder = {}
+
+    class DivergingExploration:
+        def observe_navigation_pose(self, pose):
+            assert pose == (3.0, 2.0, 0.5)
+            return {
+                "ok": False,
+                "reason": "navigation_diverging",
+                "distance_to_goal_m": 4.2,
+                "allowed_distance_m": 1.8,
+            }
+
+    class CancelingNav:
+        def __init__(self):
+            self.cancel_reasons = []
+
+        def cancel_current(self, reason="mission_cancel"):
+            self.cancel_reasons.append(reason)
+            return True
+
+    nav = CancelingNav()
+    orch._get_live_robot_pose = lambda: (3.0, 2.0, 0.5)
+
+    orch._monitor_frontier_navigation_progress(
+        stop_event, DivergingExploration(), nav, holder, 0.01)
+
+    assert nav.cancel_reasons == ["navigation_diverging"]
+    assert holder["failure"]["reason"] == "navigation_diverging"
+
+
+def test_frontier_progress_monitor_cancels_goal_that_becomes_unreachable():
+    orch = make_orchestrator([], FakeNav())
+    stop_event = threading.Event()
+    holder = {}
+
+    class DynamicallyBlockedExploration:
+        def observe_navigation_pose(self, _pose):
+            return {"ok": True}
+
+        def revalidate_current_goal(self):
+            return {
+                "ok": False,
+                "reason": "goal_became_unreachable",
+                "goal_revalidation_failures": 2,
+            }
+
+    class CancelingNav:
+        def __init__(self):
+            self.cancel_reasons = []
+
+        def cancel_current(self, reason="mission_cancel"):
+            self.cancel_reasons.append(reason)
+            return True
+
+    nav = CancelingNav()
+    orch._get_live_robot_pose = lambda: (0.0, 0.0, 0.0)
+
+    orch._monitor_frontier_navigation_progress(
+        stop_event, DynamicallyBlockedExploration(), nav, holder, 0.01,
+        path_revalidation_interval=0.01)
+
+    assert nav.cancel_reasons == ["goal_became_unreachable"]
+    assert holder["failure"]["reason"] == "goal_became_unreachable"
+
+
 def test_en_route_observer_bounded_queue(monkeypatch, tmp_path):
     """worker queue 不超过 max_samples (防 100 张 frame 堆积)。"""
     if not _ensure_person_deps():
@@ -1313,12 +1632,30 @@ def test_completion_status_prefers_bounded_room_coverage():
         "reachable_frontiers_exhausted",
         {
             "coverage_valid": True,
+            "roi": {"type": "polygon"},
             "explored_ratio": 0.2,
             "bounded_explored_ratio": 1.0,
             "enclosed_unknown_regions": [],
         },
     )
     assert status == "completed"
+
+
+def test_dynamic_circle_roi_cannot_complete_with_most_area_still_unknown():
+    orchestrator = make_orchestrator([], FakeNav())
+    status = orchestrator._derive_completion_status(
+        "reachable_frontiers_exhausted",
+        {
+            "coverage_valid": True,
+            "roi": {"type": "circle"},
+            "explored_ratio": 0.011631,
+            "bounded_explored_ratio": 0.978814,
+            "exterior_unknown_cells": 58876,
+            "enclosed_unknown_regions": [],
+        },
+    )
+
+    assert status == "incomplete"
 
 
 def test_frontier_explore_report_completed_with_gaps_for_walled_pocket(monkeypatch):

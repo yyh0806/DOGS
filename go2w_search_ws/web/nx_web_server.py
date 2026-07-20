@@ -84,7 +84,13 @@ from nx_motion_intent import build_motion_intent
 from nx_mission_schema import (
     MissionValidationError,
     SearchMissionRequest,
+    canonicalize_move_tasks,
     canonicalize_search_tasks,
+)
+from nx_move_executor import (
+    compute_angular_target_yaw,
+    compute_linear_target,
+    run_angular_turn,
 )
 from nx_observation_sync import ObservationSynchronizer
 from nx_control_auth import (
@@ -1440,9 +1446,15 @@ class TaskManager:
         # 阶段E: 房间级搜索编排注入 (spec §7.2.2); None 时 search_room 任务标 failed
         self.room_orchestrator = room_orchestrator
         self._navigation_arbiter = None
+        # move_relative (spec §1.3): linear→point_nav, angular→cmd_vel+odom
+        self._point_nav = None
 
     def set_navigation_arbiter(self, arbiter):
         self._navigation_arbiter = arbiter
+
+    def set_point_nav(self, port):
+        """Inject the PointNavigationController owner port for linear moves."""
+        self._point_nav = port
 
     def _notify_navigation_drained(self):
         if self._navigation_arbiter is None:
@@ -1565,12 +1577,17 @@ class TaskManager:
         invalid_reason = None
         if tasks:
             try:
-                tasks = canonicalize_search_tasks(tasks)
+                first_type = (tasks[0].get("type")
+                              if isinstance(tasks[0], dict) else None)
+                if first_type == "move_relative":
+                    tasks = canonicalize_move_tasks(tasks)
+                else:
+                    tasks = canonicalize_search_tasks(tasks)
             except MissionValidationError as exc:
-                logger.warning("拒绝非规范搜索任务: %s", exc)
-                response = "搜索任务格式无效"
+                logger.warning("拒绝非规范任务: %s", exc)
+                response = "任务格式无效"
                 tasks = []
-                invalid_reason = "invalid_search_mission"
+                invalid_reason = "invalid_task"
         logger.info(f"指令解析: '{text}' → response='{response}' tasks={len(tasks)}")
         ws_broadcast({
             "type": "vlm",
@@ -1813,6 +1830,8 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
                     self._execute_follow(task)
                 elif task.type == "search_area":
                     self._execute_search(task)
+                elif task.type == "move_relative":
+                    self._execute_move_relative(task)
                 elif task.type == "search_room":
                     # 阶段E: 房间级搜索编排 (spec §7.2.2)
                     # RoomSearchOrchestrator.run 同步跑状态机, 内部设 task.status/result
@@ -1862,6 +1881,93 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
         self._tracker.start_follow(target)
         task.status = "completed"
         task.result = "跟踪已启动 (后台运行)"
+
+    def _execute_move_relative(self, task):
+        """move_relative 执行 (spec §1.3): linear→nav2, angular→cmd_vel+odom 闭环."""
+        p = task.params
+        mode = p.get("mode")
+        direction = p.get("direction")
+
+        def broadcast(phase, **extra):
+            ws_broadcast({"type": "move_result",
+                          "data": {"phase": phase, "direction": direction, **extra}})
+
+        node_obj = getattr(self.robot, "_node", None)
+        health_getter = getattr(node_obj, "get_localization_health", None)
+        health = health_getter() if callable(health_getter) else {}
+        if not health.get("healthy"):
+            task.status = "failed"
+            task.result = "localization_unhealthy"
+            broadcast("aborted", reason="localization_unhealthy")
+            return
+
+        if mode == "linear":
+            if self._point_nav is None:
+                task.status = "failed"
+                task.result = "point_nav_unavailable"
+                broadcast("aborted", reason="point_nav_unavailable")
+                return
+            x = float(health["x"]); y = float(health["y"]); yaw = float(health["yaw"])
+            tx, ty, tyaw = compute_linear_target(
+                x, y, yaw, direction, float(p["distance_m"]))
+            self._point_nav.submit(tx, ty, tyaw)
+            phase = self._await_point_nav_terminal(task)
+            if phase == "succeeded":
+                task.status = "completed"
+                task.result = {"distance_m": p["distance_m"], "direction": direction}
+            else:
+                task.status = "failed"
+                task.result = phase
+            broadcast(phase, distance_m=p["distance_m"])
+        else:  # angular
+            yaw0 = float(health["yaw"])
+            target_yaw = compute_angular_target_yaw(
+                yaw0, direction, float(p["angle_deg"]))
+
+            def read_yaw():
+                h = health_getter() if callable(health_getter) else {}
+                return float(h.get("yaw", yaw0))
+
+            def send_cmd(vx, vy, vyaw_v):
+                self.robot.move(vx, vy, vyaw_v, manual=True)
+
+            phase = run_angular_turn(
+                read_yaw, send_cmd, time.sleep, time.monotonic,
+                target_yaw, direction, vyaw=0.5,
+                tolerance_rad=math.radians(3.0),
+            )
+            self.robot.stop_move()
+            if phase == "succeeded":
+                task.status = "completed"
+                task.result = {"angle_deg": p["angle_deg"], "direction": direction}
+            else:
+                task.status = "failed"
+                task.result = phase
+            broadcast(phase, angle_deg=p["angle_deg"])
+
+    def _await_point_nav_terminal(self, task, timeout=60.0):
+        """轮询 point_nav 终态; cancel-aware. 返回 phase str."""
+        if self._point_nav is None:
+            return "aborted"
+        terminal = {"succeeded", "aborted", "timed_out", "canceled",
+                    "error", "rejected"}
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if task.status == "cancelled":
+                try:
+                    self._point_nav.cancel("task_cancelled")
+                except Exception:
+                    pass
+                return "cancelled"
+            status = self._point_nav.get_state().get("status")
+            if status in terminal:
+                return status
+            time.sleep(0.1)
+        try:
+            self._point_nav.cancel("timeout")
+        except Exception:
+            pass
+        return "timed_out"
 
     def _execute_search(self, task):
         p = task.params
@@ -2016,9 +2122,16 @@ def _point_navigation_health_sample(nx_node):
         "localization_reason": localization.get("reason"),
     }
     if not motion_ok:
+        # A parked drive session is a recoverable ownership transition, not a
+        # hard safety fault.  Give the mission gateway its health-grace window
+        # so it can reactivate the session without canceling the active goal.
+        recoverable_parked = (
+            motion.get("reason") == "drive_session_parked"
+            and bool(motion.get("activatable"))
+        )
         return {
             "healthy": False,
-            "immediate": True,
+            "immediate": not recoverable_parked,
             "reason": "motion_unhealthy",
             **common,
         }
@@ -2589,6 +2702,22 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
     global _trail
     logger.info("广播启动")
     slam_counter = 0
+    ipc_mtimes = {}
+
+    def _broadcast_json_if_changed(path, event_type, *, force=True):
+        try:
+            modified = os.path.getmtime(path)
+            if modified <= float(ipc_mtimes.get(path, 0.0)):
+                return False
+            with open(path, encoding="utf-8") as source:
+                payload = json.load(source)
+            ipc_mtimes[path] = modified
+            ws_broadcast(
+                {"type": event_type, "data": payload}, force=force)
+            return True
+        except Exception:
+            return False
+
     while True:
         try:
             # ---- 取订阅缓存快照 (一次锁定) ----
@@ -2698,28 +2827,17 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
             # "IndexError: wait set index too big" → spin 崩 (见 costmap_bridge.py 头注释).
             # bridge 独立进程降采写 JSON, web 读文件转发 WS (不加 rclpy 订阅), 前端 map.js 渲染.
             if slam_counter % 10 == 0:
-                try:
-                    with open('/tmp/costmap_lite.json') as _f:
-                        # Camera and lidar streams may saturate the bounded
-                        # realtime queue.  This compact, low-rate state update
-                        # must still reach Panel or Nav2 obstacles disappear.
-                        ws_broadcast(
-                            {"type": "costmap", "data": json.load(_f)}, force=True)
-                except Exception:
-                    pass  # costmap_bridge 未起 / nav2 未起 / 文件没就绪, 静默跳过
+                # Only forward new IPC snapshots. Re-sending identical maps
+                # every loop used to congest the same WebSocket as room state.
+                _broadcast_json_if_changed(
+                    '/tmp/costmap_lite.json', 'costmap', force=True)
                 # 2026-07-18: global costmap (规划用, 前端切换看 ghost 对比) + plan (规划路线 polyline)
-                try:
-                    with open('/tmp/costmap_global.json') as _f:
-                        ws_broadcast(
-                            {"type": "costmap_global", "data": json.load(_f)}, force=True)
-                except Exception:
-                    pass
-                try:
-                    with open('/tmp/plan_lite.json') as _f:
-                        ws_broadcast(
-                            {"type": "plan", "data": json.load(_f)}, force=True)
-                except Exception:
-                    pass
+                _broadcast_json_if_changed(
+                    '/tmp/costmap_global.json', 'costmap_global', force=True)
+                _broadcast_json_if_changed(
+                    '/tmp/map_frontier_walls.json', 'occupancy_map', force=True)
+                _broadcast_json_if_changed(
+                    '/tmp/plan_lite.json', 'plan', force=True)
 
             # ---- status 推送 (字段名匹配 panel.html:396-400) ----
             det_list = ai_engine.get_detection_list() if ai_engine is not None and hasattr(ai_engine, "get_detection_list") else []
@@ -2825,6 +2943,7 @@ def main():
             detector_proxy = None
 
     task_mgr = TaskManager(robot, vlm_engine=vlm_proxy, detector=detector_proxy)
+    task_mgr.set_point_nav(point_nav)
 
     # C13 云台双流桥接 (独立 daemon 线程拉 vis+ir RTSP → type=gimbal 推前端)
     gimbal_bridge = None
@@ -2873,6 +2992,8 @@ def main():
     # lock.  It never spins ROS; each ownership hand-off is terminal-state gated.
     navigation_arbiter = NavigationArbiter(point_nav, task_mgr, robot)
     task_mgr.set_navigation_arbiter(navigation_arbiter)
+    mission_navigation.set_recovery_callback(
+        navigation_arbiter.recover_task_motion)
 
     # Humble's rclpy wait-set cannot be mutated while an executor is waiting.
     # PointNav and RoomSearch both create ActionClients, so start spin only

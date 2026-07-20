@@ -27,12 +27,14 @@ def test_frame_broadcast_does_not_include_unused_jpeg_payload():
 def test_costmap_broadcast_bypasses_realtime_frame_backpressure():
     text = SOURCE.read_text(encoding="utf-8")
 
-    # One small map update every ~1.5 s must not be starved by the much faster
-    # camera/lidar streams, otherwise Panel never renders Nav2 obstacles.
+    # New IPC snapshots bypass camera/lidar backpressure, while unchanged
+    # maps are not resent and cannot starve room-search state updates.
+    assert "def _broadcast_json_if_changed(path, event_type, *, force=True):" in text
     assert re.search(
-        r'ws_broadcast\(\s*\{"type": "costmap", "data": json\.load\(_f\)\},\s*force=True\)',
+        r'_broadcast_json_if_changed\(\s*[\'\"]?/tmp/costmap_lite\.json[\'\"]?,\s*[\'\"]costmap[\'\"],\s*force=True\)',
         text,
     )
+    assert "modified <= float(ipc_mtimes.get(path, 0.0))" in text
 
 
 def test_realtime_bridges_are_stopped_on_process_exit():

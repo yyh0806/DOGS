@@ -296,7 +296,7 @@ def test_c13_detection_overlay_exposes_bbox_and_snapshots(monkeypatch):
 
     ai = NxAiEngine()
     frame = np.zeros((100, 200, 3), dtype=np.uint8)
-    det = {"class": "chair", "confidence": 0.73, "bbox": [40, 10, 90, 80]}
+    det = {"class": "chair", "confidence": 0.83, "bbox": [40, 10, 90, 80]}
 
     ai._cache_detection_result(
         raw_frame=frame,
@@ -313,7 +313,7 @@ def test_c13_detection_overlay_exposes_bbox_and_snapshots(monkeypatch):
     assert payload["count"] == 1
     obs = payload["detections"][0]
     assert obs["class"] == "chair"
-    assert obs["confidence"] == 0.73
+    assert obs["confidence"] == 0.83
     assert obs["bbox"] == [40.0, 10.0, 90.0, 80.0]
     assert obs["frame_width"] == 200
     assert obs["frame_height"] == 100
@@ -321,6 +321,37 @@ def test_c13_detection_overlay_exposes_bbox_and_snapshots(monkeypatch):
     assert "&kind=crop" in obs["crop_url"]
     assert "&kind=frame" in obs["frame_url"]
     assert ai.get_detection_snapshot_jpeg(obs["snapshot_id"], "crop") == b"jpeg"
+
+
+def test_detection_results_below_eighty_percent_are_discarded(monkeypatch):
+    fake_cv2 = types.SimpleNamespace(
+        IMWRITE_JPEG_QUALITY=1,
+        imencode=lambda *args, **kwargs: (True, _FakeJpeg()),
+    )
+    monkeypatch.setitem(sys.modules, "cv2", fake_cv2)
+
+    from nx_ai_node import NxAiEngine
+
+    ai = NxAiEngine()
+    frame = np.zeros((100, 200, 3), dtype=np.uint8)
+    ai._cache_detection_result(
+        raw_frame=frame,
+        display_frame=frame.copy(),
+        dets=[
+            {"class": "person", "confidence": 0.799,
+             "bbox": [20, 10, 60, 80]},
+            {"class": "person", "confidence": 0.8,
+             "bbox": [100, 10, 150, 80]},
+        ],
+        source="c13_vis",
+        detect_frame_w=200,
+        detect_frame_h=100,
+    )
+
+    payload = ai.get_detection_overlay()
+
+    assert payload["count"] == 1
+    assert payload["detections"][0]["confidence"] == 0.8
 
 
 def test_detection_overlays_keep_multiple_video_sources(monkeypatch):
@@ -337,7 +368,7 @@ def test_detection_overlays_keep_multiple_video_sources(monkeypatch):
     ai._cache_detection_result(
         raw_frame=frame,
         display_frame=frame.copy(),
-        dets=[{"class": "chair", "confidence": 0.73, "bbox": [40, 10, 90, 80]}],
+        dets=[{"class": "chair", "confidence": 0.83, "bbox": [40, 10, 90, 80]}],
         source="c13_vis",
         detect_frame_w=200,
         detect_frame_h=100,
@@ -378,7 +409,7 @@ def test_detection_snapshot_cache_retains_clickable_history(monkeypatch):
         ai._cache_detection_result(
             raw_frame=frame,
             display_frame=frame.copy(),
-            dets=[{"class": "chair", "confidence": 0.73, "bbox": [40, 10, 90, 80]}],
+            dets=[{"class": "chair", "confidence": 0.83, "bbox": [40, 10, 90, 80]}],
             source="c13_vis",
             detect_frame_w=200,
             detect_frame_h=100,

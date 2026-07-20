@@ -40,6 +40,71 @@ def read(relative_path):
     return (ROOT / relative_path).read_text(encoding="utf-8")
 
 
+def test_search_room_button_calls_canonical_current_room_mission_endpoint():
+    panel = read("web/static/panel.html")
+
+    assert 'onclick="searchRoom()"' in panel
+    assert "controlFetch('/api/search_room'" in panel
+    assert "room: 'current_room'" in panel
+    # searchRoom 参数化 (spec §3.2): 默认 person, 可传任意类/多类组合/all_objects
+    assert "let tc = targetClasses || ['person']" in panel
+    assert "target_classes: tc" in panel
+    assert "tc === 'all_objects'" in panel
+
+
+def test_panel_has_search_target_buttons():
+    """搜人/搜桌椅/搜物体 三按钮 (spec §3.2)."""
+    panel = read("web/static/panel.html")
+    assert "searchRoom(['person'])" in panel
+    assert "searchRoom(['dining table','chair'])" in panel
+    assert "searchRoom('all_objects')" in panel
+
+
+def test_search_room_http_endpoint_admits_spatial_frontier_mission(
+        monkeypatch, tmp_path):
+    web = _load_web_server(monkeypatch)
+    admitted = []
+
+    class TaskManager:
+        def add_list(self, tasks, *, reason):
+            admitted.append((list(tasks), reason))
+            return {"ok": True, "phase": "active", "owner": "tasks"}
+
+    web.task_mgr = TaskManager()
+    server = web.create_server("127.0.0.1", 0, str(tmp_path))
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            *server.server_address, timeout=1.0)
+        connection.request(
+            "POST", "/api/search_room",
+            body=json.dumps({
+                "room": "current_room",
+                "target_classes": ["person"],
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        connection.close()
+    finally:
+        server.shutdown()
+        thread.join(timeout=1.0)
+        server.server_close()
+
+    assert response.status == 200
+    assert payload["ok"] is True
+    assert payload["mission_request"]["room"] == "current_room"
+    assert payload["mission_request"]["frontier_spacing_m"] == pytest.approx(1.5)
+    assert len(admitted) == 1
+    tasks, reason = admitted[0]
+    assert reason == "search_room"
+    assert tasks[0].type == "search_room"
+    assert tasks[0].params["search_strategy"] == "frontier_explore"
+    assert tasks[0].params["frontier_spacing_m"] == pytest.approx(1.5)
+
+
 def _install_ros_stubs(monkeypatch):
     rclpy = types.ModuleType("rclpy")
     rclpy.init = lambda: None
@@ -811,6 +876,31 @@ def test_point_navigation_health_combines_localization_and_motion_readiness(monk
     )
 
 
+def test_parked_activatable_drive_uses_recovery_grace_not_immediate_cancel(
+        monkeypatch):
+    web = _load_web_server(monkeypatch)
+    node = types.SimpleNamespace(
+        get_localization_health=lambda: {
+            "healthy": True, "reason": "ok"},
+        get_navigation_readiness=lambda: {
+            "ready": False,
+            "activatable": True,
+            "reason": "drive_session_parked",
+            "drive_session": "parked",
+        },
+    )
+
+    sample = web._point_navigation_health_sample(node)
+
+    assert sample == {
+        "healthy": False,
+        "immediate": False,
+        "reason": "motion_unhealthy",
+        "motion_reason": "drive_session_parked",
+        "localization_reason": "ok",
+    }
+
+
 def test_motion_readiness_loss_cancels_an_active_point_goal(monkeypatch):
     web = _load_web_server(monkeypatch)
     from test_point_navigation import accept, make_controller
@@ -1285,7 +1375,7 @@ def test_point_controller_is_created_before_ros_spin_and_stopped_before_shutdown
     controller_create = server.index("PointNavigationController(")
     room_client_create = server.index("room_orchestrator = RoomSearchOrchestrator(")
     arbiter_create = server.index("navigation_arbiter = NavigationArbiter(")
-    spin_start = server.index("target=rclpy.spin")
+    spin_start = server.index("target=_spin_loop_yielding")
     arbiter_shutdown = server.rindex("navigation_arbiter.shutdown()")
     ros_shutdown = server.rindex("rclpy.shutdown()")
     assert controller_create < room_client_create < arbiter_create < spin_start
@@ -1384,3 +1474,18 @@ def test_panel_manual_release_and_startup_cannot_cancel_autonomy():
     assert "controlFetch('/api/manual_stop'" in stop_move
     assert "controlFetch('/api/stop'" not in stop_move
     assert "controlFetch('/api/stop'" not in startup
+
+
+def test_panel_has_bare_move_buttons():
+    """无参数运动按钮 (前进/后退/左转/右转) 各至少出现一次 (spec §3.2)."""
+    panel = read("web/static/panel.html")
+    for cmd in ("quickCmd('前进')", "quickCmd('后退')",
+                "quickCmd('左转')", "quickCmd('右转')"):
+        assert cmd in panel, f"缺无参数按钮: {cmd}"
+
+
+def test_panel_keeps_parameterized_move_buttons():
+    """原有带参数运动按钮不丢失."""
+    panel = read("web/static/panel.html")
+    assert "quickCmd('前进两米')" in panel
+    assert "quickCmd('左转90度')" in panel

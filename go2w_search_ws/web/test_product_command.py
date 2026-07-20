@@ -31,13 +31,14 @@ def _expected_task(room):
     }
     if current:
         params.update({
-            "max_radius_m": 30.0,
-            "max_time": 1800.0,
-            "initial_radius_m": 6.0,
-            "radius_step_m": 6.0,
-            "tile_size_m": 6.0,
+            "max_radius_m": 120.0,
+            "max_time": 7200.0,
+            "initial_radius_m": 16.0,
+            "radius_step_m": 16.0,
+            "tile_size_m": 16.0,
+            "frontier_spacing_m": 1.5,
             "stable_exhaustion_cycles": 3,
-            "max_frontiers": 200,
+            "max_frontiers": 1000,
             "max_plan_probes_per_cycle": 12,
         })
     return {
@@ -73,13 +74,14 @@ def test_parse_current_room_all_tables_command():
                 "mark_on_map": True,
                 "search_strategy": "frontier_explore",
                 "use_lidar_target_range": True,
-                "max_radius_m": 30.0,
-                "max_time": 1800.0,
-                "initial_radius_m": 6.0,
-                "radius_step_m": 6.0,
-                "tile_size_m": 6.0,
+                "max_radius_m": 120.0,
+                "max_time": 7200.0,
+                "initial_radius_m": 16.0,
+                "radius_step_m": 16.0,
+                "tile_size_m": 16.0,
+                "frontier_spacing_m": 1.5,
                 "stable_exhaustion_cycles": 3,
-                "max_frontiers": 200,
+                "max_frontiers": 1000,
                 "max_plan_probes_per_cycle": 12,
             },
         }],
@@ -130,7 +132,8 @@ def test_parse_go_named_room_find_people_command():
 
 
 def test_non_product_command_returns_none():
-    assert parse_product_command("前进两米") is None
+    # "前进两米" 现已支持 (move_relative, spec §1.1); 用真正不支持的文本测 None 路径
+    assert parse_product_command("今天天气真好") is None
 
 
 def test_non_room_people_command_returns_none():
@@ -355,3 +358,105 @@ def _import_nx_web_server_with_ros_stubs(monkeypatch):
 
     monkeypatch.delitem(sys.modules, "nx_web_server", raising=False)
     return importlib.import_module("nx_web_server")
+
+
+# ---- 运动指令解析 (spec §1.1, move_relative) ----
+
+
+def _move_task(text):
+    result = parse_product_command(text)
+    assert result is not None, f"未解析出运动指令: {text!r}"
+    tasks = result["tasks"]
+    assert len(tasks) == 1 and tasks[0]["type"] == "move_relative"
+    return tasks[0]["params"]
+
+
+def test_move_forward_default():
+    p = _move_task("前进")
+    assert p == {"mode": "linear", "direction": "forward",
+                 "distance_m": 1.0, "clamped": False}
+
+
+def test_move_forward_two_meters_chinese():
+    p = _move_task("前进两米")
+    assert p["mode"] == "linear" and p["direction"] == "forward"
+    assert p["distance_m"] == 2.0 and p["clamped"] is False
+
+
+def test_move_forward_half_meter():
+    p = _move_task("前进半米")
+    assert p["distance_m"] == 0.5
+
+
+def test_move_backward_arabic():
+    p = _move_task("后退1.5米")
+    assert p["mode"] == "linear" and p["direction"] == "backward"
+    assert p["distance_m"] == 1.5
+
+
+def test_move_left_default():
+    p = _move_task("左转")
+    assert p == {"mode": "angular", "direction": "left",
+                 "angle_deg": 90.0, "clamped": False}
+
+
+def test_move_left_45_chinese():
+    p = _move_task("左转四十五度")
+    assert p["angle_deg"] == 45.0
+
+
+def test_move_right_half_turn():
+    p = _move_task("右转半圈")
+    assert p["angle_deg"] == 180.0
+
+
+def test_move_distance_clamped():
+    p = _move_task("前进一百米")
+    assert p["distance_m"] == 20.0 and p["clamped"] is True
+
+
+def test_move_does_not_trigger_on_search():
+    """搜索指令不应误触发运动."""
+    assert parse_product_command("搜索这个房间里所有人") is not None
+    result = parse_product_command("搜索会议室里所有人")
+    assert result["tasks"][0]["type"] == "search_room"
+
+
+def test_move_negation_rejected():
+    assert parse_product_command("别前进") is None
+
+
+# ---- 搜索目标扩展 (spec §2) ----
+def _search_task(text):
+    result = parse_product_command(text)
+    assert result is not None, f"未解析出搜索指令: {text!r}"
+    tasks = result["tasks"]
+    assert len(tasks) == 1 and tasks[0]["type"] == "search_room"
+    return tasks[0]["params"]["target_classes"]
+
+
+def test_search_all_objects_expands_to_preset():
+    tc = _search_task("搜索这个房间里所有物体")
+    assert "person" in tc and "chair" in tc and "couch" in tc
+    assert "dining table" in tc and "laptop" in tc
+    assert len(tc) >= 15  # 室内清单
+
+
+def test_search_table_and_chair_combo():
+    tc = _search_task("搜索这个房间所有桌椅")
+    assert tc == ["dining table", "chair"]
+
+
+def test_search_chair_only():
+    tc = _search_task("搜索这个房间椅子")
+    assert tc == ["chair"]
+
+
+def test_search_arbitrary_dict_item():
+    tc = _search_task("搜索这个房间沙发")
+    assert tc == ["couch"]
+
+
+def test_search_multi_items_combined():
+    tc = _search_task("搜索这个房间的沙发和床")
+    assert "couch" in tc and "bed" in tc

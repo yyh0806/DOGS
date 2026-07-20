@@ -81,6 +81,32 @@ _CAMERA_CALIBRATION = resolve_camera_calibration("c13_vis")
 _CAMERA_HFOV_DEG = _CAMERA_CALIBRATION["hfov_deg"]
 _CAMERA_YAW_OFFSET_DEG = _CAMERA_CALIBRATION["effective_yaw_offset_deg"]
 _DETECTION_SNAPSHOT_MAX = max(64, int(os.environ.get("GO2W_DETECTION_SNAPSHOT_MAX", "256")))
+try:
+    _DETECTION_MIN_CONFIDENCE = float(os.environ.get(
+        "GO2W_DETECTION_MIN_CONFIDENCE", "0.8"))
+except (TypeError, ValueError):
+    _DETECTION_MIN_CONFIDENCE = 0.8
+if not math.isfinite(_DETECTION_MIN_CONFIDENCE):
+    _DETECTION_MIN_CONFIDENCE = 0.8
+_DETECTION_MIN_CONFIDENCE = min(1.0, max(0.0, _DETECTION_MIN_CONFIDENCE))
+
+
+def _filter_confident_detections(detections):
+    """Keep only detector results meeting the product confidence floor."""
+
+    accepted = []
+    for detection in detections or []:
+        if not isinstance(detection, dict):
+            continue
+        raw = detection.get(
+            "confidence", detection.get("score", detection.get("probability", 0.0)))
+        try:
+            confidence = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(confidence) and confidence >= _DETECTION_MIN_CONFIDENCE:
+            accepted.append(detection)
+    return accepted
 
 # ============================================================================
 # 检测器解耦 (round-3): 视频流不再依赖 ultralytics/torch
@@ -522,7 +548,7 @@ class NxAiEngine:
             return []
         try:
             dets = det.detect(frame, target_classes=target_classes)
-            return dets if dets else []
+            return _filter_confident_detections(dets)
         except Exception as e:
             logger.warning(f"[AI] 检测异常 ({type(det).__name__}): {e} (本帧 detections 空, 视频流继续)")
         return []
@@ -793,7 +819,7 @@ class NxAiEngine:
             self._detection_seq += 1
             seq = self._detection_seq
 
-        for idx, det in enumerate((dets or [])[:16]):
+        for idx, det in enumerate(_filter_confident_detections(dets)[:16]):
             if not isinstance(det, dict):
                 continue
             bbox = self._clean_bbox(det.get("bbox"), detect_frame_w, detect_frame_h)

@@ -42,6 +42,10 @@ class PathResult:
     reason: Optional[str] = None
     path_length: Optional[float] = None
     poses: int = 0
+    endpoint_x: Optional[float] = None
+    endpoint_y: Optional[float] = None
+    goal_error_m: Optional[float] = None
+    path: Optional[tuple] = None
 
 
 class NavigationGateway:
@@ -160,19 +164,61 @@ class NavigationGateway:
             if str(status) in TERMINAL_STATUSES:
                 self._finish_locked(str(status), reason)
 
-    def wait_terminal(self, *, owner: object, timeout: float) -> NavigationResult:
+    def wait_terminal(
+        self,
+        *,
+        owner: object,
+        timeout: float,
+        recovery_callback: Optional[Callable[[str], Any]] = None,
+        recovery_interval: float = 0.5,
+    ) -> NavigationResult:
         owner_name = self._owner_name(owner)
         deadline = self._monotonic() + max(0.0, float(timeout))
+        recovery_interval = max(0.0, float(recovery_interval))
+        last_recovery_at = float("-inf")
         with self._lock:
             generation = self._generation
             if self._owner != owner_name:
                 return NavigationResult(False, "rejected", "navigation_owner_mismatch")
         while True:
-            self.tick()
+            state = self.tick()
             with self._lock:
                 terminal = self._terminal.get(generation)
                 if terminal is not None:
                     return terminal
+            now = self._monotonic()
+            recoverable_motion_health = (
+                (
+                    str(state.get("status")) == "waiting_health"
+                    and str(state.get("reason")) == "motion_unhealthy"
+                )
+                or (
+                    bool(state.get("health_degraded"))
+                    and str(state.get("health_reason")) == "motion_unhealthy"
+                )
+            )
+            if (
+                recovery_callback is not None
+                and recoverable_motion_health
+                and now - last_recovery_at >= recovery_interval
+            ):
+                last_recovery_at = now
+                try:
+                    recovered = dict(recovery_callback("motion_unhealthy") or {})
+                except Exception as exc:
+                    recovered = {
+                        "ok": False,
+                        "reason": "motion_recovery_error",
+                        "message": str(exc),
+                    }
+                if not recovered.get("ok"):
+                    self.cancel(owner=owner_name, reason="motion_recovery_failed")
+                    return NavigationResult(
+                        False,
+                        "aborted",
+                        str(recovered.get("reason") or "motion_recovery_failed"),
+                    )
+                continue
             remaining = deadline - self._monotonic()
             if remaining <= 0.0:
                 self.cancel(owner=owner_name, reason="navigation_timeout")
@@ -214,6 +260,14 @@ class NavigationGateway:
             path_length=(float(result["path_length"])
                          if result.get("path_length") is not None else None),
             poses=int(result.get("poses", 0)),
+            endpoint_x=(float(result["endpoint_x"])
+                        if result.get("endpoint_x") is not None else None),
+            endpoint_y=(float(result["endpoint_y"])
+                        if result.get("endpoint_y") is not None else None),
+            goal_error_m=(float(result["goal_error_m"])
+                          if result.get("goal_error_m") is not None else None),
+            path=(tuple(dict(point) for point in result.get("path", ()))
+                  if result.get("path") else None),
         )
 
     def snapshot(self) -> dict:
@@ -291,13 +345,33 @@ class OwnerNavigationPort:
 class MissionNavigationPort:
     """Blocking room/exploration facade over the same gateway owner."""
 
-    def __init__(self, gateway: NavigationGateway, owner: str = "mission") -> None:
+    def __init__(
+        self,
+        gateway: NavigationGateway,
+        owner: str = "mission",
+        *,
+        recovery_callback: Optional[Callable[[str], Any]] = None,
+        recovery_interval: float = 0.5,
+    ) -> None:
         self._gateway = gateway
         self._owner = str(owner)
         self._feedback_callback = None
+        self._recovery_callback = recovery_callback
+        self._recovery_interval = max(0.0, float(recovery_interval))
+        self._admission_lock = threading.RLock()
+        self._accepting_goals = True
+
+    def begin_mission(self) -> None:
+        """Open a fresh admission epoch after the previous mission drained."""
+
+        with self._admission_lock:
+            self._accepting_goals = True
 
     def set_feedback_callback(self, callback) -> None:
         self._feedback_callback = callback
+
+    def set_recovery_callback(self, callback) -> None:
+        self._recovery_callback = callback
 
     def wait_for_server(self, timeout=2.0) -> bool:
         del timeout
@@ -311,16 +385,27 @@ class MissionNavigationPort:
     def send_goal_and_wait(self, x, y, yaw, frame_id="map") -> dict:
         if frame_id != "map":
             return {"ok": False, "reason": "invalid_frame"}
-        submitted = self._gateway.submit(
-            owner=self._owner,
-            pose=(x, y, yaw),
-            feedback_cb=self._feedback_callback,
-        )
+        # Serialize the mission-cancel fence with gateway submission. If the
+        # submit wins, cancel_current() observes and cancels the new owner. If
+        # cancellation wins, no stale worker may submit after it returns.
+        with self._admission_lock:
+            if not self._accepting_goals:
+                return {"ok": False, "reason": "cancelled"}
+            submitted = self._gateway.submit(
+                owner=self._owner,
+                pose=(x, y, yaw),
+                feedback_cb=self._feedback_callback,
+            )
         if not submitted.accepted:
             return {"ok": False, "reason": submitted.reason}
         # 2026-07-15 实测: 120s 单 goal 超时太长, 卡死的 frontier goal(DWB 不终止)
         # 会吃掉整个 mission 预算. 40s 足够 6m 半径内正常接近, 卡死则 abort→跳过该 frontier.
-        result = self._gateway.wait_terminal(owner=self._owner, timeout=40.0)
+        result = self._gateway.wait_terminal(
+            owner=self._owner,
+            timeout=40.0,
+            recovery_callback=self._recovery_callback,
+            recovery_interval=self._recovery_interval,
+        )
         if result.ok:
             return {"ok": True, "status": 4}
         reasons = {
@@ -346,11 +431,22 @@ class MissionNavigationPort:
             value["path_length"] = result.path_length
         if result.poses:
             value["poses"] = result.poses
+        if result.endpoint_x is not None:
+            value["endpoint_x"] = result.endpoint_x
+        if result.endpoint_y is not None:
+            value["endpoint_y"] = result.endpoint_y
+        if result.goal_error_m is not None:
+            value["goal_error_m"] = result.goal_error_m
+        if result.path is not None:
+            value["path"] = [dict(point) for point in result.path]
         return value
 
-    def cancel_current(self) -> bool:
-        return self._gateway.cancel(
-            owner=self._owner, reason="mission_cancel").accepted
+    def cancel_current(self, reason="mission_cancel") -> bool:
+        with self._admission_lock:
+            if str(reason or "") == "mission_cancel":
+                self._accepting_goals = False
+            return self._gateway.cancel(
+                owner=self._owner, reason=reason).accepted
 
     def wait_drained(self, timeout: float) -> bool:
         return self._gateway.wait_drained(
@@ -417,7 +513,22 @@ class RosComputePathPort:
             length += math.hypot(
                 current.pose.position.x - previous.pose.position.x,
                 current.pose.position.y - previous.pose.position.y)
-        return {"ok": True, "path_length": length, "poses": len(poses)}
+        path = [
+            {"x": float(item.pose.position.x),
+             "y": float(item.pose.position.y)}
+            for item in poses
+        ]
+        endpoint_x = path[-1]["x"]
+        endpoint_y = path[-1]["y"]
+        return {
+            "ok": True,
+            "path_length": length,
+            "poses": len(poses),
+            "endpoint_x": endpoint_x,
+            "endpoint_y": endpoint_y,
+            "goal_error_m": math.hypot(endpoint_x - x, endpoint_y - y),
+            "path": path,
+        }
 
 
 __all__ = [

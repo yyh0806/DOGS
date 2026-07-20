@@ -88,6 +88,35 @@ def test_compute_path_is_read_only_and_does_not_take_goal_ownership():
     assert gateway.snapshot()["owner"] is None
 
 
+def test_compute_path_preserves_endpoint_error_and_path_for_goal_validation():
+    class EndpointPathPort:
+        def compute_path(self, pose, timeout):
+            return {
+                "ok": True,
+                "path_length": 2.5,
+                "poses": 3,
+                "endpoint_x": 1.8,
+                "endpoint_y": 2.9,
+                "goal_error_m": 0.2236,
+                "path": [
+                    {"x": 0.0, "y": 0.0},
+                    {"x": 1.0, "y": 2.0},
+                    {"x": 1.8, "y": 2.9},
+                ],
+            }
+
+    gateway = NavigationGateway(
+        action_port=FakeActionPort(), path_port=EndpointPathPort())
+    mission = MissionNavigationPort(gateway)
+
+    result = mission.compute_path_to_pose(2.0, 3.0, 0.0)
+
+    assert result["goal_error_m"] == 0.2236
+    assert result["endpoint_x"] == 1.8
+    assert result["endpoint_y"] == 2.9
+    assert result["path"][-1] == {"x": 1.8, "y": 2.9}
+
+
 def test_shutdown_keeps_quarantine_until_action_is_drained():
     port = FakeActionPort()
     gateway = NavigationGateway(action_port=port)
@@ -126,3 +155,135 @@ def test_mission_wait_drained_tracks_its_own_action_until_terminal():
 
     port.state = {"status": "canceled", "drained": True, "healthy": True}
     assert mission.wait_drained(0.0) is True
+
+
+def test_mission_cancel_preserves_the_internal_cancellation_reason():
+    port = FakeActionPort()
+    gateway = NavigationGateway(action_port=port)
+    gateway.submit(owner="mission", pose=(1, 0, 0))
+    mission = MissionNavigationPort(gateway)
+
+    assert mission.cancel_current("goal_became_unreachable") is True
+
+    assert port.canceled == ["goal_became_unreachable"]
+
+
+def test_idle_mission_cancel_fences_late_goal_until_next_mission_begins():
+    class InstantSuccessPort(FakeActionPort):
+        def submit(self, x, y, yaw):
+            self.sent.append((x, y, yaw))
+            self.state = {
+                "status": "succeeded",
+                "drained": True,
+                "healthy": True,
+                "generation": len(self.sent),
+            }
+            return {"ok": True, "generation": len(self.sent)}
+
+    port = InstantSuccessPort()
+    mission = MissionNavigationPort(NavigationGateway(action_port=port))
+
+    assert mission.cancel_current() is True
+    late = mission.send_goal_and_wait(3.0, 0.0, 0.0)
+
+    assert late == {"ok": False, "reason": "cancelled"}
+    assert port.sent == []
+
+    mission.begin_mission()
+    accepted = mission.send_goal_and_wait(4.0, 0.0, 0.0)
+
+    assert accepted["ok"] is True
+    assert port.sent == [(4.0, 0.0, 0.0)]
+
+
+def test_mission_recovers_motion_unhealthy_goal_without_resubmitting():
+    recoveries = []
+
+    class RecoverableActionPort(FakeActionPort):
+        def submit(self, x, y, yaw):
+            self.sent.append((x, y, yaw))
+            self.state = {
+                "status": "waiting_health",
+                "reason": "motion_unhealthy",
+                "drained": False,
+                "healthy": False,
+                "generation": len(self.sent),
+            }
+            return {"ok": True, "generation": len(self.sent)}
+
+    port = RecoverableActionPort()
+    gateway = NavigationGateway(action_port=port, poll_interval=0.001)
+
+    def recover(reason):
+        recoveries.append(reason)
+        port.state = {
+            "status": "succeeded",
+            "reason": None,
+            "drained": True,
+            "healthy": True,
+            "generation": 1,
+        }
+        return {"ok": True}
+
+    mission = MissionNavigationPort(
+        gateway, recovery_callback=recover, recovery_interval=0.0)
+
+    result = mission.send_goal_and_wait(4.0, 0.0, 0.0)
+
+    assert result["ok"] is True
+    assert recoveries == ["motion_unhealthy"]
+    assert port.sent == [(4.0, 0.0, 0.0)]
+
+
+def test_mission_recovers_during_health_grace_before_active_goal_is_canceled():
+    recoveries = []
+
+    class DegradedActivePort(FakeActionPort):
+        def submit(self, x, y, yaw):
+            self.sent.append((x, y, yaw))
+            self.state = {
+                "status": "active",
+                "reason": None,
+                "health_degraded": True,
+                "health_reason": "motion_unhealthy",
+                "drained": False,
+                "healthy": True,
+                "generation": len(self.sent),
+            }
+            return {"ok": True, "generation": len(self.sent)}
+
+    port = DegradedActivePort()
+    clock = [0.0]
+
+    def advance(seconds):
+        clock[0] += seconds
+
+    gateway = NavigationGateway(
+        action_port=port,
+        monotonic=lambda: clock[0],
+        sleep=advance,
+        poll_interval=0.1,
+    )
+
+    def recover(reason):
+        recoveries.append(reason)
+        port.state = {
+            "status": "succeeded",
+            "reason": None,
+            "health_degraded": False,
+            "health_reason": None,
+            "drained": True,
+            "healthy": True,
+            "generation": 1,
+        }
+        return {"ok": True}
+
+    mission = MissionNavigationPort(
+        gateway, recovery_callback=recover, recovery_interval=0.0)
+
+    result = mission.send_goal_and_wait(4.0, 0.0, 0.0)
+
+    assert result["ok"] is True
+    assert recoveries == ["motion_unhealthy"]
+    assert port.canceled == []
+    assert port.sent == [(4.0, 0.0, 0.0)]

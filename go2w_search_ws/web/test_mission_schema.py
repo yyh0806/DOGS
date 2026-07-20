@@ -21,14 +21,16 @@ def test_person_and_table_commands_share_one_schema():
 def test_current_room_defaults_support_adaptive_large_room_search():
     request = SearchMissionRequest.current_room(["person"], request_id="large-room")
 
-    assert request.max_radius_m == 30.0
-    assert request.max_time_s == 1800.0
-    assert request.initial_radius_m == 6.0
-    assert request.radius_step_m == 6.0
-    assert request.tile_size_m == 6.0
+    assert request.max_radius_m == 120.0
+    assert request.max_time_s == 7200.0
+    assert request.initial_radius_m == 16.0
+    assert request.radius_step_m == 16.0
+    assert request.tile_size_m == 16.0
     assert request.stable_exhaustion_cycles == 3
-    assert request.max_frontiers == 200
+    assert request.max_frontiers == 1000
     assert request.max_plan_probes_per_cycle == 12
+    assert request.frontier_spacing_m == pytest.approx(1.5)
+    assert request.to_task_params()["frontier_spacing_m"] == pytest.approx(1.5)
 
 
 def test_schema_round_trip_is_stable_and_generates_orchestrator_params():
@@ -48,6 +50,7 @@ def test_schema_round_trip_is_stable_and_generates_orchestrator_params():
         "stable_exhaustion_cycles": 4,
         "max_frontiers": 120,
         "max_plan_probes_per_cycle": 9,
+        "frontier_spacing_m": 0.8,
     })
     assert request.target_classes == ("person", "dining table")
     assert SearchMissionRequest.from_dict(request.to_dict()) == request
@@ -66,6 +69,7 @@ def test_schema_round_trip_is_stable_and_generates_orchestrator_params():
         "stable_exhaustion_cycles": 4,
         "max_frontiers": 120,
         "max_plan_probes_per_cycle": 9,
+        "frontier_spacing_m": 0.8,
         "use_lidar_target_range": True,
     }
 
@@ -86,12 +90,13 @@ def test_legacy_http_table_payload_is_migrated_to_the_same_schema():
         {"target_classes": ["../bad"]},
         {"max_radius_m": math.nan},
         {"max_time_s": 0},
-        {"initial_radius_m": 31.0},
+        {"initial_radius_m": 121.0},
         {"radius_step_m": 0},
         {"tile_size_m": 0},
         {"stable_exhaustion_cycles": 0},
         {"max_frontiers": 0},
         {"max_plan_probes_per_cycle": 0},
+        {"frontier_spacing_m": 0},
         {"search_strategy": "drive_forward_blindly"},
     ],
 )
@@ -141,3 +146,61 @@ def test_task_manager_never_defaults_missing_task_type_to_move():
 
     assert 't.get("type", "move")' not in source
     assert "canonicalize_search_tasks(tasks)" in source
+
+
+# ---- move_relative canonicalize (spec §1.2) ----
+from nx_mission_schema import canonicalize_move_tasks  # noqa: E402
+
+
+def test_canonicalize_linear_move():
+    out = canonicalize_move_tasks([{
+        "type": "move_relative", "priority": 5,
+        "params": {"mode": "linear", "direction": "forward",
+                   "distance_m": 2.0, "clamped": False},
+    }])
+    assert len(out) == 1
+    assert out[0]["type"] == "move_relative"
+    assert out[0]["params"]["distance_m"] == 2.0
+    assert out[0]["priority"] == 5
+
+
+def test_canonicalize_angular_move():
+    out = canonicalize_move_tasks([{
+        "type": "move_relative", "priority": 5,
+        "params": {"mode": "angular", "direction": "left",
+                   "angle_deg": 45.0, "clamped": False},
+    }])
+    assert out[0]["params"]["angle_deg"] == 45.0
+    assert "distance_m" not in out[0]["params"]
+
+
+def test_canonicalize_rejects_wrong_type():
+    with pytest.raises(MissionValidationError):
+        canonicalize_move_tasks([{"type": "search_room", "params": {}}])
+
+
+def test_canonicalize_rejects_bad_mode():
+    with pytest.raises(MissionValidationError):
+        canonicalize_move_tasks([{
+            "type": "move_relative",
+            "params": {"mode": "sideways", "direction": "forward",
+                       "distance_m": 1.0},
+        }])
+
+
+def test_canonicalize_rejects_nonpositive_distance():
+    with pytest.raises(MissionValidationError):
+        canonicalize_move_tasks([{
+            "type": "move_relative",
+            "params": {"mode": "linear", "direction": "forward",
+                       "distance_m": 0.0},
+        }])
+
+
+# ---- 物品别名归一化 (spec §2.2) ----
+def test_normalize_accepts_furniture_aliases():
+    from nx_mission_schema import normalize_target_class
+    assert normalize_target_class("椅子") == "chair"
+    assert normalize_target_class("沙发") == "couch"
+    assert normalize_target_class("绿植") == "potted plant"
+    assert normalize_target_class("potted plant") == "potted plant"

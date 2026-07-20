@@ -8,10 +8,14 @@ new owner: the caller gets a failure and the robot is emergency-stopped.
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
 from typing import Any, Callable, Iterable, Optional
+
+
+logger = logging.getLogger("go2w.navigation_arbiter")
 
 
 class NavigationArbiter:
@@ -80,6 +84,11 @@ class NavigationArbiter:
         return None
 
     def _park_drive(self, reason: str, *, wait: bool = False) -> bool:
+        logger.info(
+            "parking drive session: reason=%s motion_owner=%s",
+            reason,
+            self._motion_owner,
+        )
         try:
             self._robot.park_drive_session(reason)
         except Exception:
@@ -100,6 +109,7 @@ class NavigationArbiter:
         # zero speed.  Parking and re-balancing here would physically alternate
         # StandUp/BalanceStand and can destabilize Go2W during rapid handoffs.
         handoff = False
+        reuse_existing = False
         state_reader = getattr(self._robot, "get_drive_session_state", None)
         if callable(state_reader):
             try:
@@ -110,7 +120,8 @@ class NavigationArbiter:
                     "reason": "drive_session_feedback_error",
                     "message": str(exc),
                 }
-            if state.get("drive_session") in ("active", "nav_active"):
+            if state.get("drive_session") in (
+                    "active", "manual_active", "nav_active"):
                 # "nav_active" = nav 已激活 (motion_machine 用此值表示 nav owner 激活态),
                 # 语义等同 "active": 已激活需零速 handoff, 不应走 wait_drive_parked。
                 # 之前只认 "active" → nav_active 被当作未激活 → handoff=False →
@@ -147,9 +158,12 @@ class NavigationArbiter:
                         )
                     except (TypeError, ValueError, OverflowError):
                         stopped = False
-                    if (session in ("active", "nav_active")
+                    if (session in ("active", "manual_active", "nav_active")
                             and state.get("sport_mode") in (1, 3)
                             and stopped):
+                        reuse_existing = (
+                            str(state.get("drive_session_owner") or "")
+                            == str(owner))
                         break
                     if state.get("drive_fault"):
                         return {"ok": False, "reason": state["drive_fault"]}
@@ -160,6 +174,17 @@ class NavigationArbiter:
                             "reason": "drive_handoff_not_stopped",
                         }
                     self._sleep(min(self._poll_interval, remaining))
+
+        if reuse_existing:
+            try:
+                return dict(self._robot.wait_drive_ready(
+                    owner, self._drive_activation_timeout))
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "reason": "drive_session_wait_error",
+                    "message": str(exc),
+                }
 
         if not handoff:
             # A pose/stop command may have published the parking request while
@@ -256,7 +281,11 @@ class NavigationArbiter:
 
             self._tasks.cancel_all()
             if not self._wait_tasks_drained(self._transition_timeout):
-                self._emergency_stop()
+                # 2026-07-19 治本(同 cancel_all_and_drain:410 的 2026-07-17 修复):
+                # drain 失败改 park 不 estop 锁存. 原 _emergency_stop → estop_latched
+                # 锁死(需 restart 清). 触发: 旧任务 worker 卡 send_goal_and_wait
+                # 不及时响应 cancel (start_tasks 重复点搜索房间 / submit_point 点导航时旧任务在跑).
+                self._park_drive("tasks_not_drained")
                 return {"ok": False, "reason": "tasks_not_drained"}
             if self._read_emergency_epoch() != admission_epoch:
                 return {"ok": False, "reason": "emergency_interrupted"}
@@ -330,14 +359,22 @@ class NavigationArbiter:
                 self._emergency_stop()
                 return {"ok": False, "reason": "point_nav_cancel_error"}
             if not self._wait_point_drained(self._transition_timeout):
-                self._emergency_stop()
+                # 2026-07-19 治本(同 cancel_all_and_drain:410 的 2026-07-17 修复):
+                # drain 失败改 park 不 estop 锁存. 原 _emergency_stop → estop_latched
+                # 锁死(需 restart 清)致新任务启动反复 EMERGENCY (用户在上一任务 NAVIGATING
+                # 时重复点搜索房间触发). park 失败才由 _park_drive:86 兜底 estop.
+                self._park_drive("point_nav_not_drained")
                 return {"ok": False, "reason": "point_nav_not_drained"}
             if self._read_emergency_epoch() != admission_epoch:
                 return {"ok": False, "reason": "emergency_interrupted"}
 
             self._tasks.cancel_all()
             if not self._wait_tasks_drained(self._transition_timeout):
-                self._emergency_stop()
+                # 2026-07-19 治本(同 cancel_all_and_drain:410 的 2026-07-17 修复):
+                # drain 失败改 park 不 estop 锁存. 原 _emergency_stop → estop_latched
+                # 锁死(需 restart 清). 触发: 旧任务 worker 卡 send_goal_and_wait
+                # 不及时响应 cancel (start_tasks 重复点搜索房间 / submit_point 点导航时旧任务在跑).
+                self._park_drive("tasks_not_drained")
                 return {"ok": False, "reason": "tasks_not_drained"}
             if self._read_emergency_epoch() != admission_epoch:
                 return {"ok": False, "reason": "emergency_interrupted"}
@@ -345,6 +382,15 @@ class NavigationArbiter:
             activation = self._activate_drive("nav", "task_activation_failed")
             if not activation.get("ok"):
                 return activation
+            try:
+                self._point_nav.tick()
+            except Exception:
+                self._park_drive("task_health_refresh_failed")
+                return {"ok": False, "reason": "point_nav_unavailable"}
+            preflight_error = self._point_preflight()
+            if preflight_error is not None:
+                self._park_drive("task_preflight_failed")
+                return {"ok": False, "reason": preflight_error}
             self._motion_owner = "tasks"
             enqueue = getattr(self._tasks, "_add_list_unchecked", None)
             if not callable(enqueue):
@@ -359,6 +405,73 @@ class NavigationArbiter:
                 return {"ok": False, "reason": "task_enqueue_error", "message": str(exc)}
             return {"ok": True, "count": len(task_list)}
 
+    def recover_task_motion(self, reason: str = "motion_unhealthy") -> dict:
+        """Re-activate a recoverable drive session without replacing the task.
+
+        The room mission remains the logical Nav2 owner while the physical
+        motion state machine may safely fall back to PARKED after a transient
+        mode loss.  Recovery is deliberately scoped to that existing owner and
+        reuses the same feedback-gated activation path as task admission.
+        """
+
+        with self._lock:
+            if self._stopping:
+                return {"ok": False, "reason": "shutting_down"}
+            if self._motion_owner != "tasks":
+                return {"ok": False, "reason": "task_motion_not_owned"}
+
+            state_reader = getattr(self._robot, "get_drive_session_state", None)
+            if not callable(state_reader):
+                return {"ok": False, "reason": "drive_session_feedback_unavailable"}
+            try:
+                state = dict(state_reader())
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "reason": "drive_session_feedback_error",
+                    "message": str(exc),
+                }
+
+            drive_fault = state.get("drive_fault")
+            if drive_fault:
+                return {"ok": False, "reason": str(drive_fault)}
+            session = str(state.get("drive_session") or "")
+            owner = str(state.get("drive_session_owner") or "")
+            already_active = (
+                session in {"active", "nav_active"} and owner == "nav")
+
+            if not already_active:
+                default_activatable = session == "parked"
+                if not bool(state.get("activatable", default_activatable)):
+                    return {
+                        "ok": False,
+                        "reason": str(
+                            state.get("reason")
+                            or "drive_session_not_activatable"),
+                    }
+                activation = self._activate_drive(
+                    "nav", "task_reactivation_failed")
+                if not activation.get("ok"):
+                    return activation
+
+            try:
+                self._point_nav.tick()
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "reason": "point_nav_unavailable",
+                    "message": str(exc),
+                }
+            preflight_error = self._point_preflight()
+            if preflight_error is not None:
+                return {"ok": False, "reason": preflight_error}
+            logger.info(
+                "task motion recovered: trigger=%s motion_owner=%s",
+                reason,
+                self._motion_owner,
+            )
+            return {"ok": True, "owner": "tasks", "reason": None}
+
     def on_point_state(self, state: dict) -> None:
         terminal = {
             "succeeded", "aborted", "rejected", "timed_out",
@@ -372,6 +485,11 @@ class NavigationArbiter:
         if status not in terminal or not bool((state or {}).get("drained")):
             return
         with self._lock:
+            logger.info(
+                "point terminal observed: status=%s motion_owner=%s",
+                status,
+                self._motion_owner,
+            )
             if self._motion_owner != "point":
                 return
             self._motion_owner = None
@@ -386,6 +504,8 @@ class NavigationArbiter:
 
     def on_tasks_drained(self) -> None:
         with self._lock:
+            logger.info(
+                "task drain observed: motion_owner=%s", self._motion_owner)
             if self._motion_owner != "tasks":
                 return
             self._motion_owner = None
