@@ -25,3 +25,11 @@ deps/
 # 工具缓存 (不在仓库内但常出现在仓库根: locate-anything.cpp 上游克隆 / playwright MCP)
 .cache/
 .playwright-mcp/
+.playwright-cli/
+
+# 运行时产物: mission report 存储 / costmap 快照 / pytest 缓存 / 调试输出
+costmap.pgm
+.pytest_fastlio_tmp/
+go2w_search_ws/web/missions/
+tmp/
+go2w_search_ws/tmp/
