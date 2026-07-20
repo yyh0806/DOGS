@@ -76,39 +76,33 @@ def load_control_token(path=None, *, environ=None) -> str:
     return token
 
 
-def validate_search_command(text: str) -> dict:
-    """Allow only product-grade room target-search voice intents."""
+def validate_voice_command(text: str) -> dict:
+    """放行所有确定性产品指令 (search_room OR move_relative).
+
+    search_room 仍校验嵌套 mission_request 合法; move_relative 由 parse_product_command
+    + canonicalize_move_tasks 保证合法, 这里直接放行. fingerprint 含 direction/distance/angle,
+    所以"前进两米"和"前进一米"互不压制 (dedupe 不误杀).
+    """
     raw_text = text.strip() if isinstance(text, str) else ""
     result = parse_product_command(raw_text)
     tasks = result.get("tasks", []) if isinstance(result, dict) else []
     task = tasks[0] if len(tasks) == 1 and isinstance(tasks[0], dict) else None
-    params = task.get("params", {}) if isinstance(task, dict) else {}
-    try:
-        mission = SearchMissionRequest.from_dict(params.get("mission_request"))
-    except (MissionValidationError, TypeError):
-        mission = None
-    valid = (
-        task is not None
-        and task.get("type") == "search_room"
-        and mission is not None
-        and params == mission.to_task_params()
-        or (
-            mission is not None
-            and mission.room != "current_room"
-            and params.get("room") == mission.room
-            and params.get("target_classes") == list(mission.target_classes)
-            and params.get("search_strategy") == mission.search_strategy
-            and params.get("require_photos") is mission.require_photos
-            and params.get("mark_on_map") is mission.mark_on_map
-        )
-    )
-    if not valid:
+    if task is None:
         return {
             "ok": False,
             "reason": "unsupported_voice_command",
             "text": raw_text,
         }
-    fingerprint = json.dumps(mission.to_dict(), ensure_ascii=False, sort_keys=True,
+    if task.get("type") == "search_room":
+        try:
+            SearchMissionRequest.from_dict(task["params"]["mission_request"])
+        except (MissionValidationError, TypeError, KeyError):
+            return {
+                "ok": False,
+                "reason": "unsupported_voice_command",
+                "text": raw_text,
+            }
+    fingerprint = json.dumps(task, ensure_ascii=False, sort_keys=True,
                              separators=(",", ":"))
     return {
         "ok": True,
@@ -117,6 +111,10 @@ def validate_search_command(text: str) -> dict:
         "task": task,
         "fingerprint": fingerprint,
     }
+
+
+# 向后兼容: 旧调用方 (SearchCommandDispatcher.dispatch 等) 仍可用旧名
+validate_search_command = validate_voice_command
 
 
 class SearchCommandDispatcher:
@@ -253,6 +251,22 @@ def _on_ws_message(ws, message: str) -> None:
         elif phase == "INIT_SLAM":
             # 无图 (frontier_explore) 路径开始: SLAM 建图初始化, 给用户"任务启动"反馈
             speak("开始探索房间")
+    elif mtype == "move_result":
+        phase = payload.get("phase")
+        direction = payload.get("direction")
+        dir_cn = {"forward": "前进", "backward": "后退",
+                  "left": "左转", "right": "右转"}.get(direction, direction or "")
+        amount = payload.get("distance_m")
+        if amount is None:
+            amount = payload.get("angle_deg")
+        unit = "米" if payload.get("distance_m") is not None else "度"
+        if phase == "succeeded" and amount is not None:
+            speak(f"已{dir_cn}{amount}{unit}")
+        elif phase == "aborted":
+            reason = payload.get("reason") or ""
+            speak(f"无法{dir_cn}：{reason}" if reason else f"无法{dir_cn}")
+        elif phase == "timed_out":
+            speak(f"{dir_cn}超时，已停止")
     # 其他 type (frame/scan/locate/vlm/partial) 不播报
 
 

@@ -90,10 +90,10 @@ def test_validate_search_command_accepts_spaced_table_search_phrase():
     assert result["task"]["params"]["mark_on_map"] is True
 
 
-def test_validate_search_command_rejects_motion_and_negated_search():
+def test_validate_search_command_rejects_unrelated_and_negated_search():
     module = load_voice_console()
-
-    for transcript in ("前进两米", "别搜索这个房间", "你好"):
+    # "前进两米" 现已支持 (move_relative, spec §1.1); 只测真正不支持的文本
+    for transcript in ("别搜索这个房间", "你好"):
         result = module.validate_search_command(transcript)
         assert result == {
             "ok": False,
@@ -261,7 +261,7 @@ def test_dispatcher_retries_after_failed_admission_and_never_sends_non_search():
 
     assert dispatcher.dispatch("http://nx/api/command", text)["ok"] is False
     assert dispatcher.dispatch("http://nx/api/command", text)["ok"] is True
-    rejected = dispatcher.dispatch("http://nx/api/command", "前进两米")
+    rejected = dispatcher.dispatch("http://nx/api/command", "你好")
 
     assert rejected["reason"] == "unsupported_voice_command"
     assert sends == [text, text]
@@ -291,3 +291,44 @@ def test_text_validation_mode_needs_no_model_or_microphone(tmp_path):
     assert "search_room" in result.stdout
     assert "__current__" in result.stdout
     assert "仅验证" in result.stdout
+
+
+# ---- move_relative 放行 (spec §3.1) ----
+def test_validate_voice_command_accepts_forward_move():
+    module = load_voice_console()
+    result = module.validate_voice_command("前进两米")
+    assert result["ok"] is True
+    assert result["task"]["type"] == "move_relative"
+    assert result["task"]["params"]["direction"] == "forward"
+    assert result["task"]["params"]["distance_m"] == 2.0
+
+
+def test_validate_voice_command_accepts_angular_turn():
+    module = load_voice_console()
+    result = module.validate_voice_command("左转45度")
+    assert result["ok"] is True
+    assert result["task"]["params"]["mode"] == "angular"
+
+
+def test_validate_voice_command_rejects_unrelated_text():
+    module = load_voice_console()
+    result = module.validate_voice_command("今天天气真好")
+    assert result["ok"] is False
+    assert result["reason"] == "unsupported_voice_command"
+
+
+def test_validate_voice_command_still_accepts_search():
+    module = load_voice_console()
+    result = module.validate_voice_command("搜索这个房间里所有人")
+    assert result["ok"] is True
+    assert result["task"]["type"] == "search_room"
+
+
+def test_dedupe_distinguishes_move_distances():
+    """前进两米 vs 前进一米 不同 fingerprint, 不互相压制."""
+    module = load_voice_console()
+    sent = []
+    dispatcher = module.SearchCommandDispatcher(
+        sender=lambda url, text: sent.append(text) or {"ok": True, "accepted": True})
+    assert dispatcher.dispatch("http://x", "前进两米").get("ok")
+    assert dispatcher.dispatch("http://x", "前进一米").get("ok")

@@ -7,6 +7,8 @@ model_path 含 "world" → YOLO-World 开放词汇 (运行时 set_classes 指定
 """
 
 import logging
+import os
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -14,6 +16,22 @@ import numpy as np
 from ai.config import YOLO_MODEL_PATH, YOLO_CONFIDENCE
 
 logger = logging.getLogger("go2w.detector")
+
+
+def _configure_ultralytics_weights_dir(
+        ultralytics_utils, text_model_module=None) -> Path:
+    """Keep YOLO-World's CLIP encoder outside atomic release directories."""
+
+    configured = os.environ.get("GO2W_ULTRALYTICS_WEIGHTS_DIR")
+    weights_dir = Path(configured or Path(YOLO_MODEL_PATH).expanduser().parent)
+    weights_dir = weights_dir.expanduser()
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    ultralytics_utils.WEIGHTS_DIR = weights_dir
+    if text_model_module is not None:
+        # ultralytics.nn.text_model imports WEIGHTS_DIR by value, so update
+        # that module too when it has already been loaded.
+        text_model_module.WEIGHTS_DIR = weights_dir
+    return weights_dir
 
 
 class Detector:
@@ -39,6 +57,10 @@ class Detector:
         try:
             if self._is_world:
                 from ultralytics import YOLOWorld
+                from ultralytics import utils as ultralytics_utils
+                from ultralytics.nn import text_model
+                _configure_ultralytics_weights_dir(
+                    ultralytics_utils, text_model)
                 self._model = YOLOWorld(model_path)
                 self._model.set_classes(self._default_classes)
                 self._current_classes = list(self._default_classes)
