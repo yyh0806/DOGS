@@ -1569,6 +1569,21 @@ class RoomSearchOrchestrator:
                     self._ingest_en_route_samples(
                         en_route_samples, store, "__frontier__", require_photos)
                     self._broadcast_person_markers(mission_id, store.markers())
+                if progress_failure:
+                    # v3 修复 (P0): frontier goal 不可达是探索常态 (未知区难免,
+                    # planner 判 unreachable 不应终结整个 mission). blacklist
+                    # 此 frontier + 选下一个, 不 cancel mission. 修复前 status=
+                    # canceled 被 _nav_failure_reason 映射成 "cancelled" 命中
+                    # _fail+return, 导致搜索死于首个不可达 frontier.
+                    pf_reason = str(progress_failure.get("reason") or
+                                    "goal_became_unreachable")
+                    exploration.mark_navigation_failed(pf_reason, target)
+                    self._phase("FRONTIER_DETECT", progress=progress,
+                                room="__frontier__", current_wp=iteration,
+                                total_wp=max_frontiers,
+                                warning=f"frontier {iteration} skipped ({pf_reason})",
+                                **self._exploration_live_fields(exploration))
+                    continue
                 if not result.get("ok"):
                     reason = self._nav_failure_reason(result)
                     if reason in ("no_nav", "cancelled"):

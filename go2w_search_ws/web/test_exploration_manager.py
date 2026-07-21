@@ -1886,3 +1886,18 @@ def test_mixed_yaw_optimization_parallel_probe_compatible():
     selected = m.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
     assert selected is not None
     assert m.snapshot()["parallel_probe_workers"] == 2
+
+
+def test_degenerate_plan_accelerates_spatial_blacklist():
+    """v3 P1 fix: degenerate_plan 1 ci ji rang spatial count da pai chu yu zhi."""
+    cands = [{"x": 3.0, "y": 0.0, "yaw": 0.0, "size": 10, "center_cell": (0, 30),
+              "distance": 3.0, "information_gain": 10.0, "adjacent_wall_count": 0}]
+    m = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room", room_radius_m=8.0, initial_radius_m=8.0,
+        tile_size_m=16.0,
+        candidate_selector=lambda *_a, **k: [dict(c) for c in cands],
+        reject_map_edge=False, max_failures_per_cell=2,
+    )
+    m._record_failure(cands[0], "degenerate_plan", "plan")
+    assert m._spatial_failure_count(cands[0]) >= 2, "degenerate_plan should accelerate spatial blacklist"

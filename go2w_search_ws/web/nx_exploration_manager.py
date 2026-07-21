@@ -8,7 +8,10 @@ import math
 import os
 import threading
 import time
+import logging
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger("go2w.exploration")
 
 from nx_frontier_planner import (
     callable_accepts_keyword,
@@ -777,7 +780,13 @@ class ExplorationManager:
             record = {"x": x, "y": y, "count": 0}
         else:
             record = self._spatial_failures.pop(spatial_key)
-        record["count"] = int(record.get("count", 0)) + 1
+        # v3 修复 (P1): degenerate_plan 是结构性退化 (goal 落在障碍/已观测区/
+        # plan 端点不达 goal), 1 次即应排除候选. 加速 spatial count 累积达
+        # max_failures_per_cell, 避免退化点被反复 probe (实测 (0.047,-0.062)
+        # 被重试 8 次/20 probe 浪费 40%).
+        increment = (max(1, self.max_failures_per_cell)
+                     if reason == "degenerate_plan" else 1)
+        record["count"] = int(record.get("count", 0)) + increment
         self._spatial_failures[spatial_key] = record
         while len(self._spatial_failures) > self.max_spatial_failure_entries:
             self._spatial_failures.popitem(last=False)
@@ -1430,6 +1439,14 @@ class ExplorationManager:
                 cand["yaw"] = yaw
                 cand["visual_gain"] = vg
                 cand["heading_change"] = hc
+                try:
+                    logger.info(
+                        "v3 yaw_opt: x=%.2f y=%.2f size=%.0f awc=%d "
+                        "yaw=%.0fdeg vg=%d hc=%.2frad util=%.3f",
+                        cx, cy, base_ig, awc,
+                        math.degrees(yaw), int(vg), hc, best[0][0])
+                except Exception:
+                    pass
             cand["wall_proximity_bonus"] = wall_bonus
         return candidates
 
