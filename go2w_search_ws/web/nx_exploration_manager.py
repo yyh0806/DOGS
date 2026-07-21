@@ -19,6 +19,11 @@ from nx_frontier_planner import (
 )
 
 
+def _abs_angle_delta(a: float, b: float) -> float:
+    """abs 角度差, 结果在 [0, π]。"""
+    return abs(math.atan2(math.sin(a - b), math.cos(a - b)))
+
+
 def map_revision(map_msg) -> str:
     """Return a stable revision that changes when occupancy or geometry changes."""
 
@@ -316,6 +321,9 @@ class ExplorationManager:
         candidate_selector = self._candidate_selector or select_frontier_candidates
         candidates = self._select_candidates(
             candidate_selector, map_msg, robot_pose)
+        # v3 yaw 优化 (仅 mixed + tracker 时生效)
+        candidates = self._optimize_yaw_for_candidates(
+            candidates, robot_pose, map_msg)
         # Grow the active radius until the in-radius list has candidates AND
         # nothing was truncated by it (or we hit max_radius). The old "only
         # when list completely empty" condition stranded far frontier (e.g.
@@ -328,6 +336,9 @@ class ExplorationManager:
             self._expand_radius()
             candidates = self._select_candidates(
                 candidate_selector, map_msg, robot_pose)
+            # v3 yaw 优化 (半径扩张后重选)
+            candidates = self._optimize_yaw_for_candidates(
+                candidates, robot_pose, map_msg)
         if not candidates:
             candidates = self._select_visual_coverage_candidates(
                 map_msg, robot_pose)
@@ -1351,6 +1362,75 @@ class ExplorationManager:
         )
         # Return as tuple so callers can compose tiebreakers (distance, x, y).
         return (-utility,)
+
+    def _optimize_yaw_for_candidates(
+            self, candidates: list, robot_pose, map_msg) -> list:
+        """v3 yaw 优化: 每个 candidate 试全360° K 个 yaw, 选 mixed-utility 最优.
+
+        仅 mixed 模式 + visibility_tracker 存在时调用. 否则只填 wall_proximity_bonus.
+        候选集: robot_yaw + ±k·yaw_step (覆盖全360°含 90/180) + 朝frontier方向.
+        不硬排除大角度 — 靠 k_time·t_turn 加权偏好小角度, 前方受阻时 180° 自然胜出.
+        """
+        try:
+            robot_yaw = float(robot_pose[2])
+        except (TypeError, IndexError, ValueError):
+            robot_yaw = 0.0
+        try:
+            rx = float(robot_pose[0]); ry = float(robot_pose[1])
+        except (TypeError, IndexError, ValueError):
+            rx = ry = 0.0
+        for cand in candidates:
+            awc = int(cand.get("adjacent_wall_count", 0))
+            wall_bonus = 1.0 if awc >= 2 else 0.0
+            if (self.utility_mode != "mixed"
+                    or self.visibility_tracker is None):
+                cand["wall_proximity_bonus"] = wall_bonus
+                continue
+            try:
+                cx = float(cand["x"]); cy = float(cand["y"])
+            except (KeyError, TypeError, ValueError):
+                cand["wall_proximity_bonus"] = wall_bonus
+                continue
+            frontier_yaw = math.atan2(cy - ry, cx - rx)
+            step = math.radians(max(5.0, float(self.yaw_step_deg)))
+            yaw_offsets = [0.0]
+            k = 1
+            while k * step < math.pi - 1e-9:
+                yaw_offsets.append(k * step)
+                yaw_offsets.append(-k * step)
+                k += 1
+            yaw_offsets.append(math.pi)
+            yaw_offsets.append(_abs_angle_delta(frontier_yaw, robot_yaw)
+                               * (1.0 if frontier_yaw >= robot_yaw else -1.0))
+            path_cost = self._distance_from_pose(cand, robot_pose)
+            t_travel = path_cost / max(self.max_vel_x, 1e-6)
+            try:
+                base_ig = float(cand.get(
+                    "information_gain", cand.get("size", 0.0)))
+            except (TypeError, ValueError, OverflowError):
+                base_ig = 0.0
+            best = None  # (key_tuple, yaw, vg, hc)
+            for offset in set(yaw_offsets):
+                yaw = robot_yaw + offset
+                vg = self.visibility_tracker.visual_gain_at(map_msg, cx, cy, yaw)
+                hc = _abs_angle_delta(yaw, robot_yaw)
+                t_turn = hc / max(self.max_vel_theta, 1e-6)
+                utility = (
+                    self.mixed_frontier_weight * base_ig
+                    + self.mixed_visual_gain_weight * float(vg)
+                    + self.mixed_wall_bonus * wall_bonus
+                    - self.mixed_heading_penalty * (t_travel + t_turn)
+                )
+                key = (utility, -hc, -vg)
+                if best is None or key > best[0]:
+                    best = (key, yaw, vg, hc)
+            if best is not None:
+                _, yaw, vg, hc = best
+                cand["yaw"] = yaw
+                cand["visual_gain"] = vg
+                cand["heading_change"] = hc
+            cand["wall_proximity_bonus"] = wall_bonus
+        return candidates
 
     def _path_cost_for_utility(self, candidate: dict, robot_pose) -> float:
         """Return Nav2 path_length when known, else euclidean distance.

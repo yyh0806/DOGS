@@ -1734,3 +1734,114 @@ def test_mixed_time_normalization_respects_max_vel_theta():
     assert selected is not None
     assert selected["heading_change"] == pytest.approx(0.0, abs=1e-6)
     assert m.snapshot()["mixed_heading_penalty"] == 10.0
+
+
+def _corner_vs_open_candidates():
+    return [
+        {"x": 3.0, "y": 0.0, "yaw": 0.0, "size": 10, "center_cell": (0, 30),
+         "distance": 3.0, "information_gain": 10.0, "visual_gain": 5.0,
+         "heading_change": 0.0, "adjacent_wall_count": 0},
+        {"x": 0.0, "y": -3.0, "yaw": -math.pi / 2, "size": 10, "center_cell": (-6, 0),
+         "distance": 3.0, "information_gain": 10.0, "visual_gain": 5.0,
+         "heading_change": math.pi / 2, "adjacent_wall_count": 3},
+    ]
+
+
+def test_mixed_wall_bonus_prefers_corner_frontier():
+    cands = _corner_vs_open_candidates()
+    m = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [dict(c) for c in cands],
+        reject_map_edge=False, utility_mode="mixed",
+        mixed_frontier_weight=0.5, mixed_visual_gain_weight=1.0,
+        mixed_heading_penalty=0.0, mixed_wall_bonus=10.0,
+    )
+    selected = m.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    assert selected is not None
+    assert selected["adjacent_wall_count"] == 3
+
+
+def test_mixed_heading_prefers_no_turn_when_visual_gain_close():
+    cands = [
+        {"x": 3.0, "y": 0.0, "yaw": 0.0, "size": 10, "center_cell": (0, 30),
+         "distance": 3.0, "information_gain": 10.0, "visual_gain": 5.0,
+         "heading_change": 0.0, "adjacent_wall_count": 0},
+        {"x": 0.0, "y": 3.0, "yaw": math.pi / 2, "size": 10, "center_cell": (6, 0),
+         "distance": 3.0, "information_gain": 10.0, "visual_gain": 5.0,
+         "heading_change": math.pi / 2, "adjacent_wall_count": 0},
+    ]
+    m = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [dict(c) for c in cands],
+        reject_map_edge=False, utility_mode="mixed",
+        mixed_frontier_weight=0.5, mixed_visual_gain_weight=1.0,
+        mixed_heading_penalty=5.0, max_vel_x=1.0, max_vel_theta=1.0,
+    )
+    selected = m.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    assert selected is not None
+    assert selected["heading_change"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_mixed_yaw_optimization_can_select_180_when_front_blocked():
+    cands = [
+        {"x": 3.0, "y": 0.0, "yaw": 0.0, "size": 10, "center_cell": (0, 30),
+         "distance": 3.0, "information_gain": 10.0, "visual_gain": 0.0,
+         "heading_change": 0.0, "adjacent_wall_count": 0},
+        {"x": -3.0, "y": 0.0, "yaw": math.pi, "size": 10, "center_cell": (0, -30),
+         "distance": 3.0, "information_gain": 10.0, "visual_gain": 20.0,
+         "heading_change": math.pi, "adjacent_wall_count": 0},
+    ]
+    m = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [dict(c) for c in cands],
+        reject_map_edge=False, utility_mode="mixed",
+        mixed_frontier_weight=0.5, mixed_visual_gain_weight=1.0,
+        mixed_heading_penalty=1.0, max_vel_x=1.0, max_vel_theta=1.0,
+    )
+    selected = m.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    assert selected is not None
+    assert selected["x"] == pytest.approx(-3.0)
+
+
+class _StubTracker:
+    """记录 (x,y,yaw) → visual_gain 的 stub."""
+    def __init__(self, gain_map):
+        self._gain_map = gain_map
+        self._observed = set()
+    def visual_gain_at(self, map_msg, x, y, yaw):
+        return self._gain_map.get((round(x, 1), round(y, 1), round(yaw, 2)), 0)
+    def rank_candidates(self, map_msg, robot_pose, candidates):
+        return list(candidates)
+    def observe(self, map_msg, robot_pose, scan):
+        return {}
+    def snapshot(self, map_msg=None):
+        return {}
+
+
+def test_mixed_yaw_optimization_picks_visual_gain_yaw():
+    cands = [
+        {"x": 3.0, "y": 0.0, "yaw": 0.0, "size": 10, "center_cell": (0, 30),
+         "distance": 3.0, "information_gain": 10.0, "visual_gain": 0.0,
+         "heading_change": 0.0, "adjacent_wall_count": 0},
+    ]
+    tracker = _StubTracker({
+        (3.0, 0.0, 0.0): 0,
+        (3.0, 0.0, round(math.pi / 3, 2)): 40,
+    })
+    m = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [dict(c) for c in cands],
+        reject_map_edge=False, utility_mode="mixed",
+        visibility_tracker=tracker,
+        mixed_frontier_weight=0.5, mixed_visual_gain_weight=1.0,
+        mixed_heading_penalty=1.0, max_vel_x=1.0, max_vel_theta=1.0,
+        yaw_step_deg=60.0,
+    )
+    selected = m.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    assert selected is not None
+    assert selected["visual_gain"] == 40
+    assert selected["yaw"] == pytest.approx(math.pi / 3, abs=1e-6)
