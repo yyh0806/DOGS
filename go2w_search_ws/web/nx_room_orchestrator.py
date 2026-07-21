@@ -1386,6 +1386,18 @@ class RoomSearchOrchestrator:
                         warning="person seen without reliable lidar range; "
                                 "continuing from another viewpoint",
                     )
+                elif reason == "stale_detection_frame":
+                    # 2026-07-21: tolerate stale frame at initial viewpoint
+                    # (YOLO warm-up race after go2w-web restart). Warn and
+                    # continue to the frontier loop; per-viewpoint detection
+                    # at each frontier arrival retries once YOLO is ready.
+                    self._phase(
+                        "FRONTIER_DETECT", progress=0.0,
+                        room="__frontier__", current_wp=0,
+                        total_wp=max_frontiers,
+                        warning="initial_viewpoint detection stale; "
+                                "continuing (YOLO warm-up?)",
+                        **self._exploration_live_fields(exploration))
                 else:
                     self._fail(reason, room="__frontier__",
                                stage="initial_viewpoint",
@@ -1483,6 +1495,19 @@ class RoomSearchOrchestrator:
                 en_route_holder = {}
                 progress_holder = {}
 
+                # Closure that reads the latest /map_frontier message under
+                # the same lock the subscription callback writes with. The
+                # progress thread uses it to refresh visibility coverage while
+                # send_goal_and_wait blocks the main thread (2026-07-20:
+                # front-end "explored area" must update en-route, not only
+                # at the next FRONTIER_DETECT iteration).
+                def _latest_map_snapshot():
+                    with map_lock:
+                        return latest_map_box[0]
+
+                visibility_broadcast_interval = self._positive_float(
+                    params.get("visibility_broadcast_interval"), 1.0)
+
                 def _en_route_worker():
                     try:
                         en_route_holder["samples"] = self._observe_en_route(
@@ -1507,6 +1532,15 @@ class RoomSearchOrchestrator:
                         self._positive_float(
                             params.get("goal_revalidation_interval"), 1.0),
                     ),
+                    kwargs={
+                        "mission_id": mission_id,
+                        "iteration": iteration,
+                        "max_frontiers": max_frontiers,
+                        "progress": progress,
+                        "get_map_fn": _latest_map_snapshot,
+                        "broadcast_fn": self._ws,
+                        "visibility_interval": visibility_broadcast_interval,
+                    },
                     daemon=True,
                     name=f"frontier-progress-{mission_id}-{iteration}",
                 )
@@ -1766,7 +1800,8 @@ class RoomSearchOrchestrator:
                     **frontier_result,
                 }
                 return
-            if completion_reason != "reachable_frontiers_exhausted":
+            if completion_reason not in (
+                    "reachable_frontiers_exhausted", "room_enclosed"):
                 reason = "exploration_incomplete"
                 self._fail(
                     reason,
@@ -1817,6 +1852,11 @@ class RoomSearchOrchestrator:
         }
         if completion_reason in budget_reasons:
             return "incomplete"
+        # 封闭房间判据 (2026-07-21): topology-based completion — when the
+        # only remaining frontier is the entry door, the room is enclosed
+        # regardless of the padding-polluted coverage ratio.
+        if completion_reason == "room_enclosed":
+            return "completed"
         threshold = self._positive_float(
             os.environ.get("GO2W_FRONTIER_COVERAGE_THRESHOLD"), 0.90)
         roi = coverage_metrics.get("roi") or {}
@@ -2108,13 +2148,26 @@ class RoomSearchOrchestrator:
 
     def _monitor_frontier_navigation_progress(
             self, stop_event, exploration, nav, holder, sample_interval=0.1,
-            path_revalidation_interval=1.0):
-        """Cancel a leg after divergence or a freshly blocked goal."""
+            path_revalidation_interval=1.0, *,
+            mission_id=None, iteration=0, max_frontiers=0, progress=0.0,
+            get_map_fn=None, broadcast_fn=None, visibility_interval=1.0):
+        """Cancel a leg after divergence or a freshly blocked goal.
+
+        Optional en-route visibility broadcast (2026-07-20): when
+        ``get_map_fn`` and ``broadcast_fn`` are supplied, the loop refreshes
+        VisibilityCoverageTracker.observe() every ``visibility_interval``
+        seconds and pushes a type=search_room phase=NAVIGATING payload so the
+        front-end fog layer expands while send_goal_and_wait blocks the main
+        thread. VisibilityCoverageTracker's internal RLock makes this safe
+        to run concurrently with the main thread's rank_candidates()/snapshot().
+        """
 
         interval = max(0.05, float(sample_interval))
         revalidation_interval = max(
             interval, float(path_revalidation_interval))
         next_revalidation = time.monotonic() + revalidation_interval
+        visibility_interval = max(interval, float(visibility_interval))
+        next_visibility_broadcast = time.monotonic() + visibility_interval
         while not stop_event.wait(interval):
             pose = self._get_live_robot_pose()
             if pose is not None:
@@ -2137,6 +2190,34 @@ class RoomSearchOrchestrator:
                         logger.warning(
                             "frontier progress guard cancel failed: %s", exc)
                     return
+            # En-route visibility broadcast: refresh observed cells and push
+            # them to the front-end so the fog layer expands during a long
+            # navigation leg instead of only at the next DETECT iteration.
+            if (broadcast_fn is not None and get_map_fn is not None
+                    and pose is not None
+                    and time.monotonic() >= next_visibility_broadcast):
+                next_visibility_broadcast = (
+                    time.monotonic() + visibility_interval)
+                try:
+                    map_msg = get_map_fn()
+                    if map_msg is not None:
+                        exploration.observe_environment(
+                            map_msg, pose, self._visibility_scan_snapshot())
+                        broadcast_fn({
+                            "type": "search_room",
+                            "data": {
+                                "mission_id": mission_id,
+                                "phase": "NAVIGATING",
+                                "room": "__frontier__",
+                                "current_wp": iteration,
+                                "total_wp": max_frontiers,
+                                "progress": progress,
+                                **self._exploration_live_fields(exploration),
+                            },
+                        })
+                except Exception as exc:
+                    logger.debug(
+                        "en-route visibility broadcast failed: %s", exc)
             if time.monotonic() < next_revalidation:
                 continue
             next_revalidation = time.monotonic() + revalidation_interval

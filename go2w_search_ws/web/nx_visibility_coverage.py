@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 import math
+import threading
 from typing import Any, Iterable, Optional
 
 
@@ -160,64 +161,72 @@ class VisibilityCoverageTracker:
             0.1, float(path_corridor_half_width_m))
         self.obstacle_standoff_m = max(0.0, float(obstacle_standoff_m))
         self._observed: set[tuple[int, int]] = set()
+        # RLock (not Lock) because observe() calls self.snapshot() internally.
+        # The lock lets the en-route / progress helper threads call observe()
+        # while the main planning thread reads rank_candidates()/snapshot()
+        # without racing on the _observed set (which would raise
+        # "Set changed size during iteration" mid-ray-cast).
+        self._lock = threading.RLock()
         self._last_profile = self._conservative_profile()
         self._last_pose: Optional[tuple[float, float, float]] = None
         self._last_visible: set[tuple[int, int]] = set()
         self._last_scan: Any = None
 
     def observe(self, map_msg: Any, robot_pose: Iterable, scan_snapshot: Any) -> dict:
-        grid = _Grid(map_msg)
-        pose = self._pose(robot_pose)
-        scan_usable = self._scan_usable(scan_snapshot)
-        self._last_profile = (
-            self._scene_profile(scan_snapshot)
-            if scan_usable else self._conservative_profile())
-        self._last_scan = scan_snapshot if scan_usable else None
-        self._last_pose = pose
-        visible = self._visible_buckets(
-            grid, pose, scan_snapshot if scan_usable else None)
-        self._last_visible = visible
-        self._observed.update(visible)
-        return self.snapshot(map_msg)
+        with self._lock:
+            grid = _Grid(map_msg)
+            pose = self._pose(robot_pose)
+            scan_usable = self._scan_usable(scan_snapshot)
+            self._last_profile = (
+                self._scene_profile(scan_snapshot)
+                if scan_usable else self._conservative_profile())
+            self._last_scan = scan_snapshot if scan_usable else None
+            self._last_pose = pose
+            visible = self._visible_buckets(
+                grid, pose, scan_snapshot if scan_usable else None)
+            self._last_visible = visible
+            self._observed.update(visible)
+            return self.snapshot(map_msg)
 
     def rank_candidates(
         self, map_msg: Any, robot_pose: Iterable, candidates: Iterable[dict]
     ) -> list[dict]:
-        grid = _Grid(map_msg)
-        pose = self._pose(robot_pose)
-        result = []
-        for source in candidates or []:
-            candidate = dict(source)
-            candidate_pose = (
-                _finite(candidate.get("x")),
-                _finite(candidate.get("y")),
-                _finite(candidate.get("yaw")),
-            )
-            visible = self._visible_buckets(grid, candidate_pose, None)
-            visual_gain = len(visible.difference(self._observed))
-            base_gain = _finite(candidate.get(
-                "information_gain", candidate.get("size", 0.0)))
-            path_profile = self._candidate_path_profile(pose, candidate_pose)
-            candidate.update({
-                "base_information_gain": base_gain,
-                "visual_gain": int(visual_gain),
-                "information_gain": (
-                    base_gain + visual_gain * self.visual_gain_weight),
-                "adaptive_step_m": path_profile["adaptive_step_m"],
-                "scene_complexity": path_profile["scene_complexity"],
-                "forward_clearance_m": path_profile["forward_clearance_m"],
-                "path_clearance_m": path_profile["forward_clearance_m"],
-                "heading_change": abs(_angle_delta(candidate_pose[2], pose[2])),
-            })
-            result.append(candidate)
-        return sorted(result, key=lambda item: (
-            -_finite(item.get("visual_gain")),
-            -_finite(item.get("information_gain")),
-            _finite(item.get("heading_change")),
-            _finite(item.get("distance")),
-            _finite(item.get("x")),
-            _finite(item.get("y")),
-        ))
+        with self._lock:
+            grid = _Grid(map_msg)
+            pose = self._pose(robot_pose)
+            result = []
+            for source in candidates or []:
+                candidate = dict(source)
+                candidate_pose = (
+                    _finite(candidate.get("x")),
+                    _finite(candidate.get("y")),
+                    _finite(candidate.get("yaw")),
+                )
+                visible = self._visible_buckets(grid, candidate_pose, None)
+                visual_gain = len(visible.difference(self._observed))
+                base_gain = _finite(candidate.get(
+                    "information_gain", candidate.get("size", 0.0)))
+                path_profile = self._candidate_path_profile(pose, candidate_pose)
+                candidate.update({
+                    "base_information_gain": base_gain,
+                    "visual_gain": int(visual_gain),
+                    "information_gain": (
+                        base_gain + visual_gain * self.visual_gain_weight),
+                    "adaptive_step_m": path_profile["adaptive_step_m"],
+                    "scene_complexity": path_profile["scene_complexity"],
+                    "forward_clearance_m": path_profile["forward_clearance_m"],
+                    "path_clearance_m": path_profile["forward_clearance_m"],
+                    "heading_change": abs(_angle_delta(candidate_pose[2], pose[2])),
+                })
+                result.append(candidate)
+            return sorted(result, key=lambda item: (
+                -_finite(item.get("visual_gain")),
+                -_finite(item.get("information_gain")),
+                _finite(item.get("heading_change")),
+                _finite(item.get("distance")),
+                _finite(item.get("x")),
+                _finite(item.get("y")),
+            ))
 
     def coverage_candidates(
         self,
@@ -431,41 +440,42 @@ class VisibilityCoverageTracker:
         return candidates[:output_limit]
 
     def snapshot(self, map_msg: Any = None) -> dict:
-        total_free = 0
-        observed_free = 0
-        if map_msg is not None and self._last_pose is not None:
-            try:
-                grid = _Grid(map_msg)
-                free_buckets = {
-                    self._bucket(*grid.cell_to_world(row, col))
-                    for row, col in grid.reachable_free(
-                        self._last_pose[0], self._last_pose[1])
+        with self._lock:
+            total_free = 0
+            observed_free = 0
+            if map_msg is not None and self._last_pose is not None:
+                try:
+                    grid = _Grid(map_msg)
+                    free_buckets = {
+                        self._bucket(*grid.cell_to_world(row, col))
+                        for row, col in grid.reachable_free(
+                            self._last_pose[0], self._last_pose[1])
+                    }
+                    total_free = len(free_buckets)
+                    observed_free = len(free_buckets.intersection(self._observed))
+                except (TypeError, ValueError):
+                    total_free = observed_free = 0
+            ratio = (
+                float(observed_free) / float(total_free)
+                if total_free > 0 else 0.0)
+            observed_cells = [
+                {
+                    "x": (col + 0.5) * self.coverage_cell_size_m,
+                    "y": (row + 0.5) * self.coverage_cell_size_m,
                 }
-                total_free = len(free_buckets)
-                observed_free = len(free_buckets.intersection(self._observed))
-            except (TypeError, ValueError):
-                total_free = observed_free = 0
-        ratio = (
-            float(observed_free) / float(total_free)
-            if total_free > 0 else 0.0)
-        observed_cells = [
-            {
-                "x": (col + 0.5) * self.coverage_cell_size_m,
-                "y": (row + 0.5) * self.coverage_cell_size_m,
+                for row, col in sorted(self._observed)
+            ]
+            return {
+                "observed_cells": observed_cells[-5000:],
+                "observed_cell_count": len(self._observed),
+                "visible_cell_count": len(self._last_visible),
+                "reachable_free_cell_count": total_free,
+                "observed_reachable_cell_count": observed_free,
+                "visual_coverage_ratio": round(ratio, 6),
+                "coverage_cell_size_m": self.coverage_cell_size_m,
+                "visual_range_m": self.visual_range_m,
+                **self._last_profile,
             }
-            for row, col in sorted(self._observed)
-        ]
-        return {
-            "observed_cells": observed_cells[-5000:],
-            "observed_cell_count": len(self._observed),
-            "visible_cell_count": len(self._last_visible),
-            "reachable_free_cell_count": total_free,
-            "observed_reachable_cell_count": observed_free,
-            "visual_coverage_ratio": round(ratio, 6),
-            "coverage_cell_size_m": self.coverage_cell_size_m,
-            "visual_range_m": self.visual_range_m,
-            **self._last_profile,
-        }
 
     def _visible_buckets(
         self,

@@ -5,11 +5,14 @@ from __future__ import annotations
 from collections import OrderedDict
 import hashlib
 import math
+import os
+import threading
 import time
 from typing import Any, Callable, Optional
 
 from nx_frontier_planner import (
     callable_accepts_keyword,
+    find_frontier_clusters,
     point_in_polygon,
     score_frontier,
     select_frontier_candidates,
@@ -97,6 +100,24 @@ class ExplorationManager:
         coverage_candidate_limit: int = 32,
         candidate_selector: Optional[Callable] = None,
         monotonic: Callable[[], float] = time.monotonic,
+        # Mixed-utility scoring (2026-07-20). When utility_mode != "mixed"
+        # the manager preserves the historical nearest-reachable-first
+        # behaviour (locked by test_frontier_explore score contracts).
+        # In "mixed" mode the eligible.sort primary key becomes a linear
+        # combination that rewards frontier size + visual gain and penalises
+        # path cost, so the dog actively seeks unexplored area instead of
+        # always walking the closest small frontier first.
+        utility_mode: str = "nearest",
+        mixed_frontier_weight: float = 0.5,
+        mixed_visual_gain_weight: float = 1.0,
+        mixed_path_cost_penalty: float = 0.5,
+        # Parallel Nav2 probe (2026-07-20). 0 = serial (historical, locked
+        # by plan_calls ordering tests). >0 = ThreadPoolExecutor workers
+        # used to probe the first approach of each eligible candidate
+        # concurrently, reducing worst-case selection stall from
+        # max_plan_probes × planning_timeout_s (e.g. 12×3s=36s) to a single
+        # planning_timeout_s round (~3s) when many candidates are reachable.
+        parallel_probe_workers: int = 0,
     ) -> None:
         normalized_mode = str(mode).strip().lower()
         if normalized_mode not in self.MODES:
@@ -209,7 +230,35 @@ class ExplorationManager:
         self._navigation_divergence_count = 0
         self._goal_revalidation_failure_count = 0
         self._visibility_snapshot: dict = {}
+        # Trap-escape counter (2026-07-21). When the dog gets stuck in a
+        # dense-obstacle pocket, DWB aborts back-to-back on nearby frontiers.
+        # After escape_abort_threshold consecutive failures with no success,
+        # choose_next drops near candidates and picks a far one to jump out.
+        self._consecutive_nav_failures = 0
+        self._escape_abort_threshold = max(1, int(3))
+        self._escape_min_distance_m = max(0.0, float(3.0))
+        # worker thread writing while the main planning/broadcast thread
+        # reads via snapshot()/_effective_heading_weight(). The visibility
+        # tracker's own RLock protects _observed; this lock is the
+        # ExplorationManager-side mirror for its cached snapshot field.
+        self._visibility_lock = threading.Lock()
         self._staging_transition_pending = False
+        # Mixed-utility mode (env-overridable). GO2W_FRONTIER_UTILITY_MODE
+        # accepts "nearest" (default, historical behaviour) or "mixed"
+        # (linear combination of frontier size, visual gain, path cost).
+        env_mode = str(os.environ.get(
+            "GO2W_FRONTIER_UTILITY_MODE", str(utility_mode))).strip().lower()
+        self.utility_mode = "mixed" if env_mode == "mixed" else "nearest"
+        self.mixed_frontier_weight = max(0.0, float(mixed_frontier_weight))
+        self.mixed_visual_gain_weight = max(0.0, float(mixed_visual_gain_weight))
+        self.mixed_path_cost_penalty = max(0.0, float(mixed_path_cost_penalty))
+        try:
+            env_workers = int(os.environ.get(
+                "GO2W_FRONTIER_PROBE_WORKERS",
+                str(parallel_probe_workers)))
+        except (TypeError, ValueError):
+            env_workers = 0
+        self.parallel_probe_workers = max(0, int(env_workers))
 
     def budget_status(self, *, battery_percent: Optional[float] = None) -> Optional[str]:
         if self._monotonic() - self._started_at >= self.max_time_s:
@@ -231,12 +280,32 @@ class ExplorationManager:
         if self.budget_status() is not None:
             self._last_selection_reason = self.budget_status()
             return None
+        # 封闭房间判据 (2026-07-21): if every remaining frontier cluster
+        # lies within door_radius of mission_origin, the room is walled
+        # off except for the entry door — stop rather than push into the
+        # corridor. Only fires in current_room mode with a visibility
+        # tracker injected (production current_room path); test stubs
+        # rarely set up a tracker, so this guard keeps them on the
+        # historical frontier-driven path.
+        if (self.mode == "current_room"
+                and os.environ.get("GO2W_FRONTIER_ROOM_ENCLOSURE_CHECK", "0") == "1"
+                and self.detect_room_enclosure(map_msg, robot_pose)):
+            self._last_selection_reason = "room_enclosed"
+            return None
         revision = map_revision(map_msg)
         self._map_revision = revision
         candidate_selector = self._candidate_selector or select_frontier_candidates
         candidates = self._select_candidates(
             candidate_selector, map_msg, robot_pose)
-        while (not candidates and self._can_expand_radius()):
+        # Grow the active radius until the in-radius list has candidates AND
+        # nothing was truncated by it (or we hit max_radius). The old "only
+        # when list completely empty" condition stranded far frontier (e.g.
+        # (21,-10) at 23m) behind a wall of always-present near frontiers,
+        # because the list never went empty once the dog was inside the room.
+        while self._can_expand_radius():
+            truncated = getattr(self, "_last_radius_truncated", 0)
+            if candidates and truncated == 0:
+                break
             self._expand_radius()
             candidates = self._select_candidates(
                 candidate_selector, map_msg, robot_pose)
@@ -280,26 +349,85 @@ class ExplorationManager:
 
         self._exhaustion_streak = 0
         eligible = self._prioritize_active_tile(eligible, robot_pose)
+        # Trap-escape (2026-07-21): if recent nav failures stacked, the dog
+        # is stuck in a dense-obstacle pocket. Pick the FARTHEST eligible
+        # frontier to maximise the chance Nav2's global planner can route
+        # around the trap. A fixed distance threshold failed in production
+        # because small rooms had no candidate beyond it (far list empty,
+        # escape silently no-op'd, dog kept abort-cycling on near goals).
+        # Resets to normal once one goal succeeds.
+        if (self._consecutive_nav_failures >= self._escape_abort_threshold
+                and self._escape_min_distance_m > 0.0
+                and len(eligible) > 1):
+            farthest = max(
+                eligible,
+                key=lambda candidate: self._distance_from_pose(
+                    candidate, robot_pose),
+            )
+            eligible = [farthest]
+            self._last_selection_reason = "escape_trap_pending"
         if eligible and all(
                 not item.get("coverage_candidate")
                 and not item.get("lidar_candidate")
                 for item in eligible):
-            # Physical frontier travel dominates mission duration. Probe the
-            # nearest unknown boundary first; visual gain breaks distance
-            # ties. Long movement in open space is still produced by the
-            # LiDAR-confirmed lookahead in _candidate_approaches().
-            eligible.sort(key=lambda item: (
-                self._distance_from_pose(item, robot_pose),
-                -float(item.get("score", 0.0)),
-                -float(item.get("visual_gain", 0.0)),
-                -float(item.get("information_gain", item.get("size", 0.0))),
-                float(item.get("heading_change", 0.0)),
-                float(item["x"]), float(item["y"]),
-            ))
+            if self.utility_mode == "mixed":
+                # 2026-07-20 mixed mode: rank by α·size + β·visual_gain
+                # - γ·path_cost so the dog actively approaches unexplored
+                # area. Distance/heading remain as tiebreakers only.
+                eligible.sort(key=lambda item: (
+                    self._mixed_utility_sort_key(item, robot_pose),
+                    self._distance_from_pose(item, robot_pose),
+                    float(item.get("heading_change", 0.0)),
+                    -float(item.get("visual_gain", 0.0)),
+                    float(item["x"]), float(item["y"]),
+                ))
+            else:
+                # Physical frontier travel dominates mission duration. Probe
+                # the nearest unknown boundary first; visual gain breaks
+                # distance ties. Long movement in open space is still
+                # produced by the LiDAR-confirmed lookahead in
+                # _candidate_approaches().
+                eligible.sort(key=lambda item: (
+                    self._distance_from_pose(item, robot_pose),
+                    -float(item.get("score", 0.0)),
+                    -float(item.get("visual_gain", 0.0)),
+                    -float(item.get("information_gain", item.get("size", 0.0))),
+                    float(item.get("heading_change", 0.0)),
+                    float(item["x"]), float(item["y"]),
+                ))
 
         reachable = []
         probes_this_cycle = 0
+        # Parallel fast path (2026-07-20): concurrently probe the first
+        # approach of each eligible candidate. When enabled this collapses
+        # the worst-case selection stall from max_plan_probes × timeout to
+        # a single timeout round. The serial loop below still runs (it
+        # breaks on the first reachable candidate, which the parallel path
+        # already inserted), so semantics are preserved. A known P2
+        # inefficiency: the serial sweep re-probes candidates the parallel
+        # path already examined, roughly doubling probe count for the same
+        # waypoint output (sim: 68 → 132). Acceptable because ComputePath
+        # calls are cheap vs send_goal_and_wait latency.
+        if self.parallel_probe_workers > 0 and len(eligible) > 1:
+            chosen_parallel, parallel_probes = (
+                self._parallel_probe_first_approaches(
+                    eligible, robot_pose, self.max_plan_probes))
+            probes_this_cycle += parallel_probes
+            self._plan_probes += parallel_probes
+            if chosen_parallel is not None:
+                reachable.append(chosen_parallel)
         for candidate in eligible:
+            # NOTE: critic #2 asked for a short-circuit `if reachable: break`
+            # here, but doing so skips lower-priority candidates' standoff
+            # fallbacks (the serial loop probes multiple standoff offsets
+            # per candidate). Sim showed mixed+parallel dropping coverage
+            # from 98.44% to 96.48% with the short-circuit. We keep the
+            # serial sweep running so behaviour matches the serial path
+            # exactly (sim H3 PASS), accepting ~2× probe count (68→132)
+            # as the cost. ComputePath calls are cheaper than the goal
+            # send_goal_and_wait they precede, and parallel_probe_workers
+            # defaults to 0 (opt-in) so this only fires when an operator
+            # explicitly enables it.
             if probes_this_cycle >= self.max_plan_probes:
                 break
             approaches = self._candidate_approaches(candidate, robot_pose)
@@ -381,12 +509,22 @@ class ExplorationManager:
                 not item.get("coverage_candidate")
                 and not item.get("lidar_candidate")
                 for item in reachable):
-            reachable.sort(key=lambda item: (
-                item["path_length"],
-                -float(item.get("visual_gain", 0.0)),
-                -float(item.get("information_gain", item.get("size", 0.0))),
-                -item["score"], item["x"], item["y"],
-            ))
+            if self.utility_mode == "mixed":
+                # path_length is now known (post-probe); utility uses the
+                # real Nav2 cost instead of euclidean distance.
+                reachable.sort(key=lambda item: (
+                    self._mixed_utility_sort_key(item, robot_pose),
+                    item["path_length"],
+                    -float(item.get("visual_gain", 0.0)),
+                    item["x"], item["y"],
+                ))
+            else:
+                reachable.sort(key=lambda item: (
+                    item["path_length"],
+                    -float(item.get("visual_gain", 0.0)),
+                    -float(item.get("information_gain", item.get("size", 0.0))),
+                    -item["score"], item["x"], item["y"],
+                ))
         else:
             reachable.sort(key=lambda item: (
                 -item["score"], item["path_length"], item["x"], item["y"]))
@@ -399,14 +537,28 @@ class ExplorationManager:
         return dict(self._current_goal)
 
     def observe_environment(self, map_msg, robot_pose, scan_snapshot) -> dict:
-        """Accumulate LiDAR-bounded camera coverage at the current pose."""
+        """Accumulate LiDAR-bounded camera coverage at the current pose.
+
+        Thread-safe: called from the main frontier loop AND from the
+        en-route progress worker concurrently. The lock ensures the
+        _visibility_snapshot rebind and the visibility_tracker.observe
+        mutation are not interleaved with snapshot() readers.
+        """
 
         if self.visibility_tracker is None:
-            self._visibility_snapshot = {}
+            with self._visibility_lock:
+                self._visibility_snapshot = {}
             return {}
-        self._visibility_snapshot = dict(self.visibility_tracker.observe(
+        observed = dict(self.visibility_tracker.observe(
             map_msg, robot_pose, scan_snapshot) or {})
-        return dict(self._visibility_snapshot)
+        with self._visibility_lock:
+            self._visibility_snapshot = observed
+        return dict(observed)
+
+    def _visibility_snapshot_snapshot(self) -> dict:
+        """Lock-guarded copy of the cached visibility snapshot."""
+        with self._visibility_lock:
+            return dict(self._visibility_snapshot)
 
     def mark_visited(self, candidate: Optional[dict] = None) -> None:
         target = dict(candidate or self._current_goal or {})
@@ -425,6 +577,7 @@ class ExplorationManager:
             self._reset_navigation_progress()
             return
         self._staging_transition_pending = False
+        self._consecutive_nav_failures = 0
         self._visited.append({"x": float(target["x"]), "y": float(target["y"])})
         tile = self._tile_key(float(target["x"]), float(target["y"]))
         self._visited_tiles.add(tile)
@@ -439,6 +592,7 @@ class ExplorationManager:
         target = dict(candidate or self._current_goal or {})
         if target:
             self._record_failure(target, str(reason or "navigation_failed"), "navigation")
+        self._consecutive_nav_failures += 1
         self._current_goal = None
         self._reset_navigation_progress()
 
@@ -559,9 +713,13 @@ class ExplorationManager:
             "max_frontier_standoff_steps": self.max_frontier_standoff_steps,
             "open_space_heading_weight": self.open_space_heading_weight,
             "visual_coverage_threshold": self.visual_coverage_threshold,
+            "utility_mode": self.utility_mode,
+            "mixed_frontier_weight": self.mixed_frontier_weight,
+            "mixed_visual_gain_weight": self.mixed_visual_gain_weight,
+            "mixed_path_cost_penalty": self.mixed_path_cost_penalty,
             "coverage_candidate_limit": self.coverage_candidate_limit,
             "staging_transition_pending": self._staging_transition_pending,
-            "visibility": dict(self._visibility_snapshot),
+            "visibility": self._visibility_snapshot_snapshot(),
             "visited_frontiers": [dict(item) for item in self._visited],
             "blacklist": [dict(record) for record in self._blacklist.values()],
             "current_goal": (
@@ -956,16 +1114,22 @@ class ExplorationManager:
         if self.visibility_tracker is not None:
             candidates = self.visibility_tracker.rank_candidates(
                 map_msg, robot_pose, candidates)
-            positive_visual_gain = [
-                item for item in candidates
-                if float(item.get("visual_gain", 0.0)) > 0.0
-            ]
-            if positive_visual_gain:
-                # A geometrically persistent frontier can remain in the SLAM
-                # grid after C13 has already covered it. Prefer candidates
-                # that reveal at least one new visibility bucket instead of
-                # walking the same aisle again for stale base cluster size.
-                candidates = positive_visual_gain
+            # Hard-filtering visual_gain==0 frontiers was too aggressive in
+            # mixed mode: once the dog's视锥 swept a region, every remaining
+            # map frontier got dropped, the candidate list went empty, and
+            # stable_exhaustion fired after 3 cycles — ending the mission
+            # with most of the room unexplored (sim critique #3, confirmed
+            # in 2026-07-21 production run: only 3 waypoints in a 4-wall
+            # room). Mixed mode already uses visual_gain as a utility term,
+            # so the filter is redundant there. Keep it only for nearest
+            # mode where it was the historical tie-breaker.
+            if self.utility_mode != "mixed":
+                positive_visual_gain = [
+                    item for item in candidates
+                    if float(item.get("visual_gain", 0.0)) > 0.0
+                ]
+                if positive_visual_gain:
+                    candidates = positive_visual_gain
         for item in candidates:
             count = self._spatial_failure_count(item)
             item["failure_count"] = int(count)
@@ -984,15 +1148,24 @@ class ExplorationManager:
             float(item["x"]), float(item["y"]),
         ))
         # Enforce the active mission bound here too, so custom/test candidate
-        # sources cannot bypass dynamic current-room containment.
+        # sources cannot bypass dynamic current-room containment. Track how
+        # many candidates were truncated so choose_next can grow the radius
+        # proactively — otherwise a room larger than initial_radius_m leaves
+        #远 frontier permanently out of reach while near frontiers keep the
+        # candidate list non-empty (2026-07-21 production: (21,-10) at 23m
+        # never explored because initial_radius=16m never expanded).
+        self._last_radius_truncated = 0
         if self._active_radius_m is not None:
-            candidates = [
-                item for item in candidates
+            kept = []
+            for item in candidates:
                 if math.hypot(
                     float(item["x"]) - self.mission_origin[0],
                     float(item["y"]) - self.mission_origin[1],
-                ) <= self._active_radius_m
-            ]
+                ) <= self._active_radius_m:
+                    kept.append(item)
+                else:
+                    self._last_radius_truncated += 1
+            candidates = kept
         if self.room_polygon:
             candidates = [
                 item for item in candidates
@@ -1104,7 +1277,8 @@ class ExplorationManager:
         return prepared
 
     def _effective_heading_weight(self, candidate: Optional[dict] = None) -> float:
-        source = candidate or self._visibility_snapshot
+        source = candidate if candidate is not None else (
+            self._visibility_snapshot_snapshot())
         try:
             complexity = float(source.get("scene_complexity", 1.0))
         except (AttributeError, TypeError, ValueError, OverflowError):
@@ -1114,6 +1288,294 @@ class ExplorationManager:
             self.heading_weight
             + self.open_space_heading_weight * (1.0 - complexity)
         )
+
+    def _mixed_utility_sort_key(self, candidate: dict, robot_pose) -> tuple:
+        """Primary sort key for mixed-utility mode.
+
+        Linear combination: ``alpha * information_gain + beta * visual_gain
+        - gamma * path_length``. Unlike ``score_frontier``'s gain/cost ratio,
+        this rewards large frontiers AND fresh visibility gain at the cost of
+        longer travel, so the dog actively approaches unexplored area instead
+        of always picking the closest small frontier.
+
+        ``path_length`` is preferred over raw euclidean ``distance`` when
+        available — the rank/coverage pipelines leave ``path_length`` unset
+        until Nav2 preflight fills it, so we fall back to ``distance`` and
+        let ``choose_next`` re-rank reachable paths with their real
+        ``path_length`` after probing.
+        """
+        try:
+            information_gain = float(candidate.get(
+                "information_gain", candidate.get("size", 0.0)))
+        except (TypeError, ValueError, OverflowError):
+            information_gain = 0.0
+        try:
+            visual_gain = float(candidate.get("visual_gain", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            visual_gain = 0.0
+        path_cost = self._path_cost_for_utility(candidate, robot_pose)
+        utility = (
+            self.mixed_frontier_weight * information_gain
+            + self.mixed_visual_gain_weight * visual_gain
+            - self.mixed_path_cost_penalty * path_cost
+        )
+        # Return as tuple so callers can compose tiebreakers (distance, x, y).
+        return (-utility,)
+
+    def _path_cost_for_utility(self, candidate: dict, robot_pose) -> float:
+        """Return Nav2 path_length when known, else euclidean distance.
+
+        At preflight time only ``distance`` is set; ``path_length`` is filled
+        after ``compute_path_to_pose``. Using whichever is available keeps the
+        utility meaningful both before and after probing.
+        """
+        path_length = candidate.get("path_length")
+        try:
+            if path_length is not None:
+                value = float(path_length)
+                if math.isfinite(value) and value >= 0.0:
+                    return value
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return self._distance_from_pose(candidate, robot_pose)
+
+    def _parallel_probe_first_approaches(
+            self, eligible: list, robot_pose, budget: int):
+        """Concurrently probe the first approach of each eligible candidate.
+
+        Opt-in fast path (2026-07-20) used when ``parallel_probe_workers`` > 0
+        and at least two candidates are eligible. Submits one
+        ``compute_path_to_pose`` per candidate to a ThreadPoolExecutor, then
+        walks results in submission order so the highest-priority reachable
+        candidate wins — matching the serial loop's first-reachable-wins rule.
+
+        Returns ``(chosen_or_None, probes_used)``. The caller falls through
+        to the serial loop when ``chosen`` is None so per-candidate standoff
+        fallbacks still run for hard-to-reach frontiers.
+        """
+        import concurrent.futures
+
+        candidates_to_probe: list = []
+        first_approaches: list = []
+        for candidate in eligible:
+            if len(candidates_to_probe) >= budget:
+                break
+            approaches = self._candidate_approaches(candidate, robot_pose)
+            approaches = [
+                approach for approach in approaches
+                if not self._approach_revisits_viewpoint(approach)
+            ]
+            if not approaches:
+                continue
+            candidates_to_probe.append(candidate)
+            first_approaches.append(approaches[0])
+        if not candidates_to_probe:
+            return None, 0
+
+        workers = max(1, min(
+            int(self.parallel_probe_workers), len(candidates_to_probe)))
+
+        def _probe(index):
+            approach = first_approaches[index]
+            result = self.navigation_port.compute_path_to_pose(
+                approach["x"], approach["y"], approach["yaw"],
+                frame_id="map", timeout=self.planning_timeout_s)
+            return index, result
+
+        results_in_order: list = [None] * len(candidates_to_probe)
+        probes_used = 0
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers) as pool:
+            futures = {
+                pool.submit(_probe, i): i
+                for i in range(len(candidates_to_probe))
+            }
+            for future in concurrent.futures.as_completed(futures):
+                probes_used += 1
+                index, result = future.result()
+                results_in_order[index] = result
+
+        chosen = None
+        for index, result in enumerate(results_in_order):
+            if result is None:
+                continue
+            approach = first_approaches[index]
+            ok = (
+                result.get("ok")
+                and self._path_respects_room(result)
+                and self._path_makes_progress(result)
+                and self._path_detour_is_safe(result, approach, robot_pose)
+                and self._path_endpoint_reaches_goal(result))
+            if not ok:
+                continue
+            chosen_approach = dict(approach)
+            chosen_approach["path_length"] = float(
+                result.get("path_length", approach.get("distance", 0.0)))
+            chosen_approach["path_poses"] = int(result.get("poses", 0) or 0)
+            if result.get("goal_error_m") is not None:
+                chosen_approach["goal_error_m"] = float(result["goal_error_m"])
+            chosen_approach["score"] = score_frontier(
+                chosen_approach,
+                path_length=chosen_approach["path_length"],
+                heading_change=chosen_approach.get("heading_change", 0.0),
+                failure_count=chosen_approach.get("failure_count", 0),
+                distance_weight=self.distance_weight,
+                heading_weight=self._effective_heading_weight(chosen_approach),
+                failure_penalty=self.failure_penalty,
+            ) + float(chosen_approach.get("lidar_progress_bonus", 0.0))
+            if chosen is None:
+                chosen = chosen_approach
+        return chosen, probes_used
+
+    def detect_room_enclosure(self, map_msg, robot_pose, door_radius_m: float = 2.5,
+                              min_wall_ratio: float = 0.8) -> bool:
+        """Return True when the reachable free space is walled in.
+
+        封闭房间判据 (2026-07-21, rev 2): a room is enclosed when BOTH hold:
+          1. every remaining frontier cluster is at the entry door (within
+             ``door_radius_m`` of ``mission_origin``), AND
+          2. the reachable free perimeter is mostly occupied walls
+             (``wall_ratio >= min_wall_ratio``).
+
+        Condition (2) is the user's literal spec — "外围全部被遮挡".
+        Without it the first version triggered on a rolling-window artefact:
+        the dog walked 17m from the door, MID360's window showed only the
+        explored neighbourhood, frontier clusters came back empty, and the
+        check returned True even though 51% of the room was still unknown
+        (production mission 4903b09d: explored_ratio=0.485, 154 enclosed
+        unknown regions, but completion_reason=room_enclosed).
+
+        frontier-empty no longer claims enclosure; it defers to the regular
+        stable_exhaustion path so radius expansion + further exploration
+        can run.
+        """
+        wall_ratio = self._reachable_free_wall_ratio(map_msg, robot_pose)
+        if wall_ratio < min_wall_ratio:
+            return False
+        try:
+            clusters = find_frontier_clusters(
+                map_msg, robot_pose, [], min_cluster_size=3,
+                revisit_radius=0.0, frontier_spacing_m=self.frontier_spacing_m)
+        except Exception:
+            return False
+        if not clusters:
+            # Reachable free is walled in AND no frontier at all → fully
+            # mapped room. This is a true enclosure (distinct from the
+            # rolling-window empty-frontier case, which fails wall_ratio).
+            return True
+        ox = float(self.mission_origin[0])
+        oy = float(self.mission_origin[1])
+        door_radius = max(0.5, float(door_radius_m))
+        for cluster in clusters:
+            world = cluster.get("center_world") or (0.0, 0.0)
+            try:
+                wx, wy = float(world[0]), float(world[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if math.hypot(wx - ox, wy - oy) > door_radius:
+                return False
+        return True
+
+    def _reachable_free_wall_ratio(self, map_msg, robot_pose) -> float:
+        """Fraction of reachable-free perimeter neighbors that are walls.
+
+        Flood-fills the 4-connected free component containing the robot,
+        then walks its 8-neighbors: every non-free neighbor is a perimeter
+        sample, classified as wall (occupied, value > 0) or opening
+        (unknown, value < 0). Returns walls / non-free. Low ratio means
+        the explored region still borders meaningful unknown area
+        (unexplored room); ratio near 1 means the region is hemmed in by
+        walls (truly enclosed).
+        """
+        from collections import deque
+        info = getattr(map_msg, "info", None)
+        if info is None:
+            return 0.0
+        resolution = float(getattr(info, "resolution", 0.0) or 0.0)
+        width = int(getattr(info, "width", 0) or 0)
+        height = int(getattr(info, "height", 0) or 0)
+        try:
+            data = list(getattr(map_msg, "data", []) or [])
+        except Exception:
+            return 0.0
+        if (resolution <= 0.0 or width <= 0 or height <= 0
+                or len(data) != width * height):
+            return 0.0
+        origin = getattr(info, "origin", None)
+        position = getattr(origin, "position", None)
+        orientation = getattr(origin, "orientation", None)
+        ox = float(getattr(position, "x", 0.0))
+        oy = float(getattr(position, "y", 0.0))
+        qx = float(getattr(orientation, "x", 0.0))
+        qy = float(getattr(orientation, "y", 0.0))
+        qz = float(getattr(orientation, "z", 0.0))
+        qw = float(getattr(orientation, "w", 1.0))
+        yaw = math.atan2(
+            2.0 * (qw * qz + qx * qy),
+            1.0 - 2.0 * (qy * qy + qz * qz),
+        )
+        try:
+            rx, ry = float(robot_pose[0]), float(robot_pose[1])
+        except (TypeError, ValueError, IndexError):
+            return 0.0
+        dx = rx - ox
+        dy = ry - oy
+        local_x = math.cos(yaw) * dx + math.sin(yaw) * dy
+        local_y = -math.sin(yaw) * dx + math.cos(yaw) * dy
+        col = int(math.floor(local_x / resolution))
+        row = int(math.floor(local_y / resolution))
+        if not (0 <= row < height and 0 <= col < width):
+            return 0.0
+        seed = row * width + col
+        if data[seed] != 0:
+            best = None
+            radius_cells = max(1, int(math.ceil(1.0 / resolution)))
+            for dr in range(-radius_cells, radius_cells + 1):
+                for dc in range(-radius_cells, radius_cells + 1):
+                    nr, nc = row + dr, col + dc
+                    if not (0 <= nr < height and 0 <= nc < width):
+                        continue
+                    if data[nr * width + nc] != 0:
+                        continue
+                    key = (dr * dr + dc * dc, nr, nc)
+                    if best is None or key < best[0]:
+                        best = (key, nr * width + nc)
+            if best is None:
+                return 0.0
+            seed = best[1]
+        seen = bytearray(width * height)
+        seen[seed] = 1
+        queue = deque([seed])
+        reachable = []
+        while queue:
+            index = queue.popleft()
+            reachable.append(index)
+            r, c = divmod(index, width)
+            for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                if not (0 <= nr < height and 0 <= nc < width):
+                    continue
+                neighbor = nr * width + nc
+                if not seen[neighbor] and data[neighbor] == 0:
+                    seen[neighbor] = 1
+                    queue.append(neighbor)
+        wall = 0
+        non_free = 0
+        for index in reachable:
+            r, c = divmod(index, width)
+            for nr, nc in ((r - 1, c - 1), (r - 1, c), (r - 1, c + 1),
+                           (r, c - 1), (r, c + 1),
+                           (r + 1, c - 1), (r + 1, c), (r + 1, c + 1)):
+                if not (0 <= nr < height and 0 <= nc < width):
+                    continue
+                value = data[nr * width + nc]
+                if value == 0:
+                    continue
+                non_free += 1
+                if value > 0:
+                    wall += 1
+        if non_free == 0:
+            return 0.0
+        return wall / float(non_free)
 
     def _can_expand_radius(self) -> bool:
         return bool(

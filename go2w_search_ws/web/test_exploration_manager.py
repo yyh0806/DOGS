@@ -181,6 +181,164 @@ def test_current_room_prefers_nearest_reachable_frontier_over_distant_large_clus
     assert selected["x"] == pytest.approx(1.5)
 
 
+# ---------------------------------------------------------------------------
+# Mixed-utility mode (2026-07-20): α·size + β·visual_gain − γ·path_cost
+# ---------------------------------------------------------------------------
+_MIXED_CANDIDATES = [
+    {
+        "x": 5.0, "y": 0.0, "yaw": 0.0, "size": 100,
+        "center_cell": (0, 50), "distance": 5.0,
+        "information_gain": 100.0,
+    },
+    {
+        "x": 1.5, "y": 0.0, "yaw": 0.0, "size": 5,
+        "center_cell": (0, 15), "distance": 1.5,
+        "information_gain": 5.0,
+    },
+]
+
+
+def test_mixed_mode_prefers_large_distant_frontier_over_near_small():
+    """Same input as the nearest-mode test above, but utility_mode='mixed'.
+
+    With α=0.5, γ=0.5 (β irrelevant — no visibility tracker injected):
+      utility(x=5)  = 0.5·100 − 0.5·5  = 47.5
+      utility(x=1.5) = 0.5·5   − 0.5·1.5 =  1.75
+    The large distant frontier wins, so the dog actively seeks more gain
+    instead of walking the nearest small boundary first.
+    """
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=8.0,
+        initial_radius_m=8.0,
+        tile_size_m=16.0,
+        candidate_selector=lambda *_a, **_k: [dict(item) for item in _MIXED_CANDIDATES],
+        reject_map_edge=False,
+        utility_mode="mixed",
+        mixed_frontier_weight=0.5,
+        mixed_visual_gain_weight=1.0,
+        mixed_path_cost_penalty=0.5,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(5.0)
+    assert manager.snapshot()["utility_mode"] == "mixed"
+
+
+def test_mixed_mode_visual_gain_breaks_size_tie():
+    """Two frontiers with identical size/distance but different visual_gain.
+
+    The candidate whose viewpoint reveals more unseen cells must win in
+    mixed mode (visual_gain is the 'actively explore unexplored area' term).
+    """
+    candidates = [
+        {
+            "x": 3.0, "y": 0.0, "yaw": 0.0, "size": 10,
+            "center_cell": (0, 30), "distance": 3.0,
+            "information_gain": 10.0, "visual_gain": 0.0,
+        },
+        {
+            "x": -3.0, "y": 0.0, "yaw": math.pi, "size": 10,
+            "center_cell": (0, -30), "distance": 3.0,
+            "information_gain": 10.0, "visual_gain": 40.0,
+        },
+    ]
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [dict(item) for item in candidates],
+        reject_map_edge=False,
+        utility_mode="mixed",
+        mixed_frontier_weight=0.5,
+        mixed_visual_gain_weight=1.0,
+        mixed_path_cost_penalty=0.5,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(-3.0)
+    assert selected["visual_gain"] == 40.0
+
+
+def test_mixed_mode_env_override_switches_behaviour(monkeypatch):
+    """GO2W_FRONTIER_UTILITY_MODE=mixed env var flips the default nearest mode.
+
+    Constructor default is utility_mode='nearest'; the env var must override
+    it at construction time so deploy jobs can opt in without code changes.
+    """
+    monkeypatch.setenv("GO2W_FRONTIER_UTILITY_MODE", "mixed")
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=8.0,
+        initial_radius_m=8.0,
+        tile_size_m=16.0,
+        candidate_selector=lambda *_a, **_k: [dict(item) for item in _MIXED_CANDIDATES],
+        reject_map_edge=False,
+        # utility_mode intentionally left at default 'nearest'
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert manager.snapshot()["utility_mode"] == "mixed"
+    assert selected is not None
+    assert selected["x"] == pytest.approx(5.0)
+
+
+# ---------------------------------------------------------------------------
+# Parallel Nav2 probe (2026-07-20): collapse serial probe stall
+# ---------------------------------------------------------------------------
+def test_parallel_probe_picks_first_reachable_in_eligible_order():
+    """parallel_probe_workers>0 must still respect first-reachable-wins.
+
+    Eligible order is nearest-first (x=1.5, 3.0, 5.0). x=1.5 is blocked, so
+    the parallel path must return x=3.0 — not the larger x=5.0 — exactly
+    matching the serial loop's behaviour.
+    """
+    candidates = [
+        {"x": 1.5, "y": 0.0, "yaw": 0.0, "size": 5,
+         "center_cell": (0, 15), "distance": 1.5, "information_gain": 5.0},
+        {"x": 3.0, "y": 0.0, "yaw": 0.0, "size": 8,
+         "center_cell": (0, 30), "distance": 3.0, "information_gain": 8.0},
+        {"x": 5.0, "y": 0.0, "yaw": 0.0, "size": 12,
+         "center_cell": (0, 50), "distance": 5.0, "information_gain": 12.0},
+    ]
+    nav = _PlannerPort(blocked_x=(1.5,))
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [dict(c) for c in candidates],
+        reject_map_edge=False,
+        parallel_probe_workers=2,
+    )
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    assert selected is not None
+    assert selected["x"] == pytest.approx(3.0)
+    # At least two probes fired (blocked + first reachable).
+    assert manager.snapshot()["plan_probes"] >= 2
+
+
+def test_parallel_probe_env_override_enables_it(monkeypatch):
+    """GO2W_FRONTIER_PROBE_WORKERS env var opts the manager into parallel probes."""
+    monkeypatch.setenv("GO2W_FRONTIER_PROBE_WORKERS", "2")
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [dict(c) for c in _MIXED_CANDIDATES],
+        reject_map_edge=False,
+    )
+    assert manager.parallel_probe_workers == 2
+
+
 def test_plan_endpoint_must_reach_candidate_instead_of_stopping_beside_obstacle():
     class ApproximatePlanner:
         def compute_path_to_pose(

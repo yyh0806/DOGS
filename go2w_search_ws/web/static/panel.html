@@ -168,6 +168,11 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
       <canvas id="mapCanvas"></canvas>
       <div class="map-source" id="mapSource">SLAM: 未连接</div>
       <div class="map-hint">map 坐标系 (米) · 单击前往 · 拖框选区</div>
+      <div class="map-legend" id="mapLegend" style="position:absolute;top:8px;right:8px;background:rgba(8,16,24,0.78);color:#cfe3ff;padding:6px 9px;border-radius:6px;font-size:10px;line-height:1.55;pointer-events:none;display:none;z-index:5;">
+        <div><span style="display:inline-block;width:10px;height:10px;background:rgba(0,230,118,0.55);border:1px solid #00e676;margin-right:5px;vertical-align:middle;"></span>视锥已扫过(看过)</div>
+        <div><span style="display:inline-block;width:10px;height:10px;background:#2a4a6b;margin-right:5px;vertical-align:middle;border:1px solid #3a5a7b;"></span>SLAM 已建图(走过)</div>
+        <div><span style="display:inline-block;width:10px;height:10px;background:rgba(3,10,18,0.86);margin-right:5px;vertical-align:middle;border:1px solid #1a2a3a;"></span>未探索(深雾)</div>
+      </div>
       <div class="det-list" id="detList"><div class="det-empty">无检测</div></div>
     </div>
   </div>
@@ -1389,6 +1394,13 @@ function connectWS() {
         updateDetList(markers);
       } else if (data.type === 'search_room') {
         if (map) map.update({ room_search: data.data || {} });
+        // Toggle the layered-coverage legend while a frontier mission is live.
+        const legend = document.getElementById('mapLegend');
+        if (legend) {
+          const phase = data.data && data.data.phase;
+          const active = phase && !['DONE', 'REPORT', 'FAILED', ''].includes(phase);
+          legend.style.display = active ? 'block' : 'none';
+        }
         console.log('[房间搜索]', data.data || {});
       } else if (data.type === 'mission_report') {
         const report = data.data || {};
