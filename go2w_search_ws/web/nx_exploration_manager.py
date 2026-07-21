@@ -747,6 +747,7 @@ class ExplorationManager:
             "mixed_frontier_weight": self.mixed_frontier_weight,
             "mixed_visual_gain_weight": self.mixed_visual_gain_weight,
             "mixed_path_cost_penalty": self.mixed_path_cost_penalty,
+            "parallel_probe_workers": self.parallel_probe_workers,
             "mixed_heading_penalty": self.mixed_heading_penalty,
             "mixed_wall_bonus": self.mixed_wall_bonus,
             "yaw_step_deg": self.yaw_step_deg,

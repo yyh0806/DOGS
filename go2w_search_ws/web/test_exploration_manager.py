@@ -1845,3 +1845,44 @@ def test_mixed_yaw_optimization_picks_visual_gain_yaw():
     assert selected is not None
     assert selected["visual_gain"] == 40
     assert selected["yaw"] == pytest.approx(math.pi / 3, abs=1e-6)
+
+
+def test_nearest_mode_unchanged_by_v3():
+    """nearest 模式: 选最近, 不受 wall_bonus 影响。"""
+    cands = [
+        {"x": 5.0, "y": 0.0, "yaw": 0.0, "size": 100, "center_cell": (0, 50),
+         "distance": 5.0, "information_gain": 100.0, "adjacent_wall_count": 3},
+        {"x": 1.5, "y": 0.0, "yaw": 0.0, "size": 5, "center_cell": (0, 15),
+         "distance": 1.5, "information_gain": 5.0, "adjacent_wall_count": 0},
+    ]
+    m = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room", room_radius_m=8.0, initial_radius_m=8.0, tile_size_m=16.0,
+        candidate_selector=lambda *_a, **_k: [dict(c) for c in cands],
+        reject_map_edge=False,
+        mixed_wall_bonus=10.0,
+    )
+    selected = m.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    assert selected is not None
+    assert selected["x"] == pytest.approx(1.5)
+
+
+def test_mixed_yaw_optimization_parallel_probe_compatible():
+    cands = [
+        {"x": 1.5, "y": 0.0, "yaw": 0.0, "size": 5, "center_cell": (0, 15),
+         "distance": 1.5, "information_gain": 5.0, "adjacent_wall_count": 0},
+        {"x": 3.0, "y": 0.0, "yaw": 0.0, "size": 8, "center_cell": (0, 30),
+         "distance": 3.0, "information_gain": 8.0, "adjacent_wall_count": 0},
+    ]
+    m = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [dict(c) for c in cands],
+        reject_map_edge=False, utility_mode="mixed",
+        parallel_probe_workers=2,
+        mixed_frontier_weight=0.5, mixed_visual_gain_weight=1.0,
+        mixed_heading_penalty=0.5, max_vel_x=1.0, max_vel_theta=1.0,
+    )
+    selected = m.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    assert selected is not None
+    assert m.snapshot()["parallel_probe_workers"] == 2
