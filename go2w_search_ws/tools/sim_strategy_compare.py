@@ -117,6 +117,52 @@ class _KnownFreePlanner:
         )
 
 
+class _SimTracker:
+    """Sim-only: visual_gain_at = 从 (x,y,yaw) raycast truth grid,
+    返回 observed 还没揭示的 free cell 数。"""
+    def __init__(self, truth, observed, width, height, resolution,
+                 hfov=1.2, vrange=5.0):
+        self.truth = truth
+        self.observed = observed  # 引用, _reveal 更新同一份
+        self.width = width
+        self.height = height
+        self.resolution = resolution
+        self.hfov = hfov
+        self.vrange = vrange
+        self._observed = set()
+
+    def visual_gain_at(self, map_msg, x, y, yaw):
+        step = self.resolution * 0.5
+        gain = 0
+        seen = set()
+        ray_count = max(3, int(math.ceil(self.hfov / math.radians(2.0))) + 1)
+        for k in range(ray_count):
+            offset = -self.hfov / 2 + self.hfov * k / max(1, ray_count - 1)
+            angle = yaw + offset
+            d = 0.0
+            while d <= self.vrange:
+                wx = x + d * math.cos(angle)
+                wy = y + d * math.sin(angle)
+                col = int(math.floor(wx / self.resolution))
+                row = int(math.floor(wy / self.resolution))
+                if not (0 <= row < self.height and 0 <= col < self.width):
+                    break
+                idx = row * self.width + col
+                if self.truth[idx] >= 50:
+                    break
+                if self.observed[idx] == -1 and idx not in seen:
+                    gain += 1
+                    seen.add(idx)
+                d += step
+        return gain
+
+    def observe(self, *a, **k): return {}
+    def snapshot(self, *a, **k): return {}
+    def rank_candidates(self, m, p, c): return list(c)
+    def coverage_candidates(self, *a, **k): return []
+    def lidar_candidates(self, *a, **k): return []
+
+
 def _build_world():
     """20m × 12m room with perimeter walls + two internal obstacles."""
     resolution = 0.25
@@ -164,10 +210,14 @@ def _run_scenario(label, *, utility_mode, parallel_workers,
     if mixed_weights is not None:
         kwargs.update(mixed_weights)
 
+    sim_tracker = _SimTracker(truth, observed, width, height, resolution)
+    kwargs["visibility_tracker"] = sim_tracker
+
     manager = ExplorationManager(**kwargs)
 
     goals = []
     total_path = 0.0
+    total_turn = 0.0
     terminal_reason = None
     for _ in range(max_iterations):
         nav.pose[:] = pose
@@ -180,6 +230,10 @@ def _run_scenario(label, *, utility_mode, parallel_workers,
                 break
             continue
         goals.append((target["x"], target["y"]))
+        target_yaw = float(target.get("yaw", 0.0))
+        total_turn += abs(math.atan2(
+            math.sin(target_yaw - pose[2]),
+            math.cos(target_yaw - pose[2])))
         step_len = math.hypot(
             target["x"] - pose[0], target["y"] - pose[1])
         total_path += step_len
@@ -197,6 +251,7 @@ def _run_scenario(label, *, utility_mode, parallel_workers,
         "waypoints": len(goals),
         "coverage_pct": round(coverage * 100.0, 2),
         "total_path_m": round(total_path, 2),
+        "total_turn_rad": round(total_turn, 2),
         "max_x_reached": round(max((g[0] for g in goals), default=0.0), 2),
         "max_y_reached": round(max((g[1] for g in goals), default=0.0), 2),
         "plan_probes": snapshot["plan_probes"],
@@ -207,10 +262,11 @@ def _run_scenario(label, *, utility_mode, parallel_workers,
 
 
 def _print_table(results):
-    headers = ["mode", "waypoints", "coverage%", "path_m",
+    headers = ["mode", "waypoints", "coverage%", "path_m", "turn_rad",
                "max_x", "max_y", "probes", "rejects", "terminal"]
     rows = [[r["label"], r["waypoints"], r["coverage_pct"],
-             r["total_path_m"], r["max_x_reached"], r["max_y_reached"],
+             r["total_path_m"], r["total_turn_rad"],
+             r["max_x_reached"], r["max_y_reached"],
              r["plan_probes"], r["plan_rejections"], r["terminal_reason"]]
             for r in results]
     widths = [max(len(str(h)), *(len(str(row[i])) for row in rows))
@@ -257,12 +313,26 @@ def main():
                 "mixed_path_cost_penalty": 0.5,
             },
         ),
+        _run_scenario(
+            "v3",
+            utility_mode="mixed",
+            parallel_workers=0,
+            mixed_weights={
+                "mixed_frontier_weight": 0.5,
+                "mixed_visual_gain_weight": 1.0,
+                "mixed_heading_penalty": 1.0,
+                "mixed_wall_bonus": 2.0,
+                "yaw_step_deg": 45.0,
+                "max_vel_x": 1.5, "max_vel_theta": 1.0,
+            },
+        ),
     ]
     _print_table(results)
 
     nearest = results[0]
     mixed = results[1]
     mixed_par = results[2]
+    v3 = results[3]
 
     print("\n=== Hypothesis checks ===")
     h1 = mixed["coverage_pct"] >= nearest["coverage_pct"] - 1.0
@@ -279,6 +349,50 @@ def main():
           f"wp={mixed_par['waypoints']}/{mixed['waypoints']} "
           f"cov={mixed_par['coverage_pct']}/{mixed['coverage_pct']} -> "
           f"{'PASS' if h3 else 'FAIL'}")
+    h4 = v3["coverage_pct"] >= nearest["coverage_pct"] - 1.0
+    print(f"  H4 v3 coverage >= nearest (±1%): "
+          f"{v3['coverage_pct']} vs {nearest['coverage_pct']} -> "
+          f"{'PASS' if h4 else 'FAIL'}")
+    h5 = v3["total_turn_rad"] < nearest["total_turn_rad"]
+    print(f"  H5 v3 turn_rad < nearest: "
+          f"{v3['total_turn_rad']} vs {nearest['total_turn_rad']} -> "
+          f"{'PASS' if h5 else 'FAIL'}")
+
+    print("\n=== v3 权重网格搜索 (k_time × δ) ===")
+    grid_results = []
+    for k_time in [0.5, 1.0, 2.0, 5.0]:
+        for delta in [0.0, 1.0, 2.0, 5.0]:
+            r = _run_scenario(
+                f"k={k_time},δ={delta}",
+                utility_mode="mixed", parallel_workers=0,
+                mixed_weights={
+                    "mixed_frontier_weight": 0.5,
+                    "mixed_visual_gain_weight": 1.0,
+                    "mixed_heading_penalty": k_time,
+                    "mixed_wall_bonus": delta,
+                    "yaw_step_deg": 45.0,
+                })
+            grid_results.append((k_time, delta, r))
+    base_cov = results[0]["coverage_pct"]
+    candidates_ok = [(k, d, r) for k, d, r in grid_results
+                     if r["coverage_pct"] >= base_cov - 1.0]
+    recommended = None
+    if candidates_ok:
+        best = min(candidates_ok, key=lambda t: t[2]["total_turn_rad"])
+        recommended = (best[0], best[1])
+        print(f"  推荐: k_time={best[0]}, δ={best[1]}, "
+              f"turn={best[2]['total_turn_rad']}rad, cov={best[2]['coverage_pct']}%")
+    else:
+        print("  WARN: 所有 (k_time,δ) 组合 coverage 退步 > 1%, 需调参")
+    print(f"  网格 coverage 范围: "
+          f"{min(r['coverage_pct'] for _, _, r in grid_results)}%"
+          f" ~ {max(r['coverage_pct'] for _, _, r in grid_results)}%")
+    print(f"  网格 turn_rad 范围: "
+          f"{min(r['total_turn_rad'] for _, _, r in grid_results)}"
+          f" ~ {max(r['total_turn_rad'] for _, _, r in grid_results)}")
+    if recommended is not None:
+        print(f"  RECOMMENDED_K_TIME={recommended[0]}")
+        print(f"  RECOMMENDED_DELTA={recommended[1]}")
 
     print("\n=== Notes ===")
     print("  - coverage is 'ground-truth free cells the sensor revealed'.")
