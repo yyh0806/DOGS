@@ -1650,3 +1650,36 @@ def test_visibility_snapshot_and_observation_are_exposed_for_frontend():
     assert snapshot["visibility"]["observed_cells"] == [
         {"x": 0.25, "y": 0.25}
     ]
+
+
+def test_find_frontier_clusters_reports_adjacent_wall_count():
+    """墙角 frontier 的 adjacent_wall_count >= 1；朝开阔区的可能 == 0。
+
+    10m x 10m 房间, 四周墙, robot 在 (5,5)。靠墙的 frontier 邻接 occupied。
+    """
+    from nx_frontier_planner import find_frontier_clusters
+    resolution = 0.5
+    width = height = 20
+    data = [0] * (width * height)
+    for row in range(height):
+        for col in range(width):
+            if row in {0, height - 1} or col in {0, width - 1}:
+                data[row * width + col] = 100  # 墙
+    # 在 (1,1) 放 unknown, 紧贴两面墙；frontier 代表 cell 落入墙的 support_radius。
+    data[1 * width + 1] = -1
+    map_msg = type("M", (), {
+        "info": type("I", (), {
+            "resolution": resolution, "width": width, "height": height,
+            "origin": type("O", (), {
+                "position": type("P", (), {"x": 0.0, "y": 0.0, "z": 0.0}),
+                "orientation": type("Q", (), {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}),
+            }),
+        })(),
+        "data": data,
+    })()
+    clusters = find_frontier_clusters(map_msg, (5.0, 5.0, 0.0), [], min_cluster_size=1)
+    assert clusters, "应至少有一个 frontier cluster"
+    assert all("adjacent_wall_count" in c for c in clusters), \
+        "每个 cluster 必须带 adjacent_wall_count 字段"
+    assert any(c["adjacent_wall_count"] >= 1 for c in clusters), \
+        "靠墙 frontier 的 adjacent_wall_count 应 >= 1"

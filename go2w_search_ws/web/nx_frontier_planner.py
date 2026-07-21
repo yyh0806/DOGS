@@ -292,7 +292,9 @@ def find_frontier_clusters(
                    for vx, vy in visited_points):
                 continue
             support_count = 0
+            wall_neighbor_count = 0
             touches_map_edge = False
+            obstacle_threshold = 50
             for row in range(
                     max(0, rep_row - support_radius_cells),
                     min(height, rep_row + support_radius_cells + 1)):
@@ -302,6 +304,9 @@ def find_frontier_clusters(
                         min(width, rep_col + support_radius_cells + 1)):
                     if dr_sq + (col - rep_col) ** 2 > support_radius_sq:
                         continue
+                    cell_value = data[row * width + col]
+                    if cell_value >= obstacle_threshold:
+                        wall_neighbor_count += 1
                     if not component_mask[row * width + col]:
                         continue
                     support_count += 1
@@ -319,6 +324,7 @@ def find_frontier_clusters(
                 "distance": math.hypot(
                     world_x - robot_x, world_y - robot_y),
                 "touches_map_edge": touches_map_edge,
+                "adjacent_wall_count": wall_neighbor_count,
             })
             if len(selected_cells) >= candidate_limit:
                 break
