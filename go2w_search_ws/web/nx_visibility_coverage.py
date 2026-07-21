@@ -228,6 +228,22 @@ class VisibilityCoverageTracker:
                 _finite(item.get("y")),
             ))
 
+    def visual_gain_at(
+        self, map_msg: Any, x: float, y: float, yaw: float,
+    ) -> int:
+        """从 (x,y,yaw) 出发的视锥 frustum 内, 尚不在 _observed 的 bucket 数。
+
+        供 ExplorationManager 的 yaw 优化调用。线程安全 (RLock)。
+        """
+        with self._lock:
+            try:
+                grid = _Grid(map_msg)
+            except ValueError:
+                return 0
+            visible = self._visible_buckets(
+                grid, (float(x), float(y), float(yaw)), None)
+            return len(visible.difference(self._observed))
+
     def coverage_candidates(
         self,
         map_msg: Any,

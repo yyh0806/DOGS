@@ -1683,3 +1683,29 @@ def test_find_frontier_clusters_reports_adjacent_wall_count():
         "每个 cluster 必须带 adjacent_wall_count 字段"
     assert any(c["adjacent_wall_count"] >= 1 for c in clusters), \
         "靠墙 frontier 的 adjacent_wall_count 应 >= 1"
+
+
+def test_visual_gain_at_counts_unobserved_cells_for_yaw():
+    """同一 (x,y)，不同 yaw 的 visual_gain > 0（朝向敏感）。"""
+    from nx_visibility_coverage import VisibilityCoverageTracker
+    resolution = 0.5
+    width = height = 20
+    data = [-1] * (width * height)
+    for dr in range(-2, 3):
+        for dc in range(-2, 3):
+            data[(10 + dr) * width + (10 + dc)] = 0
+    map_msg = type("M", (), {
+        "info": type("I", (), {
+            "resolution": resolution, "width": width, "height": height,
+            "origin": type("O", (), {
+                "position": type("P", (), {"x": 0.0, "y": 0.0, "z": 0.0}),
+                "orientation": type("Q", (), {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}),
+            }),
+        })(),
+        "data": data,
+    })()
+    tracker = VisibilityCoverageTracker(camera_hfov_rad=1.2, visual_range_m=5.0)
+    gain_east = tracker.visual_gain_at(map_msg, 5.0, 5.0, 0.0)
+    gain_west = tracker.visual_gain_at(map_msg, 5.0, 5.0, math.pi)
+    assert gain_east > 0, "朝东应扫到未观测 cell"
+    assert gain_west > 0, "朝西应扫到未观测 cell"
