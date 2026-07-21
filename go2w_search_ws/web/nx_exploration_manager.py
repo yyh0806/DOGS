@@ -111,6 +111,12 @@ class ExplorationManager:
         mixed_frontier_weight: float = 0.5,
         mixed_visual_gain_weight: float = 1.0,
         mixed_path_cost_penalty: float = 0.5,
+        # v3 (2026-07-21): heading 时间归一化 + wall_bonus + yaw 优化
+        mixed_heading_penalty: float = 0.0,
+        mixed_wall_bonus: float = 0.0,
+        yaw_step_deg: float = 45.0,
+        max_vel_x: float = 1.5,
+        max_vel_theta: float = 1.0,
         # Parallel Nav2 probe (2026-07-20). 0 = serial (historical, locked
         # by plan_calls ordering tests). >0 = ThreadPoolExecutor workers
         # used to probe the first approach of each eligible candidate
@@ -252,6 +258,19 @@ class ExplorationManager:
         self.mixed_frontier_weight = max(0.0, float(mixed_frontier_weight))
         self.mixed_visual_gain_weight = max(0.0, float(mixed_visual_gain_weight))
         self.mixed_path_cost_penalty = max(0.0, float(mixed_path_cost_penalty))
+        # v3 (2026-07-21): heading 时间归一化 + wall_bonus + yaw 优化.
+        # 所有 env override 走 max() 下限保护, 避免误配 0/负数导致除零
+        # 或反向 selection.
+        self.mixed_heading_penalty = max(0.0, float(os.environ.get(
+            "GO2W_FRONTIER_TIME_PENALTY", str(mixed_heading_penalty))))
+        self.mixed_wall_bonus = max(0.0, float(os.environ.get(
+            "GO2W_FRONTIER_MIXED_WALL_BONUS", str(mixed_wall_bonus))))
+        self.yaw_step_deg = max(5.0, float(os.environ.get(
+            "GO2W_FRONTIER_YAW_STEP_DEG", str(yaw_step_deg))))
+        self.max_vel_x = max(0.1, float(os.environ.get(
+            "GO2W_FRONTIER_MAX_VEL_X", str(max_vel_x))))
+        self.max_vel_theta = max(0.05, float(os.environ.get(
+            "GO2W_FRONTIER_MAX_VEL_THETA", str(max_vel_theta))))
         try:
             env_workers = int(os.environ.get(
                 "GO2W_FRONTIER_PROBE_WORKERS",
@@ -717,6 +736,11 @@ class ExplorationManager:
             "mixed_frontier_weight": self.mixed_frontier_weight,
             "mixed_visual_gain_weight": self.mixed_visual_gain_weight,
             "mixed_path_cost_penalty": self.mixed_path_cost_penalty,
+            "mixed_heading_penalty": self.mixed_heading_penalty,
+            "mixed_wall_bonus": self.mixed_wall_bonus,
+            "yaw_step_deg": self.yaw_step_deg,
+            "max_vel_x": self.max_vel_x,
+            "max_vel_theta": self.max_vel_theta,
             "coverage_candidate_limit": self.coverage_candidate_limit,
             "staging_transition_pending": self._staging_transition_pending,
             "visibility": self._visibility_snapshot_snapshot(),
@@ -1290,14 +1314,9 @@ class ExplorationManager:
         )
 
     def _mixed_utility_sort_key(self, candidate: dict, robot_pose) -> tuple:
-        """Primary sort key for mixed-utility mode.
+        """v3: α·size + β·visual_gain + δ·wall − k_time·(t_travel+t_turn).
 
-        Linear combination: ``alpha * information_gain + beta * visual_gain
-        - gamma * path_length``. Unlike ``score_frontier``'s gain/cost ratio,
-        this rewards large frontiers AND fresh visibility gain at the cost of
-        longer travel, so the dog actively approaches unexplored area instead
-        of always picking the closest small frontier.
-
+        path_cost 和 heading 都换算成秒 (时间归一化).
         ``path_length`` is preferred over raw euclidean ``distance`` when
         available — the rank/coverage pipelines leave ``path_length`` unset
         until Nav2 preflight fills it, so we fall back to ``distance`` and
@@ -1313,11 +1332,22 @@ class ExplorationManager:
             visual_gain = float(candidate.get("visual_gain", 0.0))
         except (TypeError, ValueError, OverflowError):
             visual_gain = 0.0
+        try:
+            wall_bonus = float(candidate.get("wall_proximity_bonus", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            wall_bonus = 0.0
         path_cost = self._path_cost_for_utility(candidate, robot_pose)
+        try:
+            heading_change = abs(float(candidate.get("heading_change", 0.0)))
+        except (TypeError, ValueError, OverflowError):
+            heading_change = 0.0
+        t_travel = path_cost / max(self.max_vel_x, 1e-6)
+        t_turn = heading_change / max(self.max_vel_theta, 1e-6)
         utility = (
             self.mixed_frontier_weight * information_gain
             + self.mixed_visual_gain_weight * visual_gain
-            - self.mixed_path_cost_penalty * path_cost
+            + self.mixed_wall_bonus * wall_bonus
+            - self.mixed_heading_penalty * (t_travel + t_turn)
         )
         # Return as tuple so callers can compose tiebreakers (distance, x, y).
         return (-utility,)

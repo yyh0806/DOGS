@@ -1709,3 +1709,28 @@ def test_visual_gain_at_counts_unobserved_cells_for_yaw():
     gain_west = tracker.visual_gain_at(map_msg, 5.0, 5.0, math.pi)
     assert gain_east > 0, "朝东应扫到未观测 cell"
     assert gain_west > 0, "朝西应扫到未观测 cell"
+
+
+def test_mixed_time_normalization_respects_max_vel_theta():
+    """max_vel_theta 调小 → heading 惩罚变大 → 选不转身。"""
+    candidates = [
+        {"x": 3.0, "y": 0.0, "yaw": 0.0, "size": 10, "center_cell": (0, 30),
+         "distance": 3.0, "information_gain": 10.0, "visual_gain": 5.0,
+         "heading_change": 0.0, "wall_proximity_bonus": 0.0},
+        {"x": 0.0, "y": 3.0, "yaw": math.pi / 2, "size": 10, "center_cell": (6, 0),
+         "distance": 3.0, "information_gain": 10.0, "visual_gain": 5.0,
+         "heading_change": math.pi / 2, "wall_proximity_bonus": 0.0},
+    ]
+    m = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [dict(c) for c in candidates],
+        reject_map_edge=False, utility_mode="mixed",
+        mixed_frontier_weight=0.5, mixed_visual_gain_weight=1.0,
+        mixed_heading_penalty=10.0,
+        max_vel_x=1.0, max_vel_theta=0.1,
+    )
+    selected = m.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    assert selected is not None
+    assert selected["heading_change"] == pytest.approx(0.0, abs=1e-6)
+    assert m.snapshot()["mixed_heading_penalty"] == 10.0
