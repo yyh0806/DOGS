@@ -1307,6 +1307,8 @@ class RoomSearchOrchestrator:
                 radius_step_m=radius_step,
                 tile_size_m=tile_size,
                 frontier_spacing_m=frontier_spacing,
+                max_vel_x=float(os.environ.get("GO2W_FRONTIER_MAX_VEL_X", "1.5")),
+                max_vel_theta=float(os.environ.get("GO2W_FRONTIER_MAX_VEL_THETA", "1.0")),
                 stable_exhaustion_cycles=stable_exhaustion_cycles,
                 max_time_s=max_time,
                 max_distance_m=params.get("max_distance_m"),
