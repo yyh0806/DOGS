@@ -747,7 +747,7 @@ function searchRoom(targetClasses) {
   controlFetch('/api/search_room', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ room: 'current_room', target_classes: tc, max_frontiers: 20 })
+    body: JSON.stringify({ room: 'current_room', target_classes: tc, max_frontiers: 50 })
   }).then(r => r.json()).then(d => {
     const el = document.getElementById('taskCount');
     if (d.ok) {
