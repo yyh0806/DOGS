@@ -60,7 +60,7 @@ utility(candidate, yaw) =
   sort candidates by frontier.utility
 
 内层（选 yaw）:
-  yaw_candidates = { robot_yaw, robot_yaw±60°, atan2(dy,dx) }  # K≤4, 去重
+  yaw_candidates = { robot_yaw, robot_yaw±45°/±90°/±135°, 180°, atan2(dy,dx) }  # K≤10, 全360°, 不硬排除
   for yaw in yaw_candidates:
       vg = _visible_buckets(frontier_pos, yaw).difference(_observed)
       hc = abs(angle_delta(yaw, robot_yaw))
@@ -105,7 +105,7 @@ yaw_candidates = {
 }  # 去重后 K ≤ 4
 ```
 
-步长 60°（用户定），最大单次转身 60° ≈ 1.05s。步长 env 可配（`GO2W_FRONTIER_YAW_STEP_DEG`）。不包含 ±90°/180°（侧身扫描 visual_gain 收益不抵转身代价）。
+步长 45° 均匀，覆盖全 360°（含 90°/180°），去重后 K≤10。**不硬排除大角度**——靠 `k_time·t_turn` 加权让小角度优先（维持狗向前状态），但 90°/180° 始终在候选集里。前方全是障碍时，大角度（含 180° 回头）的 utility 自然胜出，保证狗能回头不死锁。步长 env 可配（`GO2W_FRONTIER_YAW_STEP_DEG`，默认 45）。
 
 ### heading 时间归一化（第 3 点）
 
@@ -122,7 +122,7 @@ yaw_candidates = {
 | `α` (size weight) | frontier 规模 | 0.5 | `GO2W_FRONTIER_MIXED_FRONTIER_WEIGHT` |
 | `β` (visual_gain weight) | 视锥收益 | 1.0 | `GO2W_FRONTIER_MIXED_VISUAL_GAIN_WEIGHT` |
 | `δ` (wall_bonus) | 墙奖励 | sim 标定 | `GO2W_FRONTIER_MIXED_WALL_BONUS` |
-| `yaw_step_deg` | yaw 步长 | 60 | `GO2W_FRONTIER_YAW_STEP_DEG` |
+| `yaw_step_deg` | yaw 步长 | 45 | `GO2W_FRONTIER_YAW_STEP_DEG` |
 | `max_vel_x` | 前向速度上限 (m/s) | 1.5 | `GO2W_FRONTIER_MAX_VEL_X` |
 | `max_vel_theta` | 角速度上限 (rad/s) | 1.0 | `GO2W_FRONTIER_MAX_VEL_THETA` |
 
@@ -138,19 +138,21 @@ yaw_candidates = {
 | nav2 `max_vel_x` / `max_vel_theta` 读不到 | env 注入默认（1.5 / 1.0） |
 | `adjacent_wall_count` 全 0（开阔区） | wall_bonus 全 0，退化为 `α·size + β·visual_gain − k_time·t` |
 | 所有 yaw 的 Nav2 probe 失败 | 沿用 v0.95 serial fallback + trap-escape |
-| yaw 优化 raycast 计算量 | K≤4 × N≤32 ≤ 128 次 `_visible_buckets`，参考现状 0.05s/50 测试，<50ms |
+| yaw 优化 raycast 计算量 | K≤10 × N≤32 ≤ 320 次 `_visible_buckets`，估 ~300ms（每 waypoint 选点一次，可接受） |
+| 前方全是障碍（frontier 都朝已观测/障碍） | 身后 frontier 的 180° yaw visual_gain 高 → utility 胜出，狗回头不死锁（与 trap-escape 互补：角度维度逃生 vs 空间维度逃生） |
 | mixed 模式 visual_gain==0 的 frontier | yaw 优化可能救活（换 yaw 扫到新区域，visual_gain 变正），扩大有效候选池 |
 
 ## 测试策略
 
 **单元测试**（`test_exploration_manager.py`，+6）：
 
-1. `test_mixed_yaw_optimization_picks_visual_gain_yaw` — robot_yaw 朝已观测区，±60° 朝未观测区 → 选 ±60° yaw
+1. `test_mixed_yaw_optimization_picks_visual_gain_yaw` — robot_yaw 朝已观测区，±45° 朝未观测区 → 选 ±45° yaw
 2. `test_mixed_heading_prefers_no_turn_when_visual_gain_close` — 两 frontier visual_gain 接近 → 选不转身的（验证 heading 内生）
 3. `test_mixed_wall_bonus_prefers_corner_frontier` — size/visual_gain/path 相同，`adjacent_wall_count` 3 vs 0 → 选墙角
 4. `test_mixed_time_normalization_respects_max_vel_theta` — `max_vel_theta` 调小 → heading 惩罚变大 → 更偏好不转身
 5. `test_nearest_mode_unchanged_by_v3` — nearest 模式 yaw 固定 + 无 wall_bonus（回归保护，50 旧测继续绿）
 6. `test_mixed_yaw_optimization_parallel_probe_compatible` — yaw 优化 + `parallel_probe_workers>0` 不冲突
+7. `test_mixed_yaw_optimization_can_select_180_when_front_blocked` — 前方 frontier visual_gain=0（已观测/障碍），身后 frontier 180° yaw visual_gain 高 → 选身后 frontier + 180° yaw（验证不硬排除、能回头）
 
 **sim 扩展**（`sim_strategy_compare.py`）：+v3 列 + `(k_time, δ)` 网格搜索 + 新指标 `total_turn_rad = Σ|heading_change|`。
 
