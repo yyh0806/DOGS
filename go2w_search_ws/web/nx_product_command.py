@@ -16,12 +16,18 @@ from nx_mission_schema import SearchMissionRequest
 _CURRENT_ROOM = "__current__"
 
 _CURRENT_ROOM_TERMS = (
+    "整个房间",
     "这个房间",
     "当前房间",
+    "整间房",
+    "房间",
     "这间房",
     "这间屋",
     "本房间",
     "本屋",
+)
+_CURRENT_ROOM_EXPLICIT_TERMS = tuple(
+    term for term in _CURRENT_ROOM_TERMS if term != "房间"
 )
 
 _NEGATION_TERMS = (
@@ -151,6 +157,19 @@ def _terms_re(terms: tuple[str, ...]) -> str:
 
 _CURRENT_ROOM_TERMS_RE = f"(?:{_terms_re(_CURRENT_ROOM_TERMS)})"
 _KNOWN_ROOM_TERMS_RE = f"(?:{_terms_re(_KNOWN_ROOM_TERMS)})"
+_BARE_CURRENT_ROOM_TARGET_TERMS = (
+    "人",
+    *_EXPLICIT_PERSON_TERMS,
+    *_TABLE_TERMS,
+    *_CHAIR_TERMS,
+    *_ALL_OBJECTS_TERMS,
+    *_TABLE_CHAIR_TERMS,
+    *_OBJECT_TERM_ALIASES,
+)
+_BARE_CURRENT_ROOM_FOLLOW_RE = (
+    rf"{_ROOM_PERSON_SEPARATOR_RE}(?=$|"
+    rf"{_terms_re(_MARK_TERMS)}|{_terms_re(_BARE_CURRENT_ROOM_TARGET_TERMS)})"
+)
 
 # 运动指令触发词 (spec §1.1): 用完整词避免"搜索前面房间"误触发前进
 _MOVE_FORWARD_TERMS = ("前进", "向前走", "往前走", "直走")
@@ -182,6 +201,19 @@ def parse_product_command(text: str) -> dict | None:
     if move is not None:
         return _move_command_result(move)
 
+    if not _contains_any(normalized, _CURRENT_ROOM_EXPLICIT_TERMS):
+        named_room = _extract_named_room(normalized)
+        if named_room:
+            return _command_result(named_room)
+
+        named_table_room = _extract_named_room_target(normalized, _TABLE_TERMS)
+        if named_table_room:
+            return _command_result(
+                named_table_room,
+                target_class="dining table",
+                target_label="所有桌子",
+            )
+
     if _is_current_room_person_search(normalized):
         return _command_result(_CURRENT_ROOM)
 
@@ -189,7 +221,7 @@ def parse_product_command(text: str) -> dict | None:
         return _command_result(
             _CURRENT_ROOM, target_class="dining table", target_label="所有桌子")
 
-    if (_contains_any(normalized, _CURRENT_ROOM_TERMS)
+    if (_contains_current_room_reference(normalized)
             and (_contains_any(normalized, _SEARCH_TERMS)
                  or _contains_any(normalized, _MARK_TERMS))):
         obj_targets = _extract_current_room_objects(normalized)
@@ -315,15 +347,27 @@ def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
     return any(term in text for term in terms)
 
 
+def _contains_current_room_reference(text: str) -> bool:
+    """Return whether text contains an unqualified current-room reference."""
+    if _contains_any(text, _CURRENT_ROOM_EXPLICIT_TERMS):
+        return True
+    return bool(re.search(
+        rf"(?:{_SEARCH_TERMS_RE}|{_terms_re(_MARK_TERMS)})房间"
+        f"{_BARE_CURRENT_ROOM_FOLLOW_RE}",
+        text,
+    ))
+
+
 def _is_current_room_person_search(text: str) -> bool:
-    if not _contains_any(text, _CURRENT_ROOM_TERMS):
+    if not _contains_current_room_reference(text):
         return False
     if not (_contains_any(text, _SEARCH_TERMS) or _contains_any(text, _MARK_TERMS)):
         return False
     if _contains_any(text, _EXPLICIT_PERSON_TERMS):
         return True
     return bool(re.search(
-        rf"{_CURRENT_ROOM_TERMS_RE}{_ROOM_PERSON_SEPARATOR_RE}人{_PERSON_TARGET_FOLLOW_RE}",
+        rf"{_CURRENT_ROOM_TERMS_RE}{_ROOM_PERSON_SEPARATOR_RE}"
+        rf"(?:{_terms_re(_MARK_TERMS)})?人{_PERSON_TARGET_FOLLOW_RE}",
         text,
     ))
 
@@ -332,7 +376,7 @@ def _is_current_room_target_search(
     text: str, target_terms: tuple[str, ...]
 ) -> bool:
     return (
-        _contains_any(text, _CURRENT_ROOM_TERMS)
+        _contains_current_room_reference(text)
         and (_contains_any(text, _SEARCH_TERMS) or _contains_any(text, _MARK_TERMS))
         and _contains_any(text, target_terms)
     )
@@ -353,7 +397,7 @@ def _extract_named_room(text: str) -> str | None:
         match = re.search(pattern, text)
         if match:
             room = _clean_room_name(match.group("room"))
-            if room and not _contains_any(room, _CURRENT_ROOM_TERMS):
+            if room and room not in _CURRENT_ROOM_TERMS:
                 return room
     return None
 
@@ -376,7 +420,7 @@ def _extract_named_room_target(
         match = re.search(pattern, text)
         if match:
             room = _clean_room_name(match.group("room"))
-            if room and not _contains_any(room, _CURRENT_ROOM_TERMS):
+            if room and room not in _CURRENT_ROOM_TERMS:
                 return room
     return None
 
@@ -385,7 +429,7 @@ def _clean_room_name(room: str) -> str | None:
     room = _TRAILING_ROOM_WORDS_RE.sub("", room.strip())
     if not room:
         return None
-    if room in ("这个房间", "当前房间", "这间房", "这间屋", "本房间", "本屋"):
+    if room in _CURRENT_ROOM_TERMS:
         return None
     if room in _NON_ROOM_CANDIDATES:
         return None

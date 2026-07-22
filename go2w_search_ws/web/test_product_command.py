@@ -371,6 +371,156 @@ def _move_task(text):
     return tasks[0]["params"]
 
 
+@pytest.mark.parametrize(("utterance", "expected_params"), [
+    ("往前走", {
+        "mode": "linear", "direction": "forward",
+        "distance_m": 1.0, "clamped": False,
+    }),
+    ("往后退", {
+        "mode": "linear", "direction": "backward",
+        "distance_m": 1.0, "clamped": False,
+    }),
+    ("左转", {
+        "mode": "angular", "direction": "left",
+        "angle_deg": 90.0, "clamped": False,
+    }),
+    ("右转", {
+        "mode": "angular", "direction": "right",
+        "angle_deg": 90.0, "clamped": False,
+    }),
+    ("向前走2米", {
+        "mode": "linear", "direction": "forward",
+        "distance_m": 2.0, "clamped": False,
+    }),
+])
+def test_requested_voice_move_utterance_contract(utterance, expected_params):
+    result = parse_product_command(utterance)
+
+    assert result is not None
+    assert result["tasks"] == [{
+        "type": "move_relative",
+        "priority": 5,
+        "params": expected_params,
+    }]
+
+
+def test_requested_voice_current_room_person_search_utterance_contract():
+    result = parse_product_command("搜索整个房间，标注人")
+
+    assert result is not None
+    assert result["tasks"] == [_expected_task("__current__")]
+
+
+def test_requested_voice_current_room_chair_search_utterance_contract():
+    result = parse_product_command("搜索房间，标注所有椅子")
+
+    assert result is not None
+    assert result["tasks"] == [{
+        "type": "search_room",
+        "priority": 8,
+        "params": {
+            "mission_request": build_search_mission(
+                "__current__", "chair").to_dict(),
+            "room": "__current__",
+            "target_classes": ["chair"],
+            "require_photos": True,
+            "mark_on_map": True,
+            "search_strategy": "frontier_explore",
+            "use_lidar_target_range": True,
+            "max_radius_m": 120.0,
+            "max_time": 7200.0,
+            "initial_radius_m": 16.0,
+            "radius_step_m": 16.0,
+            "tile_size_m": 16.0,
+            "frontier_spacing_m": 1.5,
+            "stable_exhaustion_cycles": 3,
+            "max_frontiers": 1000,
+            "max_plan_probes_per_cycle": 12,
+        },
+    }]
+
+
+@pytest.mark.parametrize("separator", ("里", "里面", "内", "中", "的"))
+def test_bare_current_room_alias_accepts_existing_person_separators(separator):
+    result = parse_product_command(f"搜索房间{separator}所有人")
+
+    assert result is not None
+    assert result["tasks"] == [_expected_task("__current__")]
+
+
+@pytest.mark.parametrize(("utterance", "target_class"), [
+    ("搜索房间人", "person"),
+    ("搜索房间桌子", "dining table"),
+    ("搜索房间椅子", "chair"),
+    ("搜索房间沙发", "couch"),
+])
+def test_bare_current_room_alias_accepts_direct_targets(utterance, target_class):
+    result = parse_product_command(utterance)
+
+    assert result is not None
+    assert len(result["tasks"]) == 1
+    task = result["tasks"][0]
+    assert task["type"] == "search_room"
+    assert task["params"]["room"] == "__current__"
+    assert task["params"]["target_classes"] == [target_class]
+
+
+def test_named_room_with_fangjian_suffix_stays_named_for_people():
+    result = parse_product_command("搜索二号房间里所有人")
+
+    assert result == {
+        "response": "搜索二号房间并标注所有人",
+        "tasks": [_expected_task("二号房间")],
+    }
+
+
+def test_named_room_with_fangjian_prefix_stays_named_for_people():
+    result = parse_product_command("搜索房间A里所有人")
+
+    assert result == {
+        "response": "搜索房间A并标注所有人",
+        "tasks": [_expected_task("房间A")],
+    }
+
+
+@pytest.mark.parametrize("room", ("房间沙发区", "房间人员休息室"))
+def test_named_room_with_bare_alias_target_prefix_stays_named_for_people(room):
+    result = parse_product_command(f"搜索{room}里所有人")
+
+    assert result == {
+        "response": f"搜索{room}并标注所有人",
+        "tasks": [_expected_task(room)],
+    }
+
+
+def test_named_room_with_fangjian_suffix_stays_named_for_tables():
+    result = parse_product_command("搜索二号房间里的所有桌子")
+
+    assert result is not None
+    assert result["tasks"] == [{
+        "type": "search_room",
+        "priority": 8,
+        "params": {
+            "mission_request": build_search_mission(
+                "二号房间", "dining table").to_dict(),
+            "room": "二号房间",
+            "target_classes": ["dining table"],
+            "require_photos": True,
+            "mark_on_map": True,
+            "search_strategy": "next_best_view",
+            "use_lidar_target_range": True,
+        },
+    }]
+
+
+def test_named_room_with_bare_alias_table_prefix_stays_named_for_tables():
+    result = parse_product_command("搜索房间桌椅区里的所有桌子")
+
+    assert result is not None
+    assert result["tasks"][0]["params"]["room"] == "房间桌椅区"
+    assert result["tasks"][0]["params"]["target_classes"] == ["dining table"]
+
+
 def test_move_forward_default():
     p = _move_task("前进")
     assert p == {"mode": "linear", "direction": "forward",
