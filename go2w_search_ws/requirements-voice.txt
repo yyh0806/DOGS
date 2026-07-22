@@ -1,5 +1,6 @@
 # PC-side offline voice command console
 # Install with: python -m pip install -r requirements-voice.txt
+# Local LLM HTTP uses Python's standard library; no cloud or model SDK is required.
 
 requests
 sounddevice

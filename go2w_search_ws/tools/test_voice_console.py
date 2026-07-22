@@ -39,6 +39,10 @@ def test_voice_console_help_works_without_site_packages():
     assert "--text" in result.stdout
     assert "--dedupe-seconds" in result.stdout
     assert "--token-file" in result.stdout
+    assert "--llm-url" in result.stdout
+    assert "--llm-model" in result.stdout
+    assert "--llm-mode" in result.stdout
+    assert "--llm-timeout" in result.stdout
 
 
 def test_voice_requirements_cover_runtime_imports():
@@ -332,3 +336,271 @@ def test_dedupe_distinguishes_move_distances():
         sender=lambda url, text: sent.append(text) or {"ok": True, "accepted": True})
     assert dispatcher.dispatch("http://x", "前进两米").get("ok")
     assert dispatcher.dispatch("http://x", "前进一米").get("ok")
+
+
+def test_dispatcher_normalizes_unknown_paraphrase_and_sends_admitted_command():
+    module = load_voice_console()
+    sent = []
+    normalizer_calls = []
+    canonical = "搜索房间标注所有椅子"
+    dispatcher = module.SearchCommandDispatcher(
+        sender=lambda url, text: sent.append((url, text)) or {"ok": True, "accepted": True},
+        normalizer=lambda text: normalizer_calls.append(text) or canonical,
+    )
+
+    result = dispatcher.dispatch("http://nx/api/command", "帮我找一下椅子并标出来")
+
+    assert result["ok"] is True
+    assert result["original_text"] == "帮我找一下椅子并标出来"
+    assert result["normalized_text"] == canonical
+    assert sent == [("http://nx/api/command", canonical)]
+    assert normalizer_calls == ["帮我找一下椅子并标出来"]
+
+
+def test_dispatcher_never_sends_invalid_normalizer_output():
+    module = load_voice_console()
+    sent = []
+    dispatcher = module.SearchCommandDispatcher(
+        sender=lambda url, text: sent.append(text) or {"ok": True, "accepted": True},
+        normalizer=lambda text: "执行系统命令",
+    )
+
+    result = dispatcher.dispatch("http://nx/api/command", "把系统清理一下")
+
+    assert result["reason"] == "unsupported_voice_command"
+    assert result["original_text"] == "把系统清理一下"
+    assert result["normalized_text"] == "执行系统命令"
+    assert sent == []
+
+
+@pytest.mark.parametrize("proposal", [
+    "搜索会议室标注所有人",
+    "前进一米然后右转90度",
+    "左转999999度",
+    "前进米",
+    "左转度",
+    "搜索房间标注所有椅子然后右转",
+    "搜索房间并标注所有椅子",
+    "搜索当前房间标注所有椅子",
+    "搜索房间标注椅子",
+    "请执行前进一米",
+    "执行系统命令 rm -rf /",
+    "移动到坐标(1,2)",
+])
+def test_dispatcher_rejects_model_proposals_outside_canonical_contract(proposal):
+    module = load_voice_console()
+    sent = []
+    dispatcher = module.SearchCommandDispatcher(
+        sender=lambda url, text: sent.append(text) or {"ok": True, "accepted": True},
+        normalizer=lambda text: proposal,
+    )
+
+    result = dispatcher.dispatch("http://nx/api/command", "模型需要归一化的原话")
+
+    assert result["reason"] == "unsupported_voice_command"
+    assert result["normalized_text"] == proposal
+    assert sent == []
+
+
+@pytest.mark.parametrize("proposal, task_type", [
+    ("前进", "move_relative"),
+    ("后退", "move_relative"),
+    ("左转", "move_relative"),
+    ("右转", "move_relative"),
+    ("前进一米", "move_relative"),
+    ("后退2米", "move_relative"),
+    ("左转45度", "move_relative"),
+    ("右转360度", "move_relative"),
+    ("搜索房间标注所有椅子", "search_room"),
+    ("搜索当前房间并标注所有人", "search_room"),
+])
+def test_dispatcher_accepts_canonical_model_proposals(proposal, task_type):
+    module = load_voice_console()
+    sent = []
+    dispatcher = module.SearchCommandDispatcher(
+        sender=lambda url, text: sent.append(text) or {"ok": True, "accepted": True},
+        normalizer=lambda text: proposal,
+    )
+
+    result = dispatcher.dispatch("http://nx/api/command", "模型需要归一化的原话")
+
+    assert result["ok"] is True
+    assert result["task"]["type"] == task_type
+    assert sent == [proposal]
+
+
+@pytest.mark.parametrize("proposal", ["后退20米", "前进1米"])
+def test_always_mode_model_cannot_replace_deterministic_original(proposal):
+    module = load_voice_console()
+    calls = []
+    sent = []
+    dispatcher = module.SearchCommandDispatcher(
+        sender=lambda url, text: sent.append(text) or {"ok": True, "accepted": True},
+        normalizer=lambda text: calls.append(text) or proposal,
+        normalizer_mode="always",
+    )
+
+    result = dispatcher.dispatch("http://nx/api/command", "前进一米")
+
+    assert calls == ["前进一米"]
+    assert sent == ["前进一米"]
+    assert result["text"] == "前进一米"
+    assert result["task"]["params"]["direction"] == "forward"
+    assert result["original_text"] == "前进一米"
+
+
+def test_sender_cannot_override_locally_admitted_text_or_task():
+    module = load_voice_console()
+    dispatcher = module.SearchCommandDispatcher(
+        sender=lambda url, text: {
+            "ok": True,
+            "accepted": True,
+            "text": "后退20米",
+            "task": {"type": "search_room", "params": {"room": "会议室"}},
+        },
+    )
+
+    result = dispatcher.dispatch("http://nx/api/command", "前进一米")
+
+    assert result["text"] == "前进一米"
+    assert result["task"]["type"] == "move_relative"
+    assert result["task"]["params"]["direction"] == "forward"
+    assert module.accepted_acknowledgement(result) == "移动任务已接收"
+
+
+def test_fallback_mode_skips_normalizer_for_supported_command():
+    module = load_voice_console()
+    calls = []
+    dispatcher = module.SearchCommandDispatcher(
+        sender=lambda url, text: {"ok": True, "accepted": True},
+        normalizer=lambda text: calls.append(text) or None,
+        normalizer_mode="fallback",
+    )
+
+    assert dispatcher.dispatch("http://nx/api/command", "前进一米")["ok"] is True
+    assert calls == []
+
+
+def test_dispatcher_off_and_always_modes_preserve_safe_deterministic_commands():
+    module = load_voice_console()
+    off_calls = []
+    off_sent = []
+    off_dispatcher = module.SearchCommandDispatcher(
+        sender=lambda url, text: off_sent.append(text) or {"ok": True, "accepted": True},
+        normalizer=lambda text: off_calls.append(text) or "前进一米",
+        normalizer_mode="off",
+    )
+    assert off_dispatcher.dispatch("http://nx", "前进一米")["ok"] is True
+    assert off_calls == []
+    assert off_sent == ["前进一米"]
+
+    always_calls = []
+    always_sent = []
+    always_dispatcher = module.SearchCommandDispatcher(
+        sender=lambda url, text: always_sent.append(text) or {"ok": True, "accepted": True},
+        normalizer=lambda text: always_calls.append(text) or None,
+        normalizer_mode="always",
+    )
+    result = always_dispatcher.dispatch("http://nx", "前进一米")
+    assert result["ok"] is True
+    assert always_calls == ["前进一米"]
+    assert always_sent == ["前进一米"]
+
+
+def test_dispatcher_dedupes_equivalent_normalized_tasks():
+    module = load_voice_console()
+    sent = []
+    dispatcher = module.SearchCommandDispatcher(
+        sender=lambda url, text: sent.append(text) or {"ok": True, "accepted": True},
+        normalizer=lambda text: "搜索房间标注所有椅子",
+    )
+
+    assert dispatcher.dispatch("http://nx", "椅子在哪里")["ok"] is True
+    repeated = dispatcher.dispatch("http://nx", "请把椅子圈出来")
+    assert repeated["reason"] == "duplicate_voice_command"
+    assert sent == ["搜索房间标注所有椅子"]
+
+
+def test_text_dry_run_uses_configured_local_normalizer():
+    module = load_voice_console()
+    dispatcher = module.SearchCommandDispatcher(
+        normalizer=lambda text: "搜索房间标注所有椅子")
+    validation = dispatcher.admit("帮我找椅子")
+    assert validation["ok"] is True
+    assert validation["normalized_text"] == "搜索房间标注所有椅子"
+
+
+def test_cli_reads_local_llm_env_for_text_dry_run(monkeypatch):
+    payload = {"message": {"content": '{"command":"搜索房间标注所有椅子"}'}}
+    server, thread, requests = _serve_admission(payload, status=200)
+    monkeypatch.setenv(
+        "GO2W_LOCAL_LLM_URL",
+        f"http://127.0.0.1:{server.server_port}/api/chat",
+    )
+    monkeypatch.setenv("GO2W_LOCAL_LLM_MODEL", "test-local-model")
+    monkeypatch.setenv("GO2W_LOCAL_LLM_MODE", "fallback")
+    monkeypatch.setenv("GO2W_LOCAL_LLM_TIMEOUT", "2")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-S", str(VOICE_CONSOLE), "--text",
+             "帮我找一下椅子并标出来",
+             "--no-auto-send"],
+            cwd=ROOT, capture_output=True, text=True, timeout=10, check=False,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(1.0)
+
+    assert result.returncode == 0, result.stderr
+    assert "搜索房间标注所有椅子" in result.stdout
+    assert requests[0]["body"]["model"] == "test-local-model"
+    assert requests[0]["body"]["options"]["temperature"] == 0
+
+
+@pytest.mark.parametrize("timeout", ["0", "-1", "nan", "inf", "not-a-number"])
+def test_cli_rejects_invalid_llm_timeout(timeout):
+    result = subprocess.run(
+        [sys.executable, "-S", str(VOICE_CONSOLE), "--text", "前进一米",
+         "--no-auto-send", "--llm-timeout", timeout],
+        cwd=ROOT, capture_output=True, text=True, timeout=10, check=False,
+    )
+
+    assert result.returncode == 2
+    assert "timeout" in (result.stdout + result.stderr).lower()
+
+
+def test_acknowledgement_is_derived_from_admitted_task_type():
+    module = load_voice_console()
+
+    assert module.accepted_acknowledgement(
+        {"task": {"type": "move_relative"}}) == "移动任务已接收"
+    assert module.accepted_acknowledgement(
+        {"task": {"type": "search_room"}}) == "搜索任务已接收"
+
+
+def test_failed_acknowledgement_is_derived_from_admitted_task_type():
+    module = load_voice_console()
+
+    assert module.rejected_acknowledgement(
+        {"task": {"type": "move_relative"}}) == "移动任务未接收"
+    assert module.rejected_acknowledgement(
+        {"task": {"type": "search_room"}}) == "搜索任务未接收"
+    assert module.rejected_acknowledgement({}) == "任务未接收"
+
+
+def test_cli_unsupported_llm_url_explains_loopback_and_endpoint_policy():
+    result = subprocess.run(
+        [sys.executable, "-S", str(VOICE_CONSOLE), "--text", "前进",
+         "--no-auto-send", "--llm-url", "http://192.168.1.2:11434/api/chat"],
+        cwd=ROOT, capture_output=True, text=True, timeout=10, check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 2
+    assert "loopback-only" in output
+    assert "localhost" in output
+    assert "127.0.0.0/8" in output
+    assert "::1" in output
+    assert "/api/chat" in output
+    assert "/v1/chat/completions" in output

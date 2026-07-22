@@ -119,6 +119,22 @@ bash web/verify_nx_web.sh       # 启 nx_web + mock，跑 curl + WS 断言
 
 ---
 
+## PC 本地语音指令
+
+`tools/voice_console.py` 的本地流程为：Vosk 离线识别 → 确定性产品指令解析 →（仅在需要时）本地 LLM 归一化 → 再次确定性校验 → NX `/api/command`。先用文本 dry-run 检查配置：
+
+```bash
+python tools/voice_console.py --text "帮我找一下椅子并标出来" --no-auto-send \
+  --llm-url http://127.0.0.1:11434/api/chat \
+  --llm-model qwen2.5:3b --llm-mode fallback --llm-timeout 5
+```
+
+Ollama 使用 `/api/chat`；其他本地 OpenAI 兼容服务使用完整的 `/v1/chat/completions` 地址，例如 `http://127.0.0.1:8080/v1/chat/completions`。对应环境变量为 `GO2W_LOCAL_LLM_URL`、`GO2W_LOCAL_LLM_MODEL`、`GO2W_LOCAL_LLM_MODE` 和 `GO2W_LOCAL_LLM_TIMEOUT`。模式可选 `off`、`fallback`（默认，仅在确定性解析失败时调用）和 `always`；URL 留空会彻底禁用 LLM 请求。
+
+安全边界：本地模型没有直接控制权，只能提出一个规范中文移动或“当前房间搜索”指令；任何输出都必须重新通过 `validate_voice_command`，并继续接受 NX 端解析与任务准入检查。自动发送仍要求控制 Token；首次调试建议始终保留 `--no-auto-send`。
+
+---
+
 ## 架构演进方向
 
 正在从「PC 跑重活」迁移到「NX 跑所有重活，PC 仅 UI」。分阶段路线与并行分工见

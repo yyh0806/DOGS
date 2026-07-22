@@ -1,10 +1,10 @@
 """PC 端语音对话控制台 — Vosk STT + TTS 双向语音 (全离线)。
 
-发指令: 麦克风 → Vosk STT → POST /api/command → NX
+发指令: 麦克风 → Vosk STT → 确定性解析/可选本地 LLM 归一化 → POST /api/command → NX
 收反馈: NX WebSocket(8001) → 关键状态 (mission_report / FAILED / ARRIVED) → pyttsx3 TTS 播报
 
 绕开浏览器 Web Speech API 的安全上下文限制; PC 本地全离线 (Vosk + pyttsx3).
-NLU (parse_product_command + VLM 兜底) 全在 NX 侧, PC 只做"听 + 发原文 + 播报".
+本地 LLM 只归一化文本；每个结果仍须通过 PC 确定性解析器和 NX 安全门。
 
 依赖:
     pip install vosk sounddevice requests pyttsx3 websocket-client
@@ -21,6 +21,8 @@ NLU (parse_product_command + VLM 兜底) 全在 NX 侧, PC 只做"听 + 发原�
     --no-tts         关闭 TTS 播报 (只看文字)
     --model PATH     Vosk 模型路径 (默认 VOSK_MODEL_PATH 或 ./vosk-model-small-cn-0.22)
     --token-file PATH 读取部署时生成的控制 Token
+    --llm-url URL    Ollama /api/chat 或 OpenAI 兼容 /v1/chat/completions
+    --llm-mode MODE  off、fallback 或 always
     --port 8000      NX HTTP 端口
     --ws-port 8001   NX WebSocket 端口
 """
@@ -29,6 +31,7 @@ import json
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -117,25 +120,186 @@ def validate_voice_command(text: str) -> dict:
 validate_search_command = validate_voice_command
 
 
+_CANONICAL_MOVE_PROPOSAL = re.compile(
+    r"(?P<direction>前进|后退|左转|右转)"
+    r"(?:(?P<amount>\d+(?:\.\d+)?|[零一二两三四五六七八九十百半]+)"
+    r"(?P<unit>米|度))?"
+)
+_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3,
+              "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _canonical_number(text: str) -> float | None:
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return float(text)
+    if text == "半":
+        return 0.5
+    if text == "一百":
+        return 100.0
+    if text == "十":
+        return 10.0
+    if len(text) == 1 and text in _CN_DIGITS:
+        return float(_CN_DIGITS[text])
+    if len(text) == 2 and text[0] == "十" and text[1] in _CN_DIGITS:
+        return float(10 + _CN_DIGITS[text[1]])
+    if len(text) == 2 and text[0] in _CN_DIGITS and text[1] == "十":
+        return float(_CN_DIGITS[text[0]] * 10)
+    if (len(text) == 3 and text[0] in _CN_DIGITS and text[1] == "十"
+            and text[2] in _CN_DIGITS):
+        return float(_CN_DIGITS[text[0]] * 10 + _CN_DIGITS[text[2]])
+    return None
+
+
+def validate_model_proposal(text: str) -> dict:
+    """Apply the narrow canonical grammar to an already-untrusted proposal."""
+    validation = validate_voice_command(text)
+    if not validation.get("ok"):
+        return validation
+
+    proposal = validation["text"]
+    task = validation["task"]
+    params = task.get("params", {})
+    task_type = task.get("type")
+
+    if task_type == "search_room":
+        if params.get("room") != "__current__":
+            return {"ok": False, "reason": "unsupported_voice_command", "text": proposal}
+        response = validation.get("response", "")
+        prefix = "搜索当前房间并标注"
+        if not isinstance(response, str) or not response.startswith(prefix):
+            return {"ok": False, "reason": "unsupported_voice_command", "text": proposal}
+        target = response[len(prefix):]
+        if target.startswith("全部"):
+            target = f"所有{target[2:]}"
+        elif not target.startswith("所有"):
+            target = f"所有{target}"
+        canonical_forms = {
+            f"搜索房间标注{target}",
+            f"搜索当前房间并标注{target}",
+        }
+        if proposal not in canonical_forms:
+            return {"ok": False, "reason": "unsupported_voice_command", "text": proposal}
+        return validation
+
+    if task_type == "move_relative":
+        match = _CANONICAL_MOVE_PROPOSAL.fullmatch(proposal)
+        if match is None or params.get("clamped") is True:
+            return {"ok": False, "reason": "unsupported_voice_command", "text": proposal}
+        direction = match.group("direction")
+        amount_text = match.group("amount")
+        unit = match.group("unit")
+        if direction in {"前进", "后退"}:
+            expected_direction = "forward" if direction == "前进" else "backward"
+            admitted_amount = params.get("distance_m")
+            amount = 1.0 if amount_text is None else _canonical_number(amount_text)
+            valid_range = amount is not None and 0.0 < amount <= 20.0
+            valid_unit = unit is None if amount_text is None else unit == "米"
+        else:
+            expected_direction = "left" if direction == "左转" else "right"
+            admitted_amount = params.get("angle_deg")
+            amount = 90.0 if amount_text is None else _canonical_number(amount_text)
+            valid_range = amount is not None and 0.0 < amount <= 360.0
+            valid_unit = unit is None if amount_text is None else unit == "度"
+        if not valid_range or not valid_unit or params.get("direction") != expected_direction:
+            return {"ok": False, "reason": "unsupported_voice_command", "text": proposal}
+        try:
+            same_amount = math.isclose(float(admitted_amount), amount)
+        except (TypeError, ValueError):
+            same_amount = False
+        if not same_amount:
+            return {"ok": False, "reason": "unsupported_voice_command", "text": proposal}
+        return validation
+
+    return {"ok": False, "reason": "unsupported_voice_command", "text": proposal}
+
+
 class SearchCommandDispatcher:
-    """Validate, submit, and de-duplicate confirmed room-search commands."""
+    """Validate, optionally normalize, submit, and de-duplicate commands."""
 
     def __init__(self, *, sender=None, dedupe_seconds: float = 15.0,
-                 monotonic=time.monotonic):
+                 monotonic=time.monotonic, normalizer=None,
+                 normalizer_mode: str | None = None):
         try:
             dedupe = float(dedupe_seconds)
         except (TypeError, ValueError) as exc:
             raise ValueError("dedupe_seconds must be a finite non-negative number") from exc
         if not math.isfinite(dedupe) or dedupe < 0.0:
             raise ValueError("dedupe_seconds must be a finite non-negative number")
+        mode = ("fallback" if normalizer is not None else "off") \
+            if normalizer_mode is None else str(normalizer_mode).strip().lower()
+        if mode not in {"off", "fallback", "always"}:
+            raise ValueError("normalizer_mode must be one of: off, fallback, always")
         self._sender = sender or send_command
         self._dedupe_seconds = dedupe
         self._monotonic = monotonic
+        self._normalizer = normalizer
+        self._normalizer_mode = mode
         self._last_fingerprint = None
         self._last_accepted_at = None
 
+    def _normalize(self, text: str) -> str | None:
+        if self._normalizer is None:
+            return None
+        try:
+            if callable(self._normalizer):
+                normalized = self._normalizer(text)
+            else:
+                normalized = self._normalizer.normalize(text)
+        except Exception:
+            return None
+        return normalized if isinstance(normalized, str) else None
+
+    @staticmethod
+    def _with_admission_metadata(validation: dict, original_text: str,
+                                 normalized_text: str | None) -> dict:
+        result = dict(validation)
+        result["original_text"] = original_text
+        result["normalized_text"] = normalized_text
+        return result
+
+    def admit(self, text: str) -> dict:
+        """Return the single parser-admitted command without sending it."""
+        original_text = text.strip() if isinstance(text, str) else ""
+        deterministic = validate_voice_command(original_text)
+
+        if self._normalizer_mode == "off":
+            return self._with_admission_metadata(
+                deterministic, original_text, original_text)
+
+        if self._normalizer_mode == "fallback" and deterministic.get("ok"):
+            return self._with_admission_metadata(
+                deterministic, original_text, original_text)
+
+        normalized_text = self._normalize(original_text)
+        if self._normalizer_mode == "always" and deterministic.get("ok"):
+            metadata_text = original_text
+            if normalized_text is not None:
+                normalized = validate_model_proposal(normalized_text)
+                if (normalized.get("ok")
+                        and normalized.get("fingerprint") == deterministic.get("fingerprint")):
+                    metadata_text = normalized["text"]
+            return self._with_admission_metadata(
+                deterministic, original_text, metadata_text)
+
+        if normalized_text is not None:
+            normalized = validate_model_proposal(normalized_text)
+            if normalized.get("ok"):
+                return self._with_admission_metadata(
+                    normalized, original_text, normalized["text"])
+            if not deterministic.get("ok"):
+                return self._with_admission_metadata(
+                    normalized, original_text, normalized_text)
+
+        # In always mode a known product command remains safe if the local model
+        # is unavailable or proposes anything the deterministic parser rejects.
+        if deterministic.get("ok"):
+            return self._with_admission_metadata(
+                deterministic, original_text, original_text)
+        return self._with_admission_metadata(
+            deterministic, original_text, normalized_text)
+
     def dispatch(self, api_url: str, text: str) -> dict:
-        validation = validate_search_command(text)
+        validation = self.admit(text)
         if not validation.get("ok"):
             return validation
 
@@ -152,11 +316,15 @@ class SearchCommandDispatcher:
                 "reason": "duplicate_voice_command",
                 "text": validation["text"],
                 "task": validation["task"],
+                "original_text": validation["original_text"],
+                "normalized_text": validation["normalized_text"],
             }
 
         result = dict(self._sender(api_url, validation["text"]) or {})
-        result.setdefault("text", validation["text"])
-        result.setdefault("task", validation["task"])
+        result["text"] = validation["text"]
+        result["task"] = validation["task"]
+        result["original_text"] = validation["original_text"]
+        result["normalized_text"] = validation["normalized_text"]
         if result.get("ok") is True and result.get("accepted") is True:
             self._last_fingerprint = fingerprint
             self._last_accepted_at = now
@@ -322,7 +490,7 @@ def send_command(nx_url: str, text: str, *, token: str | None = None) -> dict:
         })
         result.setdefault("accepted", False)
         if confirmed:
-            print("  [OK] NX 已确认接收搜索任务")
+            print("  [OK] NX 已确认接收任务")
             return result
 
         reason = payload.get("reason")
@@ -336,6 +504,24 @@ def send_command(nx_url: str, text: str, *, token: str | None = None) -> dict:
     except requests.exceptions.RequestException as e:
         print(f"  [FAIL] 连接 NX 失败 (NX 在线? {nx_url}): {e.__class__.__name__}")
         return {"ok": False, "reason": "nx_unreachable", "error": e.__class__.__name__}
+
+
+def accepted_acknowledgement(result: dict) -> str:
+    """Choose the confirmed acknowledgement from the admitted task type."""
+    task = result.get("task") if isinstance(result, dict) else None
+    if isinstance(task, dict) and task.get("type") == "move_relative":
+        return "移动任务已接收"
+    return "搜索任务已接收"
+
+
+def rejected_acknowledgement(result: dict) -> str:
+    """Choose a failure acknowledgement when an admitted task is available."""
+    task = result.get("task") if isinstance(result, dict) else None
+    if isinstance(task, dict) and task.get("type") == "move_relative":
+        return "移动任务未接收"
+    if isinstance(task, dict) and task.get("type") == "search_room":
+        return "搜索任务未接收"
+    return "任务未接收"
 
 
 # ============================================================================
@@ -353,9 +539,20 @@ def main() -> int:
     p.add_argument("--text", default=None,
                    help="不用麦克风，直接验证或发送这段文本")
     p.add_argument("--dedupe-seconds", type=float, default=15.0,
-                   help="相同搜索任务成功下发后的防重复秒数 (默认 15)")
+                   help="相同任务成功下发后的防重复秒数 (默认 15)")
     p.add_argument("--token-file", default=None,
                    help="控制 Token 文件；默认读取 GO2W_CONTROL_TOKEN")
+    p.add_argument("--llm-url", default=os.environ.get("GO2W_LOCAL_LLM_URL", ""),
+                   help="本地 Ollama/OpenAI 兼容端点；空值禁用 (GO2W_LOCAL_LLM_URL)")
+    p.add_argument("--llm-model", default=os.environ.get(
+        "GO2W_LOCAL_LLM_MODEL", "qwen2.5:3b"),
+        help="本地 LLM 模型名 (默认 qwen2.5:3b)")
+    p.add_argument("--llm-mode", choices=("off", "fallback", "always"),
+                   default=os.environ.get("GO2W_LOCAL_LLM_MODE", "fallback"),
+                   help="归一化模式 (默认 fallback)")
+    p.add_argument("--llm-timeout", type=float,
+                   default=os.environ.get("GO2W_LOCAL_LLM_TIMEOUT", "5"),
+                   help="本地 LLM 请求超时秒数，必须为有限正数 (默认 5)")
     p.add_argument("--no-auto-send", action="store_true",
                    help="识别后只验证不发送")
     p.add_argument("--no-tts", action="store_true", help="关闭 TTS 播报")
@@ -372,23 +569,38 @@ def main() -> int:
         print("[FAIL] 自动发送需要 --token-file 或 GO2W_CONTROL_TOKEN")
         return 2
     try:
+        if not math.isfinite(args.llm_timeout) or args.llm_timeout <= 0.0:
+            raise ValueError("LLM timeout must be a finite positive number")
+        normalizer = None
+        llm_url = args.llm_url.strip()
+        if args.llm_mode != "off" and llm_url:
+            from local_llm_nlu import LocalLLMCommandNormalizer
+            normalizer = LocalLLMCommandNormalizer(
+                llm_url, args.llm_model, timeout=args.llm_timeout)
+            if not normalizer.supported_endpoint:
+                raise ValueError(
+                    "LLM URL is loopback-only (localhost, 127.0.0.0/8, or ::1) "
+                    "and must use /api/chat or /v1/chat/completions")
         dispatcher = SearchCommandDispatcher(
             sender=lambda url, command: send_command(
                 url, command, token=control_token),
-            dedupe_seconds=args.dedupe_seconds)
+            dedupe_seconds=args.dedupe_seconds,
+            normalizer=normalizer,
+            normalizer_mode=args.llm_mode)
     except ValueError as exc:
         print(f"[FAIL] {exc}")
         return 2
 
     # 文本模式与麦克风使用同一个安全门；不加载模型、不打开音频设备。
     if args.text is not None:
-        validation = validate_search_command(args.text)
+        validation = dispatcher.admit(args.text)
         if args.no_auto_send:
             print(json.dumps(validation, ensure_ascii=False, indent=2))
             if validation.get("ok"):
-                print("[OK] 仅验证：语音文本将生成 search_room 任务，未发送到 NX")
+                task_type = validation.get("task", {}).get("type", "voice")
+                print(f"[OK] 仅验证：语音文本将生成 {task_type} 任务，未发送到 NX")
                 return 0
-            print("[FAIL] 仅支持已配置目标的房间搜索并标注指令")
+            print("[FAIL] 仅支持单个相对移动或当前房间目标搜索指令")
             return 2
         result = dispatcher.dispatch(nx_url, args.text)
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -461,7 +673,7 @@ def main() -> int:
                     if text:
                         print(f"\n[VOICE] 识别: {text}")
                         if args.no_auto_send:
-                            validation = validate_search_command(text)
+                            validation = dispatcher.admit(text)
                             print(json.dumps(validation, ensure_ascii=False))
                             print("  (no-auto-send 模式，仅验证，不发送)")
                         else:
@@ -469,13 +681,14 @@ def main() -> int:
                             reason = result.get("reason")
                             if result.get("ok"):
                                 if use_tts:
-                                    speak("搜索任务已接收")
+                                    speak(accepted_acknowledgement(result))
                             elif reason == "unsupported_voice_command":
-                                print("  [IGNORED] 不是受支持的房间目标搜索指令")
+                                print("  [IGNORED] 不是受支持的单个移动或当前房间搜索指令")
                             elif reason == "duplicate_voice_command":
                                 print("  [IGNORED] 重复语音，未再次下发")
                             elif use_tts:
-                                speak(f"搜索任务未接收：{reason or '未知原因'}")
+                                failure_ack = rejected_acknowledgement(result)
+                                speak(f"{failure_ack}：{reason or '未知原因'}")
                     # 空文本 = 纯静音, 忽略
                 else:
                     # partial: 实时显示正在说的话
