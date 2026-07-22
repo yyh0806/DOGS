@@ -81,6 +81,12 @@ from nx_navigation_arbiter import NavigationArbiter
 from nx_camera_calibration import resolve_camera_calibration
 from nx_person_localizer import decode_pointcloud_xyz
 from nx_motion_intent import build_motion_intent
+from nx_ws_latest import (
+    LatestValueOutbox,
+    ReliableQueueFull,
+    classify_message,
+    serialize_message,
+)
 from nx_mission_schema import (
     MissionValidationError,
     SearchMissionRequest,
@@ -223,10 +229,19 @@ except Exception as _e:
 # ============================================================================
 WS_CLIENTS = set()
 WS_LOOP = None
-_WS_PENDING = 0
-_WS_PENDING_LOCK = threading.Lock()
-_WS_MAX_PENDING = max(1, int(os.environ.get("GO2W_WS_MAX_PENDING", "3")))
+_WS_RELIABLE_CAPACITY = max(
+    8, int(os.environ.get("GO2W_WS_RELIABLE_CAPACITY", "256")))
 _WS_SEND_TIMEOUT = max(0.02, float(os.environ.get("GO2W_WS_SEND_TIMEOUT", "1.0")))  # H4 fix: 0.2→1.0 (本地/局域网, 避免瞬时抖动误踢健康连接)
+_WS_OUTBOXES = {}
+_WS_SENDER_TASKS = {}
+_WS_CLOSING = set()
+_WS_REGISTRY_LOCK = threading.Lock()
+_WS_INGRESS = LatestValueOutbox(reliable_capacity=_WS_RELIABLE_CAPACITY)
+_WS_INGRESS_LOCK = threading.Lock()
+_WS_INGRESS_SCHEDULED = False
+_WS_INGRESS_OVERFLOWED = False
+_WS_STREAM_REPLACED = 0
+_WS_METRICS_LOCK = threading.Lock()
 # C1 fix: NxRobotBridge.move 执行层 guard — 前进时前方 /scan 障碍 < 此阈值→强制 vx=0 (防自主跟踪撞墙)
 _FRONT_CLEARANCE_M = float(os.environ.get("GO2W_FRONT_CLEARANCE", "0.5"))
 _REVERSE_CLEARANCE_M = sanitize_clearance_margin(
@@ -234,38 +249,173 @@ _REVERSE_CLEARANCE_M = sanitize_clearance_margin(
 
 
 def ws_broadcast(data, force=False):
-    global _WS_PENDING
-    if WS_LOOP and WS_CLIENTS:
-        if not force:
-            with _WS_PENDING_LOCK:
-                if _WS_PENDING >= _WS_MAX_PENDING:
-                    return
-                _WS_PENDING += 1
-        msg = json.dumps(data, ensure_ascii=False)
-        fut = asyncio.run_coroutine_threadsafe(_async_broadcast(msg), WS_LOOP)
+    """Queue a broadcast without putting network work on a ROS callback.
 
-        def _done(_):
-            global _WS_PENDING
-            if not force:
-                with _WS_PENDING_LOCK:
-                    _WS_PENDING = max(0, _WS_PENDING - 1)
+    ``force`` remains accepted for older producers (notably the C13 bridge),
+    but it no longer bypasses backpressure or creates unbounded coroutines.
+    """
+    global _WS_INGRESS_SCHEDULED, _WS_INGRESS_OVERFLOWED
+    del force
+    loop = WS_LOOP
+    with _WS_REGISTRY_LOCK:
+        has_clients = bool(WS_CLIENTS)
+    if loop is None or not has_clients:
+        return
+    should_schedule = False
+    with _WS_INGRESS_LOCK:
+        try:
+            replaced = _WS_INGRESS.enqueue(data, notify=False)
+            if replaced:
+                _add_ws_stream_replaced()
+        except ReliableQueueFull:
+            # An event cannot be silently dropped.  Mark the batch failed and
+            # close clients from the WS loop with a retryable overload code.
+            _WS_INGRESS_OVERFLOWED = True
+        if not _WS_INGRESS_SCHEDULED:
+            _WS_INGRESS_SCHEDULED = True
+            should_schedule = True
+    if should_schedule:
+        try:
+            loop.call_soon_threadsafe(_drain_ws_ingress)
+        except RuntimeError:
+            with _WS_INGRESS_LOCK:
+                _WS_INGRESS_SCHEDULED = False
 
-        fut.add_done_callback(_done)
+
+def _add_ws_stream_replaced(amount=1):
+    global _WS_STREAM_REPLACED
+    with _WS_METRICS_LOCK:
+        _WS_STREAM_REPLACED += int(amount)
 
 
-async def _send_ws(ws, msg):
+def _drain_ws_ingress():
+    """Run on WS_LOOP; distribute one bounded/coalesced producer batch."""
+    global _WS_INGRESS_SCHEDULED, _WS_INGRESS_OVERFLOWED
+    # Drain exactly one atomic snapshot and yield.  Producers arriving after
+    # scheduled is reset below arrange another call_soon_threadsafe callback;
+    # this prevents a hot producer from monopolizing the WS event loop.
+    with _WS_INGRESS_LOCK:
+        messages = _WS_INGRESS.drain_nowait()
+        overflowed = _WS_INGRESS_OVERFLOWED
+        _WS_INGRESS_OVERFLOWED = False
+        _WS_INGRESS_SCHEDULED = False
+    if overflowed:
+        logger.error("WebSocket reliable ingress overflow; closing clients")
+        for ws in _ws_client_snapshot():
+            _schedule_ws_disconnect(ws, "reliable ingress overflow")
+    for message in messages:
+        try:
+            serialized = serialize_message(message)
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.warning("WebSocket JSON serialization failed: %s", exc)
+            if classify_message(message) == "reliable":
+                # A reliable event cannot be silently skipped.  Close every
+                # affected connection so clients must rehydrate after retry.
+                for ws in _ws_client_snapshot():
+                    _schedule_ws_disconnect(
+                        ws, "reliable serialization failure")
+            continue
+        with _WS_REGISTRY_LOCK:
+            clients = [
+                (ws, _WS_OUTBOXES.get(ws)) for ws in WS_CLIENTS
+            ]
+        for ws, outbox in clients:
+            if outbox is None:
+                continue
+            try:
+                if outbox.enqueue_serialized(serialized):
+                    _add_ws_stream_replaced()
+            except ReliableQueueFull:
+                logger.warning("WebSocket reliable client queue overflow")
+                _schedule_ws_disconnect(ws, "reliable queue overflow")
+
+
+def _schedule_ws_disconnect(ws, reason):
+    if ws in _WS_CLOSING:
+        return
+    _WS_CLOSING.add(ws)
+    asyncio.create_task(_disconnect_ws(ws, reason))
+
+
+def _ws_client_snapshot():
+    with _WS_REGISTRY_LOCK:
+        return list(WS_CLIENTS)
+
+
+async def _disconnect_ws(ws, reason):
     try:
-        await asyncio.wait_for(ws.send(msg), timeout=_WS_SEND_TIMEOUT)
-        return None
+        await asyncio.wait_for(
+            ws.close(code=1013, reason=reason), timeout=_WS_SEND_TIMEOUT)
     except Exception:
-        return ws
+        pass
+    finally:
+        await _unregister_ws(ws)
+        _WS_CLOSING.discard(ws)
 
 
-async def _async_broadcast(msg):
-    stale = await asyncio.gather(*[_send_ws(ws, msg) for ws in list(WS_CLIENTS)])
-    for ws in stale:
-        if ws is not None:
-            WS_CLIENTS.discard(ws)
+async def _ws_client_sender(ws, outbox):
+    close_reason = "sender stopped"
+    try:
+        await outbox.send_forever(ws, timeout=_WS_SEND_TIMEOUT)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug("WebSocket sender stopped: %s", exc)
+        close_reason = "send timeout"
+    finally:
+        try:
+            await asyncio.wait_for(
+                ws.close(code=1013, reason=close_reason),
+                timeout=_WS_SEND_TIMEOUT,
+            )
+        except Exception:
+            pass
+        # Do not rely on close() waking the handler promptly: sender failure
+        # owns its registry cleanup too.  _unregister_ws is idempotent.
+        await _unregister_ws(ws)
+
+
+async def _register_ws(ws):
+    outbox = LatestValueOutbox(reliable_capacity=_WS_RELIABLE_CAPACITY)
+    sender = asyncio.create_task(_ws_client_sender(ws, outbox))
+    with _WS_REGISTRY_LOCK:
+        WS_CLIENTS.add(ws)
+        _WS_OUTBOXES[ws] = outbox
+        _WS_SENDER_TASKS[ws] = sender
+
+
+async def _unregister_ws(ws):
+    with _WS_REGISTRY_LOCK:
+        WS_CLIENTS.discard(ws)
+        outbox = _WS_OUTBOXES.pop(ws, None)
+        sender = _WS_SENDER_TASKS.pop(ws, None)
+    if outbox is not None:
+        outbox.close()
+    if sender is not None and sender is not asyncio.current_task():
+        sender.cancel()
+        await asyncio.gather(sender, return_exceptions=True)
+
+
+def ws_telemetry():
+    """Return WS pressure metrics for status snapshots.
+
+    ``ws_stream_replaced`` is cumulative across producer ingress and every
+    client outbox. ``ws_reliable_depth`` is an aggregate gauge and therefore
+    includes duplicated per-client reliable backlog plus producer ingress.
+    """
+    with _WS_REGISTRY_LOCK:
+        outboxes = list(_WS_OUTBOXES.values())
+        connected_clients = len(WS_CLIENTS)
+    with _WS_METRICS_LOCK:
+        replaced = _WS_STREAM_REPLACED
+    return {
+        "ws_stream_replaced": replaced,
+        "ws_reliable_depth": (
+            _WS_INGRESS.reliable_depth
+            + sum(outbox.reliable_depth for outbox in outboxes)
+        ),
+        "ws_connected_clients": connected_clients,
+    }
 
 
 # 阶段B: 把 ws_broadcast 注入 nx_ai_node (避免循环 import; nx_ai_node 顶层不能
@@ -2755,19 +2905,66 @@ def create_server(host, port, static_dir, mission_root=None):
 # ============================================================================
 # WS server (照抄 panel.py:731-739, 端口固定 8001)
 # ============================================================================
-def run_ws(host, port):
-    global WS_LOOP
-    import websockets
-    async def h(ws, path):
-        WS_CLIENTS.add(ws)
+async def _start_ws_server(websockets, host, port):
+    async def h(ws, path=None):
+        # ``path`` is optional for compatibility with both the legacy
+        # websockets two-argument handler and newer one-argument releases.
+        del path
+        await _register_ws(ws)
         try:
             await ws.wait_closed()
         finally:
-            WS_CLIENTS.discard(ws)
-    WS_LOOP = asyncio.new_event_loop()
-    asyncio.set_event_loop(WS_LOOP)
-    WS_LOOP.run_until_complete(websockets.serve(h, host, port))
-    WS_LOOP.run_forever()
+            await _unregister_ws(ws)
+    # Recent websockets releases require serve() to be constructed while an
+    # event loop is running.  This coroutine is entered by run_until_complete.
+    return await websockets.serve(h, host, port)
+
+
+async def _shutdown_ws_server(server):
+    server.close()
+    clients = _ws_client_snapshot()
+    if clients:
+        await asyncio.gather(*[
+            _disconnect_ws(ws, "server shutdown") for ws in clients
+        ], return_exceptions=True)
+    try:
+        await asyncio.wait_for(
+            server.wait_closed(), timeout=max(1.0, 2.0 * _WS_SEND_TIMEOUT))
+    except asyncio.TimeoutError:
+        logger.warning("WebSocket server close timed out; cancelling handlers")
+    with _WS_REGISTRY_LOCK:
+        senders = list(_WS_SENDER_TASKS.values())
+    for sender in senders:
+        sender.cancel()
+    if senders:
+        await asyncio.gather(*senders, return_exceptions=True)
+
+
+def run_ws(host, port):
+    global WS_LOOP
+    import websockets
+    loop = asyncio.new_event_loop()
+    WS_LOOP = loop
+    asyncio.set_event_loop(loop)
+    server = None
+    try:
+        server = loop.run_until_complete(
+            _start_ws_server(websockets, host, port))
+        loop.run_forever()
+    finally:
+        try:
+            if server is not None:
+                loop.run_until_complete(_shutdown_ws_server(server))
+        finally:
+            remaining = list(asyncio.all_tasks(loop))
+            for task in remaining:
+                task.cancel()
+            if remaining:
+                loop.run_until_complete(asyncio.gather(
+                    *remaining, return_exceptions=True))
+            WS_LOOP = None
+            asyncio.set_event_loop(None)
+            loop.close()
 
 
 # ============================================================================
@@ -2936,7 +3133,8 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
                           "stats": {"imu_count": imu_count,
                                      "robot_mode": 0,
                                      "robot_velocity": [dog_vx, dog_vy, dog_vyaw],
-                                     "connected": connected},
+                                     "connected": connected,
+                                     **ws_telemetry()},
                           "dog_state": dog_state,
                           "tasks": task_manager.get_state() if task_manager else {},
                            "localization": localization,
