@@ -14,6 +14,8 @@ class FakeContext {
   setTransform() {}
   fillRect(x, y, w, h) { this.ops.push({ type: 'fillRect', x, y, w, h, fillStyle: this.fillStyle }); }
   clearRect(x, y, w, h) { this.ops.push({ type: 'clearRect', x, y, w, h }); }
+  createImageData(w, h) { return { width: w, height: h, data: new Uint8ClampedArray(w * h * 4) }; }
+  putImageData(image, x, y) { this.ops.push({ type: 'putImageData', image, x, y }); }
   drawImage(image, ...args) { this.ops.push({ type: 'drawImage', image, args }); }
   strokeRect(x, y, w, h) { this.ops.push({ type: 'strokeRect', x, y, w, h, strokeStyle: this.strokeStyle }); }
   beginPath() {}
@@ -36,11 +38,15 @@ class FakeCanvas {
   constructor(ctx) {
     this.clientWidth = 800;
     this.clientHeight = 600;
-    this.width = 0;
-    this.height = 0;
+    this._width = 0;
+    this._height = 0;
     this._ctx = ctx;
     this._listeners = new Map();
   }
+  get width() { return this._width; }
+  set width(value) { this._width = Math.max(0, Math.floor(Number(value) || 0)); }
+  get height() { return this._height; }
+  set height(value) { this._height = Math.max(0, Math.floor(Number(value) || 0)); }
   getContext() { return this._ctx; }
   addEventListener(type, callback) {
     if (!this._listeners.has(type)) this._listeners.set(type, []);
@@ -59,10 +65,15 @@ class FakeCanvas {
   getBoundingClientRect() { return { left: 0, top: 0 }; }
 }
 
-function loadMapClass() {
+function loadMapClass(runtime = {}) {
   const source = fs.readFileSync(path.join(__dirname, 'static', 'map.js'), 'utf8');
   const context = {
-    window: { devicePixelRatio: 1 },
+    window: {
+      devicePixelRatio: runtime.devicePixelRatio || 1,
+      addEventListener: runtime.addWindowListener || (() => {}),
+    },
+    requestAnimationFrame: runtime.requestAnimationFrame || (() => 1),
+    cancelAnimationFrame: runtime.cancelAnimationFrame || (() => {}),
     document: {
       createElement(tag) {
         assert.strictEqual(tag, 'canvas');
@@ -76,13 +87,121 @@ function loadMapClass() {
   return context.window.Go2WMap;
 }
 
-function createMap(opts = {}) {
+function createMap(opts = {}, runtime = {}) {
   const ctx = new FakeContext();
   const canvas = new FakeCanvas(ctx);
-  const Go2WMap = loadMapClass();
+  const Go2WMap = loadMapClass(runtime);
   const map = new Go2WMap(canvas, opts);
   map._resize();
   return { map, ctx, canvas };
+}
+
+function fakeRafRuntime() {
+  let nextId = 1;
+  const callbacks = new Map();
+  return {
+    requestAnimationFrame(callback) {
+      const id = nextId++;
+      callbacks.set(id, callback);
+      return id;
+    },
+    cancelAnimationFrame(id) { callbacks.delete(id); },
+    flush() {
+      const pending = Array.from(callbacks.values());
+      callbacks.clear();
+      for (const callback of pending) callback(0);
+      return pending.length;
+    },
+    pending() { return callbacks.size; },
+  };
+}
+
+function testDirtySchedulerStaysIdleAndCoalescesUpdates() {
+  const raf = fakeRafRuntime();
+  const { map } = createMap({}, raf);
+  let draws = 0;
+  const originalDraw = map._draw.bind(map);
+  map._draw = () => { draws += 1; originalDraw(); };
+
+  map.start();
+  assert.strictEqual(raf.pending(), 1);
+  raf.flush();
+  assert.strictEqual(draws, 1);
+  for (let i = 0; i < 100; i++) raf.flush();
+  assert.strictEqual(draws, 1, 'idle RAF ticks must not redraw an unchanged map');
+
+  map.update({ x: 1 });
+  map.update({ y: 2 });
+  map.setNavGoal({ x: 3, y: 4, yaw: 0, frame_id: 'map' });
+  assert.strictEqual(raf.pending(), 1, 'many mutations before a frame must coalesce');
+  raf.flush();
+  assert.strictEqual(draws, 2);
+  assert.strictEqual(raf.pending(), 0);
+}
+
+function testDirtySchedulerInvalidatesCachesInteractionAndResize() {
+  const raf = fakeRafRuntime();
+  let resizeListener = null;
+  const { map, canvas } = createMap({}, {
+    ...raf,
+    addWindowListener(type, callback) { if (type === 'resize') resizeListener = callback; },
+  });
+  map.start();
+  raf.flush();
+
+  map._cmDirty = false;
+  map._tf = { stale: true };
+  map.update({ costmap: { w: 1, h: 1, vals: [100], ox: 0, oy: 0, res: 0.1 } });
+  assert.strictEqual(map._cmDirty, true);
+  assert.strictEqual(map._tf, null);
+  assert.strictEqual(raf.pending(), 1);
+  raf.flush();
+
+  map._tf = { stale: true };
+  map.update({ occupancy_map: { points: [[2, 3]], resolution: 0.1 } });
+  assert.strictEqual(map._tf, null, 'occupancy changes must invalidate transform bounds');
+  raf.flush();
+
+  canvas.emit('mousedown', 100, 100);
+  canvas.emit('mousemove', 140, 140);
+  assert.strictEqual(raf.pending(), 1, 'drag feedback must invalidate the frame');
+  raf.flush();
+
+  map._fogCacheKey = 'old';
+  map._tf = { stale: true };
+  canvas.clientWidth = 900;
+  resizeListener();
+  assert.strictEqual(map._tf, null);
+  assert.strictEqual(map._fogCacheKey, '');
+  assert.strictEqual(raf.pending(), 1);
+  raf.flush();
+  assert.strictEqual(map.W, 900);
+
+  map.update({ x: 9 });
+  assert.strictEqual(raf.pending(), 1);
+  map.stop();
+  assert.strictEqual(raf.pending(), 0, 'stop must cancel a queued frame');
+  map.start();
+  assert.strictEqual(raf.pending(), 1, 'restart must create one fresh frame');
+}
+
+function testFractionalDevicePixelRatioDoesNotInvalidateEveryDirtyFrame() {
+  const { map, canvas } = createMap({}, { devicePixelRatio: 1.25 });
+  canvas.clientWidth = 801;
+  canvas.clientHeight = 601;
+  map._resize();
+  assert.strictEqual(canvas.width, Math.round(801 * 1.25));
+  assert.strictEqual(canvas.height, Math.round(601 * 1.25));
+
+  const transform = { shouldSurvive: true };
+  map._tf = transform;
+  map._fogCacheKey = 'cached-for-current-viewport';
+  map._resize();
+
+  assert.strictEqual(map._tf, transform,
+    'an unchanged fractional-DPR viewport must not invalidate transforms');
+  assert.strictEqual(map._fogCacheKey, 'cached-for-current-viewport',
+    'an unchanged fractional-DPR viewport must not rebuild fog caches');
 }
 
 function near(a, b) {
@@ -532,12 +651,15 @@ function testStatusPollingRefreshesRoomSearchWhenWebSocketStateIsDropped() {
   const panel = fs.readFileSync(path.join(__dirname, 'static', 'panel.html'), 'utf8');
   const helper = panel.indexOf('function applyRoomNavigationState(roomNav)');
   assert(helper >= 0, 'room navigation state should have one shared renderer');
-  const poll = panel.indexOf('// 状态轮询');
-  assert(poll >= 0, 'status polling block missing');
+  const poll = panel.indexOf('function applyStatusSnapshot(snapshot');
+  assert(poll >= 0, 'shared status rehydration helper missing');
   assert(
-    panel.indexOf('applyRoomNavigationState(d.room_nav)', poll) > poll,
+    panel.indexOf('applyRoomNavigationState(snapshot.room_nav)', poll) > poll,
     'HTTP status polling must refresh room-search mask when WebSocket updates are dropped',
   );
+  assert(panel.includes('panelStatusPoller.start(0)'), 'self-scheduling status poll must start');
+  assert(!panel.includes("setInterval(() => {\n  const statusEpoch"),
+    'status polling must not use an overlapping fixed interval');
 }
 
 function testPanelFiltersDetectionResultsBelowEightyPercent() {
@@ -572,6 +694,9 @@ function testPanelForwardsGenericTargetMarkerEventsIntoMap() {
 }
 
 testWorldScanPointsAreDrawnWithoutSecondTransform();
+testDirtySchedulerStaysIdleAndCoalescesUpdates();
+testDirtySchedulerInvalidatesCachesInteractionAndResize();
+testFractionalDevicePixelRatioDoesNotInvalidateEveryDirtyFrame();
 testTransformRecomputesAfterSlamUpdate();
 testTransformIgnoresStaleRemoteMapOutliers();
 testLocalLidarPointsAccumulateIntoObstacleMap();

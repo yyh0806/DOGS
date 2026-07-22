@@ -302,7 +302,7 @@ async function controlFetch(url, options = {}) {
   // 前端不再弹窗索要令牌、不发 Bearer (用户要求去掉权限 token 限制)。
   return fetch(url, options);
 }
-let ws, connected = false, frameCount = 0, lastFpsTime = Date.now(), _moveInterval = null, _locateLoopTimer = null;
+let connected = false, frameCount = 0, lastFpsTime = Date.now(), _moveInterval = null, _locateLoopTimer = null;
 let latestDetections = [];
 let latestDetectionsBySource = {};
 let latestLocateResult = null, latestLocateTs = 0;
@@ -320,9 +320,11 @@ function filterDetectionResults(detections) {
 }
 function _isGenericClass(s) { return _LOCATE_GENERIC.has((s || '').toLowerCase()); }
 const DETECTION_VIEWS = {
-  c13_vis: { overlayId: 'detectOverlay', imgId: 'videoImg' },
-  c13_ir: { overlayId: 'irDetectOverlay', imgId: 'irImg' }
+  c13_vis: { overlayId: 'detectOverlay', imgId: 'videoImg', emptyId: 'noVideo' },
+  c13_ir: { overlayId: 'irDetectOverlay', imgId: 'irImg', emptyId: 'noIrVideo' }
 };
+const overlayFrameScheduler = createLatestFrameScheduler();
+const streamFrameGeneration = { c13_vis: 0, c13_ir: 0 };
 let map = null;
 let latestNavigationReadiness = {
   ready: false,
@@ -527,6 +529,16 @@ function applyRoomNavigationState(roomNav) {
 /** 地图点选 → map-frame NavigateToPose；目标朝向默认指向点击位置。 */
 async function sendNavGoal(point) {
   if (!map || !point) return;
+  // Parked sessions may be activated by /api/navigate.  Other unhealthy
+  // states must never emit a control request from the browser.
+  if (latestNavigationReadiness.ready !== true
+      && latestNavigationReadiness.activatable !== true) {
+    setNavStatusChip(
+      'waiting_health',
+      navigationReasonLabel(latestNavigationReadiness.reason) || '导航尚未就绪',
+    );
+    return;
+  }
   // JS ready 守卫已移除 (2026-07-16): 后端 /api/navigate 用 activatable 判定, 会自动激活 drive session;
   // 前端 ready 过严造成死锁 (ready 要求 drive session 已 active, 但只有发 /api/navigate 才会激活它).
   const x = Number(point.x), y = Number(point.y);
@@ -639,6 +651,7 @@ function clearTrail() {
     // 失效), nav2 停发 /plan, 前端 plan=null 保持; 若导航仍在跑 /plan 灌回属预期。
     map.slam.plan = null;
     if (map.slam.goal) { map.slam.goal = null; }
+    if (typeof map._markDirty === 'function') map._markDirty();
   }
   // 联动后端清 _trail (轨迹源头) + nav2 costmap (clearEntirely service);
   // 否则前端清了, 下一帧 WS 又把后端 _trail 灌回 = 轨迹"清不掉"。
@@ -1069,6 +1082,60 @@ function detectionStreamFromPayload(payload, source) {
   };
 }
 
+function scheduleDetectionOverlay(payload, source = 'c13_vis', expectedGeneration = null) {
+  return overlayFrameScheduler.schedule(
+    `detection:${source}`,
+    { payload, expectedGeneration },
+    latest => {
+      if (latest.expectedGeneration !== null
+          && latest.expectedGeneration !== streamFrameGeneration[source]) return;
+      renderDetectionOverlay(latest.payload, source);
+    },
+  );
+}
+
+function scheduleLocateOverlay(result, options = {}) {
+  const record = options.record === true;
+  if (record) {
+    latestLocateResult = result || null;
+    if (result) latestLocateTs = Date.now();
+  }
+  const generation = options.expectedGeneration === undefined
+    ? streamFrameGeneration.c13_vis : options.expectedGeneration;
+  return overlayFrameScheduler.schedule(
+    'locate:c13_vis',
+    { result: result || null, generation },
+    latest => {
+      if (latest.generation !== streamFrameGeneration.c13_vis) return;
+      renderLocateOverlay(latest.result, false);
+    },
+  );
+}
+
+function setStreamImage(source, base64Payload) {
+  const view = DETECTION_VIEWS[source];
+  if (!view || !base64Payload) return false;
+  const img = document.getElementById(view.imgId);
+  if (!img) return false;
+  const generation = (streamFrameGeneration[source] || 0) + 1;
+  streamFrameGeneration[source] = generation;
+  img.onload = () => {
+    if (generation !== streamFrameGeneration[source]) return;
+    const detections = latestDetectionsBySource[source] || [];
+    if (detections.length) {
+      scheduleDetectionOverlay({ detections }, source, generation);
+    }
+    if (source === 'c13_vis' && latestLocateResult) {
+      scheduleLocateOverlay(latestLocateResult, { expectedGeneration: generation });
+    }
+  };
+  img.src = `data:image/${source === 'c13_ir' ? 'jpeg' : 'jpeg'};base64,${base64Payload}`;
+  img.style.display = 'block';
+  const empty = document.getElementById(view.emptyId);
+  if (empty) empty.style.display = 'none';
+  return true;
+}
+
 function renderDetectionOverlay(payload, source = 'c13_vis') {
   const view = DETECTION_VIEWS[source] || DETECTION_VIEWS.c13_vis;
   const overlay = document.getElementById(view.overlayId);
@@ -1125,7 +1192,7 @@ function renderDetectionStreams(payload) {
     const view = DETECTION_VIEWS[source];
     const dets = Array.isArray(stream.detections) ? stream.detections : [];
     if (view && renderedOverlays.has(view.overlayId) && !dets.length) continue;
-    renderDetectionOverlay(stream, source);
+    scheduleDetectionOverlay(stream, source, streamFrameGeneration[source]);
     if (view) renderedOverlays.add(view.overlayId);
   }
   latestDetections = Array.isArray(payload && payload.detections)
@@ -1216,9 +1283,11 @@ function showLocateNote(text) {
   overlay.appendChild(note);
 }
 
-function renderLocateOverlay(result) {
-  latestLocateResult = result || null;
-  if (result) latestLocateTs = Date.now();  // M3: 刷新 TTL 时间戳
+function renderLocateOverlay(result, record = true) {
+  if (record) {
+    latestLocateResult = result || null;
+    if (result) latestLocateTs = Date.now();  // M3: 刷新 TTL 时间戳
+  }
   const overlay = document.getElementById('locateOverlay');
   if (!overlay) return;
   overlay.innerHTML = '';
@@ -1275,28 +1344,331 @@ function renderLocateOverlay(result) {
   if (!drawn) showLocateNote('LocateAnything: 缺少图像尺寸，无法画框');
 }
 
-// ---- WebSocket ----
-function connectWS() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const wsUrl = `${proto}://${location.hostname}:8001`;
-  const socket = new WebSocket(wsUrl);
-  let socketEpoch = null;
-  ws = socket;
-  socket.onopen = () => {
-    if (ws !== socket) return;
-    socketEpoch = resetNavOrderingForNewConnection();
-    // 立即从新后端实例恢复当前目标；周期轮询继续作为丢 WS 消息的兜底。
-    fetch('/api/status').then(r => r.json()).then(d => {
-      if (d.navigation) applyNavigationReadiness(d.navigation);
-      if (d.point_nav) applyNavStateForEpoch(d.point_nav, 'status', socketEpoch);
-      if (d.room_nav) applyRoomNavigationState(d.room_nav);
-      updatePoseInfo(d.localization, d.odometry);
-    }).catch(() => {});
+// ---- Panel lifecycle helpers ----
+function computeWsReconnectDelay(attempt, randomValue = Math.random()) {
+  const exponent = Math.max(0, Math.min(20, Number(attempt) || 0));
+  const base = Math.min(10000, 500 * (2 ** exponent));
+  const jitter = 0.8 + 0.4 * Math.max(0, Math.min(1, Number(randomValue) || 0));
+  return Math.min(10000, Math.max(0, Math.round(base * jitter)));
+}
+
+function createLatestFrameScheduler(runtime = {}) {
+  const requestFrame = runtime.requestFrame || requestAnimationFrame;
+  const cancelFrame = runtime.cancelFrame || cancelAnimationFrame;
+  const states = new Map();
+  return {
+    schedule(source, payload, render) {
+      const key = String(source || 'default');
+      const state = states.get(key) || {
+        generation: 0, epoch: 0, rafId: null, payload: null, render: null,
+      };
+      state.generation += 1;
+      state.payload = payload;
+      state.render = render;
+      states.set(key, state);
+      if (state.rafId === null) {
+        const scheduledEpoch = state.epoch;
+        state.rafId = requestFrame(() => {
+          if (state.epoch !== scheduledEpoch) return;
+          state.rafId = null;
+          const latestPayload = state.payload;
+          const latestRender = state.render;
+          state.payload = null;
+          if (typeof latestRender === 'function') latestRender(latestPayload);
+        });
+      }
+      return state.generation;
+    },
+    isCurrent(source, generation) {
+      const state = states.get(String(source || 'default'));
+      return !!state && state.generation === generation;
+    },
+    cancel(source) {
+      const state = states.get(String(source || 'default'));
+      if (!state) return;
+      state.epoch += 1;
+      state.generation += 1;
+      if (state.rafId !== null) cancelFrame(state.rafId);
+      state.rafId = null;
+      state.payload = null;
+      state.render = null;
+    },
   };
-  socket.onmessage = (e) => {
+}
+
+function createStatusPoller(runtime) {
+  const setTimer = runtime.setTimeoutFn || setTimeout;
+  const clearTimer = runtime.clearTimeoutFn || clearTimeout;
+  const intervalMs = Number(runtime.intervalMs) || 3000;
+  const timeoutMs = Number(runtime.timeoutMs) || 2500;
+  let timer = null;
+  let running = false;
+  let stopped = true;
+  let controller = null;
+  const schedule = delay => {
+    if (stopped || timer !== null) return;
+    timer = setTimer(() => { timer = null; void poll(); }, Math.max(0, delay));
+  };
+  const poll = async () => {
+    if (stopped || running) return;
+    running = true;
+    const epoch = runtime.getEpoch();
+    const realtimeVersion = runtime.getVersion ? runtime.getVersion() : null;
+    controller = new AbortController();
+    const timeout = setTimer(() => controller.abort(), timeoutMs);
+    try {
+      const snapshot = await runtime.fetchStatus(controller.signal);
+      const versionCurrent = !runtime.getVersion
+        || realtimeVersion === runtime.getVersion();
+      if (!stopped && epoch === runtime.getEpoch() && versionCurrent) {
+        runtime.applySnapshot(snapshot, epoch);
+      }
+    } catch (error) {
+      if (runtime.onError) runtime.onError(error, epoch);
+    } finally {
+      clearTimer(timeout);
+      controller = null;
+      running = false;
+      schedule(intervalMs);
+    }
+  };
+  return {
+    start(delay = 0) { if (!stopped) return; stopped = false; schedule(delay); },
+    stop() {
+      stopped = true;
+      if (timer !== null) clearTimer(timer);
+      timer = null;
+      if (controller) controller.abort();
+    },
+    poll,
+    state: () => ({ running, scheduled: timer !== null }),
+  };
+}
+
+function createSocketLifecycle(runtime) {
+  const setTimer = runtime.setTimeoutFn || setTimeout;
+  const clearTimer = runtime.clearTimeoutFn || clearTimeout;
+  const setEvery = runtime.setIntervalFn || setInterval;
+  const clearEvery = runtime.clearIntervalFn || clearInterval;
+  const now = runtime.now || (() => Date.now());
+  const random = runtime.random || (() => Math.random());
+  let socket = null;
+  let reconnectTimer = null;
+  let watchdog = null;
+  let attempt = 0;
+  let lastMessageAt = 0;
+  const scheduleReconnect = () => {
+    if (reconnectTimer !== null) return;
+    const delay = Math.max(1000, computeWsReconnectDelay(attempt, random()));
+    attempt = Math.min(20, attempt + 1);
+    reconnectTimer = setTimer(() => { reconnectTimer = null; connect(); }, delay);
+  };
+  const connect = () => {
+    if (socket && (socket.readyState === 0 || socket.readyState === 1)) return socket;
+    const current = runtime.createSocket(runtime.url);
+    socket = current;
+    let closeHandled = false;
+    if (runtime.onSocket) runtime.onSocket(current);
+    current.onopen = () => {
+      if (reconnectTimer !== null) clearTimer(reconnectTimer);
+      reconnectTimer = null;
+      attempt = 0;
+      lastMessageAt = now();
+      if (watchdog !== null) clearEvery(watchdog);
+      watchdog = setEvery(() => {
+        if (current.readyState === 1 && now() - lastMessageAt >= 6000) {
+          current.close(4000, 'stale websocket');
+        }
+      }, 2000);
+      if (runtime.onOpen) runtime.onOpen(current);
+    };
+    current.onmessage = event => {
+      lastMessageAt = now();
+      if (runtime.onMessage) runtime.onMessage(current, event);
+    };
+    current.onclose = event => {
+      if (closeHandled) return;
+      closeHandled = true;
+      if (watchdog !== null) clearEvery(watchdog);
+      watchdog = null;
+      if (runtime.onClose) runtime.onClose(current, event);
+      scheduleReconnect();
+    };
+    return current;
+  };
+  return { connect, state: () => ({ socket, attempt, reconnectScheduled: reconnectTimer !== null }) };
+}
+
+// ---- Realtime lifecycle core (kept deterministic for browser tests) ----
+const STATUS_POLL_INTERVAL_MS = 3000;
+const STATUS_REQUEST_TIMEOUT_MS = 2500;
+let ws = null;
+let lastWsMessageAt = 0;
+let statusRequestPromise = null;
+let statusRequestController = null;
+let statusRequestToken = 0;
+let realtimeStateVersion = 0;
+
+function markRealtimeStateUpdate() {
+  realtimeStateVersion += 1;
+  return realtimeStateVersion;
+}
+
+const STATUS_OVERLAP_WS_TYPES = new Set([
+  'status', 'tasks', 'nav_goal', 'detections', 'locate',
+  'target_markers', 'person_markers', 'search_room', 'mission_report',
+]);
+
+function wsMessageOverlapsStatus(type) {
+  return STATUS_OVERLAP_WS_TYPES.has(String(type || ''));
+}
+
+function cacheDetectionSnapshot(detections) {
+  const filtered = filterDetectionResults(detections);
+  const nextBySource = {};
+  const sources = Object.keys(DETECTION_VIEWS);
+  for (const source of sources) {
+    overlayFrameScheduler.cancel(`detection:${source}`);
+    nextBySource[source] = [];
+  }
+  for (const detection of filtered) {
+    const requested = String((detection && detection.source) || '');
+    const source = sources.includes(requested) ? requested : 'c13_vis';
+    if (nextBySource[source]) nextBySource[source].push(detection);
+  }
+  latestDetectionsBySource = nextBySource;
+  latestDetections = filtered.slice();
+  updateDetectionBadge();
+  // HTTP status contains metadata but no frame identity.  Clear stale boxes
+  // now and let the next matching image onload paint the cached detections.
+  for (const view of Object.values(DETECTION_VIEWS)) {
+    const overlay = document.getElementById(view.overlayId);
+    if (overlay) overlay.innerHTML = '';
+  }
+  return filtered;
+}
+
+function updateServiceBar(services) {
+  if (!services || typeof services !== 'object') return;
+  const bar = document.getElementById('svcBar');
+  if (!bar) return;
+  let html = '';
+  for (const [name, info] of Object.entries(services)) {
+    const item = info || {};
+    html += `<span class="svc-item" title="${name}: ${item.state || ''}"><span class="svc-dot ${item.color || ''}"></span>${item.label || name}</span>`;
+  }
+  bar.innerHTML = html;
+}
+
+function updateStreamHealthMetadata(snapshot) {
+  const stats = snapshot && snapshot.stats && typeof snapshot.stats === 'object'
+    ? snapshot.stats : {};
+  const dot = document.getElementById('nxDot');
+  if (dot) {
+    const clients = Number(stats.ws_connected_clients);
+    const depth = Number(stats.ws_reliable_depth);
+    const replaced = Number(stats.ws_stream_replaced);
+    const parts = [];
+    if (Number.isFinite(clients)) parts.push(`WS clients ${clients}`);
+    if (Number.isFinite(depth)) parts.push(`reliable queue ${depth}`);
+    if (Number.isFinite(replaced)) parts.push(`stream replacements ${replaced}`);
+    if (parts.length) dot.title = parts.join(' · ');
+    if (dot.dataset) {
+      if (Number.isFinite(clients)) dot.dataset.wsClients = String(clients);
+      if (Number.isFinite(depth)) dot.dataset.wsReliableDepth = String(depth);
+      if (Number.isFinite(replaced)) dot.dataset.wsStreamReplaced = String(replaced);
+    }
+  }
+  const perception = snapshot && snapshot.perception;
+  const videoMeta = document.getElementById('videoMeta');
+  if (videoMeta && perception && typeof perception === 'object') {
+    videoMeta.title = `perception: ${perception.status || perception.state || 'unknown'}`;
+  }
+}
+
+function applyStatusSnapshot(snapshot, epoch = navConnectionEpoch) {
+  if (!snapshot || typeof snapshot !== 'object' || epoch !== navConnectionEpoch) return false;
+  if (snapshot.connected !== undefined) {
+    connected = snapshot.connected === true;
+    updateDogStatus(connected);
+  }
+  if (snapshot.dog_state) updateDogState(snapshot.dog_state);
+  if (snapshot.tasks) updateTasks(snapshot.tasks);
+  if (snapshot.navigation) applyNavigationReadiness(snapshot.navigation);
+  if (snapshot.point_nav) applyNavStateForEpoch(snapshot.point_nav, 'status', epoch);
+  if (snapshot.room_nav) applyRoomNavigationState(snapshot.room_nav);
+  updatePoseInfo(snapshot.localization, snapshot.odometry);
+  if (snapshot.services) updateServiceBar(snapshot.services);
+  const detections = Array.isArray(snapshot.det_list)
+    ? snapshot.det_list
+    : (Array.isArray(snapshot.detections) ? snapshot.detections : null);
+  if (detections) {
+    const filtered = cacheDetectionSnapshot(detections);
+    updateDetList(filtered);
+  }
+  if (Array.isArray(snapshot.target_markers) && map) {
+    map.update({ target_markers: filterDetectionResults(snapshot.target_markers) });
+  }
+  updateStreamHealthMetadata(snapshot);
+  const nxDot = document.getElementById('nxDot');
+  if (nxDot) nxDot.className = 'status-dot on';
+  return true;
+}
+
+async function refreshStatusSnapshot(epoch, replaceInFlight = false) {
+  if (replaceInFlight && statusRequestController) statusRequestController.abort();
+  if (statusRequestPromise && !replaceInFlight) return statusRequestPromise;
+  const token = ++statusRequestToken;
+  const requestRealtimeVersion = realtimeStateVersion;
+  const controller = new AbortController();
+  statusRequestController = controller;
+  const timeoutId = setTimeout(() => controller.abort(), STATUS_REQUEST_TIMEOUT_MS);
+  const request = (async () => {
+    try {
+      const response = await fetch('/api/status', { signal: controller.signal });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const snapshot = await response.json();
+      if (requestRealtimeVersion === realtimeStateVersion) {
+        applyStatusSnapshot(snapshot, epoch);
+      }
+      return snapshot;
+    } finally {
+      clearTimeout(timeoutId);
+      if (token === statusRequestToken) {
+        statusRequestPromise = null;
+        statusRequestController = null;
+      }
+    }
+  })();
+  statusRequestPromise = request;
+  return request;
+}
+
+const panelStatusPoller = createStatusPoller({
+  fetchStatus: async signal => {
+    const response = await fetch('/api/status', { signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  },
+  applySnapshot: (snapshot, epoch) => applyStatusSnapshot(snapshot, epoch),
+  getEpoch: () => navConnectionEpoch,
+  getVersion: () => realtimeStateVersion,
+  onError: (_error, epoch) => {
+    if (epoch !== navConnectionEpoch) return;
+    const dot = document.getElementById('nxDot');
+    if (dot) dot.className = 'status-dot off';
+  },
+  timeoutMs: STATUS_REQUEST_TIMEOUT_MS,
+  intervalMs: STATUS_POLL_INTERVAL_MS,
+});
+
+// ---- WebSocket ----
+function handleSocketMessage(socket, socketEpoch, e) {
     if (ws !== socket || socketEpoch !== navConnectionEpoch) return;
+    lastWsMessageAt = Date.now();
     try {
       const data = JSON.parse(e.data);
+      if (wsMessageOverlapsStatus(data.type)) markRealtimeStateUpdate();
       if (data.type === 'lidar') {
         const li = document.getElementById('lidarImg');
         li.src = 'data:image/png;base64,' + data.data;
@@ -1308,27 +1680,14 @@ function connectWS() {
       } else if (data.type === 'gimbal') {
         // C13 云台双流 (可见光+红外合并推送)
         if (data.vis) {
-          const img = document.getElementById('videoImg');
-          img.src = 'data:image/jpeg;base64,' + data.vis;
-          img.style.display = 'block';
-          document.getElementById('noVideo').style.display = 'none';
+          setStreamImage('c13_vis', data.vis);
           frameCount++;
           if (latestLocateResult) {
             if (Date.now() - latestLocateTs > LOCATE_TTL_MS) { latestLocateResult = null; document.getElementById('locateOverlay').innerHTML = ''; }
-            else requestAnimationFrame(() => renderLocateOverlay(latestLocateResult));
-          }
-          if ((latestDetectionsBySource.c13_vis || []).length) {
-            requestAnimationFrame(() => renderDetectionOverlay({ detections: latestDetectionsBySource.c13_vis }, 'c13_vis'));
           }
         }
         if (data.ir) {
-          const ir = document.getElementById('irImg');
-          ir.src = 'data:image/jpeg;base64,' + data.ir;
-          ir.style.display = 'block';
-          document.getElementById('noIrVideo').style.display = 'none';
-          if ((latestDetectionsBySource.c13_ir || []).length) {
-            requestAnimationFrame(() => renderDetectionOverlay({ detections: latestDetectionsBySource.c13_ir }, 'c13_ir'));
-          }
+          setStreamImage('c13_ir', data.ir);
         }
       } else if (data.type === 'detections') {
         const payload = data.data || {};
@@ -1349,24 +1708,7 @@ function connectWS() {
       } else if (data.type === 'nav_goal') {
         applyNavStateForEpoch(data.data, 'ws', socketEpoch);
       } else if (data.type === 'status') {
-        if (data.tasks) updateTasks(data.tasks);
-        if (data.connected !== undefined) { connected = data.connected; updateDogStatus(connected); }
-        if (data.dog_state) updateDogState(data.dog_state);
-        if (data.navigation) applyNavigationReadiness(data.navigation);
-        updatePoseInfo(data.localization, data.odometry);
-        if (data.services) {
-          const bar = document.getElementById('svcBar');
-          if (bar) {
-            let h = '';
-            for (const [name, info] of Object.entries(data.services)) {
-              h += `<span class="svc-item" title="${name}: ${info.state}"><span class="svc-dot ${info.color}"></span>${info.label}</span>`;
-            }
-            bar.innerHTML = h;
-          }
-        }
-        if (data.point_nav) applyNavStateForEpoch(data.point_nav, 'ws', socketEpoch);
-        if (data.room_nav) applyRoomNavigationState(data.room_nav);
-        if (data.det_list) updateDetList(data.det_list);
+        applyStatusSnapshot(data, socketEpoch);
       } else if (data.type === 'tasks') {
         updateTasks(data.data);
       } else if (data.type === 'vlm') {
@@ -1376,7 +1718,12 @@ function connectWS() {
         if (data.data && data.data.detections) updateDetList(data.data.detections);
         // 有框才重画 (更新 latestLocateResult); 无框保留上次框 (hold last result, 不闪烁)
         const _hasBox = !!(data.data && (data.data.found || (data.data.detections && data.data.detections.length)));
-        if (_hasBox && data.data) renderLocateOverlay(data.data);
+        if (_hasBox && data.data) {
+          scheduleLocateOverlay(data.data, {
+            record: true,
+            expectedGeneration: streamFrameGeneration.c13_vis,
+          });
+        }
         const meta = document.getElementById('videoMeta');
         if (meta && data.data) {
           meta.textContent = data.data.found
@@ -1427,18 +1774,51 @@ function connectWS() {
         console.log('[任务报告]', report);
       }
     } catch (err) { console.error('[WS] parse', err); }
-  };
-  socket.onclose = () => {
-    if (ws !== socket) return;
-    clearInterval(_moveInterval); _moveInterval = null;
-    if (_locateLoopTimer) { clearTimeout(_locateLoopTimer); _locateLoopTimer = null; }
-    setTimeout(connectWS, 2000);
-  };
+}
+
+const socketEpochs = new WeakMap();
+let panelSocketLifecycle = null;
+function connectWS() {
+  if (!panelSocketLifecycle) {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    panelSocketLifecycle = createSocketLifecycle({
+      url: `${proto}://${location.hostname}:8001`,
+      createSocket: url => new WebSocket(url),
+      onSocket: socket => {
+        ws = socket;
+        socket.onerror = () => {
+          if (ws === socket && socket.readyState !== WebSocket.CLOSED) socket.close();
+        };
+      },
+      onOpen: socket => {
+        if (ws !== socket) return;
+        lastWsMessageAt = Date.now();
+        const epoch = resetNavOrderingForNewConnection();
+        socketEpochs.set(socket, epoch);
+        panelStatusPoller.stop();
+        refreshStatusSnapshot(epoch, true)
+          .catch(() => {})
+          .finally(() => panelStatusPoller.start(STATUS_POLL_INTERVAL_MS));
+      },
+      onMessage: (socket, event) => {
+        lastWsMessageAt = Date.now();
+        handleSocketMessage(socket, socketEpochs.get(socket), event);
+      },
+      onClose: socket => {
+        if (ws !== socket) return;
+        ws = null;
+        clearInterval(_moveInterval); _moveInterval = null;
+        if (_locateLoopTimer) { clearTimeout(_locateLoopTimer); _locateLoopTimer = null; }
+      },
+    });
+  }
+  return panelSocketLifecycle.connect();
 }
 
 // ---- 启动 ----
 initMap();
 connectWS();
+panelStatusPoller.start(0);
 
 // FPS
 setInterval(() => {
@@ -1447,34 +1827,20 @@ setInterval(() => {
   frameCount = 0; lastFpsTime = now;
 }, 1000);
 
-// 状态轮询
-setInterval(() => {
-  const statusEpoch = navConnectionEpoch;
-  fetch('/api/status').then(r => r.json()).then(d => {
-    if (statusEpoch !== navConnectionEpoch) return;
-    if (d.connected !== undefined) { connected = d.connected; updateDogStatus(connected); }
-    if (d.dog_state) updateDogState(d.dog_state);
-    if (d.tasks) updateTasks(d.tasks);
-    if (d.navigation) applyNavigationReadiness(d.navigation);
-    if (d.point_nav) applyNavStateForEpoch(d.point_nav, 'status', statusEpoch);
-    if (d.room_nav) applyRoomNavigationState(d.room_nav);
-    updatePoseInfo(d.localization, d.odometry);
-    document.getElementById('nxDot').className = 'status-dot on';
-  }).catch(() => {
-    if (statusEpoch === navConnectionEpoch) {
-      document.getElementById('nxDot').className = 'status-dot off';
-    }
-  });
-}, 3000);
-
 window.addEventListener('blur', () => { pressedKeys.clear(); resetKeyHighlight(); stopMove(); });
 window.addEventListener('resize', () => {
   for (const source of Object.keys(DETECTION_VIEWS)) {
     if ((latestDetectionsBySource[source] || []).length) {
-      renderDetectionOverlay({ detections: latestDetectionsBySource[source] }, source);
+      scheduleDetectionOverlay(
+        { detections: latestDetectionsBySource[source] },
+        source,
+        streamFrameGeneration[source],
+      );
     }
   }
-  if (latestLocateResult) renderLocateOverlay(latestLocateResult);
+  if (latestLocateResult) scheduleLocateOverlay(latestLocateResult, {
+    expectedGeneration: streamFrameGeneration.c13_vis,
+  });
 });
 </script>
 </body>

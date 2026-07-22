@@ -2330,6 +2330,31 @@ def _perception_health(robot_bridge):
         return health
 
 
+def _detection_list_snapshot(robot_bridge):
+    """Return lightweight detection metadata without touching video frames."""
+    ai = getattr(robot_bridge, "_ai_engine", None) if robot_bridge else None
+    get_detections = getattr(ai, "get_detection_list", None)
+    if not callable(get_detections):
+        return []
+    try:
+        detections = get_detections()
+        return list(detections) if isinstance(detections, (list, tuple)) else []
+    except Exception as exc:
+        logger.warning("detection list snapshot failed: %s", exc)
+        return []
+
+
+def _status_stats_snapshot(robot_bridge):
+    """Merge robot counters with current WebSocket pressure telemetry."""
+    raw_stats = getattr(robot_bridge, "stats", {}) if robot_bridge else {}
+    try:
+        stats = dict(raw_stats) if raw_stats is not None else {}
+    except (TypeError, ValueError):
+        stats = {}
+    stats.update(ws_telemetry())
+    return stats
+
+
 def _handle_point_nav_state(state):
     ws_broadcast({"type": "nav_goal", "data": state}, force=True)
     if navigation_arbiter is not None:
@@ -2435,6 +2460,10 @@ def create_server(host, port, static_dir, mission_root=None):
                 self._json({"url": f"http://{host_ip}:8080", "ws": f"ws://{host_ip}:8765"})
             elif p.path == '/api/status':
                 snap = node.get_status_snapshot() if node else {}
+                room_nav_state = (
+                    room_orchestrator.get_navigation_state()
+                    if room_orchestrator else {}
+                )
                 self._json({
                     "release_id": RELEASE_ID,
                     "motion_release_id": snap.get("motion_release_id"),
@@ -2442,18 +2471,16 @@ def create_server(host, port, static_dir, mission_root=None):
                     "connected": robot.connected if robot else False,
                     "imu_yaw": robot.imu_yaw if robot else 0,
                     "dog_state": snap.get("dog_state", "UNKNOWN"),
-                    "stats": robot.stats if robot else {},
+                    "stats": _status_stats_snapshot(robot),
                     "tasks": task_mgr.get_state() if task_mgr else {},
                     "localization": snap.get("localization", {}),
                     "odometry": snap.get("odometry", {}),
                     "navigation": snap.get("navigation", {}),
                     "services": snap.get("services", {}),
                     "point_nav": point_nav.get_state() if point_nav else {},
-                    "room_nav": (
-                        room_orchestrator.get_navigation_state()
-                        if room_orchestrator else {}
-                    ),
+                    "room_nav": room_nav_state,
                     "perception": _perception_health(robot),
+                    "det_list": _detection_list_snapshot(robot),
                 })
             elif p.path == '/api/version':
                 snap = node.get_status_snapshot() if node else {}
@@ -3127,7 +3154,7 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
                     '/tmp/plan_lite.json', 'plan', force=True)
 
             # ---- status 推送 (字段名匹配 panel.html:396-400) ----
-            det_list = ai_engine.get_detection_list() if ai_engine is not None and hasattr(ai_engine, "get_detection_list") else []
+            det_list = _detection_list_snapshot(robot_bridge)
             ws_broadcast({"type": "status",
                           "imu_yaw": round(raw_imu_heading, 3),
                           "stats": {"imu_count": imu_count,

@@ -64,7 +64,19 @@ class Go2WMap {
     this._bindMouse();
 
     // 渲染循环
+    // Draw only after a mutation; high-rate WS updates coalesce into one frame.
     this._running = false;
+    this._rafId = null;
+    this._frameGeneration = 0;
+    this._inFrame = false;
+    this._dirty = true;
+    this._handleResize = () => {
+      this._invalidateViewport();
+      this._markDirty();
+    };
+    if (window && typeof window.addEventListener === 'function') {
+      window.addEventListener('resize', this._handleResize);
+    }
   }
 
   /** 更新 slam 数据 (来自 WS 的 type=slam 消息) */
@@ -92,6 +104,7 @@ class Go2WMap {
       this.slam.wallPoints = Array.isArray(occupancy.points)
         ? occupancy.points.slice(-5000) : [];
       this.slam.wallResolution = Number(occupancy.resolution) || 0.05;
+      this._fogCacheKey = '';
     }
     if (data.scan) this.slam.scanPoints = data.scan;
     if (data.slam_source !== undefined) this.slam.slamSource = data.slam_source;
@@ -105,6 +118,7 @@ class Go2WMap {
     }
     if (data.plan) this.slam.plan = data.plan;
     this._tf = null;
+    this._markDirty();
   }
 
   /** 切换前端显示的 costmap: false=local(避障,默认) / true=global(规划) */
@@ -112,6 +126,7 @@ class Go2WMap {
     this._showGlobalCostmap = !!v;
     const src = this._showGlobalCostmap ? this.slam.costmapGlobal : this.slam.costmapLocal;
     if (src) { this.slam.costmap = src; this._cmDirty = true; this._tf = null; }
+    this._markDirty();
   }
 
   _updateRoomSearch(progress) {
@@ -178,14 +193,15 @@ class Go2WMap {
   }
 
   /** 设置/清除搜索区域 (世界坐标 {x,y,w,h}); 表单输入也调这个同步显示 */
-  setRegion(region) { this.searchRegion = region; this._tf = null; }
-  clearRegion() { this.searchRegion = null; this._tf = null; }
+  setRegion(region) { this.searchRegion = region; this._tf = null; this._markDirty(); }
+  clearRegion() { this.searchRegion = null; this._tf = null; this._markDirty(); }
 
   /** 设置 Panel/Nav2 当前目标及状态；只接受 map 系有限坐标。 */
   setNavGoal(state) {
     if (state == null) {
       this.navGoal = null;
       this._tf = null;
+      this._markDirty();
       return true;
     }
     const nested = state.goal && typeof state.goal === 'object' ? state.goal : {};
@@ -206,6 +222,7 @@ class Go2WMap {
     this.navGoal = { ...nested, ...state, x, y, yaw, frame_id: 'map' };
     delete this.navGoal.goal;
     this._tf = null;
+    this._markDirty();
     return true;
   }
 
@@ -227,6 +244,7 @@ class Go2WMap {
     }
     this.slam.lidarMapPoints = Array.from(this._lidarCells.values());
     this._tf = null;
+    this._markDirty();
   }
 
   _addLidarObstacleCell(wx, wy) {
@@ -287,25 +305,68 @@ class Go2WMap {
   }
 
   start() {
+    if (this._running) return;
     this._running = true;
-    const loop = () => {
-      if (!this._running) return;
-      this._resize();
-      this._draw();
-      requestAnimationFrame(loop);
-    };
-    requestAnimationFrame(loop);
+    this._dirty = true;
+    this._scheduleFrame();
   }
-  stop() { this._running = false; }
+
+  stop() {
+    if (!this._running && this._rafId === null) return;
+    this._running = false;
+    this._frameGeneration += 1;
+    if (this._rafId !== null) cancelAnimationFrame(this._rafId);
+    this._rafId = null;
+    this._inFrame = false;
+  }
+
+  _markDirty() {
+    this._dirty = true;
+    this._scheduleFrame();
+  }
+
+  _scheduleFrame() {
+    if (!this._running || this._rafId !== null || this._inFrame || !this._dirty) return;
+    const generation = this._frameGeneration;
+    this._rafId = requestAnimationFrame(() => {
+      // cancelAnimationFrame is not guaranteed to suppress a callback which is
+      // already dispatching.  A generation guard keeps old stop/start frames
+      // from clearing or repainting the current scheduler.
+      if (!this._running || generation !== this._frameGeneration) return;
+      this._rafId = null;
+      if (!this._dirty) return;
+      this._dirty = false;
+      this._inFrame = true;
+      try {
+        this._resize();
+        this._draw();
+      } finally {
+        this._inFrame = false;
+      }
+      this._scheduleFrame();
+    });
+  }
+
+  _invalidateViewport() {
+    this._tf = null;
+    this._fogCacheKey = '';
+  }
 
   _resize() {
     const dpr = window.devicePixelRatio || 1;
     const w = this.canvas.clientWidth;
     const h = this.canvas.clientHeight;
-    if (this.canvas.width !== w * dpr || this.canvas.height !== h * dpr) {
-      this.canvas.width = w * dpr;
-      this.canvas.height = h * dpr;
+    // Canvas bitmap dimensions are integers in the DOM.  Comparing them with
+    // fractional CSS*dpr values would invalidate every dirty frame at 125%
+    // or 150% Windows scaling.
+    const pixelWidth = Math.max(1, Math.round(w * dpr));
+    const pixelHeight = Math.max(1, Math.round(h * dpr));
+    if (this.canvas.width !== pixelWidth || this.canvas.height !== pixelHeight) {
+      this.canvas.width = pixelWidth;
+      this.canvas.height = pixelHeight;
       this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      this._invalidateViewport();
+      if (!this._inFrame) this._markDirty();
     }
     this.W = w; this.H = h;
   }
@@ -472,6 +533,7 @@ class Go2WMap {
   _bindMouse() {
     const c = this.canvas;
     c.addEventListener('mousedown', e => {
+      this._markDirty();
       if (e.button !== undefined && e.button !== 0) return;
       const r = c.getBoundingClientRect();
       const sx = e.clientX - r.left, sy = e.clientY - r.top;
@@ -492,6 +554,7 @@ class Go2WMap {
       if (!this._dragging) return;
       const r = c.getBoundingClientRect();
       this._dragCur = { x: e.clientX - r.left, y: e.clientY - r.top };
+      this._markDirty();
     });
     const resetDrag = () => {
       this._dragging = false;
@@ -513,6 +576,7 @@ class Go2WMap {
       if (Math.hypot(a.x - b.x, a.y - b.y) <= 8) {
         const goal = this._screenToWorldWithTransform(b.x, b.y, transform);
         resetDrag();
+        this._markDirty();
         if (this.onSelectGoal) this.onSelectGoal({ ...goal, frame_id: 'map' });
         return;
       }
@@ -526,11 +590,16 @@ class Go2WMap {
       };
       this.searchRegion = region;
       resetDrag();
+      this._markDirty();
       if (this.onSelectRegion) this.onSelectRegion(region);
     };
     c.addEventListener('mouseup', endDrag);
     // 鼠标离开后释放位置不可靠：取消手势，绝不误发目标或选区。
-    c.addEventListener('mouseleave', resetDrag);
+    c.addEventListener('mouseleave', () => {
+      const wasDragging = this._dragging;
+      resetDrag();
+      if (wasDragging) this._markDirty();
+    });
   }
 
   _draw() {

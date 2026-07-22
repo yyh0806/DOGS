@@ -1256,8 +1256,8 @@ def test_panel_pose_header_uses_fresh_status_instead_of_backlogged_slam_frames()
     )[0]
 
     assert "function updatePoseInfo(localization, odometry" in panel
-    assert "updatePoseInfo(data.localization, data.odometry)" in panel
-    assert "updatePoseInfo(d.localization, d.odometry)" in panel
+    assert "updatePoseInfo(snapshot.localization, snapshot.odometry)" in panel
+    assert "applyStatusSnapshot(data, socketEpoch)" in panel
     assert "poseInfo" not in slam_branch
 
 
@@ -1308,6 +1308,88 @@ def test_status_api_exposes_perception_health_without_copying_frames():
     assert "resolve_camera_calibration" in server
 
 
+def test_status_api_rehydrates_detections_markers_and_ws_health(
+    monkeypatch, tmp_path
+):
+    web = _load_web_server(monkeypatch)
+    frame_reads = []
+
+    class AiEngine:
+        def get_detection_list(self):
+            return [{
+                "class": "person",
+                "confidence": 0.93,
+                "bbox": [10, 20, 30, 40],
+            }]
+
+        def get_person_detection_health(self):
+            return {"healthy": True, "source": "front_visible"}
+
+        def get_video_frame_jpeg(self, source):
+            frame_reads.append(source)
+            return b"must-not-be-read-by-status"
+
+    web.robot = types.SimpleNamespace(
+        connected=True,
+        imu_yaw=0.25,
+        stats={"imu_count": 5},
+        _ai_engine=AiEngine(),
+    )
+    web.node = types.SimpleNamespace(get_status_snapshot=lambda: {
+        "motion_release_id": "motion-test",
+        "release_consistent": True,
+        "dog_state": "STANDING",
+        "localization": {"healthy": True},
+        "odometry": {"x": 1.0},
+        "navigation": {"ready": True},
+        "services": {"cmd_vel": True},
+    })
+    web.task_mgr = types.SimpleNamespace(
+        get_state=lambda: {"phase": "idle"})
+    web.point_nav = types.SimpleNamespace(
+        get_state=lambda: {"status": "idle"})
+    web.room_orchestrator = types.SimpleNamespace(
+        get_navigation_state=lambda: {
+            "status": "completed",
+            "target_markers": [{"id": "person_001", "x": 1.2, "y": 0.4}],
+        })
+    monkeypatch.setattr(web, "ws_telemetry", lambda: {
+        "ws_stream_replaced": 7,
+        "ws_reliable_depth": 0,
+        "ws_connected_clients": 1,
+    })
+
+    server = web.create_server("127.0.0.1", 0, str(tmp_path))
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            *server.server_address, timeout=1.0)
+        connection.request("GET", "/api/status")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        connection.close()
+    finally:
+        server.shutdown()
+        thread.join(timeout=1.0)
+        server.server_close()
+
+    assert response.status == 200
+    assert payload["det_list"] == [{
+        "class": "person",
+        "confidence": 0.93,
+        "bbox": [10, 20, 30, 40],
+    }]
+    assert payload["room_nav"]["target_markers"][0]["id"] == "person_001"
+    assert payload["stats"] == {
+        "imu_count": 5,
+        "ws_stream_replaced": 7,
+        "ws_reliable_depth": 0,
+        "ws_connected_clients": 1,
+    }
+    assert frame_reads == []
+
+
 def test_websocket_status_rehydrates_persisted_room_markers():
     server = read("web/nx_web_server.py")
     panel = read("web/static/panel.html")
@@ -1315,7 +1397,7 @@ def test_websocket_status_rehydrates_persisted_room_markers():
     broadcast = server.split("def broadcast_loop", 1)[1].split(
         "# Main", 1)[0]
     assert '"room_nav": room_orchestrator.get_navigation_state()' in broadcast
-    assert "data.room_nav" in panel
+    assert "snapshot.room_nav" in panel
     assert "target_markers" in panel
 
 
@@ -1408,9 +1490,10 @@ def test_panel_posts_map_goal_and_restores_monotonic_ws_state():
     assert "function applyNavState" in panel
     assert "function applyNavStateForEpoch" in panel
     assert "function resetNavOrderingForNewConnection" in panel
-    assert "socket.onopen" in panel
+    assert "createSocketLifecycle" in panel
+    assert "current.onopen" in panel
     assert "state.generation" in panel
-    assert "d.point_nav" in panel
+    assert "snapshot.point_nav" in panel
     assert "server_unavailable" in panel
     assert 'id="navStatus"' in panel
 
