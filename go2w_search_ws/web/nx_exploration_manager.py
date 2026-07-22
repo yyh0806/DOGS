@@ -122,6 +122,7 @@ class ExplorationManager:
         # v3 (2026-07-21): heading 时间归一化 + wall_bonus + yaw 优化
         mixed_heading_penalty: float = 0.0,
         mixed_wall_bonus: float = 0.0,
+        mixed_expansion_bonus: float = 0.0,
         yaw_step_deg: float = 45.0,
         max_vel_x: float = 1.5,
         max_vel_theta: float = 1.0,
@@ -273,6 +274,8 @@ class ExplorationManager:
             "GO2W_FRONTIER_TIME_PENALTY", str(mixed_heading_penalty))))
         self.mixed_wall_bonus = max(0.0, float(os.environ.get(
             "GO2W_FRONTIER_MIXED_WALL_BONUS", str(mixed_wall_bonus))))
+        self.mixed_expansion_bonus = max(0.0, float(os.environ.get(
+            "GO2W_FRONTIER_MIXED_EXPANSION_BONUS", str(mixed_expansion_bonus))))
         self.yaw_step_deg = max(5.0, float(os.environ.get(
             "GO2W_FRONTIER_YAW_STEP_DEG", str(yaw_step_deg))))
         self.max_vel_x = max(0.1, float(os.environ.get(
@@ -753,6 +756,7 @@ class ExplorationManager:
             "parallel_probe_workers": self.parallel_probe_workers,
             "mixed_heading_penalty": self.mixed_heading_penalty,
             "mixed_wall_bonus": self.mixed_wall_bonus,
+            "mixed_expansion_bonus": self.mixed_expansion_bonus,
             "yaw_step_deg": self.yaw_step_deg,
             "max_vel_x": self.max_vel_x,
             "max_vel_theta": self.max_vel_theta,
@@ -1357,6 +1361,11 @@ class ExplorationManager:
             wall_bonus = float(candidate.get("wall_proximity_bonus", 0.0))
         except (TypeError, ValueError, OverflowError):
             wall_bonus = 0.0
+        try:
+            expansion_potential = float(candidate.get(
+                "adjacent_unknown_count", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            expansion_potential = 0.0
         path_cost = self._path_cost_for_utility(candidate, robot_pose)
         try:
             heading_change = abs(float(candidate.get("heading_change", 0.0)))
@@ -1368,6 +1377,7 @@ class ExplorationManager:
             self.mixed_frontier_weight * information_gain
             + self.mixed_visual_gain_weight * visual_gain
             + self.mixed_wall_bonus * wall_bonus
+            + self.mixed_expansion_bonus * expansion_potential
             - self.mixed_heading_penalty * (t_travel + t_turn)
         )
         # Return as tuple so callers can compose tiebreakers (distance, x, y).

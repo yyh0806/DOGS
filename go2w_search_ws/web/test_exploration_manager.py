@@ -1901,3 +1901,23 @@ def test_degenerate_plan_accelerates_spatial_blacklist():
     )
     m._record_failure(cands[0], "degenerate_plan", "plan")
     assert m._spatial_failure_count(cands[0]) >= 2, "degenerate_plan should accelerate spatial blacklist"
+
+
+def test_mixed_expansion_bonus_prefers_unknown_adjacent_frontier():
+    """v3 C: expansion_bonus prefers frontier adjacent to more unknown (passage entry)."""
+    base = {"x": 3.0, "y": 0.0, "yaw": 0.0, "size": 10, "center_cell": (0, 30),
+            "distance": 3.0, "information_gain": 10.0, "visual_gain": 5.0,
+            "heading_change": 0.0, "adjacent_wall_count": 0}
+    c_low = dict(base, adjacent_unknown_count=2)
+    c_high = dict(base, adjacent_unknown_count=20)
+    m = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **k: [],
+        reject_map_edge=False, utility_mode="mixed",
+        mixed_frontier_weight=0.5, mixed_visual_gain_weight=1.0,
+        mixed_expansion_bonus=1.0,
+    )
+    k_low = m._mixed_utility_sort_key(c_low, (0, 0, 0))
+    k_high = m._mixed_utility_sort_key(c_high, (0, 0, 0))
+    assert k_high < k_low, "passage entry (more adjacent_unknown) should have higher utility"
