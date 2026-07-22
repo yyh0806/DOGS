@@ -402,7 +402,7 @@ class MissionNavigationPort:
         # 会吃掉整个 mission 预算. 40s 足够 6m 半径内正常接近, 卡死则 abort→跳过该 frontier.
         result = self._gateway.wait_terminal(
             owner=self._owner,
-            timeout=40.0,
+            timeout=float(os.environ.get("GO2W_FRONTIER_NAV_TIMEOUT", "90.0")),
             recovery_callback=self._recovery_callback,
             recovery_interval=self._recovery_interval,
         )
