@@ -3029,6 +3029,8 @@ class RoomSearchOrchestrator:
                 snapshot.get("visited_frontiers") or []),
             "observed_cells": list(
                 visibility.get("observed_cells") or []),
+            "visible_cells": list(
+                visibility.get("visible_cells") or []),
             "coverage_ratio": visibility.get(
                 "visual_coverage_ratio", 0.0),
             "visual_coverage_ratio": visibility.get(
@@ -3038,6 +3040,9 @@ class RoomSearchOrchestrator:
             "coverage_cell_size_m": visibility.get(
                 "coverage_cell_size_m", 0.5),
             "visual_range_m": visibility.get("visual_range_m", 0.0),
+            "camera_hfov_deg": visibility.get("camera_hfov_deg"),
+            "camera_yaw_offset_deg": visibility.get(
+                "camera_yaw_offset_deg"),
             "scan_usable": visibility.get("scan_usable", False),
             "forward_clearance_m": visibility.get(
                 "forward_clearance_m"),

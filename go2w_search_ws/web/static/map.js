@@ -33,8 +33,10 @@ class Go2WMap {
       personMarkers: [], // compatibility alias for older panel/tests
       roomSearch: {
         missionId: '', phase: '', room: '', roomArea: null,
-        candidateViewpoints: [], visitedViewpoints: [], observedCells: [],
+        candidateViewpoints: [], visitedViewpoints: [], observedCells: [], visibleCells: [],
+        visibleCellsAvailable: false,
         coverageRatio: 0, coverageThreshold: 0.9, visualRangeM: 0,
+        cameraHfovDeg: null, cameraYawOffsetDeg: null,
         coverageCellSizeM: 0.5, adaptiveStepM: 0,
         sceneComplexity: 1, forwardClearanceM: 0,
       },
@@ -142,8 +144,10 @@ class Go2WMap {
     const base = missionChanged ? {
       missionId: incomingMissionId,
       phase: '', room: '', roomArea: null,
-      candidateViewpoints: [], visitedViewpoints: [], observedCells: [],
+      candidateViewpoints: [], visitedViewpoints: [], observedCells: [], visibleCells: [],
+      visibleCellsAvailable: false,
       coverageRatio: 0, coverageThreshold: 0.9, visualRangeM: 0,
+      cameraHfovDeg: null, cameraYawOffsetDeg: null,
       coverageCellSizeM: 0.5, adaptiveStepM: 0,
       sceneComplexity: 1, forwardClearanceM: 0,
     } : previous;
@@ -164,6 +168,11 @@ class Go2WMap {
       && Number.isFinite(area.width) && Number.isFinite(area.height)
       && area.width > 0 && area.height > 0 ? area : null;
     const finiteOr = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+    const finiteCalibration = value => {
+      if (value === null || value === undefined || value === '') return null;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    };
     this.slam.roomSearch = {
       missionId: incomingMissionId || String(base.missionId || ''),
       phase: has('phase') ? String(src.phase || '') : String(base.phase || ''),
@@ -175,12 +184,22 @@ class Go2WMap {
         ? finitePointList(src.visited_viewpoints) : (base.visitedViewpoints || []),
       observedCells: has('observed_cells')
         ? finitePointList(src.observed_cells) : (base.observedCells || []),
+      visibleCells: has('visible_cells')
+        ? finitePointList(src.visible_cells) : (base.visibleCells || []),
+      visibleCellsAvailable: has('visible_cells')
+        ? true : base.visibleCellsAvailable === true,
       coverageRatio: Math.max(0, Math.min(1, has('coverage_ratio')
         ? finiteOr(src.coverage_ratio, 0) : finiteOr(base.coverageRatio, 0))),
       coverageThreshold: Math.max(0, Math.min(1, has('coverage_threshold')
         ? finiteOr(src.coverage_threshold, 0.9) : finiteOr(base.coverageThreshold, 0.9))),
       visualRangeM: Math.max(0, has('visual_range_m')
         ? finiteOr(src.visual_range_m, 0) : finiteOr(base.visualRangeM, 0)),
+      cameraHfovDeg: has('camera_hfov_deg')
+        ? finiteCalibration(src.camera_hfov_deg)
+        : finiteCalibration(base.cameraHfovDeg),
+      cameraYawOffsetDeg: has('camera_yaw_offset_deg')
+        ? finiteCalibration(src.camera_yaw_offset_deg)
+        : finiteCalibration(base.cameraYawOffsetDeg),
       coverageCellSizeM: Math.max(0.1, has('coverage_cell_size_m')
         ? finiteOr(src.coverage_cell_size_m, 0.5) : finiteOr(base.coverageCellSizeM, 0.5)),
       adaptiveStepM: Math.max(0, has('adaptive_step_m')
@@ -500,6 +519,13 @@ class Go2WMap {
     for (const point of roomSearch.candidateViewpoints || []) include(point.x, point.y);
     for (const point of roomSearch.visitedViewpoints || []) include(point.x, point.y);
     for (const point of roomSearch.observedCells || []) include(point.x, point.y);
+    for (const point of roomSearch.visibleCells || []) include(point.x, point.y);
+    const frustum = this._cameraFrustumGeometry(roomSearch);
+    if (frustum) {
+      include(frustum.leftEndpoint.x, frustum.leftEndpoint.y);
+      include(frustum.centerEndpoint.x, frustum.centerEndpoint.y);
+      include(frustum.rightEndpoint.x, frustum.rightEndpoint.y);
+    }
 
     const minX = Math.min(...allX), maxX = Math.max(...allX);
     const minY = Math.min(...allY), maxY = Math.max(...allY);
@@ -602,6 +628,132 @@ class Go2WMap {
     });
   }
 
+  _cameraFrustumGeometry(roomSearch = this.slam.roomSearch) {
+    const source = roomSearch && typeof roomSearch === 'object' ? roomSearch : {};
+    const requiredFinite = value => value !== null && value !== undefined && value !== ''
+      && Number.isFinite(Number(value));
+    if (!requiredFinite(source.cameraHfovDeg)
+      || !requiredFinite(source.cameraYawOffsetDeg)
+      || !requiredFinite(source.visualRangeM)) return null;
+    const hfovDeg = Number(source.cameraHfovDeg);
+    const yawOffsetDeg = Number(source.cameraYawOffsetDeg);
+    const rangeM = Number(source.visualRangeM);
+    const robotX = Number(this.slam.robotX);
+    const robotY = Number(this.slam.robotY);
+    const robotYaw = Number(this.slam.robotYaw);
+    if (
+      !Number.isFinite(hfovDeg) || hfovDeg <= 0 || hfovDeg > 360
+      || !Number.isFinite(yawOffsetDeg)
+      || !Number.isFinite(rangeM) || rangeM <= 0
+      || !Number.isFinite(robotX) || !Number.isFinite(robotY)
+      || !Number.isFinite(robotYaw)
+    ) return null;
+
+    const hfovRad = hfovDeg * Math.PI / 180;
+    const centerBearingRad = robotYaw + yawOffsetDeg * Math.PI / 180;
+    const leftBearingRad = centerBearingRad + hfovRad / 2;
+    const rightBearingRad = centerBearingRad - hfovRad / 2;
+    const endpoint = bearing => ({
+      x: robotX + rangeM * Math.cos(bearing),
+      y: robotY + rangeM * Math.sin(bearing),
+    });
+    return {
+      origin: { x: robotX, y: robotY },
+      rangeM,
+      hfovDeg,
+      hfovRad,
+      centerBearingRad,
+      centerBearingDeg: centerBearingRad * 180 / Math.PI,
+      leftBearingRad,
+      rightBearingRad,
+      leftEndpoint: endpoint(leftBearingRad),
+      centerEndpoint: endpoint(centerBearingRad),
+      rightEndpoint: endpoint(rightBearingRad),
+    };
+  }
+
+  _drawCameraFrustum(roomSearch, coverageCellWorld, toX, toY) {
+    const source = roomSearch && typeof roomSearch === 'object' ? roomSearch : {};
+    const visibleCells = Array.isArray(source.visibleCells) ? source.visibleCells : [];
+    const visibleCellsAvailable = source.visibleCellsAvailable === true;
+    const geometry = this._cameraFrustumGeometry(source);
+    if (!visibleCellsAvailable && !geometry) return;
+
+    const ctx = this.ctx;
+    ctx.save();
+    if (visibleCellsAvailable && visibleCells.length) {
+      const cellWorld = Number.isFinite(coverageCellWorld) && coverageCellWorld > 0
+        ? coverageCellWorld : 0.5;
+      const cellPx = Math.max(1, cellWorld * this._tf.scale);
+      ctx.fillStyle = 'rgba(0,229,255,0.18)';
+      for (const cell of visibleCells) {
+        ctx.fillRect(
+          toX(cell.x - cellWorld / 2),
+          toY(cell.y + cellWorld / 2),
+          cellPx,
+          cellPx,
+        );
+      }
+    }
+
+    if (!geometry) {
+      ctx.restore();
+      return;
+    }
+
+    const ox = toX(geometry.origin.x);
+    const oy = toY(geometry.origin.y);
+    const lx = toX(geometry.leftEndpoint.x);
+    const ly = toY(geometry.leftEndpoint.y);
+    const rx = toX(geometry.rightEndpoint.x);
+    const ry = toY(geometry.rightEndpoint.y);
+    const radiusPx = geometry.rangeM * this._tf.scale;
+    const screenLeftAngle = -geometry.leftBearingRad;
+    const screenRightAngle = -geometry.rightBearingRad;
+
+    if (!visibleCellsAvailable) {
+      ctx.fillStyle = 'rgba(0,229,255,0.12)';
+      ctx.beginPath();
+      ctx.moveTo(ox, oy);
+      ctx.lineTo(lx, ly);
+      ctx.arc(ox, oy, radiusPx, screenLeftAngle, screenRightAngle, false);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    ctx.strokeStyle = 'rgba(0,229,255,0.9)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(ox, oy);
+    ctx.lineTo(lx, ly);
+    ctx.moveTo(ox, oy);
+    ctx.lineTo(rx, ry);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(ox, oy, radiusPx, screenLeftAngle, screenRightAngle, false);
+    ctx.stroke();
+
+    const cx = toX(geometry.centerEndpoint.x);
+    const cy = toY(geometry.centerEndpoint.y);
+    ctx.strokeStyle = 'rgba(128,222,234,0.8)';
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.moveTo(ox, oy);
+    ctx.lineTo(cx, cy);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    const labelDistance = geometry.rangeM * 0.62;
+    const labelX = toX(
+      geometry.origin.x + labelDistance * Math.cos(geometry.centerBearingRad));
+    const labelY = toY(
+      geometry.origin.y + labelDistance * Math.sin(geometry.centerBearingRad));
+    ctx.fillStyle = '#80deea';
+    ctx.font = '10px sans-serif';
+    ctx.fillText(`C13 ${geometry.hfovDeg.toFixed(1)}\u00b0`, labelX + 5, labelY - 5);
+    ctx.restore();
+  }
+
   _draw() {
     const ctx = this.ctx, W = this.W, H = this.H;
     if (!this._tf) this._computeTransform();
@@ -621,6 +773,20 @@ class Go2WMap {
     ctx.fillStyle = '#2a3a48'; ctx.font = '9px sans-serif';
     for (let gx = gMin; gx <= gMax; gx++) ctx.fillText(gx + 'm', toX(gx) + 2, toY(0) - 2);
     for (let gy = gMin; gy <= gMax; gy++) if (gy !== 0) ctx.fillText(gy + 'm', toX(0) + 2, toY(gy) - 2);
+
+    // Visibility layer contract (bottom to top): fog, current camera frustum,
+    // then authoritative walls/costmap. Obstacle boundaries stay unobscured.
+    const roomSearch = s.roomSearch || {};
+    const roomArea = roomSearch.roomArea;
+    const coverageCellWorld = Number.isFinite(roomSearch.coverageCellSizeM)
+      && roomSearch.coverageCellSizeM > 0
+      ? roomSearch.coverageCellSizeM
+      : (roomArea && Number.isFinite(roomArea.spacing) && roomArea.spacing > 0
+        ? Math.min(roomArea.spacing, 1.0) : 0.5);
+    this._renderSearchFog(
+      roomSearch, roomArea, coverageCellWorld, toX, toY, W, H,
+    );
+    this._drawCameraFrustum(roomSearch, coverageCellWorld, toX, toY);
 
     // Persistent /map_frontier geometry. This display-only wall layer is
     // intentionally distinct from Nav2's live red/blue costmap authority.
@@ -694,19 +860,6 @@ class Go2WMap {
       }
     }
     // 3. 产品房间搜索: 已观察覆盖、房间边界、候选/已访问视点
-    const roomSearch = s.roomSearch || {};
-    const roomArea = roomSearch.roomArea;
-    const coverageCellWorld = Number.isFinite(roomSearch.coverageCellSizeM)
-      && roomSearch.coverageCellSizeM > 0
-      ? roomSearch.coverageCellSizeM
-      : (roomArea && Number.isFinite(roomArea.spacing) && roomArea.spacing > 0
-        ? Math.min(roomArea.spacing, 1.0) : 0.5);
-    // Search fog uses the server's obstacle-aware C13 visibility cells as its
-    // source of truth.  It is cached offscreen so coverage growth does not
-    // turn into thousands of path operations on every animation frame.
-    this._renderSearchFog(
-      roomSearch, roomArea, coverageCellWorld, toX, toY, W, H,
-    );
     if (roomArea) {
       ctx.strokeStyle = '#7e57c2'; ctx.lineWidth = 2;
       ctx.setLineDash([8, 4]);

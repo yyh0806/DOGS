@@ -481,15 +481,26 @@ class VisibilityCoverageTracker:
                 }
                 for row, col in sorted(self._observed)
             ]
+            visible_cells = [
+                {
+                    "x": (col + 0.5) * self.coverage_cell_size_m,
+                    "y": (row + 0.5) * self.coverage_cell_size_m,
+                }
+                for row, col in sorted(self._last_visible)
+            ]
             return {
                 "observed_cells": observed_cells[-5000:],
                 "observed_cell_count": len(self._observed),
+                "visible_cells": visible_cells,
                 "visible_cell_count": len(self._last_visible),
                 "reachable_free_cell_count": total_free,
                 "observed_reachable_cell_count": observed_free,
                 "visual_coverage_ratio": round(ratio, 6),
                 "coverage_cell_size_m": self.coverage_cell_size_m,
                 "visual_range_m": self.visual_range_m,
+                "camera_hfov_deg": math.degrees(self.camera_hfov_rad),
+                "camera_yaw_offset_deg": math.degrees(
+                    self.camera_yaw_offset_rad),
                 **self._last_profile,
             }
 

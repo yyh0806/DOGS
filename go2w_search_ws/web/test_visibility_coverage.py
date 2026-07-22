@@ -281,3 +281,64 @@ def test_invalid_or_stale_scan_falls_back_to_conservative_step():
 
     assert snapshot["scan_usable"] is False
     assert snapshot["adaptive_step_m"] == pytest.approx(1.0)
+
+
+def test_snapshot_publishes_exact_camera_calibration_and_current_visible_cells():
+    tracker = _tracker(
+        camera_hfov_rad=math.radians(77.4),
+        camera_yaw_offset_rad=math.radians(-12.25),
+        visual_range_m=4.0,
+        coverage_cell_size_m=0.5,
+    )
+
+    snapshot = tracker.observe(
+        _grid(width=20, height=16, resolution=0.5),
+        (2.25, 3.25, 0.0),
+        _scan(4.0, range_max=6.0),
+    )
+
+    assert snapshot["camera_hfov_deg"] == pytest.approx(77.4)
+    assert snapshot["camera_yaw_offset_deg"] == pytest.approx(-12.25)
+    assert snapshot["visible_cells"]
+    assert len(snapshot["visible_cells"]) == snapshot["visible_cell_count"]
+    assert all(set(cell) == {"x", "y"} for cell in snapshot["visible_cells"])
+
+
+def test_snapshot_visible_cells_are_clipped_by_the_current_obstacle_map():
+    width, height = 12, 8
+    data = [0] * (width * height)
+    for row in range(height):
+        data[row * width + 5] = 100
+    tracker = _tracker(camera_hfov_rad=math.radians(60.0))
+
+    snapshot = tracker.observe(
+        _grid(width, height, data=data),
+        (1.5, 3.5, 0.0),
+        _scan(8.0),
+    )
+
+    assert any(cell["x"] >= 5.0 for cell in snapshot["visible_cells"])
+    assert not any(cell["x"] >= 6.0 for cell in snapshot["visible_cells"])
+
+
+def test_exploration_live_fields_forward_tracker_frustum_without_recalibration():
+    from nx_room_orchestrator import RoomSearchOrchestrator
+
+    visibility = {
+        "camera_hfov_deg": 77.412345,
+        "camera_yaw_offset_deg": -12.234567,
+        "visible_cells": [{"x": 1.25, "y": 2.75}],
+        "coverage_cell_size_m": 0.5,
+        "visual_range_m": 4.0,
+    }
+    exploration = SimpleNamespace(snapshot=lambda: {
+        "visibility": visibility,
+        "visited_frontiers": [],
+    })
+
+    live = RoomSearchOrchestrator._exploration_live_fields(
+        object(), exploration)
+
+    assert live["camera_hfov_deg"] == visibility["camera_hfov_deg"]
+    assert live["camera_yaw_offset_deg"] == visibility["camera_yaw_offset_deg"]
+    assert live["visible_cells"] == visibility["visible_cells"]

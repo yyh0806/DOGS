@@ -24,7 +24,9 @@ class FakeContext {
   stroke() { this.ops.push({ type: 'stroke', strokeStyle: this.strokeStyle, lineWidth: this.lineWidth }); }
   fill(rule) { this.ops.push({ type: 'fill', fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, rule }); }
   rect(x, y, w, h) { this.ops.push({ type: 'rect', x, y, w, h }); }
-  arc(x, y, r) { this.ops.push({ type: 'arc', x, y, r }); }
+  arc(x, y, r, startAngle, endAngle, anticlockwise) {
+    this.ops.push({ type: 'arc', x, y, r, startAngle, endAngle, anticlockwise });
+  }
   translate() {}
   rotate() {}
   save() {}
@@ -637,6 +639,143 @@ function testPartialSearchProgressDoesNotEraseAccumulatedFogCoverage() {
   assert.strictEqual(map.slam.roomSearch.coverageCellSizeM, 0.5);
 }
 
+function assertClose(actual, expected, message) {
+  assert(Math.abs(actual - expected) < 1e-9,
+    `${message}: expected ${expected}, got ${actual}`);
+}
+
+function testCameraFrustumGeometryUsesRobotYawAndExactCalibration() {
+  const { map } = createMap();
+  map.update({
+    x: 0, y: 0, yaw: 0,
+    room_search: {
+      camera_hfov_deg: 60,
+      camera_yaw_offset_deg: 0,
+      visual_range_m: 2,
+    },
+  });
+
+  const straight = map._cameraFrustumGeometry();
+  assert(straight, 'complete finite calibration should produce frustum geometry');
+  assertClose(straight.centerBearingDeg, 0, 'straight camera center bearing');
+  assertClose(straight.leftEndpoint.x, Math.sqrt(3), 'left endpoint x');
+  assertClose(straight.leftEndpoint.y, 1, 'left endpoint y');
+  assertClose(straight.rightEndpoint.x, Math.sqrt(3), 'right endpoint x');
+  assertClose(straight.rightEndpoint.y, -1, 'right endpoint y');
+
+  map.update({
+    yaw: Math.PI / 2,
+    room_search: { camera_yaw_offset_deg: -10 },
+  });
+  const offset = map._cameraFrustumGeometry();
+  assert(offset, 'partial progress must preserve the remaining valid calibration');
+  assertClose(offset.centerBearingDeg, 80, 'camera yaw offset must rotate from robot yaw');
+}
+
+function testCameraFrustumHidesRatherThanGuessingInvalidCalibration() {
+  const missing = createMap().map;
+  missing.update({ room_search: {
+    phase: 'ACTIVE_SEARCH', camera_hfov_deg: 60, visual_range_m: 2,
+  } });
+  assert.strictEqual(missing._cameraFrustumGeometry(), null,
+    'a missing yaw offset must hide the geometric cone instead of guessing zero');
+
+  const invalid = createMap().map;
+  invalid.update({ room_search: {
+    camera_hfov_deg: 'not-a-number',
+    camera_yaw_offset_deg: 0,
+    visual_range_m: 2,
+  } });
+  assert.strictEqual(invalid._cameraFrustumGeometry(), null,
+    'invalid calibration must hide the geometric cone');
+}
+
+function testCameraFrustumUsesObstacleClippedCellsAndCorrectLayerOrder() {
+  const { map, ctx } = createMap();
+  map.update({
+    x: 0, y: 0, yaw: 0,
+    occupancy_map: { points: [[0.5, 0]], resolution: 0.1 },
+    costmap: { w: 1, h: 1, res: 0.1, ox: 0, oy: 0, vals: [100] },
+    room_search: {
+      phase: 'ACTIVE_SEARCH',
+      camera_hfov_deg: 77.4,
+      camera_yaw_offset_deg: 0,
+      visual_range_m: 2,
+      coverage_cell_size_m: 0.5,
+      visible_cells: [{ x: 0.25, y: 0.25 }, { x: 0.75, y: 0.25 }],
+      observed_cells: [{ x: 0.25, y: 0.25 }, { x: 0.75, y: 0.25 }],
+    },
+  });
+
+  map._draw();
+
+  assert.strictEqual(map.slam.roomSearch.visibleCells.length, 2);
+  const wallIndex = ctx.ops.findIndex(op => op.type === 'fillRect'
+    && op.fillStyle === 'rgba(207,216,220,0.82)');
+  const cellIndexes = ctx.ops.map((op, index) => ({ op, index }))
+    .filter(({ op }) => op.type === 'fillRect'
+      && op.fillStyle === 'rgba(0,229,255,0.18)')
+    .map(({ index }) => index);
+  const fogIndex = ctx.ops.findIndex(op => op.type === 'drawImage'
+    && op.image === map._fogCanvas);
+  const costmapIndex = ctx.ops.findIndex(op => op.type === 'drawImage'
+    && op.image === map._cmCanvas);
+  assert.strictEqual(cellIndexes.length, 2,
+    'the current obstacle-clipped visibility buckets must be filled exactly');
+  assert(fogIndex >= 0 && fogIndex < cellIndexes[0],
+    'search fog must be drawn below the current frustum overlay');
+  assert(wallIndex > cellIndexes[cellIndexes.length - 1],
+    'persistent walls must remain visible above the frustum overlay');
+  assert(costmapIndex > cellIndexes[cellIndexes.length - 1],
+    'the live costmap must remain visible above the frustum overlay');
+  assert(ctx.ops.some(op => op.type === 'arc'), 'frustum needs a range arc');
+  assert(ctx.ops.some(op => op.type === 'fillText' && op.text === 'C13 77.4\u00b0'),
+    'frustum label must identify the calibrated C13 horizontal field of view');
+}
+
+function testCameraFrustumFallsBackToWedgeOnlyWithCompleteCalibration() {
+  const { map, ctx } = createMap();
+  map.update({
+    x: 0, y: 0, yaw: 0,
+    room_search: {
+      camera_hfov_deg: 60,
+      camera_yaw_offset_deg: 0,
+      visual_range_m: 2,
+    },
+  });
+
+  map._draw();
+
+  assert(ctx.ops.some(op => op.type === 'fill'
+    && op.fillStyle === 'rgba(0,229,255,0.12)'),
+  'without exact visible cells, complete calibration should draw a geometric wedge');
+}
+
+function testCameraFrustumExplicitEmptyVisibilityNeverFallsBackToWedgeFill() {
+  const { map, ctx } = createMap();
+  map.update({
+    x: 0, y: 0, yaw: 0,
+    room_search: {
+      phase: 'ACTIVE_SEARCH',
+      camera_hfov_deg: 60,
+      camera_yaw_offset_deg: 0,
+      visual_range_m: 2,
+      visible_cells: [],
+    },
+  });
+  map.update({ room_search: { phase: 'NAVIGATING' } });
+
+  map._draw();
+
+  assert.strictEqual(map.slam.roomSearch.visibleCellsAvailable, true,
+    'partial progress must retain that the backend supplied exact visibility');
+  assert(!ctx.ops.some(op => op.type === 'fill'
+    && op.fillStyle === 'rgba(0,229,255,0.12)'),
+  'an explicitly empty exact visibility set must not become a guessed wedge fill');
+  assert(ctx.ops.some(op => op.type === 'arc'),
+    'valid calibration may still draw the calibrated frustum outline');
+}
+
 function testPanelForwardsSearchRoomProgressIntoMap() {
   const panel = fs.readFileSync(path.join(__dirname, 'static', 'panel.html'), 'utf8');
   const branch = panel.indexOf("data.type === 'search_room'");
@@ -715,6 +854,11 @@ testRoomSearchCoverageAndViewpointsRenderOnMap();
 testFrontierCoverageRendersWithoutCalibratedRoomRectangle();
 testSearchCoverageUsesFogMaskWithObservedCellsCutOut();
 testPartialSearchProgressDoesNotEraseAccumulatedFogCoverage();
+testCameraFrustumGeometryUsesRobotYawAndExactCalibration();
+testCameraFrustumHidesRatherThanGuessingInvalidCalibration();
+testCameraFrustumUsesObstacleClippedCellsAndCorrectLayerOrder();
+testCameraFrustumFallsBackToWedgeOnlyWithCompleteCalibration();
+testCameraFrustumExplicitEmptyVisibilityNeverFallsBackToWedgeFill();
 testPanelForwardsSearchRoomProgressIntoMap();
 testStatusPollingRefreshesRoomSearchWhenWebSocketStateIsDropped();
 testPanelFiltersDetectionResultsBelowEightyPercent();
