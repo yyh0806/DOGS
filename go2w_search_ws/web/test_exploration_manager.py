@@ -1921,3 +1921,20 @@ def test_mixed_expansion_bonus_prefers_unknown_adjacent_frontier():
     k_low = m._mixed_utility_sort_key(c_low, (0, 0, 0))
     k_high = m._mixed_utility_sort_key(c_high, (0, 0, 0))
     assert k_high < k_low, "passage entry (more adjacent_unknown) should have higher utility"
+
+
+def test_prioritize_active_tile_keeps_other_tiles():
+    """v3: _prioritize_active_tile must NOT drop non-active_tile candidates (50x50m field not locked to 16m tile)."""
+    cands = [
+        {"x": 1.0, "y": 1.0, "size": 5, "center_cell": (0, 10), "distance": 1.0},
+        {"x": 20.0, "y": 1.0, "size": 5, "center_cell": (0, 100), "distance": 20.0},
+    ]
+    m = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room", room_radius_m=50.0, initial_radius_m=50.0,
+        tile_size_m=16.0,
+        candidate_selector=lambda *_a, **k: [],
+        reject_map_edge=False,
+    )
+    result = m._prioritize_active_tile([dict(c) for c in cands], (0.0, 0.0, 0.0))
+    assert len(result) == 2, "must keep candidates from other tiles"

@@ -1750,15 +1750,17 @@ class ExplorationManager:
             tile = self._tile_key(candidate["x"], candidate["y"])
             candidate["tile"] = list(tile)
             annotated.append(candidate)
-        active = [
-            item for item in annotated
-            if tuple(item["tile"]) == self._active_tile
-        ]
-        if active:
-            return active
-
+        # v3 修复 (大场地 50x50m): 原逻辑 `if active: return active` 丢弃非
+        # active_tile 候选, 把狗锁在 16x16m tile (1/9 面积). 现在只跟踪 tile
+        # 不 filter — 让 mixed_utility + expansion_bonus 自由排序, path_cost
+        # (-k_time*t_travel) 已惩罚远 frontier 防乱跳.
         if self._active_tile is not None:
-            self._visited_tiles.add(self._active_tile)
+            try:
+                robot_tile = self._tile_key(robot_pose[0], robot_pose[1])
+                if tuple(self._active_tile) != robot_tile:
+                    self._visited_tiles.add(self._active_tile)
+            except (TypeError, ValueError, IndexError):
+                pass
         try:
             robot_tile = self._tile_key(robot_pose[0], robot_pose[1])
         except (TypeError, ValueError, IndexError):
@@ -1768,10 +1770,7 @@ class ExplorationManager:
             abs(tile[0] - robot_tile[0]) + abs(tile[1] - robot_tile[1]),
             tile[0], tile[1],
         ))
-        return [
-            item for item in annotated
-            if tuple(item["tile"]) == self._active_tile
-        ]
+        return annotated
 
     def _confirm_exhaustion(self) -> None:
         self._exhaustion_streak += 1
