@@ -90,7 +90,10 @@ from nx_mission_schema import (
 from nx_move_executor import (
     compute_angular_target_yaw,
     compute_linear_target,
+    directional_clearance_from_scan,
     run_angular_turn,
+    run_linear_translation,
+    sanitize_clearance_margin,
 )
 from nx_observation_sync import ObservationSynchronizer
 from nx_control_auth import (
@@ -226,6 +229,8 @@ _WS_MAX_PENDING = max(1, int(os.environ.get("GO2W_WS_MAX_PENDING", "3")))
 _WS_SEND_TIMEOUT = max(0.02, float(os.environ.get("GO2W_WS_SEND_TIMEOUT", "1.0")))  # H4 fix: 0.2→1.0 (本地/局域网, 避免瞬时抖动误踢健康连接)
 # C1 fix: NxRobotBridge.move 执行层 guard — 前进时前方 /scan 障碍 < 此阈值→强制 vx=0 (防自主跟踪撞墙)
 _FRONT_CLEARANCE_M = float(os.environ.get("GO2W_FRONT_CLEARANCE", "0.5"))
+_REVERSE_CLEARANCE_M = sanitize_clearance_margin(
+    os.environ.get("GO2W_REVERSE_CLEARANCE", "0.55"))
 
 
 def ws_broadcast(data, force=False):
@@ -518,6 +523,7 @@ class NxWebNode(Node):
         self._scan_range_min = 0.0
         self._scan_range_max = 0.0
         self._scan_timestamp = 0.0
+        self._scan_received_monotonic = None
         self._pointcloud_msg = None
         self._pointcloud_timestamp = 0.0
         self._pointcloud_count = 0
@@ -644,6 +650,7 @@ class NxWebNode(Node):
 
     def _on_scan(self, msg: LaserScan):
         stamp = self._message_stamp_seconds(msg)
+        received_monotonic = time.monotonic()
         scan_snapshot = {
             "angle_min": float(msg.angle_min),
             "angle_increment": float(msg.angle_increment),
@@ -659,6 +666,7 @@ class NxWebNode(Node):
             self._scan_range_min = scan_snapshot["range_min"]
             self._scan_range_max = scan_snapshot["range_max"]
             self._scan_timestamp = stamp or time.time()
+            self._scan_received_monotonic = received_monotonic
             self._scan_count += 1
         synchronizer = getattr(self, "observation_sync", None)
         if stamp is not None and synchronizer is not None:
@@ -1162,7 +1170,9 @@ class NxWebNode(Node):
     def get_scan_snapshot(self):
         with self._lock:
             timestamp = float(getattr(self, "_scan_timestamp", 0.0) or 0.0)
-            age_sec = (time.time() - timestamp) if timestamp > 0.0 else None
+            received = getattr(self, "_scan_received_monotonic", None)
+            age_sec = (time.monotonic() - received
+                       if received is not None else None)
             return {
                 "angle_min": self._scan_angle_min,
                 "angle_increment": self._scan_angle_increment,
@@ -1302,19 +1312,35 @@ class NxRobotBridge:
             }
 
     # ---- 动作: 转发到 NxWebNode 的 rclpy publisher ----
+    def directional_clearance(self, center_deg, half_fov_deg=30.0,
+                              max_age_sec=0.5):
+        """Closest fresh valid scan return around a body-frame direction."""
+        try:
+            max_age_sec = float(max_age_sec)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(max_age_sec) or max_age_sec <= 0.0:
+            return None
+        try:
+            snapshot = self._node.get_scan_snapshot()
+            age_sec = snapshot.get("age_sec")
+            age_sec = float(age_sec) if age_sec is not None else None
+        except Exception:
+            return None
+        if (age_sec is None or not math.isfinite(age_sec)
+                or age_sec < 0.0 or age_sec > max_age_sec):
+            return None
+        return directional_clearance_from_scan(
+            snapshot.get("angle_min"), snapshot.get("angle_increment"),
+            snapshot.get("range_min"), snapshot.get("range_max"),
+            snapshot.get("ranges"), center_deg=center_deg,
+            half_fov_deg=half_fov_deg,
+        )
+
     def front_clearance(self, half_fov_deg=30.0):
-        """机体前方 ±half_fov_deg 最近障碍距离(m)。无 /scan 返回大值(视为畅通, 不卡跟踪)。
-        LaserScan: angle_min=-pi, 索引 i→angle=-pi+i*2pi/n, 前方 angle=0→i=n/2 (nx_sensor /scan)。"""
-        with self._node._lock:
-            ranges = list(self._node._scan_ranges)
-        if not ranges:
-            return 999.0
-        n = len(ranges)
-        center = n / 2.0
-        span = int(round(math.radians(half_fov_deg) / (2.0 * math.pi / n)))
-        lo = max(0, int(center - span)); hi = min(n, int(center + span + 1))
-        valid = [r for r in ranges[lo:hi] if 0.05 < r < 10.0]
-        return min(valid) if valid else 999.0
+        """Legacy permissive front wrapper used by existing forward callers."""
+        clearance = self.directional_clearance(0.0, half_fov_deg)
+        return 999.0 if clearance is None else clearance
 
     def move(self, vx, vy, vyaw, manual=False):
         # C1 fix (2026-07-01, critic 收敛): guard 仅对自主路径(manual=False)生效 —
@@ -1332,6 +1358,15 @@ class NxRobotBridge:
                     front = 999.0
                 if front < _FRONT_CLEARANCE_M:
                     logger.info(f"[move] 自主前进前方障碍 {front:.2f}m<{_FRONT_CLEARANCE_M}m, 暂停(仅转向/侧移)")
+                    vx = 0.0
+            elif vx < 0.0:
+                try:
+                    rear = self.directional_clearance(180.0, 30.0)
+                except Exception:
+                    rear = None
+                if rear is None or rear <= _REVERSE_CLEARANCE_M:
+                    detail = "missing/stale" if rear is None else f"{rear:.2f}m"
+                    logger.info(f"[move] autonomous reverse rear clearance {detail}; stopping")
                     vx = 0.0
         with self._lock:
             self._vx = vx
@@ -1902,23 +1937,78 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
             return
 
         if mode == "linear":
-            if self._point_nav is None:
-                task.status = "failed"
-                task.result = "point_nav_unavailable"
-                broadcast("aborted", reason="point_nav_unavailable")
-                return
-            x = float(health["x"]); y = float(health["y"]); yaw = float(health["yaw"])
-            tx, ty, tyaw = compute_linear_target(
-                x, y, yaw, direction, float(p["distance_m"]))
-            self._point_nav.submit(tx, ty, tyaw)
-            phase = self._await_point_nav_terminal(task)
-            if phase == "succeeded":
-                task.status = "completed"
-                task.result = {"distance_m": p["distance_m"], "direction": direction}
-            else:
-                task.status = "failed"
-                task.result = phase
-            broadcast(phase, distance_m=p["distance_m"])
+            if direction == "forward":
+                if self._point_nav is None:
+                    task.status = "failed"
+                    task.result = "point_nav_unavailable"
+                    broadcast("aborted", reason="point_nav_unavailable")
+                    return
+                x = float(health["x"]); y = float(health["y"]); yaw = float(health["yaw"])
+                tx, ty, tyaw = compute_linear_target(
+                    x, y, yaw, direction, float(p["distance_m"]))
+                self._point_nav.submit(tx, ty, tyaw)
+                phase = self._await_point_nav_terminal(task)
+                if phase == "succeeded":
+                    task.status = "completed"
+                    task.result = {"distance_m": p["distance_m"], "direction": direction}
+                else:
+                    task.status = "failed"
+                    task.result = phase
+                broadcast(phase, distance_m=p["distance_m"])
+            elif direction == "backward":
+                start_xy = (float(health["x"]), float(health["y"]))
+
+                def read_xy():
+                    try:
+                        fresh_health_getter = getattr(
+                            node_obj, "get_localization_health", None)
+                        fresh = (fresh_health_getter()
+                                 if callable(fresh_health_getter) else {})
+                        if not fresh.get("healthy"):
+                            return None
+                        return (float(fresh["x"]), float(fresh["y"]))
+                    except (KeyError, TypeError, ValueError, OverflowError):
+                        return None
+
+                def read_rear_clearance(_direction):
+                    return self.robot.directional_clearance(
+                        180.0, 30.0, max_age_sec=0.5)
+
+                def send_reverse_cmd(vx, vy, vyaw_v):
+                    self.robot.move(vx, vy, vyaw_v, manual=False)
+
+                try:
+                    phase = run_linear_translation(
+                        read_xy, read_rear_clearance, send_reverse_cmd,
+                        time.sleep, time.monotonic, start_xy, direction,
+                        float(p["distance_m"]),
+                        start_yaw=float(health["yaw"]),
+                        is_cancelled=lambda: task.status == "cancelled",
+                        clearance_margin_m=_REVERSE_CLEARANCE_M,
+                    )
+                finally:
+                    self.robot.stop_move()
+
+                if phase == "succeeded":
+                    task.status = "completed"
+                    task.result = {"distance_m": p["distance_m"],
+                                   "direction": direction}
+                    broadcast("succeeded", distance_m=p["distance_m"])
+                elif phase == "cancelled":
+                    task.status = "cancelled"
+                    task.result = "cancelled"
+                    broadcast("cancelled", reason="cancelled",
+                              distance_m=p["distance_m"])
+                elif phase == "timed_out":
+                    task.status = "failed"
+                    task.result = "timed_out"
+                    broadcast("timed_out", reason="timed_out",
+                              distance_m=p["distance_m"])
+                else:
+                    task.status = "failed"
+                    task.result = phase
+                    broadcast("aborted", reason=phase,
+                              distance_m=p["distance_m"])
         else:  # angular
             yaw0 = float(health["yaw"])
             target_yaw = compute_angular_target_yaw(
