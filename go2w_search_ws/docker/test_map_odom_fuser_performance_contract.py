@@ -454,14 +454,14 @@ def test_nav_controller_and_smoother_share_one_forward_only_envelope():
     )
 
     assert "min_vel_x: 0.0" in params
-    assert "max_vel_x: 0.6" in params
+    assert "max_vel_x: 0.8" in params
     assert "max_vel_theta: 0.5" in params
     assert "min_speed_theta: 0.15" in params
     assert "acc_lim_theta: 1.0" in params
     assert "decel_lim_theta: -1.5" in params
     assert "required_movement_radius: 0.1" in params
     assert "movement_time_allowance: 60.0" in params
-    assert "max_velocity: [0.6, 0.0, 0.5]" in params
+    assert "max_velocity: [0.8, 0.0, 0.5]" in params
     assert "min_velocity: [0.0, 0.0, -0.5]" in params
     assert "max_accel: [1.2, 0.0, 1.0]" in params
     assert "max_decel: [-1.0, 0.0, -1.5]" in params

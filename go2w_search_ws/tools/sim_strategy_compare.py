@@ -11,7 +11,7 @@ Run:
 What it validates
 -----------------
 - nearest (historical): always picks closest frontier first.
-- mixed:               α·size + β·visual_gain − γ·path_cost.
+- mixed:               actual-speed tuned serial reference (k_time=12.5).
 - mixed + parallel:    same scoring + concurrent Nav2 probe fast-path.
 
 Hypotheses the sim must confirm:
@@ -20,6 +20,8 @@ Hypotheses the sim must confirm:
   H3. mixed + parallel produces identical waypoint choices as mixed when
       every candidate is reachable (parallel is a latency optimisation,
       not a behaviour change).
+  H9. the deployed physical-speed scorer retains coverage/far-boundary
+      reach, keeps path length within 110% of nearest, and reduces turning.
 """
 from __future__ import annotations
 
@@ -37,6 +39,14 @@ if str(WEB_DIR) not in sys.path:
 
 from nx_exploration_manager import ExplorationManager  # noqa: E402
 from nx_frontier_planner import select_frontier_candidates  # noqa: E402
+
+
+DEPLOY_MAX_VEL_X = 0.8
+DEPLOY_MAX_VEL_THETA = 0.5
+DEPLOY_K_TIME = 14.5
+PATH_NEAR_NEAREST_MAX_RATIO = 1.10
+PRIMARY_K_TIME_CANDIDATES = (15.0, 20.0, 25.0)
+ADJACENT_K_TIME_CANDIDATES = (10.0, 12.5, 14.0, 14.5, 17.5)
 
 
 def _grid(data, width, height, resolution):
@@ -81,6 +91,7 @@ class _KnownFreePlanner:
         self.pose = list(pose)
         self.probe_endpoints = []
         self.parallel_batches = {}
+        self._planned_metrics = {}
         self.selection_cycle_id = None
         self._probe_lock = threading.Lock()
 
@@ -108,25 +119,76 @@ class _KnownFreePlanner:
         start = self._cell(self.pose[0], self.pose[1])
         goal = self._cell(x, y)
         if start is None or goal is None:
-            return {"ok": False, "reason": "outside_map"}
+            return self._record_plan_result(
+                endpoint, {"ok": False, "reason": "outside_map"})
         distances = {start: 0}
+        parents = {start: None}
         queue = deque([start])
         while queue:
             row, col = queue.popleft()
             if (row, col) == goal:
                 steps = distances[(row, col)]
-                return {
+                path_cells = []
+                cursor = (row, col)
+                while cursor is not None:
+                    path_cells.append(cursor)
+                    cursor = parents[cursor]
+                path_cells.reverse()
+                result = {
                     "ok": True,
                     "poses": steps + 1,
                     "path_length": steps * self.resolution,
+                    "path_heading_turn_rad": self._path_heading_turn(
+                        path_cells, float(self.pose[2]), float(yaw)),
                 }
+                return self._record_plan_result(endpoint, result)
             for dr, dc in ((-1, 0), (0, -1), (0, 1), (1, 0)):
                 neighbor = (row + dr, col + dc)
                 if neighbor in distances or not self._free(*neighbor):
                     continue
                 distances[neighbor] = distances[(row, col)] + 1
+                parents[neighbor] = (row, col)
                 queue.append(neighbor)
-        return {"ok": False, "reason": "no_known_free_path"}
+        return self._record_plan_result(
+            endpoint, {"ok": False, "reason": "no_known_free_path"})
+
+    @staticmethod
+    def _path_heading_turn(path_cells, start_yaw, goal_yaw):
+        heading = float(start_yaw)
+        total = 0.0
+        for (row0, col0), (row1, col1) in zip(
+                path_cells, path_cells[1:]):
+            segment_heading = math.atan2(row1 - row0, col1 - col0)
+            total += abs(math.atan2(
+                math.sin(segment_heading - heading),
+                math.cos(segment_heading - heading)))
+            heading = segment_heading
+        total += abs(math.atan2(
+            math.sin(float(goal_yaw) - heading),
+            math.cos(float(goal_yaw) - heading)))
+        return total
+
+    def _record_plan_result(self, endpoint, result):
+        with self._probe_lock:
+            if result.get("ok"):
+                self._planned_metrics[endpoint] = {
+                    "path_length": float(result["path_length"]),
+                    "path_heading_turn_rad": float(
+                        result["path_heading_turn_rad"]),
+                }
+            else:
+                self._planned_metrics.pop(endpoint, None)
+        return result
+
+    def planned_metrics_for_pose(self, x, y, yaw, frame_id="map"):
+        endpoint = ExplorationManager._physical_probe_key({
+            "x": float(x),
+            "y": float(y),
+            "yaw": float(yaw),
+        }, frame_id=frame_id)
+        with self._probe_lock:
+            metrics = self._planned_metrics.get(endpoint)
+            return None if metrics is None else dict(metrics)
 
     def _cell(self, x, y):
         row = int(math.floor(float(y) / self.resolution))
@@ -340,6 +402,8 @@ def _run_scenario(label, *, utility_mode, parallel_workers,
         reject_map_edge=True,
         utility_mode=utility_mode,
         parallel_probe_workers=parallel_workers,
+        max_vel_x=DEPLOY_MAX_VEL_X,
+        max_vel_theta=DEPLOY_MAX_VEL_THETA,
     )
     if mixed_weights is not None:
         kwargs.update(mixed_weights)
@@ -354,7 +418,7 @@ def _run_scenario(label, *, utility_mode, parallel_workers,
     source_sequence = []
     selection_latency_ms = []
     total_path = 0.0
-    total_turn = 0.0
+    total_path_turn = 0.0
     terminal_reason = None
     source_counts = {"frontier": 0, "coverage": 0, "lidar": 0}
     fallback_with_reachable_frontier = 0
@@ -393,12 +457,17 @@ def _run_scenario(label, *, utility_mode, parallel_workers,
             round(float(target["y"]), 6),
             round(target_yaw, 6),
         ))
-        total_turn += abs(math.atan2(
-            math.sin(target_yaw - pose[2]),
-            math.cos(target_yaw - pose[2])))
-        step_len = math.hypot(
-            target["x"] - pose[0], target["y"] - pose[1])
-        total_path += step_len
+        planned_metrics = nav.planned_metrics_for_pose(
+            target["x"], target["y"], target_yaw)
+        if planned_metrics is None:
+            raise RuntimeError("selected goal has no cached planner evidence")
+        selected_path_length = float(target["path_length"])
+        if not math.isclose(
+                selected_path_length, planned_metrics["path_length"],
+                rel_tol=0.0, abs_tol=1e-9):
+            raise RuntimeError("selected goal path length differs from probe")
+        total_path += selected_path_length
+        total_path_turn += planned_metrics["path_heading_turn_rad"]
         pose[:] = [target["x"], target["y"], target["yaw"]]
         _reveal(truth, observed, width, height, resolution,
                 pose[0], pose[1], sensor_radius)
@@ -434,7 +503,7 @@ def _run_scenario(label, *, utility_mode, parallel_workers,
         "selection_latency_p95_ms": latency_percentile(0.95),
         "coverage_pct": round(coverage * 100.0, 2),
         "total_path_m": round(total_path, 2),
-        "total_turn_rad": round(total_turn, 2),
+        "total_path_turn_rad": round(total_path_turn, 2),
         "max_x_reached": round(max((g[0] for g in goals), default=0.0), 2),
         "max_y_reached": round(max((g[1] for g in goals), default=0.0), 2),
         "plan_probes": snapshot["plan_probes"],
@@ -458,11 +527,11 @@ def _run_scenario(label, *, utility_mode, parallel_workers,
 
 
 def _print_table(results):
-    headers = ["mode", "waypoints", "coverage%", "path_m", "turn_rad",
+    headers = ["mode", "waypoints", "coverage%", "path_m", "path_turn_rad",
                "max_x", "max_y", "probes", "p50ms", "p95ms", "rejects",
                "terminal"]
     rows = [[r["label"], r["waypoints"], r["coverage_pct"],
-             r["total_path_m"], r["total_turn_rad"],
+             r["total_path_m"], r["total_path_turn_rad"],
              r["max_x_reached"], r["max_y_reached"],
              r["plan_probes"], r["selection_latency_p50_ms"],
              r["selection_latency_p95_ms"], r["plan_rejections"],
@@ -480,6 +549,22 @@ def _print_table(results):
     print("\n  First 5 goals per mode:")
     for r in results:
         print(f"    {r['label']:24s} -> {r['first_5_goals']}")
+
+
+def _tuning_gate_status(result, nearest):
+    """Return explicit deployment gates; path-near means no >10% blow-up."""
+    return {
+        "coverage": (
+            result["coverage_pct"] >= nearest["coverage_pct"] - 1.0),
+        "far_boundary": (
+            result["max_x_reached"] >= result["far_boundary_x"]),
+        "path_near": (
+            result["total_path_m"]
+            <= nearest["total_path_m"] * PATH_NEAR_NEAREST_MAX_RATIO),
+        "turn_lower": (
+            result["total_path_turn_rad"]
+            < nearest["total_path_turn_rad"]),
+    }
 
 
 def main():
@@ -500,6 +585,7 @@ def main():
                 "mixed_frontier_weight": 0.5,
                 "mixed_visual_gain_weight": 1.0,
                 "mixed_path_cost_penalty": 0.5,
+                "mixed_heading_penalty": 12.5,
             },
         ),
         _run_scenario(
@@ -510,6 +596,7 @@ def main():
                 "mixed_frontier_weight": 0.5,
                 "mixed_visual_gain_weight": 1.0,
                 "mixed_path_cost_penalty": 0.5,
+                "mixed_heading_penalty": 12.5,
             },
         ),
         _run_scenario(
@@ -519,11 +606,12 @@ def main():
             mixed_weights={
                 "mixed_frontier_weight": 0.5,
                 "mixed_visual_gain_weight": 1.0,
-                "mixed_heading_penalty": 5.0,
                 "mixed_wall_bonus": 1.0,
                 "mixed_expansion_bonus": 0.1,
                 "yaw_step_deg": 45.0,
-                "max_vel_x": 1.5, "max_vel_theta": 1.0,
+                "max_vel_x": DEPLOY_MAX_VEL_X,
+                "max_vel_theta": DEPLOY_MAX_VEL_THETA,
+                "mixed_heading_penalty": DEPLOY_K_TIME,
             },
         ),
     ]
@@ -559,9 +647,10 @@ def main():
     print(f"  H4 v3 coverage >= nearest (±1%): "
           f"{v3['coverage_pct']} vs {nearest['coverage_pct']} -> "
           f"{'PASS' if h4 else 'FAIL'}")
-    h5 = v3["total_turn_rad"] < nearest["total_turn_rad"]
-    print(f"  H5 v3 turn_rad < nearest: "
-          f"{v3['total_turn_rad']} vs {nearest['total_turn_rad']} -> "
+    h5 = v3["total_path_turn_rad"] < nearest["total_path_turn_rad"]
+    print(f"  H5 v3 planned-path turn_rad < nearest: "
+          f"{v3['total_path_turn_rad']} vs "
+          f"{nearest['total_path_turn_rad']} -> "
           f"{'PASS' if h5 else 'FAIL'}")
     h6 = v3["max_x_reached"] >= v3["far_boundary_x"]
     print(f"  H6 v3 reaches far-room sensor boundary: "
@@ -602,50 +691,84 @@ def main():
           f"duplicates={mixed_par['duplicate_parallel_endpoints']} "
           f"telemetry={exact_probe_telemetry} -> {'PASS' if h8 else 'FAIL'}")
 
-    print("\n=== v3 权重网格搜索 (k_time × δ) ===")
+    print("\n=== physical-profile k_time grid (wall bonus fixed at 1.0) ===")
     grid_results = []
-    for k_time in [0.5, 1.0, 2.0, 5.0]:
-        for delta in [0.0, 1.0, 2.0, 5.0]:
+    candidate_values = (
+        PRIMARY_K_TIME_CANDIDATES + ADJACENT_K_TIME_CANDIDATES)
+    for k_time in candidate_values:
+        if math.isclose(k_time, DEPLOY_K_TIME):
+            r = v3
+        else:
             r = _run_scenario(
-                f"k={k_time},δ={delta}",
-                utility_mode="mixed", parallel_workers=0,
+                f"k={k_time}", utility_mode="mixed", parallel_workers=0,
                 mixed_weights={
                     "mixed_frontier_weight": 0.5,
                     "mixed_visual_gain_weight": 1.0,
                     "mixed_heading_penalty": k_time,
-                    "mixed_wall_bonus": delta,
+                    "mixed_wall_bonus": 1.0,
+                    "mixed_expansion_bonus": 0.1,
                     "yaw_step_deg": 45.0,
+                    "max_vel_x": DEPLOY_MAX_VEL_X,
+                    "max_vel_theta": DEPLOY_MAX_VEL_THETA,
                 })
-            grid_results.append((k_time, delta, r))
-    base_cov = results[0]["coverage_pct"]
-    candidates_ok = [(k, d, r) for k, d, r in grid_results
-                     if r["coverage_pct"] >= base_cov - 1.0]
-    recommended = None
-    if candidates_ok:
-        best = min(candidates_ok, key=lambda t: t[2]["total_turn_rad"])
-        recommended = (best[0], best[1])
-        print(f"  推荐: k_time={best[0]}, δ={best[1]}, "
-              f"turn={best[2]['total_turn_rad']}rad, cov={best[2]['coverage_pct']}%")
-    else:
-        print("  WARN: 所有 (k_time,δ) 组合 coverage 退步 > 1%, 需调参")
-    print(f"  网格 coverage 范围: "
-          f"{min(r['coverage_pct'] for _, _, r in grid_results)}%"
-          f" ~ {max(r['coverage_pct'] for _, _, r in grid_results)}%")
-    print(f"  网格 turn_rad 范围: "
-          f"{min(r['total_turn_rad'] for _, _, r in grid_results)}"
-          f" ~ {max(r['total_turn_rad'] for _, _, r in grid_results)}")
+        gates = _tuning_gate_status(r, nearest)
+        grid_results.append((k_time, r, gates))
+        print(
+            f"  k={k_time:4.1f}: cov={r['coverage_pct']:5.2f}% "
+            f"path={r['total_path_m']:6.2f}m "
+            f"path_turn={r['total_path_turn_rad']:5.2f}rad "
+            f"max_x={r['max_x_reached']:5.2f} "
+            f"gates={gates} -> "
+            f"{'PASS' if all(gates.values()) else 'FAIL'}")
+
+    primary_ok = [
+        item for item in grid_results
+        if item[0] in PRIMARY_K_TIME_CANDIDATES
+        and all(item[2].values())]
+    if not primary_ok:
+        print("  Primary k_time 15/20/25: no all-gates candidate; "
+              "adjacent search required.")
+    candidates_ok = [
+        item for item in grid_results if all(item[2].values())]
+    recommended = min(
+        candidates_ok,
+        key=lambda item: (
+            item[1]["total_path_turn_rad"],
+            abs(item[0] - min(PRIMARY_K_TIME_CANDIDATES)),
+            -item[1]["coverage_pct"],
+            item[1]["total_path_m"],
+        ),
+        default=None,
+    )
+    selected_grid = next(
+        (item for item in grid_results
+         if math.isclose(item[0], DEPLOY_K_TIME)), None)
+    h9 = (
+        recommended is not None
+        and selected_grid is not None
+        and math.isclose(recommended[0], DEPLOY_K_TIME)
+        and all(selected_grid[2].values())
+    )
     if recommended is not None:
         print(f"  RECOMMENDED_K_TIME={recommended[0]}")
-        print(f"  RECOMMENDED_DELTA={recommended[1]}")
+    print(f"  SELECTED_K_TIME={DEPLOY_K_TIME}")
+    print(f"  H9 selected physical-profile tuning passes all gates and "
+          f"is the gated grid recommendation: {'PASS' if h9 else 'FAIL'}")
 
     print("\n=== Notes ===")
     print("  - coverage is 'ground-truth free cells the sensor revealed'.")
-    print("  - path_m is the sum of straight-line leg distances (no Nav2 cost).")
+    print("  - path_m is the sum of the selected BFS planner path lengths.")
+    print("  - path_turn_rad sums heading changes along those planned paths,")
+    print("    including initial alignment and the selected goal yaw.")
     print("  - H3 requires the complete ordered goal and source sequences to match.")
     print("  - H8 allows at most workers-1 speculative calls per selection cycle;")
     print("    every physical endpoint in a parallel batch must be unique.")
+    print("  - H9 path-near is defined as path_m <= 110% of nearest path_m;")
+    print("    shorter paths pass because this gate prevents path blow-up.")
     print("  - p50/p95 selection latency is informational, not a pass gate.")
-    return 0 if (h1 and h2 and h3 and h4 and h6 and h7 and h8) else 1
+    return 0 if (
+        h1 and h2 and h3 and h4 and h5 and h6 and h7 and h8 and h9
+    ) else 1
 
 
 if __name__ == "__main__":

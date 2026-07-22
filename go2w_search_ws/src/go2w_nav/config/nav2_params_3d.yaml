@@ -126,11 +126,11 @@ controller_server:
       # sample the same forward-only model that reaches the robot.
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 0.6        # 1.0m/s² 制动时约 0.18m 刹停，适配 0.20m 到达容差
+      max_vel_x: 0.8        # 1.0m/s² 制动时中心前移 0.32m；DWB 预测 0.80m
       max_vel_y: 0.0        # 差速; 全向改 0.3
       max_vel_theta: 0.5    # 与 rotation shim 的实机稳定转速一致
       min_speed_xy: 0.05    # 允许慢速前进轨迹
-      max_speed_xy: 0.6
+      max_speed_xy: 0.8
       min_speed_theta: 0.15 # 纯旋转不得落入 Go2W 轮式死区 (现 < max_vel_theta, 区间有效)
       acc_lim_x: 1.2
       acc_lim_y: 0.0
@@ -141,7 +141,7 @@ controller_server:
       vx_samples: 15        # 2026-07-19 恢复(10→15): 10采样大转角(180°回程)DWB No valid 225全拒; spin_yield解GIL后CPU够
       vy_samples: 0         # 差速; 全向改 10
       vtheta_samples: 40         # 2026-07-19 恢复(20→40): 大转角需更多转采样覆盖对齐path轨迹, 20不够致No valid+oscillation锁死
-      sim_time: 1.0         # 0.6m/s 上限下预测 0.6m，保留近场绕障可行轨迹
+      sim_time: 1.0         # 0.8m/s 上限下预测 0.8m，覆盖 0.32m 制动距离 + 0.05m 栅格
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.5  # 有界 TF 等待窗口；时间同步由 fuser 的同时间戳校正保证
@@ -174,7 +174,7 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [0.6, 0.0, 0.5]
+    max_velocity: [0.8, 0.0, 0.5]
     min_velocity: [0.0, 0.0, -0.5]
     max_accel: [1.2, 0.0, 1.0]
     max_decel: [-1.0, 0.0, -1.5]

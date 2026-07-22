@@ -313,9 +313,9 @@ def test_point_navigation_planning_failure_cannot_trigger_motion_recovery():
     for unsafe_motion_recovery in ("<Spin", "<BackUp", "<DriveOnHeading"):
         assert unsafe_motion_recovery not in tree
     assert "min_vel_x: 0.0" in params
-    assert "max_vel_x: 0.6" in params
+    assert "max_vel_x: 0.8" in params
     assert "max_vel_theta: 0.5" in params
-    assert "max_velocity: [0.6, 0.0, 0.5]" in params
+    assert "max_velocity: [0.8, 0.0, 0.5]" in params
     assert "min_velocity: [0.0, 0.0, -0.5]" in params
     behavior = params.split("behavior_server:", 1)[1].split(
         "waypoint_follower:", 1

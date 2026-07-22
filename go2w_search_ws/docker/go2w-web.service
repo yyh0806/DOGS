@@ -42,6 +42,19 @@ Environment=GO2W_LOCATE_THREADS=4
 Environment=GO2W_LOCATE_TIMEOUT=120
 Environment=GO2W_YOLO_MODEL=/home/nx/go2w_ws/models/yolov8x-worldv2.pt
 Environment=GO2W_ULTRALYTICS_WEIGHTS_DIR=/home/nx/go2w_ws/models
+# nx_room_orchestrator owns exploration selection in this service.  Keep the
+# bundled scorer defaults aligned with bringup_slam_nav2.sh.
+# hardware.env is rebuilt by deploy_release.sh for detected hardware; ad-hoc
+# frontier overrides there are not persistent across releases.
+# Persistent frontier tuning belongs in this managed service/release config.
+Environment=GO2W_FRONTIER_UTILITY_MODE=mixed
+Environment=GO2W_FRONTIER_TIME_PENALTY=14.5
+Environment=GO2W_FRONTIER_MIXED_WALL_BONUS=1.0
+Environment=GO2W_FRONTIER_MIXED_EXPANSION_BONUS=0.1
+Environment=GO2W_FRONTIER_PROBE_WORKERS=4
+Environment=GO2W_FRONTIER_YAW_STEP_DEG=45
+Environment=GO2W_FRONTIER_MAX_VEL_X=0.8
+Environment=GO2W_FRONTIER_MAX_VEL_THETA=0.5
 # Atomic deployment writes the detected dog NIC, NX address, panel origins,
 # and installed YOLO-World model path here.  Keep it after bundled defaults.
 EnvironmentFile=-/etc/go2w/hardware.env

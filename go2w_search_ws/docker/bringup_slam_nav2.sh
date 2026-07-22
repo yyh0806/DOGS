@@ -82,17 +82,19 @@ ros_env() {
   [ -n "$GO2W_WS" ] && [ -f "$GO2W_WS/install/setup.bash" ] && source "$GO2W_WS/install/setup.bash"
   export RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_DOMAIN_ID=0
   export ROS2CLI_NO_DAEMON=1
-  # frontier v3 (2026-07-21): 边界感知 + yaw 全360°优化 + 时间归一化
-  # k_time=5.0 来自 sim 标定 (k,δ) 网格搜索最低 total_turn_rad;
-  # δ=1.0 保留边界感知 (sim 简单矩形房间标 0, 实机复杂房间建议 1.0-2.0).
+  # frontier v3 (2026-07-22): actual 0.8/0.5 m/s/rad/s ETA model.
+  # k_time=14.5 is the adjacent gated sim selection: 15/20/25 missed
+  # coverage or far-boundary gates; 14.5 retained coverage and cut simulated
+  # planned-path heading turn.
+  # Wall bonus 1.0 remains a same-tier tie-break, never a frontier substitute.
   export GO2W_FRONTIER_UTILITY_MODE=mixed
-  export GO2W_FRONTIER_TIME_PENALTY=5.0
+  export GO2W_FRONTIER_TIME_PENALTY=14.5
   export GO2W_FRONTIER_MIXED_WALL_BONUS=1.0
   export GO2W_FRONTIER_MIXED_EXPANSION_BONUS=0.1
   export GO2W_FRONTIER_PROBE_WORKERS=4
   export GO2W_FRONTIER_YAW_STEP_DEG=45
-  export GO2W_FRONTIER_MAX_VEL_X=1.5
-  export GO2W_FRONTIER_MAX_VEL_THETA=1.0
+  export GO2W_FRONTIER_MAX_VEL_X=0.8
+  export GO2W_FRONTIER_MAX_VEL_THETA=0.5
   _ROS_ENV_DONE=1
 }
 
