@@ -682,8 +682,6 @@ def test_current_room_expands_after_local_frontiers_become_unreachable():
     )
 
     assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
-    assert manager.snapshot()["last_selection_reason"] == "retry_pending"
-    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
     assert manager.snapshot()["last_selection_reason"] == "search_boundary_expanded"
     assert manager.snapshot()["active_radius_m"] == pytest.approx(12.0)
     selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
@@ -1481,7 +1479,7 @@ def test_visual_gain_prioritizes_unobserved_viewpoint():
     assert selected["visual_gain"] == pytest.approx(20.0)
 
 
-def test_already_observed_frontier_is_dropped_when_new_visual_coverage_exists():
+def test_already_observed_frontier_ranks_after_new_visual_coverage():
     class BaseGainTracker(_VisibilityTracker):
         def rank_candidates(self, _map_msg, _robot_pose, candidates):
             ranked = []
@@ -1938,3 +1936,788 @@ def test_prioritize_active_tile_keeps_other_tiles():
     )
     result = m._prioritize_active_tile([dict(c) for c in cands], (0.0, 0.0, 0.0))
     assert len(result) == 2, "must keep candidates from other tiles"
+
+
+# ---------------------------------------------------------------------------
+# Unknown-space-first / wall-aware ranking (Task 7, 2026-07-22)
+# ---------------------------------------------------------------------------
+
+def _unknown_candidate(
+        x, *, unknown, support, wall_count=0, coverage=False, lidar=False):
+    return {
+        "x": float(x), "y": 0.0, "yaw": 0.0,
+        "size": 10, "center_cell": (0, int(float(x) * 10)),
+        "distance": abs(float(x)), "information_gain": 10.0,
+        "adjacent_unknown_count": int(unknown),
+        "adjacent_support_count": int(support),
+        "adjacent_wall_count": int(wall_count),
+        "coverage_candidate": bool(coverage),
+        "lidar_candidate": bool(lidar),
+    }
+
+
+def test_unknown_priority_frontier_beats_near_zero_unknown_coverage_candidate(
+        caplog):
+    frontier = _unknown_candidate(4.0, unknown=30, support=60)
+    coverage = _unknown_candidate(
+        1.0, unknown=0, support=60, coverage=True)
+    coverage["information_gain"] = 1000.0
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [
+            dict(coverage), dict(frontier)],
+        max_frontier_standoff_steps=0,
+        reject_map_edge=False,
+    )
+
+    caplog.set_level("INFO", logger="go2w.exploration")
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(4.0)
+    assert selected["exploration_source"] == "frontier"
+    assert selected["unknown_gain"] == pytest.approx(0.5)
+    snapshot = manager.snapshot()
+    assert snapshot["mixed_expansion_bonus"] == pytest.approx(0.1)
+    assert snapshot["selected_candidate_metrics"] == {
+        "source": "frontier",
+        "unknown_gain": pytest.approx(0.5),
+        "wall_proximity_bonus": pytest.approx(0.0),
+        "eta_s": pytest.approx(4.0 / 1.5),
+    }
+    assert "source=frontier" in caplog.text
+    assert "unknown_gain=0.500" in caplog.text
+
+
+def test_unknown_priority_uses_normalized_gain_inside_bounded_eta_band():
+    # Raw cell count is deliberately larger for the lower-gain candidate.
+    # The ratio, not occupancy-grid resolution/sample density, must win.
+    low_normalized = _unknown_candidate(2.0, unknown=20, support=100)
+    high_normalized = _unknown_candidate(2.8, unknown=4, support=10)
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [
+            dict(low_normalized), dict(high_normalized)],
+        utility_mode="mixed",
+        mixed_expansion_bonus=10.0,
+        mixed_heading_penalty=10.0,
+        max_vel_x=1.0,
+        max_frontier_standoff_steps=0,
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(2.8)
+    assert selected["unknown_gain"] == pytest.approx(0.4)
+    assert selected["eta_band"] == 0
+
+
+def test_unknown_priority_wall_bonus_only_breaks_equal_unknown_tier():
+    open_high_gain = _unknown_candidate(
+        2.2, unknown=6, support=10, wall_count=0)
+    wall_low_gain = _unknown_candidate(
+        2.0, unknown=2, support=10, wall_count=3)
+    wall_equal_gain = _unknown_candidate(
+        2.4, unknown=6, support=10, wall_count=3)
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [],
+        utility_mode="mixed",
+        mixed_wall_bonus=100.0,
+        max_frontier_standoff_steps=0,
+        reject_map_edge=False,
+    )
+
+    unequal = manager._rank_exploration_candidates(
+        [dict(wall_low_gain), dict(open_high_gain)],
+        (0.0, 0.0, 0.0), _two_room_map())
+    equal = manager._rank_exploration_candidates(
+        [dict(open_high_gain), dict(wall_equal_gain)],
+        (0.0, 0.0, 0.0), _two_room_map())
+
+    assert unequal[0]["x"] == pytest.approx(2.2)
+    assert equal[0]["x"] == pytest.approx(2.4)
+
+
+def test_fallback_order_uses_coverage_only_after_frontier_is_unreachable():
+    frontier = _unknown_candidate(4.0, unknown=30, support=60)
+    coverage = _unknown_candidate(
+        1.0, unknown=0, support=60, coverage=True)
+    tracker = _VisibilityTracker(
+        adaptive_step_m=0.0, gains={4.0: 10.0},
+        coverage_candidates=[coverage])
+    nav = _PlannerPort(blocked_x=(4.0,))
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        max_failures_per_cell=1,
+        max_frontier_standoff_steps=0,
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert [probe[0] for probe in nav.probes] == pytest.approx([4.0, 1.0])
+    assert selected["exploration_source"] == "coverage"
+
+
+def test_fallback_order_uses_lidar_after_frontier_and_coverage_unreachable():
+    coverage = _unknown_candidate(
+        1.0, unknown=0, support=60, coverage=True)
+    lidar = _unknown_candidate(
+        2.0, unknown=0, support=60, coverage=True, lidar=True)
+    tracker = _VisibilityTracker(
+        adaptive_step_m=0.0,
+        coverage_candidates=[coverage], lidar_candidates=[lidar])
+    nav = _PlannerPort(blocked_x=(1.0,))
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [],
+        max_failures_per_cell=1,
+        max_frontier_standoff_steps=0,
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert [probe[0] for probe in nav.probes] == pytest.approx([1.0, 2.0])
+    assert selected["exploration_source"] == "lidar"
+
+
+def test_stable_exhaustion_counts_complete_frontier_and_fallback_failures():
+    frontier = _unknown_candidate(4.0, unknown=30, support=60)
+    coverage = _unknown_candidate(
+        1.0, unknown=0, support=60, coverage=True)
+    lidar = _unknown_candidate(
+        2.0, unknown=0, support=60, coverage=True, lidar=True)
+    tracker = _VisibilityTracker(
+        adaptive_step_m=0.0, gains={4.0: 10.0},
+        coverage_candidates=[coverage],
+        lidar_candidates=[lidar])
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(blocked_x=(1.0, 2.0, 4.0)),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        stable_exhaustion_cycles=3,
+        max_failures_per_cell=1,
+        max_frontier_standoff_steps=0,
+        reject_map_edge=False,
+    )
+
+    reasons = []
+    for _ in range(3):
+        assert manager.choose_next(
+            _two_room_map(), (0.0, 0.0, 0.0)) is None
+        reasons.append(manager.snapshot()["last_selection_reason"])
+
+    assert reasons == [
+        "stability_confirmation_pending",
+        "stability_confirmation_pending",
+        "reachable_frontiers_exhausted",
+    ]
+
+
+def test_parallel_source_tier_never_preprobes_fallback_before_frontier_complete():
+    frontier = _unknown_candidate(4.0, unknown=30, support=60)
+    frontier["prefer_standoff"] = True
+    coverage = _unknown_candidate(
+        1.0, unknown=0, support=60, coverage=True)
+    tracker = _VisibilityTracker(
+        adaptive_step_m=0.0, coverage_candidates=[coverage])
+    nav = _PlannerPort(blocked_x=(3.4,))
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=8.0,
+        initial_radius_m=8.0,
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        max_frontier_standoff_steps=2,
+        max_plan_probes=2,
+        parallel_probe_workers=2,
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["exploration_source"] == "frontier"
+    assert len(nav.probes) <= 2
+    assert all(probe[0] != pytest.approx(1.0) for probe in nav.probes)
+
+
+def test_trap_escape_reorders_best_tier_without_dropping_other_frontiers():
+    far_blocked = _unknown_candidate(5.0, unknown=6, support=10)
+    near_reachable = _unknown_candidate(2.0, unknown=6, support=10)
+    nav = _PlannerPort(blocked_x=(5.0,))
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [
+            dict(near_reachable), dict(far_blocked)],
+        max_failures_per_cell=1,
+        max_frontier_standoff_steps=0,
+        reject_map_edge=False,
+    )
+    manager._consecutive_nav_failures = manager._escape_abort_threshold
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert [probe[0] for probe in nav.probes] == pytest.approx([5.0, 2.0])
+    assert selected["x"] == pytest.approx(2.0)
+    assert selected["exploration_source"] == "frontier"
+
+
+def test_stable_exhaustion_resets_after_incomplete_probe_cycle():
+    phase = [0]
+    candidate_sets = [
+        [_unknown_candidate(1.0, unknown=2, support=10)],
+        [
+            _unknown_candidate(3.0, unknown=2, support=10),
+            _unknown_candidate(5.0, unknown=2, support=10),
+        ],
+        [_unknown_candidate(7.0, unknown=2, support=10)],
+    ]
+
+    def candidates(*_a, **_k):
+        return [dict(item) for item in candidate_sets[phase[0]]]
+
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(blocked_x=(1.0, 3.0, 5.0, 7.0)),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=candidates,
+        max_failures_per_cell=1,
+        max_plan_probes=1,
+        max_frontier_standoff_steps=0,
+        reject_map_edge=False,
+    )
+    assert manager.snapshot()["stable_exhaustion_cycles"] == 3
+
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    assert manager.snapshot()["exhaustion_streak"] == 1
+    phase[0] = 1
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    assert manager.snapshot()["last_selection_reason"] == "retry_pending"
+    assert manager.snapshot()["exhaustion_streak"] == 0
+    phase[0] = 2
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    assert manager.snapshot()["exhaustion_streak"] == 1
+    assert manager.snapshot()["last_selection_reason"] == (
+        "stability_confirmation_pending")
+
+
+def test_stable_exhaustion_resets_when_search_boundary_expands():
+    phase = [0]
+    candidate_sets = [
+        [_unknown_candidate(1.0, unknown=2, support=10)],
+        [_unknown_candidate(7.0, unknown=2, support=10)],
+    ]
+
+    def candidates(*_a, **_k):
+        return [dict(item) for item in candidate_sets[phase[0]]]
+
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(blocked_x=(1.0, 7.0)),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=6.0,
+        initial_radius_m=6.0,
+        radius_step_m=6.0,
+        candidate_selector=candidates,
+        max_failures_per_cell=1,
+        max_frontier_standoff_steps=0,
+        reject_map_edge=False,
+    )
+
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    assert manager.snapshot()["exhaustion_streak"] == 1
+
+    # A mission-bound update makes another radius available. The previously
+    # failed candidate is spatially blacklisted, so this cycle expands rather
+    # than probing and must break the consecutive-exhaustion sequence.
+    manager.room_radius_m = 12.0
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    expanded = manager.snapshot()
+    assert expanded["last_selection_reason"] == "search_boundary_expanded"
+    assert expanded["active_radius_m"] == pytest.approx(12.0)
+    assert expanded["exhaustion_streak"] == 0
+
+    phase[0] = 1
+    assert manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0)) is None
+    final = manager.snapshot()
+    assert final["exhaustion_streak"] == 1
+    assert final["last_selection_reason"] == "stability_confirmation_pending"
+
+
+def test_nearest_zero_visual_gain_frontier_remains_before_coverage_fallback():
+    positive_blocked = _unknown_candidate(4.0, unknown=5, support=10)
+    zero_reachable = _unknown_candidate(2.0, unknown=0, support=10)
+    coverage = _unknown_candidate(
+        1.0, unknown=0, support=10, coverage=True)
+    tracker = _VisibilityTracker(
+        adaptive_step_m=0.0,
+        gains={4.0: 20.0, 2.0: 0.0},
+        coverage_candidates=[coverage],
+    )
+    nav = _PlannerPort(blocked_x=(4.0,))
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [
+            dict(positive_blocked), dict(zero_reachable)],
+        max_failures_per_cell=1,
+        max_frontier_standoff_steps=0,
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert [probe[0] for probe in nav.probes] == pytest.approx([4.0, 2.0])
+    assert selected["x"] == pytest.approx(2.0)
+    assert selected["exploration_source"] == "frontier"
+
+
+def _parallel_order_candidates():
+    high = _unknown_candidate(4.0, unknown=6, support=10)
+    high["prefer_standoff"] = True
+    low = _unknown_candidate(2.0, unknown=2, support=10)
+    return high, low
+
+
+class _OrderedEvidencePlanner:
+    def __init__(self, blocked_x=()):
+        self.blocked_x = tuple(float(value) for value in blocked_x)
+        self.probes = []
+
+    def compute_path_to_pose(self, x, y, yaw, frame_id="map", timeout=3.0):
+        self.probes.append((float(x), float(y), float(yaw)))
+        if any(abs(float(x) - blocked) < 1e-6 for blocked in self.blocked_x):
+            return {"ok": False, "reason": "blocked"}
+        return {
+            "ok": True,
+            "path_length": math.hypot(float(x), float(y)),
+            "poses": 4,
+            "goal_error_m": 0.0,
+        }
+
+
+def _ordered_evidence_manager(nav, workers, max_plan_probes=12):
+    high, low = _parallel_order_candidates()
+    return ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=8.0,
+        initial_radius_m=8.0,
+        candidate_selector=lambda *_a, **_k: [dict(high), dict(low)],
+        max_frontier_standoff_steps=2,
+        max_plan_probes=max_plan_probes,
+        parallel_probe_workers=workers,
+        reject_map_edge=False,
+    )
+
+
+@pytest.mark.parametrize("max_plan_probes", [2, 12])
+def test_parallel_probe_ordered_evidence_matches_serial_without_duplicate_first(
+        max_plan_probes):
+    serial_nav = _OrderedEvidencePlanner(blocked_x=(3.4,))
+    parallel_nav = _OrderedEvidencePlanner(blocked_x=(3.4,))
+
+    serial_manager = _ordered_evidence_manager(
+        serial_nav, 0, max_plan_probes=max_plan_probes)
+    parallel_manager = _ordered_evidence_manager(
+        parallel_nav, 2, max_plan_probes=max_plan_probes)
+    high, _low = _parallel_order_candidates()
+    assert len(serial_manager._candidate_approaches(
+        high, (0.0, 0.0, 0.0))) == 3
+
+    serial = serial_manager.choose_next(
+        _two_room_map(), (0.0, 0.0, 0.0))
+    parallel = parallel_manager.choose_next(
+        _two_room_map(), (0.0, 0.0, 0.0))
+
+    assert serial is not None and parallel is not None
+    assert parallel["frontier_x"] == pytest.approx(serial["frontier_x"])
+    parallel_x = [round(item[0], 3) for item in parallel_nav.probes]
+    assert parallel_x.count(3.4) == 1
+    assert parallel_x.count(3.7) == 1
+    assert parallel_x.count(2.0) == (1 if max_plan_probes > 3 else 0)
+    assert len(parallel_x) <= max_plan_probes
+
+
+def test_parallel_probe_successful_first_result_is_reused_without_serial_reprobe():
+    nav = _OrderedEvidencePlanner()
+    selected = _ordered_evidence_manager(nav, 2).choose_next(
+        _two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["frontier_x"] == pytest.approx(4.0)
+    probe_x = [round(item[0], 3) for item in nav.probes]
+    assert sorted(probe_x) == pytest.approx([2.0, 3.4])
+    assert len(probe_x) == 2
+
+
+def test_parallel_probe_first_batch_is_bounded_to_worker_count():
+    candidates = [
+        _unknown_candidate(float(x), unknown=7 - x, support=10)
+        for x in range(1, 7)
+    ]
+    nav = _OrderedEvidencePlanner()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [
+            dict(item) for item in candidates],
+        max_frontier_standoff_steps=0,
+        max_plan_probes=12,
+        parallel_probe_workers=4,
+        reject_map_edge=False,
+    )
+
+    evidence, probes_used = manager._parallel_probe_first_approaches(
+        manager._eligible_candidates(
+            candidates, (0.0, 0.0, 0.0), _two_room_map()),
+        (0.0, 0.0, 0.0),
+        budget=12,
+    )
+
+    assert probes_used == 4
+    assert sum(item["first_probed"] for item in evidence) == 4
+    assert len(nav.probes) == 4
+
+
+class _RaisingPlanner(_OrderedEvidencePlanner):
+    def __init__(self, raising_x):
+        super().__init__()
+        self.raising_x = float(raising_x)
+
+    def compute_path_to_pose(self, x, y, yaw, frame_id="map", timeout=3.0):
+        self.probes.append((float(x), float(y), float(yaw)))
+        if abs(float(x) - self.raising_x) < 1e-6:
+            raise RuntimeError("planner exploded")
+        return {
+            "ok": True,
+            "path_length": math.hypot(float(x), float(y)),
+            "poses": 4,
+            "goal_error_m": 0.0,
+        }
+
+
+def test_parallel_probe_future_exception_does_not_hide_successful_top_candidate():
+    nav = _RaisingPlanner(raising_x=2.0)
+    manager = _ordered_evidence_manager(nav, 2)
+
+    selected = manager.choose_next(
+        _two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["frontier_x"] == pytest.approx(4.0)
+    assert sorted(round(probe[0], 3) for probe in nav.probes) == [2.0, 3.4]
+    assert manager.snapshot()["plan_probes"] == 2
+
+
+def test_serial_probe_exception_becomes_failure_and_next_candidate_runs():
+    high = _unknown_candidate(4.0, unknown=6, support=10)
+    low = _unknown_candidate(2.0, unknown=2, support=10)
+    nav = _RaisingPlanner(raising_x=4.0)
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [dict(high), dict(low)],
+        max_frontier_standoff_steps=0,
+        max_failures_per_cell=1,
+        parallel_probe_workers=0,
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(
+        _two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(2.0)
+    assert [probe[0] for probe in nav.probes] == pytest.approx([4.0, 2.0])
+    assert manager.snapshot()["plan_probes"] == 2
+    assert manager.snapshot()["blacklist"][0]["last_reason"] == "planner_error"
+
+
+def test_parallel_probe_deduplicates_identical_physical_staging_pose():
+    candidates = []
+    for index, x in enumerate((4.0, 5.0, 6.0, 7.0)):
+        candidate = _unknown_candidate(
+            x, unknown=8 - index, support=10)
+        candidate.update({
+            "prefer_standoff": True,
+            "heading_change": math.pi,
+        })
+        candidates.append(candidate)
+    nav = _OrderedEvidencePlanner()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=8.0,
+        initial_radius_m=8.0,
+        candidate_selector=lambda *_a, **_k: [
+            dict(item) for item in candidates],
+        max_frontier_standoff_steps=2,
+        max_plan_probes=12,
+        parallel_probe_workers=4,
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(
+        _two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["frontier_x"] == pytest.approx(4.0)
+    assert nav.probes == pytest.approx([(0.8, 0.0, 0.0)])
+    assert manager.snapshot()["plan_probes"] == 1
+
+
+@pytest.mark.parametrize("left_yaw,right_yaw", [
+    (math.pi, -math.pi),
+    (math.pi - 1e-7, -math.pi + 1e-7),
+])
+def test_parallel_probe_physical_key_deduplicates_yaw_wrap(
+        left_yaw, right_yaw):
+    left = {"x": 2.0, "y": -1.0, "yaw": left_yaw}
+    right = {"x": 2.0, "y": -1.0, "yaw": right_yaw}
+
+    assert ExplorationManager._physical_probe_key(left) == (
+        ExplorationManager._physical_probe_key(right))
+
+
+def test_parallel_probe_allows_only_one_batch_across_source_tiers():
+    frontier = [
+        _unknown_candidate(4.0, unknown=6, support=10),
+        _unknown_candidate(5.0, unknown=5, support=10),
+    ]
+    coverage = [
+        _unknown_candidate(1.0, unknown=0, support=10, coverage=True),
+        _unknown_candidate(2.0, unknown=0, support=10, coverage=True),
+    ]
+    lidar = [
+        _unknown_candidate(
+            6.0, unknown=0, support=10, coverage=True, lidar=True),
+        _unknown_candidate(
+            7.0, unknown=0, support=10, coverage=True, lidar=True),
+    ]
+    tracker = _VisibilityTracker(
+        adaptive_step_m=0.0,
+        coverage_candidates=coverage,
+        lidar_candidates=lidar,
+    )
+    nav = _PlannerPort(blocked_x=(1.0, 2.0, 4.0, 5.0, 6.0, 7.0))
+
+    class BatchTrackingManager(ExplorationManager):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.parallel_batch_sources = []
+
+        def _parallel_probe_first_approaches(
+                self, eligible, robot_pose, budget):
+            self.parallel_batch_sources.append(
+                self._exploration_source(eligible[0]))
+            return super()._parallel_probe_first_approaches(
+                eligible, robot_pose, budget)
+
+    manager = BatchTrackingManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [
+            dict(item) for item in frontier],
+        max_frontier_standoff_steps=0,
+        max_failures_per_cell=1,
+        max_plan_probes=6,
+        parallel_probe_workers=2,
+        reject_map_edge=False,
+    )
+
+    assert manager.choose_next(
+        _two_room_map(), (0.0, 0.0, 0.0)) is None
+    assert manager.parallel_batch_sources == ["frontier"]
+    assert len(nav.probes) == 6
+    assert manager.snapshot()["plan_probes"] == 6
+
+
+def test_lazy_fallback_generators_not_called_when_frontier_is_reachable():
+    class CountingTracker(_VisibilityTracker):
+        def __init__(self):
+            super().__init__(adaptive_step_m=0.0, gains={2.0: 10.0})
+            self.coverage_calls = 0
+            self.lidar_calls = 0
+
+        def coverage_candidates(self, *args, **kwargs):
+            self.coverage_calls += 1
+            return []
+
+        def lidar_candidates(self, *args, **kwargs):
+            self.lidar_calls += 1
+            return []
+
+    tracker = CountingTracker()
+    frontier = _unknown_candidate(2.0, unknown=5, support=10)
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor", visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        max_frontier_standoff_steps=0, reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["exploration_source"] == "frontier"
+    assert tracker.coverage_calls == 0
+    assert tracker.lidar_calls == 0
+
+
+def test_lazy_lidar_generator_not_called_when_coverage_is_reachable():
+    coverage = _unknown_candidate(
+        2.0, unknown=0, support=10, coverage=True)
+
+    class CountingTracker(_VisibilityTracker):
+        def __init__(self):
+            super().__init__(
+                adaptive_step_m=0.0, coverage_candidates=[coverage])
+            self.coverage_calls = 0
+            self.lidar_calls = 0
+
+        def coverage_candidates(self, *args, **kwargs):
+            self.coverage_calls += 1
+            return super().coverage_candidates(*args, **kwargs)
+
+        def lidar_candidates(self, *args, **kwargs):
+            self.lidar_calls += 1
+            return []
+
+    tracker = CountingTracker()
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor", visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [],
+        max_frontier_standoff_steps=0, reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["exploration_source"] == "coverage"
+    assert tracker.coverage_calls == 1
+    assert tracker.lidar_calls == 0
+
+
+def test_unknown_support_uses_exact_clipped_disk_for_production_candidate():
+    from nx_frontier_planner import select_frontier_candidates
+
+    map_msg = _two_room_map()
+    map_msg.info.resolution = 0.5
+    candidates = select_frontier_candidates(
+        map_msg, (1.0, 1.5, 0.0), [],
+        revisit_radius=0.0, origin_pose=(1.0, 1.5, 0.0),
+        max_radius=None, room_polygon=None, reject_map_edge=False,
+        failure_counts={}, distance_weight=1.0, heading_weight=0.15,
+        failure_penalty=1.0, frontier_spacing_m=1.5,
+    )
+    edge = candidates[0]
+    row0, col0 = edge["center_cell"]
+    radius_cells = 1.5 / map_msg.info.resolution
+    radius_limit = int(math.ceil(radius_cells))
+    expected_cells = []
+    for row in range(max(0, row0 - radius_limit),
+                     min(map_msg.info.height, row0 + radius_limit + 1)):
+        for col in range(max(0, col0 - radius_limit),
+                         min(map_msg.info.width, col0 + radius_limit + 1)):
+            if ((row - row0) ** 2 + (col - col0) ** 2
+                    <= radius_cells ** 2 + 1e-9):
+                expected_cells.append(map_msg.data[row * map_msg.info.width + col])
+    expected_unknown = sum(1 for value in expected_cells if value < 0)
+
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(1.0, 1.5, 0.0),
+        mode="whole_floor", frontier_spacing_m=1.5,
+        candidate_selector=lambda *_a, **_k: [], reject_map_edge=False,
+    )
+    annotated = manager._rank_exploration_candidates(
+        [edge], (1.0, 1.5, 0.0), map_msg)[0]
+
+    assert "adjacent_support_count" not in edge
+    assert annotated["adjacent_support_count"] == len(expected_cells)
+    assert annotated["adjacent_unknown_count"] == expected_unknown
+    assert annotated["unknown_gain"] == pytest.approx(
+        expected_unknown / len(expected_cells))
+
+
+def test_selected_candidate_metrics_clear_with_goal_lifecycle():
+    frontier = _unknown_candidate(2.0, unknown=5, support=10)
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        max_frontier_standoff_steps=0, reject_map_edge=False,
+    )
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    assert selected is not None
+    assert manager.snapshot()["selected_candidate_metrics"]
+    manager.mark_visited(selected)
+    assert manager.snapshot()["selected_candidate_metrics"] == {}
+
+    failed_manager = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        max_frontier_standoff_steps=0, reject_map_edge=False,
+    )
+    failed = failed_manager.choose_next(
+        _two_room_map(), (0.0, 0.0, 0.0))
+    failed_manager.mark_navigation_failed("controller_abort", failed)
+    assert failed_manager.snapshot()["selected_candidate_metrics"] == {}
+
+    exhausted_manager = ExplorationManager(
+        navigation_port=_PlannerPort(), mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        max_frontier_standoff_steps=0, reject_map_edge=False,
+    )
+    assert exhausted_manager.choose_next(
+        _two_room_map(), (0.0, 0.0, 0.0)) is not None
+    exhausted_manager._candidate_selector = lambda *_a, **_k: []
+    assert exhausted_manager.choose_next(
+        _two_room_map(), (0.0, 0.0, 0.0)) is None
+    assert exhausted_manager.snapshot()["selected_candidate_metrics"] == {}
+
+
+def test_deployment_enables_four_bounded_frontier_probe_workers():
+    with open(os.path.join(ROOT, "docker", "bringup_slam_nav2.sh"),
+              encoding="utf-8") as handle:
+        script = handle.read()
+    assert "export GO2W_FRONTIER_PROBE_WORKERS=4" in script

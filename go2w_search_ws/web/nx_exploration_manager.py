@@ -74,7 +74,7 @@ class ExplorationManager:
         radius_step_m: float = 6.0,
         tile_size_m: float = 6.0,
         frontier_spacing_m: float = 1.5,
-        stable_exhaustion_cycles: int = 1,
+        stable_exhaustion_cycles: int = 3,
         max_time_s: float = 300.0,
         max_distance_m: Optional[float] = None,
         battery_reserve_percent: float = 20.0,
@@ -122,7 +122,8 @@ class ExplorationManager:
         # v3 (2026-07-21): heading 时间归一化 + wall_bonus + yaw 优化
         mixed_heading_penalty: float = 0.0,
         mixed_wall_bonus: float = 0.0,
-        mixed_expansion_bonus: float = 0.0,
+        mixed_expansion_bonus: float = 0.1,
+        unknown_eta_band_s: float = 10.0,
         yaw_step_deg: float = 45.0,
         max_vel_x: float = 1.5,
         max_vel_theta: float = 1.0,
@@ -241,6 +242,7 @@ class ExplorationManager:
         self._plan_rejections = 0
         self._navigation_failures = 0
         self._last_selection_reason: Optional[str] = None
+        self._last_selected_metrics: dict = {}
         self._navigation_start_distance: Optional[float] = None
         self._navigation_divergence_count = 0
         self._goal_revalidation_failure_count = 0
@@ -276,6 +278,7 @@ class ExplorationManager:
             "GO2W_FRONTIER_MIXED_WALL_BONUS", str(mixed_wall_bonus))))
         self.mixed_expansion_bonus = max(0.0, float(os.environ.get(
             "GO2W_FRONTIER_MIXED_EXPANSION_BONUS", str(mixed_expansion_bonus))))
+        self.unknown_eta_band_s = max(0.1, float(unknown_eta_band_s))
         self.yaw_step_deg = max(5.0, float(os.environ.get(
             "GO2W_FRONTIER_YAW_STEP_DEG", str(yaw_step_deg))))
         self.max_vel_x = max(0.1, float(os.environ.get(
@@ -307,34 +310,26 @@ class ExplorationManager:
         return None
 
     def choose_next(self, map_msg, robot_pose) -> Optional[dict]:
-        if self.budget_status() is not None:
-            self._last_selection_reason = self.budget_status()
+        budget_reason = self.budget_status()
+        if budget_reason is not None:
+            self._clear_selected_goal()
+            self._last_selection_reason = budget_reason
             return None
-        # 封闭房间判据 (2026-07-21): if every remaining frontier cluster
-        # lies within door_radius of mission_origin, the room is walled
-        # off except for the entry door — stop rather than push into the
-        # corridor. Only fires in current_room mode with a visibility
-        # tracker injected (production current_room path); test stubs
-        # rarely set up a tracker, so this guard keeps them on the
-        # historical frontier-driven path.
         if (self.mode == "current_room"
-                and os.environ.get("GO2W_FRONTIER_ROOM_ENCLOSURE_CHECK", "0") == "1"
+                and os.environ.get(
+                    "GO2W_FRONTIER_ROOM_ENCLOSURE_CHECK", "0") == "1"
                 and self.detect_room_enclosure(map_msg, robot_pose)):
+            self._clear_selected_goal()
             self._last_selection_reason = "room_enclosed"
             return None
-        revision = map_revision(map_msg)
-        self._map_revision = revision
-        candidate_selector = self._candidate_selector or select_frontier_candidates
+
+        self._map_revision = map_revision(map_msg)
+        candidate_selector = (
+            self._candidate_selector or select_frontier_candidates)
         candidates = self._select_candidates(
             candidate_selector, map_msg, robot_pose)
-        # v3 yaw 优化 (仅 mixed + tracker 时生效)
         candidates = self._optimize_yaw_for_candidates(
             candidates, robot_pose, map_msg)
-        # Grow the active radius until the in-radius list has candidates AND
-        # nothing was truncated by it (or we hit max_radius). The old "only
-        # when list completely empty" condition stranded far frontier (e.g.
-        # (21,-10) at 23m) behind a wall of always-present near frontiers,
-        # because the list never went empty once the dog was inside the room.
         while self._can_expand_radius():
             truncated = getattr(self, "_last_radius_truncated", 0)
             if candidates and truncated == 0:
@@ -342,235 +337,98 @@ class ExplorationManager:
             self._expand_radius()
             candidates = self._select_candidates(
                 candidate_selector, map_msg, robot_pose)
-            # v3 yaw 优化 (半径扩张后重选)
             candidates = self._optimize_yaw_for_candidates(
                 candidates, robot_pose, map_msg)
-        if not candidates:
-            candidates = self._select_visual_coverage_candidates(
-                map_msg, robot_pose)
-        if not candidates:
-            candidates = self._select_lidar_candidates(robot_pose)
-        if not candidates:
-            self._current_goal = None
-            self._confirm_exhaustion()
-            return None
 
-        eligible = [
-            candidate for candidate in candidates
-            if self._spatial_failure_count(candidate)
-            < self.max_failures_per_cell
-            and self._distance_from_pose(candidate, robot_pose)
-            >= self.min_goal_distance_m
-        ]
-        if not eligible:
-            eligible = [
-                candidate for candidate in candidates
-                if self._spatial_failure_count(candidate)
-                < self.max_failures_per_cell
-                and any(
-                    self._distance_from_pose(approach, robot_pose)
-                    >= self.min_goal_distance_m
-                    for approach in self._candidate_approaches(
-                        candidate, robot_pose)
-                )
-            ]
-        if not eligible:
-            self._current_goal = None
-            if self._can_expand_radius():
+        seeded = {"frontier": [], "coverage": [], "lidar": []}
+        for candidate in candidates:
+            seeded[self._exploration_source(candidate)].append(candidate)
+
+        remaining_budget = self.max_plan_probes
+        parallel_batch_available = True
+        for source in ("frontier", "coverage", "lidar"):
+            tier_candidates = list(seeded[source])
+            if source == "coverage":
+                tier_candidates.extend(
+                    self._select_visual_coverage_candidates(
+                        map_msg, robot_pose))
+            elif source == "lidar":
+                tier_candidates.extend(
+                    self._select_lidar_candidates(robot_pose))
+            if not tier_candidates:
+                continue
+            if remaining_budget <= 0:
+                self._clear_selected_goal()
+                self._exhaustion_streak = 0
+                self._last_selection_reason = "retry_pending"
+                return None
+
+            eligible = self._eligible_candidates(
+                tier_candidates, robot_pose, map_msg)
+            if not eligible:
+                if source == "frontier" and self._can_expand_radius():
+                    self._clear_selected_goal()
+                    self._expand_radius()
+                    self._last_selection_reason = "search_boundary_expanded"
+                    return None
+                continue
+
+            chosen, probes_used, incomplete, batch_used = (
+                self._probe_ordered_candidates(
+                    eligible, robot_pose, remaining_budget,
+                    allow_parallel=parallel_batch_available))
+            if batch_used:
+                parallel_batch_available = False
+            remaining_budget -= probes_used
+            if chosen is not None:
+                return self._activate_selected_goal(
+                    chosen, robot_pose, map_msg)
+            if incomplete:
+                self._clear_selected_goal()
+                self._exhaustion_streak = 0
+                self._last_selection_reason = "retry_pending"
+                return None
+            if source == "frontier" and self._can_expand_radius():
+                self._clear_selected_goal()
                 self._expand_radius()
                 self._last_selection_reason = "search_boundary_expanded"
-            else:
-                self._confirm_exhaustion()
-            return None
+                return None
 
+        self._clear_selected_goal()
+        self._confirm_exhaustion()
+        return None
+
+    def _activate_selected_goal(
+            self, chosen: dict, robot_pose, map_msg) -> dict:
+        ranked = self._rank_exploration_candidates(
+            [chosen], robot_pose, map_msg)
+        self._current_goal = dict(ranked[0])
         self._exhaustion_streak = 0
-        eligible = self._prioritize_active_tile(eligible, robot_pose)
-        # Trap-escape (2026-07-21): if recent nav failures stacked, the dog
-        # is stuck in a dense-obstacle pocket. Pick the FARTHEST eligible
-        # frontier to maximise the chance Nav2's global planner can route
-        # around the trap. A fixed distance threshold failed in production
-        # because small rooms had no candidate beyond it (far list empty,
-        # escape silently no-op'd, dog kept abort-cycling on near goals).
-        # Resets to normal once one goal succeeds.
-        if (self._consecutive_nav_failures >= self._escape_abort_threshold
-                and self._escape_min_distance_m > 0.0
-                and len(eligible) > 1):
-            farthest = max(
-                eligible,
-                key=lambda candidate: self._distance_from_pose(
-                    candidate, robot_pose),
-            )
-            eligible = [farthest]
-            self._last_selection_reason = "escape_trap_pending"
-        if eligible and all(
-                not item.get("coverage_candidate")
-                and not item.get("lidar_candidate")
-                for item in eligible):
-            if self.utility_mode == "mixed":
-                # 2026-07-20 mixed mode: rank by α·size + β·visual_gain
-                # - γ·path_cost so the dog actively approaches unexplored
-                # area. Distance/heading remain as tiebreakers only.
-                eligible.sort(key=lambda item: (
-                    self._mixed_utility_sort_key(item, robot_pose),
-                    self._distance_from_pose(item, robot_pose),
-                    float(item.get("heading_change", 0.0)),
-                    -float(item.get("visual_gain", 0.0)),
-                    float(item["x"]), float(item["y"]),
-                ))
-            else:
-                # Physical frontier travel dominates mission duration. Probe
-                # the nearest unknown boundary first; visual gain breaks
-                # distance ties. Long movement in open space is still
-                # produced by the LiDAR-confirmed lookahead in
-                # _candidate_approaches().
-                eligible.sort(key=lambda item: (
-                    self._distance_from_pose(item, robot_pose),
-                    -float(item.get("score", 0.0)),
-                    -float(item.get("visual_gain", 0.0)),
-                    -float(item.get("information_gain", item.get("size", 0.0))),
-                    float(item.get("heading_change", 0.0)),
-                    float(item["x"]), float(item["y"]),
-                ))
-
-        reachable = []
-        probes_this_cycle = 0
-        # Parallel fast path (2026-07-20): concurrently probe the first
-        # approach of each eligible candidate. When enabled this collapses
-        # the worst-case selection stall from max_plan_probes × timeout to
-        # a single timeout round. The serial loop below still runs (it
-        # breaks on the first reachable candidate, which the parallel path
-        # already inserted), so semantics are preserved. A known P2
-        # inefficiency: the serial sweep re-probes candidates the parallel
-        # path already examined, roughly doubling probe count for the same
-        # waypoint output (sim: 68 → 132). Acceptable because ComputePath
-        # calls are cheap vs send_goal_and_wait latency.
-        if self.parallel_probe_workers > 0 and len(eligible) > 1:
-            chosen_parallel, parallel_probes = (
-                self._parallel_probe_first_approaches(
-                    eligible, robot_pose, self.max_plan_probes))
-            probes_this_cycle += parallel_probes
-            self._plan_probes += parallel_probes
-            if chosen_parallel is not None:
-                reachable.append(chosen_parallel)
-        for candidate in eligible:
-            # NOTE: critic #2 asked for a short-circuit `if reachable: break`
-            # here, but doing so skips lower-priority candidates' standoff
-            # fallbacks (the serial loop probes multiple standoff offsets
-            # per candidate). Sim showed mixed+parallel dropping coverage
-            # from 98.44% to 96.48% with the short-circuit. We keep the
-            # serial sweep running so behaviour matches the serial path
-            # exactly (sim H3 PASS), accepting ~2× probe count (68→132)
-            # as the cost. ComputePath calls are cheaper than the goal
-            # send_goal_and_wait they precede, and parallel_probe_workers
-            # defaults to 0 (opt-in) so this only fires when an operator
-            # explicitly enables it.
-            if probes_this_cycle >= self.max_plan_probes:
-                break
-            approaches = self._candidate_approaches(candidate, robot_pose)
-            approaches = [
-                approach for approach in approaches
-                if not self._approach_revisits_viewpoint(approach)
-            ]
-            if not approaches:
-                self._record_failure(candidate, "revisited_viewpoint", "plan")
-                continue
-            last_reason = "unreachable"
-            attempts_complete = True
-            candidate_reachable = False
-            for approach in approaches:
-                if probes_this_cycle >= self.max_plan_probes:
-                    attempts_complete = False
-                    break
-                probes_this_cycle += 1
-                self._plan_probes += 1
-                result = self.navigation_port.compute_path_to_pose(
-                    approach["x"], approach["y"], approach["yaw"],
-                    frame_id="map", timeout=self.planning_timeout_s)
-                path_respects_room = self._path_respects_room(result)
-                path_makes_progress = self._path_makes_progress(result)
-                path_detour_is_safe = self._path_detour_is_safe(
-                    result, approach, robot_pose)
-                endpoint_reaches_goal = self._path_endpoint_reaches_goal(
-                    result)
-                if (not result.get("ok")
-                        or not path_respects_room
-                        or not path_makes_progress
-                        or not path_detour_is_safe
-                        or not endpoint_reaches_goal):
-                    last_reason = str(result.get("reason") or "unreachable")
-                    if result.get("ok") and not path_respects_room:
-                        last_reason = "path_leaves_room_polygon"
-                    elif result.get("ok") and not path_makes_progress:
-                        last_reason = "degenerate_plan"
-                    elif result.get("ok") and not endpoint_reaches_goal:
-                        last_reason = "plan_endpoint_mismatch"
-                    elif result.get("ok"):
-                        last_reason = "excessive_plan_detour"
-                    continue
-                chosen = dict(approach)
-                chosen["path_length"] = float(
-                    result.get("path_length", approach.get("distance", 0.0)))
-                chosen["path_poses"] = int(result.get("poses", 0) or 0)
-                if result.get("goal_error_m") is not None:
-                    chosen["goal_error_m"] = float(result["goal_error_m"])
-                chosen["score"] = score_frontier(
-                    chosen,
-                    path_length=chosen["path_length"],
-                    heading_change=chosen.get("heading_change", 0.0),
-                    failure_count=chosen.get("failure_count", 0),
-                    distance_weight=self.distance_weight,
-                    heading_weight=self._effective_heading_weight(chosen),
-                    failure_penalty=self.failure_penalty,
-                ) + float(chosen.get("lidar_progress_bonus", 0.0))
-                reachable.append(chosen)
-                candidate_reachable = True
-                break
-            else:
-                attempts_complete = True
-            if candidate_reachable:
-                # Candidates are already ordered by mission utility. Starting
-                # the first verified path avoids serially blocking on up to a
-                # dozen ComputePathToPose calls while the dog stands still.
-                break
-            if not candidate_reachable and attempts_complete:
-                self._record_failure(candidate, last_reason, "plan")
-        if not reachable:
-            # A per-cycle probe cap prevents planner storms. Remaining spatial
-            # candidates are retried on the next selection cycle; the lifetime
-            # counter is telemetry only and never terminates a large mission.
-            self._last_selection_reason = "retry_pending"
-            self._current_goal = None
-            return None
-        if all(
-                not item.get("coverage_candidate")
-                and not item.get("lidar_candidate")
-                for item in reachable):
-            if self.utility_mode == "mixed":
-                # path_length is now known (post-probe); utility uses the
-                # real Nav2 cost instead of euclidean distance.
-                reachable.sort(key=lambda item: (
-                    self._mixed_utility_sort_key(item, robot_pose),
-                    item["path_length"],
-                    -float(item.get("visual_gain", 0.0)),
-                    item["x"], item["y"],
-                ))
-            else:
-                reachable.sort(key=lambda item: (
-                    item["path_length"],
-                    -float(item.get("visual_gain", 0.0)),
-                    -float(item.get("information_gain", item.get("size", 0.0))),
-                    -item["score"], item["x"], item["y"],
-                ))
-        else:
-            reachable.sort(key=lambda item: (
-                -item["score"], item["path_length"], item["x"], item["y"]))
-        self._current_goal = dict(reachable[0])
         self._navigation_start_distance = self._distance_from_pose(
             self._current_goal, robot_pose)
         self._navigation_divergence_count = 0
         self._goal_revalidation_failure_count = 0
         self._last_selection_reason = None
+        self._last_selected_metrics = {
+            "source": self._current_goal["exploration_source"],
+            "unknown_gain": float(self._current_goal["unknown_gain"]),
+            "wall_proximity_bonus": float(
+                self._current_goal["wall_proximity_bonus"]),
+            "eta_s": float(self._current_goal["eta_s"]),
+        }
+        logger.info(
+            "exploration selected source=%s unknown_gain=%.3f "
+            "wall_proximity_bonus=%.3f eta_s=%.3f",
+            self._last_selected_metrics["source"],
+            self._last_selected_metrics["unknown_gain"],
+            self._last_selected_metrics["wall_proximity_bonus"],
+            self._last_selected_metrics["eta_s"],
+        )
         return dict(self._current_goal)
+
+    def _clear_selected_goal(self) -> None:
+        self._current_goal = None
+        self._last_selected_metrics = {}
 
     def observe_environment(self, map_msg, robot_pose, scan_snapshot) -> dict:
         """Accumulate LiDAR-bounded camera coverage at the current pose.
@@ -609,7 +467,7 @@ class ExplorationManager:
             self._staging_transition_pending = True
             self._spatial_failures.clear()
             self._exhaustion_streak = 0
-            self._current_goal = None
+            self._clear_selected_goal()
             self._reset_navigation_progress()
             return
         self._staging_transition_pending = False
@@ -621,7 +479,7 @@ class ExplorationManager:
         # unreachable spatial cells may now be valid and get one fresh epoch.
         self._spatial_failures.clear()
         self._exhaustion_streak = 0
-        self._current_goal = None
+        self._clear_selected_goal()
         self._reset_navigation_progress()
 
     def mark_navigation_failed(self, reason: str, candidate: Optional[dict] = None) -> None:
@@ -629,7 +487,7 @@ class ExplorationManager:
         if target:
             self._record_failure(target, str(reason or "navigation_failed"), "navigation")
         self._consecutive_nav_failures += 1
-        self._current_goal = None
+        self._clear_selected_goal()
         self._reset_navigation_progress()
 
     def observe_navigation_pose(self, robot_pose) -> dict:
@@ -757,6 +615,7 @@ class ExplorationManager:
             "mixed_heading_penalty": self.mixed_heading_penalty,
             "mixed_wall_bonus": self.mixed_wall_bonus,
             "mixed_expansion_bonus": self.mixed_expansion_bonus,
+            "unknown_eta_band_s": self.unknown_eta_band_s,
             "yaw_step_deg": self.yaw_step_deg,
             "max_vel_x": self.max_vel_x,
             "max_vel_theta": self.max_vel_theta,
@@ -772,6 +631,7 @@ class ExplorationManager:
             "plan_rejections": self._plan_rejections,
             "navigation_failures": self._navigation_failures,
             "last_selection_reason": self._last_selection_reason,
+            "selected_candidate_metrics": dict(self._last_selected_metrics),
             "elapsed_s": max(0.0, self._monotonic() - self._started_at),
         }
 
@@ -1163,22 +1023,9 @@ class ExplorationManager:
         if self.visibility_tracker is not None:
             candidates = self.visibility_tracker.rank_candidates(
                 map_msg, robot_pose, candidates)
-            # Hard-filtering visual_gain==0 frontiers was too aggressive in
-            # mixed mode: once the dog's视锥 swept a region, every remaining
-            # map frontier got dropped, the candidate list went empty, and
-            # stable_exhaustion fired after 3 cycles — ending the mission
-            # with most of the room unexplored (sim critique #3, confirmed
-            # in 2026-07-21 production run: only 3 waypoints in a 4-wall
-            # room). Mixed mode already uses visual_gain as a utility term,
-            # so the filter is redundant there. Keep it only for nearest
-            # mode where it was the historical tie-breaker.
-            if self.utility_mode != "mixed":
-                positive_visual_gain = [
-                    item for item in candidates
-                    if float(item.get("visual_gain", 0.0)) > 0.0
-                ]
-                if positive_visual_gain:
-                    candidates = positive_visual_gain
+            # Visual gain is ranking evidence, never frontier eligibility.
+            # A zero-gain frontier may be the only reachable path into still
+            # unknown space after a positive-gain frontier fails preflight.
         for item in candidates:
             count = self._spatial_failure_count(item)
             item["failure_count"] = int(count)
@@ -1236,7 +1083,10 @@ class ExplorationManager:
             coverage_ratio = 0.0
         if coverage_ratio >= self.visual_coverage_threshold:
             return []
-        candidates = self.visibility_tracker.coverage_candidates(
+        selector = getattr(self.visibility_tracker, "coverage_candidates", None)
+        if not callable(selector):
+            return []
+        candidates = selector(
             map_msg,
             robot_pose,
             self._visited,
@@ -1338,6 +1188,180 @@ class ExplorationManager:
             + self.open_space_heading_weight * (1.0 - complexity)
         )
 
+    @staticmethod
+    def _exploration_source(candidate: dict) -> str:
+        if candidate.get("lidar_candidate"):
+            return "lidar"
+        if candidate.get("coverage_candidate"):
+            return "coverage"
+        return "frontier"
+
+    def _unknown_sample_stats(self, candidate: dict, map_msg) -> tuple:
+        """Return unknown cells and the exact clipped disk population."""
+
+        try:
+            provided_unknown = max(
+                0.0, float(candidate.get("adjacent_unknown_count", 0.0)))
+        except (TypeError, ValueError, OverflowError):
+            provided_unknown = 0.0
+        for key in ("adjacent_support_count", "unknown_support_count"):
+            try:
+                value = int(candidate.get(key, 0))
+            except (TypeError, ValueError, OverflowError):
+                value = 0
+            if value > 0:
+                return provided_unknown, value
+        try:
+            width = int(map_msg.info.width)
+            height = int(map_msg.info.height)
+            resolution = float(map_msg.info.resolution)
+            center_row, center_col = (
+                int(value) for value in candidate["center_cell"])
+            data = map_msg.data
+        except (AttributeError, KeyError, TypeError, ValueError,
+                OverflowError):
+            width = height = 0
+            resolution = 0.0
+            center_row = center_col = 0
+            data = None
+        geometry_available = (
+            width > 0 and height > 0
+            and math.isfinite(resolution) and resolution > 0.0
+            and 0 <= center_row < height and 0 <= center_col < width
+            and data is not None and len(data) >= width * height
+        )
+        if not geometry_available:
+            resolution = resolution if resolution > 0.0 else 1.0
+        radius_cells = self.frontier_spacing_m / resolution
+        radius_limit = int(math.ceil(radius_cells))
+        radius_sq = radius_cells * radius_cells
+        if geometry_available:
+            cells = [
+                int(data[row * width + col])
+                for row in range(
+                    max(0, center_row - radius_limit),
+                    min(height, center_row + radius_limit + 1))
+                for col in range(
+                    max(0, center_col - radius_limit),
+                    min(width, center_col + radius_limit + 1))
+                if ((row - center_row) ** 2 + (col - center_col) ** 2
+                    <= radius_sq + 1e-9)
+            ]
+            support_count = max(1, len(cells))
+            unknown_count = (
+                provided_unknown
+                if "adjacent_unknown_count" in candidate
+                else (
+                    float(sum(1 for value in cells if value < 0))
+                    if "touches_map_edge" in candidate else 0.0
+                )
+            )
+            return unknown_count, support_count
+        support_count = max(1, sum(
+            1
+            for row in range(-radius_limit, radius_limit + 1)
+            for col in range(-radius_limit, radius_limit + 1)
+            if row * row + col * col <= radius_sq + 1e-9
+        ))
+        return provided_unknown, support_count
+
+    def _annotate_exploration_candidate(
+            self, source: dict, robot_pose, map_msg) -> dict:
+        candidate = dict(source)
+        exploration_source = self._exploration_source(candidate)
+        unknown_count, support_count = self._unknown_sample_stats(
+            candidate, map_msg)
+        if exploration_source != "frontier":
+            unknown_count = 0.0
+        unknown_gain = min(1.0, unknown_count / float(support_count))
+        try:
+            wall_bonus = float(candidate.get(
+                "wall_proximity_bonus",
+                1.0 if int(candidate.get("adjacent_wall_count", 0)) >= 2
+                else 0.0,
+            ))
+        except (TypeError, ValueError, OverflowError):
+            wall_bonus = 0.0
+        wall_bonus = max(0.0, wall_bonus)
+        path_cost = self._path_cost_for_utility(candidate, robot_pose)
+        try:
+            heading_change = abs(float(candidate.get("heading_change", 0.0)))
+        except (TypeError, ValueError, OverflowError):
+            heading_change = 0.0
+        eta_s = (
+            path_cost / max(self.max_vel_x, 1e-6)
+            + heading_change / max(self.max_vel_theta, 1e-6)
+        )
+        candidate.update({
+            "exploration_source": exploration_source,
+            "adjacent_support_count": support_count,
+            "adjacent_unknown_count": unknown_count,
+            "unknown_gain": unknown_gain,
+            "wall_proximity_bonus": wall_bonus,
+            "eta_s": eta_s,
+            "eta_band": int(math.floor(eta_s / self.unknown_eta_band_s)),
+        })
+        return candidate
+
+    @staticmethod
+    def _exploration_priority_tier(candidate: dict) -> tuple:
+        source_rank = {"frontier": 0, "coverage": 1, "lidar": 2}
+        source = str(candidate.get("exploration_source", "frontier"))
+        unknown_gain = max(0.0, float(candidate.get("unknown_gain", 0.0)))
+        return (
+            source_rank.get(source, 3),
+            0 if unknown_gain > 1e-9 else 1,
+            int(candidate.get("eta_band", 0)),
+            -unknown_gain,
+        )
+
+    def _rank_exploration_candidates(
+            self, candidates: list, robot_pose, map_msg) -> list:
+        """Apply source, unknown, bounded-ETA, then utility ordering."""
+
+        annotated = [
+            self._annotate_exploration_candidate(item, robot_pose, map_msg)
+            for item in candidates
+        ]
+
+        def rank_key(candidate):
+            if self.utility_mode == "mixed":
+                utility_key = self._mixed_utility_sort_key(
+                    candidate, robot_pose)[0]
+                return (
+                    self._exploration_priority_tier(candidate),
+                    -float(candidate.get("wall_proximity_bonus", 0.0)),
+                    utility_key,
+                    float(candidate.get("eta_s", 0.0)),
+                    float(candidate.get("x", 0.0)),
+                    float(candidate.get("y", 0.0)),
+                )
+            # Preserve historical nearest-mode motion inside the explicit
+            # source/unknown tier. Wall affinity is a mixed-mode tie-breaker.
+            if candidate.get("exploration_source") != "frontier":
+                return (
+                    self._exploration_priority_tier(candidate),
+                    -float(candidate.get("score", 0.0)),
+                    float(candidate.get("eta_s", 0.0)),
+                    float(candidate.get("x", 0.0)),
+                    float(candidate.get("y", 0.0)),
+                )
+            try:
+                visual_gain = float(candidate.get("visual_gain", 0.0))
+            except (TypeError, ValueError, OverflowError):
+                visual_gain = 0.0
+            return (
+                self._exploration_priority_tier(candidate),
+                0 if visual_gain > 1e-9 else 1,
+                float(candidate.get("eta_s", 0.0)),
+                -float(candidate.get("score", 0.0)),
+                float(candidate.get("x", 0.0)),
+                float(candidate.get("y", 0.0)),
+            )
+
+        annotated.sort(key=rank_key)
+        return annotated
+
     def _mixed_utility_sort_key(self, candidate: dict, robot_pose) -> tuple:
         """v3: α·size + β·visual_gain + δ·wall − k_time·(t_travel+t_turn).
 
@@ -1363,7 +1387,7 @@ class ExplorationManager:
             wall_bonus = 0.0
         try:
             expansion_potential = float(candidate.get(
-                "adjacent_unknown_count", 0.0))
+                "unknown_gain", candidate.get("adjacent_unknown_count", 0.0)))
         except (TypeError, ValueError, OverflowError):
             expansion_potential = 0.0
         path_cost = self._path_cost_for_utility(candidate, robot_pose)
@@ -1477,93 +1501,298 @@ class ExplorationManager:
             pass
         return self._distance_from_pose(candidate, robot_pose)
 
-    def _parallel_probe_first_approaches(
-            self, eligible: list, robot_pose, budget: int):
-        """Concurrently probe the first approach of each eligible candidate.
+    def _probe_validation_reason(
+            self, result: dict, approach: dict, robot_pose) -> Optional[str]:
+        if not result.get("ok"):
+            return str(result.get("reason") or "unreachable")
+        if not self._path_respects_room(result):
+            return "path_leaves_room_polygon"
+        if not self._path_makes_progress(result):
+            return "degenerate_plan"
+        if not self._path_endpoint_reaches_goal(result):
+            return "plan_endpoint_mismatch"
+        if not self._path_detour_is_safe(result, approach, robot_pose):
+            return "excessive_plan_detour"
+        return None
 
-        Opt-in fast path (2026-07-20) used when ``parallel_probe_workers`` > 0
-        and at least two candidates are eligible. Submits one
-        ``compute_path_to_pose`` per candidate to a ThreadPoolExecutor, then
-        walks results in submission order so the highest-priority reachable
-        candidate wins — matching the serial loop's first-reachable-wins rule.
+    def _chosen_from_probe(self, approach: dict, result: dict) -> dict:
+        chosen = dict(approach)
+        chosen["path_length"] = float(
+            result.get("path_length", approach.get("distance", 0.0)))
+        chosen["path_poses"] = int(result.get("poses", 0) or 0)
+        if result.get("goal_error_m") is not None:
+            chosen["goal_error_m"] = float(result["goal_error_m"])
+        chosen["score"] = score_frontier(
+            chosen,
+            path_length=chosen["path_length"],
+            heading_change=chosen.get("heading_change", 0.0),
+            failure_count=chosen.get("failure_count", 0),
+            distance_weight=self.distance_weight,
+            heading_weight=self._effective_heading_weight(chosen),
+            failure_penalty=self.failure_penalty,
+        ) + float(chosen.get("lidar_progress_bonus", 0.0))
+        return chosen
 
-        Returns ``(chosen_or_None, probes_used)``. The caller falls through
-        to the serial loop when ``chosen`` is None so per-candidate standoff
-        fallbacks still run for hard-to-reach frontiers.
-        """
-        import concurrent.futures
+    @staticmethod
+    def _physical_probe_key(
+            approach: dict, frame_id: str = "map") -> tuple:
+        """Quantize one physical pose so equivalent probes can share work."""
 
-        candidates_to_probe: list = []
-        first_approaches: list = []
-        for candidate in eligible:
-            if len(candidates_to_probe) >= budget:
-                break
-            approaches = self._candidate_approaches(candidate, robot_pose)
-            approaches = [
-                approach for approach in approaches
-                if not self._approach_revisits_viewpoint(approach)
-            ]
-            if not approaches:
-                continue
-            candidates_to_probe.append(candidate)
-            first_approaches.append(approaches[0])
-        if not candidates_to_probe:
-            return None, 0
+        position_scale = 1000.0
+        orientation_scale = 1000.0
+        yaw = float(approach["yaw"])
+        return (
+            str(frame_id),
+            int(round(float(approach["x"]) * position_scale)),
+            int(round(float(approach["y"]) * position_scale)),
+            int(round(math.cos(yaw) * orientation_scale)),
+            int(round(math.sin(yaw) * orientation_scale)),
+        )
 
-        workers = max(1, min(
-            int(self.parallel_probe_workers), len(candidates_to_probe)))
+    def _safe_compute_path(self, approach: dict) -> dict:
+        """Convert planner exceptions into ordinary rejected-probe evidence."""
 
-        def _probe(index):
-            approach = first_approaches[index]
-            result = self.navigation_port.compute_path_to_pose(
+        try:
+            return self.navigation_port.compute_path_to_pose(
                 approach["x"], approach["y"], approach["yaw"],
                 frame_id="map", timeout=self.planning_timeout_s)
-            return index, result
+        except Exception as exc:
+            logger.warning(
+                "exploration planner probe failed x=%s y=%s: %s",
+                approach.get("x"), approach.get("y"), exc,
+            )
+            return {
+                "ok": False,
+                "reason": "planner_error",
+                "error": str(exc),
+            }
 
-        results_in_order: list = [None] * len(candidates_to_probe)
-        probes_used = 0
+    def _parallel_probe_first_approaches(
+            self, eligible: list, robot_pose, budget: int):
+        """Return ordered first-approach evidence without selecting a goal."""
+
+        import concurrent.futures
+
+        evidence = []
+        batch_limit = max(0, min(
+            int(budget), int(self.parallel_probe_workers)))
+        for index, candidate in enumerate(eligible):
+            approaches = [
+                approach
+                for approach in self._candidate_approaches(
+                    candidate, robot_pose)
+                if not self._approach_revisits_viewpoint(approach)
+            ]
+            entry = {
+                "candidate_index": index,
+                "candidate": candidate,
+                "approaches": approaches,
+                "first_result": None,
+                "validation_reason": None,
+                "first_probed": False,
+                "first_probe_key": None,
+            }
+            if approaches:
+                entry["first_probe_key"] = self._physical_probe_key(
+                    approaches[0])
+            evidence.append(entry)
+
+        # Speculate only when the remaining budget can still exhaust every
+        # approach of all earlier candidates.  Otherwise a lower candidate's
+        # first probe could consume the exact call the serial path needs for a
+        # higher candidate's second/third standoff.
+        submitted_by_key = {}
+        reserved_ordered_continuations = 0
+        accepting_new_keys = True
+        for entry in evidence:
+            approaches = entry["approaches"]
+            if not approaches:
+                continue
+            key = entry["first_probe_key"]
+            if key in submitted_by_key:
+                reserved_ordered_continuations += max(
+                    0, len(approaches) - 1)
+                continue
+            projected_calls = (
+                len(submitted_by_key) + 1
+                + reserved_ordered_continuations)
+            if (not accepting_new_keys
+                    or len(submitted_by_key) >= batch_limit
+                    or projected_calls > int(budget)):
+                accepting_new_keys = False
+                continue
+            submitted_by_key[key] = entry
+            reserved_ordered_continuations += max(
+                0, len(approaches) - 1)
+
+        for entry in evidence:
+            entry["first_probed"] = (
+                entry["first_probe_key"] in submitted_by_key)
+
+        submitted = list(submitted_by_key.items())
+
+        if not submitted:
+            return evidence, 0
+
+        workers = max(1, min(
+            int(self.parallel_probe_workers), len(submitted)))
+
+        def probe(key, entry):
+            approach = entry["approaches"][0]
+            return key, self._safe_compute_path(approach)
+
+        results = {}
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=workers) as pool:
             futures = {
-                pool.submit(_probe, i): i
-                for i in range(len(candidates_to_probe))
+                pool.submit(probe, key, entry): key
+                for key, entry in submitted
             }
             for future in concurrent.futures.as_completed(futures):
-                probes_used += 1
-                index, result = future.result()
-                results_in_order[index] = result
+                key = futures[future]
+                try:
+                    _returned_key, result = future.result()
+                except Exception as exc:
+                    logger.warning(
+                        "exploration planner worker failed key=%s: %s",
+                        key, exc,
+                    )
+                    result = {
+                        "ok": False,
+                        "reason": "planner_error",
+                        "error": str(exc),
+                    }
+                results[key] = result
 
-        chosen = None
-        for index, result in enumerate(results_in_order):
-            if result is None:
+        for entry in evidence:
+            if not entry["first_probed"]:
                 continue
-            approach = first_approaches[index]
-            ok = (
-                result.get("ok")
-                and self._path_respects_room(result)
-                and self._path_makes_progress(result)
-                and self._path_detour_is_safe(result, approach, robot_pose)
-                and self._path_endpoint_reaches_goal(result))
-            if not ok:
+            result = results[entry["first_probe_key"]]
+            entry["first_result"] = result
+            entry["validation_reason"] = self._probe_validation_reason(
+                result, entry["approaches"][0], robot_pose)
+        return evidence, len(submitted)
+
+    def _eligible_candidates(self, candidates, robot_pose, map_msg):
+        ranked = self._rank_exploration_candidates(
+            candidates, robot_pose, map_msg)
+        eligible = [
+            candidate for candidate in ranked
+            if self._spatial_failure_count(candidate)
+            < self.max_failures_per_cell
+            and self._distance_from_pose(candidate, robot_pose)
+            >= self.min_goal_distance_m
+        ]
+        if not eligible:
+            eligible = [
+                candidate for candidate in ranked
+                if self._spatial_failure_count(candidate)
+                < self.max_failures_per_cell
+                and any(
+                    self._distance_from_pose(approach, robot_pose)
+                    >= self.min_goal_distance_m
+                    for approach in self._candidate_approaches(
+                        candidate, robot_pose)
+                )
+            ]
+        if not eligible:
+            return []
+        eligible = self._prioritize_active_tile(eligible, robot_pose)
+        eligible = self._rank_exploration_candidates(
+            eligible, robot_pose, map_msg)
+        if (self._consecutive_nav_failures >= self._escape_abort_threshold
+                and self._escape_min_distance_m > 0.0
+                and len(eligible) > 1):
+            best_tier = self._exploration_priority_tier(eligible[0])
+            tier_candidates = [
+                item for item in eligible
+                if self._exploration_priority_tier(item) == best_tier
+            ]
+            tier_candidates.sort(
+                key=lambda candidate: self._distance_from_pose(
+                    candidate, robot_pose),
+                reverse=True,
+            )
+            eligible = tier_candidates + [
+                item for item in eligible
+                if self._exploration_priority_tier(item) != best_tier
+            ]
+            self._last_selection_reason = "escape_trap_pending"
+        return eligible
+
+    def _probe_ordered_candidates(
+            self, eligible, robot_pose, budget: int, *,
+            allow_parallel: bool = True):
+        """Probe one source tier, preserving serial candidate semantics."""
+
+        budget = max(0, int(budget))
+        evidence = []
+        probes_used = 0
+        batch_used = False
+        if (allow_parallel and self.parallel_probe_workers > 0
+                and len(eligible) > 1):
+            evidence, probes_used = self._parallel_probe_first_approaches(
+                eligible, robot_pose, budget)
+            self._plan_probes += probes_used
+            batch_used = probes_used > 0
+        evidence_by_index = {
+            item["candidate_index"]: item for item in evidence
+        }
+
+        for index, candidate in enumerate(eligible):
+            entry = evidence_by_index.get(index)
+            if entry is None:
+                approaches = [
+                    approach
+                    for approach in self._candidate_approaches(
+                        candidate, robot_pose)
+                    if not self._approach_revisits_viewpoint(approach)
+                ]
+            else:
+                approaches = entry["approaches"]
+            if not approaches:
+                self._record_failure(
+                    candidate, "revisited_viewpoint", "plan")
                 continue
-            chosen_approach = dict(approach)
-            chosen_approach["path_length"] = float(
-                result.get("path_length", approach.get("distance", 0.0)))
-            chosen_approach["path_poses"] = int(result.get("poses", 0) or 0)
-            if result.get("goal_error_m") is not None:
-                chosen_approach["goal_error_m"] = float(result["goal_error_m"])
-            chosen_approach["score"] = score_frontier(
-                chosen_approach,
-                path_length=chosen_approach["path_length"],
-                heading_change=chosen_approach.get("heading_change", 0.0),
-                failure_count=chosen_approach.get("failure_count", 0),
-                distance_weight=self.distance_weight,
-                heading_weight=self._effective_heading_weight(chosen_approach),
-                failure_penalty=self.failure_penalty,
-            ) + float(chosen_approach.get("lidar_progress_bonus", 0.0))
-            if chosen is None:
-                chosen = chosen_approach
-        return chosen, probes_used
+
+            last_reason = "unreachable"
+            next_approach = 0
+            if entry is not None and entry["first_probed"]:
+                next_approach = 1
+                last_reason = str(
+                    entry["validation_reason"] or "unreachable")
+                if entry["validation_reason"] is None:
+                    return (
+                        self._chosen_from_probe(
+                            approaches[0], entry["first_result"]),
+                        probes_used,
+                        False,
+                        batch_used,
+                    )
+
+            attempts_complete = True
+            for approach in approaches[next_approach:]:
+                if probes_used >= budget:
+                    attempts_complete = False
+                    break
+                result = self._safe_compute_path(approach)
+                probes_used += 1
+                self._plan_probes += 1
+                reason = self._probe_validation_reason(
+                    result, approach, robot_pose)
+                if reason is not None:
+                    last_reason = reason
+                    continue
+                return (
+                    self._chosen_from_probe(approach, result),
+                    probes_used,
+                    False,
+                    batch_used,
+                )
+            if not attempts_complete:
+                return None, probes_used, True, batch_used
+            self._record_failure(candidate, last_reason, "plan")
+        return None, probes_used, False, batch_used
 
     def detect_room_enclosure(self, map_msg, robot_pose, door_radius_m: float = 2.5,
                               min_wall_ratio: float = 0.8) -> bool:
