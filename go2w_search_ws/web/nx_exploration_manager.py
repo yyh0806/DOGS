@@ -1592,7 +1592,7 @@ class ExplorationManager:
             return False
         try:
             clusters = find_frontier_clusters(
-                map_msg, robot_pose, [], min_cluster_size=3,
+                map_msg, robot_pose, [], min_cluster_size=int(os.environ.get("GO2W_FRONTIER_MIN_CLUSTER_SIZE", "1")),
                 revisit_radius=0.0, frontier_spacing_m=self.frontier_spacing_m)
         except Exception:
             return False
