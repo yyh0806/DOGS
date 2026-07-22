@@ -1532,7 +1532,8 @@ class RoomSearchOrchestrator:
                         self._positive_float(
                             params.get("navigation_progress_interval"), 0.1),
                         self._positive_float(
-                            params.get("goal_revalidation_interval"), 1.0),
+                            os.environ.get("GO2W_FRONTIER_GOAL_REVALIDATION_INTERVAL",
+                            params.get("goal_revalidation_interval", 3.0)), 3.0),
                     ),
                     kwargs={
                         "mission_id": mission_id,
