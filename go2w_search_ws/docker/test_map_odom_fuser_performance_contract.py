@@ -533,6 +533,26 @@ def test_dwb_rejects_trajectories_using_the_full_rectangular_footprint():
     assert "ObstacleFootprint.scale: 0.02" in controller
 
 
+def test_dwb_disables_expensive_per_trajectory_diagnostics_in_production():
+    params = (ROOT / "src/go2w_nav/config/nav2_params_3d.yaml").read_text(
+        encoding="utf-8"
+    )
+    controller = params.split("controller_server:", 1)[1].split(
+        "local_costmap:", 1
+    )[0]
+
+    assert re.search(
+        r"^\s+debug_trajectory_details:\s*false\s*(?:#.*)?$",
+        controller,
+        re.M,
+    )
+    assert re.search(
+        r"^\s+publish_evaluation:\s*false\s*(?:#.*)?$",
+        controller,
+        re.M,
+    )
+
+
 def test_global_planner_hard_radius_allows_an_0_8m_passage():
     """Global planning admits 0.8 m gaps; local DWB keeps the full body gate."""
     params = (ROOT / "src/go2w_nav/config/nav2_params_3d.yaml").read_text(

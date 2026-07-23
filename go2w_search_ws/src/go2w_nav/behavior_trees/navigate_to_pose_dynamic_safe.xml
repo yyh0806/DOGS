@@ -4,12 +4,12 @@
   Go2W wheel-mode turns have a measured translational creep, so generic Nav2
   Spin/BackUp recovery actions are unsafe here. A transient planner failure is
   handled only by clearing the global costmap, holding zero for 1 s, and
-  retrying a bounded number of times. The 2 Hz planning branch refreshes the
+  retrying once. The 2 Hz planning branch refreshes the
   path after /scan_mid360 changes the global obstacle layer.
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="4" name="BoundedPlanningRefresh">
+    <RecoveryNode number_of_retries="1" name="BoundedPlanningRefresh">
       <PipelineSequence name="NavigateWithSafeDynamicReplanning">
         <RateController hz="2.0">
           <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>

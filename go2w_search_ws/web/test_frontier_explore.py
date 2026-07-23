@@ -1103,6 +1103,95 @@ def test_frontier_explore_checks_time_budget_before_planning(monkeypatch):
     assert task.result["completion_reason"] == "time_budget_exhausted"
 
 
+def test_frontier_explore_reports_motion_trap_without_submitting_nav_goal(
+        monkeypatch):
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(
+        orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+
+    class BlockedVisibilityTracker:
+        def __init__(self, **_kwargs):
+            pass
+
+        def observe(self, map_msg, _robot_pose, _scan_snapshot):
+            return self.snapshot(map_msg)
+
+        def rank_candidates(self, _map_msg, _robot_pose, candidates):
+            output = []
+            for source in candidates:
+                candidate = dict(source)
+                candidate.update({
+                    "visual_gain": 1.0,
+                    "adaptive_step_m": 0.0,
+                    "path_blocked": True,
+                    "scene_complexity": 1.0,
+                    "forward_clearance_m": 0.45,
+                    "path_clearance_m": 0.45,
+                    "current_adaptive_step_m": 0.0,
+                    "current_path_blocked": True,
+                    "current_forward_clearance_m": 0.45,
+                    "turn_clearance_m": 0.50,
+                    "turn_motion_blocked": True,
+                    "heading_change": math.pi / 2.0,
+                })
+                output.append(candidate)
+            return output
+
+        def coverage_candidates(
+                self, _map_msg, _robot_pose, _visited, *, limit=32):
+            del limit
+            return []
+
+        def lidar_candidates(self, _robot_pose, _visited, *, limit=16):
+            del limit
+            return []
+
+        def snapshot(self, _map_msg=None):
+            return {
+                "observed_cells": [],
+                "visual_coverage_ratio": 0.0,
+                "coverage_cell_size_m": 0.5,
+                "visual_range_m": 8.0,
+                "scan_usable": True,
+                "forward_clearance_m": 0.45,
+                "scene_complexity": 1.0,
+                "adaptive_step_m": 0.0,
+                "path_blocked": True,
+                "turn_clearance_m": 0.50,
+                "turn_motion_blocked": True,
+            }
+
+    monkeypatch.setattr(
+        orch_module, "VisibilityCoverageTracker", BlockedVisibilityTracker)
+    monkeypatch.setattr(
+        orch_module, "select_frontier_candidates",
+        lambda *_a, **_k: [{
+            "x": 0.2, "y": 2.0, "yaw": math.pi / 2.0,
+            "size": 10, "information_gain": 10.0,
+            "center_cell": (4, 0), "distance": 1.8,
+            "prefer_standoff": True,
+        }])
+    task = FakeTask()
+    task.params.update({
+        "room": "__current__",
+        "exclude_entrance_rear": False,
+        "stable_exhaustion_cycles": 1,
+    })
+    nav = FakeNav()
+    orchestrator = make_orchestrator([], nav)
+
+    orchestrator.run(task)
+
+    assert task.status == "failed"
+    assert task.result["reason"] == "motion_trapped"
+    assert task.result["completion_reason"] == "motion_trapped"
+    assert task.result["completion_status"] == "incomplete"
+    assert task.result["motion_trap"]["turn_clearance_m"] == pytest.approx(0.50)
+    assert nav.plan_calls == []
+    assert nav.calls == []
+
+
 def test_frontier_explore_plan_probe_cap_is_per_cycle_not_mission(monkeypatch):
     if not _ensure_person_deps():
         pytest.skip("frontier deps not importable")
@@ -1229,7 +1318,9 @@ def test_large_room_defaults_do_not_stop_at_fifteen_waypoints(monkeypatch):
     def candidates(_map, _pose, visited, **_kwargs):
         if len(visited) >= 16:
             return []
-        x = float(len(visited) + 1)
+        # Keep synthetic frontiers outside the 1 m revisit radius even
+        # when a LiDAR-safe lookahead deliberately passes the boundary.
+        x = float((len(visited) + 1) * 2)
         return [{
             "x": x, "y": 0.0, "yaw": 0.0, "size": 4,
             "center_cell": (0, int(x)), "distance": 1.0,

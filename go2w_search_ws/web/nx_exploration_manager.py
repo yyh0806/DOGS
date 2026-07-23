@@ -94,6 +94,7 @@ class ExplorationManager:
         frontier_lookahead_goal_m: float = 1.2,
         initial_turn_staging_threshold_rad: float = math.radians(75.0),
         initial_turn_staging_distance_m: float = 0.8,
+        local_turn_threshold_rad: float = 0.2,
         min_path_progress_m: float = 0.25,
         max_goal_endpoint_error_m: float = 0.05,
         goal_revalidation_failures: int = 2,
@@ -141,6 +142,8 @@ class ExplorationManager:
         # max_plan_probes × planning_timeout_s (e.g. 12×3s=36s) to a single
         # planning_timeout_s round (~3s) when many candidates are reachable.
         parallel_probe_workers: int = 0,
+        candidate_analysis_limit: int = 24,
+        yaw_optimization_candidate_limit: int = 12,
     ) -> None:
         normalized_mode = str(mode).strip().lower()
         if normalized_mode not in self.MODES:
@@ -223,6 +226,8 @@ class ExplorationManager:
             self.min_goal_distance_m,
             float(initial_turn_staging_distance_m),
         )
+        self.local_turn_threshold_rad = min(
+            math.pi, max(0.0, float(local_turn_threshold_rad)))
         self.min_path_progress_m = max(0.0, float(min_path_progress_m))
         self.max_goal_endpoint_error_m = max(
             0.0, float(max_goal_endpoint_error_m))
@@ -275,6 +280,7 @@ class ExplorationManager:
         self._last_selection_reason: Optional[str] = None
         self._last_selected_metrics: dict = {}
         self._navigation_start_distance: Optional[float] = None
+        self._navigation_start_pose: Optional[tuple[float, float, float]] = None
         self._navigation_divergence_count = 0
         self._goal_revalidation_failure_count = 0
         self._visibility_snapshot: dict = {}
@@ -285,6 +291,13 @@ class ExplorationManager:
         self._consecutive_nav_failures = 0
         self._escape_abort_threshold = max(1, int(3))
         self._escape_min_distance_m = max(0.0, float(3.0))
+        self._motion_trap: dict = {}
+        self._raw_candidate_count = 0
+        self._analyzed_candidate_count = 0
+        self._failure_filtered_candidate_count = 0
+        self._yaw_optimized_candidate_count = 0
+        self._candidate_analysis_ms = 0.0
+        self._yaw_optimization_ms = 0.0
         # worker thread writing while the main planning/broadcast thread
         # reads via snapshot()/_effective_heading_weight(). The visibility
         # tracker's own RLock protects _observed; this lock is the
@@ -323,6 +336,21 @@ class ExplorationManager:
         except (TypeError, ValueError):
             env_workers = 0
         self.parallel_probe_workers = max(0, int(env_workers))
+        try:
+            env_analysis_limit = int(os.environ.get(
+                "GO2W_FRONTIER_ANALYSIS_LIMIT",
+                str(candidate_analysis_limit)))
+        except (TypeError, ValueError):
+            env_analysis_limit = candidate_analysis_limit
+        self.candidate_analysis_limit = max(1, int(env_analysis_limit))
+        try:
+            env_yaw_limit = int(os.environ.get(
+                "GO2W_FRONTIER_YAW_CANDIDATE_LIMIT",
+                str(yaw_optimization_candidate_limit)))
+        except (TypeError, ValueError):
+            env_yaw_limit = yaw_optimization_candidate_limit
+        self.yaw_optimization_candidate_limit = max(
+            1, min(self.candidate_analysis_limit, int(env_yaw_limit)))
 
     def budget_status(self, *, battery_percent: Optional[float] = None) -> Optional[str]:
         if self._monotonic() - self._started_at >= self.max_time_s:
@@ -341,6 +369,7 @@ class ExplorationManager:
         return None
 
     def choose_next(self, map_msg, robot_pose) -> Optional[dict]:
+        self._motion_trap = {}
         budget_reason = self.budget_status()
         if budget_reason is not None:
             self._clear_selected_goal()
@@ -361,6 +390,15 @@ class ExplorationManager:
             candidate_selector, map_msg, robot_pose)
         candidates = self._optimize_yaw_for_candidates(
             candidates, robot_pose, map_msg)
+        if (
+            not candidates
+            and self._failure_filtered_candidate_count > 0
+            and self._can_expand_radius()
+        ):
+            self._clear_selected_goal()
+            self._expand_radius()
+            self._last_selection_reason = "search_boundary_expanded"
+            return None
         while self._can_expand_radius():
             truncated = getattr(self, "_last_radius_truncated", 0)
             if candidates and truncated == 0:
@@ -397,6 +435,11 @@ class ExplorationManager:
             eligible = self._eligible_candidates(
                 tier_candidates, robot_pose, map_msg)
             if not eligible:
+                if self._motion_trap:
+                    self._clear_selected_goal()
+                    self._exhaustion_streak = 0
+                    self._last_selection_reason = "motion_trapped"
+                    return None
                 if source == "frontier" and self._can_expand_radius():
                     self._clear_selected_goal()
                     self._expand_radius()
@@ -438,6 +481,8 @@ class ExplorationManager:
         self._last_exhaustion_revision = None
         self._navigation_start_distance = self._distance_from_pose(
             self._current_goal, robot_pose)
+        self._navigation_start_pose = tuple(
+            float(value) for value in robot_pose[:3])
         self._navigation_divergence_count = 0
         self._goal_revalidation_failure_count = 0
         self._last_selection_reason = None
@@ -514,13 +559,42 @@ class ExplorationManager:
         self._clear_selected_goal()
         self._reset_navigation_progress()
 
-    def mark_navigation_failed(self, reason: str, candidate: Optional[dict] = None) -> None:
+    def mark_navigation_failed(
+            self, reason: str, candidate: Optional[dict] = None,
+            robot_pose=None) -> Optional[str]:
         target = dict(candidate or self._current_goal or {})
+        normalized_reason = str(reason or "navigation_failed")
+        start_pose = self._navigation_start_pose
+        visibility = self._visibility_snapshot_snapshot()
+        motion_trapped = False
+        if (
+                normalized_reason in {
+                    "nav2_aborted", "controller_abort", "controller_failed"}
+                and start_pose is not None
+                and robot_pose is not None):
+            try:
+                progress = math.hypot(
+                    float(robot_pose[0]) - float(start_pose[0]),
+                    float(robot_pose[1]) - float(start_pose[1]),
+                )
+            except (TypeError, ValueError, IndexError, OverflowError):
+                progress = math.inf
+            motion_trapped = (
+                progress < 0.10
+                and bool(visibility.get("path_blocked"))
+                and bool(visibility.get("turn_motion_blocked"))
+            )
         if target:
-            self._record_failure(target, str(reason or "navigation_failed"), "navigation")
+            self._record_failure(target, normalized_reason, "navigation")
         self._consecutive_nav_failures += 1
         self._clear_selected_goal()
         self._reset_navigation_progress()
+        if motion_trapped:
+            self._motion_trap = self._motion_trap_evidence(
+                target, visibility, reason="nav2_zero_progress")
+            self._last_selection_reason = "motion_trapped"
+            return "motion_trapped"
+        return None
 
     def observe_navigation_pose(self, robot_pose) -> dict:
         """Fail closed after repeated motion materially away from the goal."""
@@ -624,6 +698,7 @@ class ExplorationManager:
                 self.initial_turn_staging_threshold_rad),
             "initial_turn_staging_distance_m": (
                 self.initial_turn_staging_distance_m),
+            "local_turn_threshold_rad": self.local_turn_threshold_rad,
             "min_path_progress_m": self.min_path_progress_m,
             "max_goal_endpoint_error_m": self.max_goal_endpoint_error_m,
             "goal_revalidation_failures": self.goal_revalidation_failures,
@@ -649,6 +724,17 @@ class ExplorationManager:
             "mixed_visual_gain_weight": self.mixed_visual_gain_weight,
             "mixed_path_cost_penalty": self.mixed_path_cost_penalty,
             "parallel_probe_workers": self.parallel_probe_workers,
+            "candidate_analysis_limit": self.candidate_analysis_limit,
+            "yaw_optimization_candidate_limit": (
+                self.yaw_optimization_candidate_limit),
+            "raw_candidate_count": self._raw_candidate_count,
+            "analyzed_candidate_count": self._analyzed_candidate_count,
+            "failure_filtered_candidate_count": (
+                self._failure_filtered_candidate_count),
+            "yaw_optimized_candidate_count": (
+                self._yaw_optimized_candidate_count),
+            "candidate_analysis_ms": round(self._candidate_analysis_ms, 3),
+            "yaw_optimization_ms": round(self._yaw_optimization_ms, 3),
             "mixed_heading_penalty": self.mixed_heading_penalty,
             "mixed_wall_bonus": self.mixed_wall_bonus,
             "mixed_expansion_bonus": self.mixed_expansion_bonus,
@@ -668,6 +754,7 @@ class ExplorationManager:
             "plan_rejections": self._plan_rejections,
             "navigation_failures": self._navigation_failures,
             "last_selection_reason": self._last_selection_reason,
+            "motion_trap": dict(self._motion_trap),
             "selected_candidate_metrics": dict(self._last_selected_metrics),
             "elapsed_s": max(0.0, self._monotonic() - self._started_at),
         }
@@ -805,6 +892,43 @@ class ExplorationManager:
             adaptive_step = 0.0
             scene_complexity = 1.0
             path_clearance = 0.0
+        path_blocked = bool(candidate.get("path_blocked", False))
+        current_path_blocked = bool(
+            candidate.get("current_path_blocked", False))
+        turn_motion_blocked = bool(
+            candidate.get("turn_motion_blocked", False))
+        try:
+            current_adaptive_step = float(candidate.get(
+                "current_adaptive_step_m", adaptive_step))
+        except (TypeError, ValueError, OverflowError):
+            current_adaptive_step = 0.0
+        if (
+                turn_motion_blocked
+                and heading_change > self.local_turn_threshold_rad + 1e-9):
+            if (
+                    current_path_blocked
+                    or not math.isfinite(current_adaptive_step)
+                    or current_adaptive_step + 1e-9 < self.min_goal_distance_m):
+                return []
+            staging_distance = min(
+                self.initial_turn_staging_distance_m,
+                current_adaptive_step,
+            )
+            staging = dict(candidate)
+            staging.update({
+                "x": robot_x + staging_distance * math.cos(robot_yaw),
+                "y": robot_y + staging_distance * math.sin(robot_yaw),
+                "yaw": robot_yaw,
+                "frontier_x": frontier_x,
+                "frontier_y": frontier_y,
+                "heading_change": 0.0,
+                "approach_staging_m": staging_distance,
+                "staging_for_heading_change_rad": heading_change,
+                "staging_reason": "turn_clearance_blocked",
+            })
+            return [staging] if self._approach_within_bounds(staging) else []
+        if path_blocked:
+            return []
         open_lidar_corridor = (
             math.isfinite(adaptive_step)
             and math.isfinite(scene_complexity)
@@ -1018,6 +1142,7 @@ class ExplorationManager:
 
     def _reset_navigation_progress(self) -> None:
         self._navigation_start_distance = None
+        self._navigation_start_pose = None
         self._navigation_divergence_count = 0
         self._goal_revalidation_failure_count = 0
 
@@ -1046,6 +1171,7 @@ class ExplorationManager:
         return not path_crosses_entrance_gate(path, self.entrance_gate)
 
     def _select_candidates(self, candidate_selector, map_msg, robot_pose):
+        started = time.perf_counter()
         selector_kwargs = dict(
             revisit_radius=self.revisit_radius_m,
             origin_pose=self.mission_origin,
@@ -1070,6 +1196,43 @@ class ExplorationManager:
             self._visited,
             **selector_kwargs,
         )
+        candidates = [dict(item) for item in (candidates or [])]
+        self._raw_candidate_count = len(candidates)
+        self._failure_filtered_candidate_count = 0
+        preanalysis_radius_truncated = 0
+        prefiltered = []
+        for item in candidates:
+            if self._active_radius_m is not None and math.hypot(
+                    float(item["x"]) - self.mission_origin[0],
+                    float(item["y"]) - self.mission_origin[1],
+            ) > self._active_radius_m:
+                preanalysis_radius_truncated += 1
+                continue
+            if self.room_polygon and not point_in_polygon(
+                    float(item["x"]), float(item["y"]), self.room_polygon):
+                continue
+            count = self._spatial_failure_count(item)
+            if count >= self.max_failures_per_cell:
+                self._failure_filtered_candidate_count += 1
+                continue
+            item["failure_count"] = int(count)
+            item["score"] = score_frontier(
+                item,
+                path_length=item.get("path_length"),
+                heading_change=item.get("heading_change", 0.0),
+                failure_count=count,
+                distance_weight=self.distance_weight,
+                heading_weight=self._effective_heading_weight(item),
+                failure_penalty=self.failure_penalty,
+            )
+            prefiltered.append(item)
+        prefiltered.sort(key=lambda item: (
+            -float(item.get("score", 0.0)),
+            float(item.get("distance", 0.0)),
+            float(item["x"]), float(item["y"]),
+        ))
+        candidates = prefiltered[:self.candidate_analysis_limit]
+        self._analyzed_candidate_count = len(candidates)
         if self.visibility_tracker is not None:
             candidates = self.visibility_tracker.rank_candidates(
                 map_msg, robot_pose, candidates)
@@ -1118,6 +1281,9 @@ class ExplorationManager:
                 if point_in_polygon(
                     float(item["x"]), float(item["y"]), self.room_polygon)
             ]
+        self._last_radius_truncated += preanalysis_radius_truncated
+        self._candidate_analysis_ms = (
+            time.perf_counter() - started) * 1000.0
         return [dict(item) for item in candidates]
 
     def _select_visual_coverage_candidates(self, map_msg, robot_pose):
@@ -1465,6 +1631,8 @@ class ExplorationManager:
         候选集: robot_yaw + ±k·yaw_step (覆盖全360°含 90/180) + 朝frontier方向.
         不硬排除大角度 — 靠 k_time·t_turn 加权偏好小角度, 前方受阻时 180° 自然胜出.
         """
+        started = time.perf_counter()
+        optimized_count = 0
         try:
             robot_yaw = float(robot_pose[2])
         except (TypeError, IndexError, ValueError):
@@ -1473,11 +1641,12 @@ class ExplorationManager:
             rx = float(robot_pose[0]); ry = float(robot_pose[1])
         except (TypeError, IndexError, ValueError):
             rx = ry = 0.0
-        for cand in candidates:
+        for index, cand in enumerate(candidates):
             awc = int(cand.get("adjacent_wall_count", 0))
             wall_bonus = 1.0 if awc >= 2 else 0.0
             if (self.utility_mode != "mixed"
-                    or self.visibility_tracker is None):
+                    or self.visibility_tracker is None
+                    or index >= self.yaw_optimization_candidate_limit):
                 cand["wall_proximity_bonus"] = wall_bonus
                 continue
             try:
@@ -1519,12 +1688,13 @@ class ExplorationManager:
                 if best is None or key > best[0]:
                     best = (key, yaw, vg, hc)
             if best is not None:
+                optimized_count += 1
                 _, yaw, vg, hc = best
                 cand["yaw"] = yaw
                 cand["visual_gain"] = vg
                 cand["heading_change"] = hc
                 try:
-                    logger.info(
+                    logger.debug(
                         "v3 yaw_opt: x=%.2f y=%.2f size=%.0f awc=%d "
                         "yaw=%.0fdeg vg=%d hc=%.2frad util=%.3f",
                         cx, cy, base_ig, awc,
@@ -1532,6 +1702,18 @@ class ExplorationManager:
                 except Exception:
                     pass
             cand["wall_proximity_bonus"] = wall_bonus
+        self._yaw_optimized_candidate_count = optimized_count
+        self._yaw_optimization_ms = (
+            time.perf_counter() - started) * 1000.0
+        logger.info(
+            "exploration candidate analysis raw=%d analyzed=%d yaw=%d "
+            "analysis_ms=%.1f yaw_ms=%.1f",
+            self._raw_candidate_count,
+            self._analyzed_candidate_count,
+            self._yaw_optimized_candidate_count,
+            self._candidate_analysis_ms,
+            self._yaw_optimization_ms,
+        )
         return candidates
 
     def _path_cost_for_utility(self, candidate: dict, robot_pose) -> float:
@@ -1749,6 +1931,19 @@ class ExplorationManager:
             ]
         if not eligible:
             return []
+        locally_executable = []
+        for candidate in eligible:
+            if self._candidate_approaches(candidate, robot_pose):
+                locally_executable.append(candidate)
+                continue
+            if (
+                    bool(candidate.get("current_path_blocked"))
+                    and bool(candidate.get("turn_motion_blocked"))):
+                self._motion_trap = self._motion_trap_evidence(
+                    candidate, candidate, reason="scan_start_infeasible")
+        eligible = locally_executable
+        if not eligible:
+            return []
         eligible = self._prioritize_active_tile(eligible, robot_pose)
         eligible = self._rank_exploration_candidates(
             eligible, robot_pose, map_msg)
@@ -1771,6 +1966,33 @@ class ExplorationManager:
             ]
             self._last_selection_reason = "escape_trap_pending"
         return eligible
+
+    @staticmethod
+    def _motion_trap_evidence(
+            candidate: dict, evidence: dict, *, reason: str) -> dict:
+        def finite_value(key, default=0.0):
+            try:
+                value = float(evidence.get(key, default))
+            except (TypeError, ValueError, OverflowError):
+                value = float(default)
+            return value if math.isfinite(value) else float(default)
+
+        return {
+            "reason": str(reason),
+            "forward_clearance_m": finite_value(
+                "current_forward_clearance_m",
+                evidence.get("forward_clearance_m", 0.0)),
+            "adaptive_step_m": finite_value(
+                "current_adaptive_step_m",
+                evidence.get("adaptive_step_m", 0.0)),
+            "turn_clearance_m": finite_value("turn_clearance_m"),
+            "path_blocked": bool(evidence.get(
+                "current_path_blocked", evidence.get("path_blocked"))),
+            "turn_motion_blocked": bool(
+                evidence.get("turn_motion_blocked")),
+            "candidate_x": finite_value("x", candidate.get("x", 0.0)),
+            "candidate_y": finite_value("y", candidate.get("y", 0.0)),
+        }
 
     def _probe_ordered_candidates(
             self, eligible, robot_pose, budget: int, *,

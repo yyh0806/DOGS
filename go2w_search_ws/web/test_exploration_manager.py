@@ -66,9 +66,25 @@ class _VisibilityTracker:
     def __init__(
             self, *, adaptive_step_m=6.0, scene_complexity=0.0,
             gains=None, coverage_candidates=None, lidar_candidates=None,
-            coverage_ratio=0.25):
+            coverage_ratio=0.25, path_blocked=False,
+            current_adaptive_step_m=None, current_path_blocked=None,
+            current_forward_clearance_m=None, turn_clearance_m=8.0,
+            turn_motion_blocked=False):
         self.adaptive_step_m = float(adaptive_step_m)
         self.scene_complexity = float(scene_complexity)
+        self.path_blocked = bool(path_blocked)
+        self.current_adaptive_step_m = float(
+            adaptive_step_m if current_adaptive_step_m is None
+            else current_adaptive_step_m)
+        self.current_path_blocked = bool(
+            self.path_blocked if current_path_blocked is None
+            else current_path_blocked)
+        self.current_forward_clearance_m = float(
+            self.current_adaptive_step_m
+            if current_forward_clearance_m is None
+            else current_forward_clearance_m)
+        self.turn_clearance_m = float(turn_clearance_m)
+        self.turn_motion_blocked = bool(turn_motion_blocked)
         self.gains = dict(gains or {})
         self._coverage_candidates = list(coverage_candidates or [])
         self._lidar_candidates = list(lidar_candidates or [])
@@ -90,8 +106,16 @@ class _VisibilityTracker:
                 "visual_gain": gain,
                 "information_gain": gain,
                 "adaptive_step_m": self.adaptive_step_m,
+                "path_blocked": self.path_blocked,
                 "scene_complexity": self.scene_complexity,
                 "forward_clearance_m": self.adaptive_step_m,
+                "path_clearance_m": self.adaptive_step_m,
+                "current_adaptive_step_m": self.current_adaptive_step_m,
+                "current_path_blocked": self.current_path_blocked,
+                "current_forward_clearance_m": (
+                    self.current_forward_clearance_m),
+                "turn_clearance_m": self.turn_clearance_m,
+                "turn_motion_blocked": self.turn_motion_blocked,
                 "heading_change": abs(math.atan2(
                     math.sin(float(candidate["yaw"]) - float(robot_pose[2])),
                     math.cos(float(candidate["yaw"]) - float(robot_pose[2])),
@@ -117,6 +141,9 @@ class _VisibilityTracker:
             "forward_clearance_m": self.adaptive_step_m,
             "scene_complexity": self.scene_complexity,
             "adaptive_step_m": self.adaptive_step_m,
+            "path_blocked": self.current_path_blocked,
+            "turn_clearance_m": self.turn_clearance_m,
+            "turn_motion_blocked": self.turn_motion_blocked,
         }
 
 
@@ -337,6 +364,117 @@ def test_parallel_probe_env_override_enables_it(monkeypatch):
         reject_map_edge=False,
     )
     assert manager.parallel_probe_workers == 2
+
+
+class _CountingVisibilityTracker(_VisibilityTracker):
+    def __init__(self):
+        super().__init__(
+            adaptive_step_m=6.0,
+            scene_complexity=0.0,
+            coverage_ratio=1.0,
+        )
+        self.rank_inputs = []
+        self.visual_gain_calls = 0
+
+    def rank_candidates(self, _map_msg, robot_pose, candidates):
+        sources = [dict(item) for item in candidates]
+        self.rank_inputs.append([float(item["x"]) for item in sources])
+        ranked = []
+        for candidate in sources:
+            candidate.update({
+                "base_information_gain": float(candidate["information_gain"]),
+                "visual_gain": 1.0,
+                "adaptive_step_m": 6.0,
+                "path_blocked": False,
+                "scene_complexity": 0.0,
+                "forward_clearance_m": 8.0,
+                "path_clearance_m": 8.0,
+                "current_adaptive_step_m": 6.0,
+                "current_path_blocked": False,
+                "current_forward_clearance_m": 8.0,
+                "turn_clearance_m": 8.0,
+                "turn_motion_blocked": False,
+                "heading_change": abs(math.atan2(
+                    math.sin(float(candidate["yaw"]) - float(robot_pose[2])),
+                    math.cos(float(candidate["yaw"]) - float(robot_pose[2])),
+                )),
+            })
+            ranked.append(candidate)
+        return ranked
+
+    def visual_gain_at(self, _map_msg, _x, _y, _yaw):
+        self.visual_gain_calls += 1
+        return 1
+
+
+def _many_frontier_candidates(count):
+    return [
+        {
+            "x": float(index + 1),
+            "y": 0.0,
+            "yaw": 0.0,
+            "size": count - index,
+            "center_cell": (0, index + 1),
+            "distance": float(index + 1),
+            "information_gain": float(count - index),
+            "score": float(count - index),
+            "prefer_standoff": True,
+        }
+        for index in range(count)
+    ]
+
+
+def test_candidate_analysis_and_yaw_optimization_are_bounded_for_98_frontiers():
+    tracker = _CountingVisibilityTracker()
+    candidates = _many_frontier_candidates(98)
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(c) for c in candidates],
+        reject_map_edge=False,
+        utility_mode="mixed",
+        candidate_analysis_limit=24,
+        yaw_optimization_candidate_limit=12,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert len(tracker.rank_inputs) == 1
+    assert len(tracker.rank_inputs[0]) == 24
+    assert tracker.visual_gain_calls <= 12 * 9
+    snapshot = manager.snapshot()
+    assert snapshot["raw_candidate_count"] == 98
+    assert snapshot["analyzed_candidate_count"] == 24
+    assert snapshot["yaw_optimized_candidate_count"] == 12
+    assert snapshot["candidate_analysis_ms"] >= 0.0
+    assert snapshot["yaw_optimization_ms"] >= 0.0
+
+
+def test_candidate_analysis_limit_rotates_past_spatially_failed_leaders():
+    tracker = _CountingVisibilityTracker()
+    candidates = _many_frontier_candidates(10)
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="whole_floor",
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(c) for c in candidates],
+        reject_map_edge=False,
+        max_failures_per_cell=1,
+        candidate_analysis_limit=4,
+        yaw_optimization_candidate_limit=2,
+    )
+    manager._record_failure(candidates[0], "blocked", "plan")
+    manager._record_failure(candidates[1], "blocked", "plan")
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert tracker.rank_inputs == [[3.0, 4.0, 5.0, 6.0]]
+    assert selected["x"] >= 3.0
 
 
 def test_plan_endpoint_must_reach_candidate_instead_of_stopping_beside_obstacle():
@@ -1441,6 +1579,126 @@ def test_open_lidar_corridor_skips_short_turn_staging_for_long_lookahead():
     assert selected["x"] == pytest.approx(-6.0)
     assert selected["approach_lidar_lookahead_m"] == pytest.approx(4.8)
     assert "approach_staging_m" not in selected
+
+
+def test_locally_blocked_start_reports_motion_trapped_without_nav2_probe():
+    tracker = _VisibilityTracker(
+        adaptive_step_m=0.0,
+        path_blocked=True,
+        current_adaptive_step_m=0.0,
+        current_path_blocked=True,
+        current_forward_clearance_m=0.45,
+        turn_clearance_m=0.50,
+        turn_motion_blocked=True,
+        gains={0.0: 20.0},
+    )
+    frontier = {
+        "x": 0.0, "y": 4.0, "yaw": math.pi / 2.0, "size": 20,
+        "center_cell": (4, 0), "distance": 4.0,
+        "information_gain": 20.0, "score": 20.0,
+        "prefer_standoff": True,
+    }
+    nav = _PlannerPort()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=12.0,
+        initial_radius_m=12.0,
+        tile_size_m=20.0,
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is None
+    assert nav.probes == []
+    snapshot = manager.snapshot()
+    assert snapshot["last_selection_reason"] == "motion_trapped"
+    assert snapshot["motion_trap"]["turn_clearance_m"] == pytest.approx(0.50)
+    assert snapshot["motion_trap"]["forward_clearance_m"] == pytest.approx(0.45)
+
+
+def test_blocked_turn_uses_one_clearance_capped_straight_staging_probe():
+    tracker = _VisibilityTracker(
+        adaptive_step_m=4.0,
+        path_blocked=False,
+        current_adaptive_step_m=0.60,
+        current_path_blocked=False,
+        current_forward_clearance_m=1.20,
+        turn_clearance_m=0.50,
+        turn_motion_blocked=True,
+        gains={0.0: 20.0},
+    )
+    frontier = {
+        "x": 0.0, "y": 4.0, "yaw": math.pi / 2.0, "size": 20,
+        "center_cell": (4, 0), "distance": 4.0,
+        "information_gain": 20.0, "score": 20.0,
+        "prefer_standoff": True,
+    }
+    nav = _PlannerPort()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=12.0,
+        initial_radius_m=12.0,
+        tile_size_m=20.0,
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(0.60)
+    assert selected["y"] == pytest.approx(0.0)
+    assert selected["yaw"] == pytest.approx(0.0)
+    assert selected["approach_staging_m"] == pytest.approx(0.60)
+    assert [probe[:3] for probe in nav.probes] == pytest.approx([
+        (0.60, 0.0, 0.0),
+    ])
+
+
+def test_first_zero_progress_nav2_abort_becomes_motion_trapped():
+    tracker = _VisibilityTracker(
+        adaptive_step_m=4.0,
+        gains={4.0: 20.0},
+    )
+    frontier = {
+        "x": 4.0, "y": 0.0, "yaw": 0.0, "size": 20,
+        "center_cell": (0, 4), "distance": 4.0,
+        "information_gain": 20.0, "score": 20.0,
+        "prefer_standoff": True,
+    }
+    manager = ExplorationManager(
+        navigation_port=_PlannerPort(),
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=12.0,
+        initial_radius_m=12.0,
+        tile_size_m=20.0,
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    assert selected is not None
+    tracker.current_path_blocked = True
+    tracker.current_adaptive_step_m = 0.0
+    tracker.current_forward_clearance_m = 0.45
+    tracker.turn_clearance_m = 0.50
+    tracker.turn_motion_blocked = True
+    manager.observe_environment(_two_room_map(), (0.0, 0.0, 0.0), None)
+
+    reason = manager.mark_navigation_failed(
+        "nav2_aborted", selected, robot_pose=(0.0, 0.0, 0.0))
+
+    assert reason == "motion_trapped"
+    assert manager.snapshot()["last_selection_reason"] == "motion_trapped"
 
 
 def test_visual_gain_prioritizes_unobserved_viewpoint():

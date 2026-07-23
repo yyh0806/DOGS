@@ -1619,7 +1619,14 @@ class RoomSearchOrchestrator:
                     # _fail+return, 导致搜索死于首个不可达 frontier.
                     pf_reason = str(progress_failure.get("reason") or
                                     "goal_became_unreachable")
-                    exploration.mark_navigation_failed(pf_reason, target)
+                    failure_outcome = exploration.mark_navigation_failed(
+                        pf_reason,
+                        target,
+                        robot_pose=self._get_live_robot_pose() or robot_pose,
+                    )
+                    if failure_outcome == "motion_trapped":
+                        completion_reason = "motion_trapped"
+                        break
                     self._phase("FRONTIER_DETECT", progress=progress,
                                 room="__frontier__", current_wp=iteration,
                                 total_wp=max_frontiers,
@@ -1635,7 +1642,14 @@ class RoomSearchOrchestrator:
                         task.status = "failed"
                         task.result = {"reason": reason, "raw": result}
                         return
-                    exploration.mark_navigation_failed(reason, target)
+                    failure_outcome = exploration.mark_navigation_failed(
+                        reason,
+                        target,
+                        robot_pose=self._get_live_robot_pose() or robot_pose,
+                    )
+                    if failure_outcome == "motion_trapped":
+                        completion_reason = "motion_trapped"
+                        break
                     self._phase("FRONTIER_DETECT", progress=progress,
                                 room="__frontier__", current_wp=iteration,
                                 total_wp=max_frontiers,
@@ -1824,6 +1838,7 @@ class RoomSearchOrchestrator:
                     "scene_complexity"),
                 "adaptive_step_m": visibility_state.get(
                     "adaptive_step_m"),
+                "motion_trap": exploration_state.get("motion_trap", {}),
                 "exploration_state": exploration_state,
                 "entrance_gate": exploration_state.get("entrance_gate"),
                 "global_search": global_search_state,
@@ -1874,7 +1889,10 @@ class RoomSearchOrchestrator:
                 return
             if completion_reason not in (
                     "reachable_frontiers_exhausted", "room_enclosed"):
-                reason = "exploration_incomplete"
+                reason = (
+                    "motion_trapped"
+                    if completion_reason == "motion_trapped"
+                    else "exploration_incomplete")
                 self._fail(
                     reason,
                     room="__frontier__",
@@ -1929,6 +1947,7 @@ class RoomSearchOrchestrator:
             "traversable_opening_blocked",
             "global_coverage_incomplete",
             "global_evidence_unverified",
+            "motion_trapped",
         }
         if completion_reason in budget_reasons:
             return "incomplete"

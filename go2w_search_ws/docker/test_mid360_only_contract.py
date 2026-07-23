@@ -307,7 +307,7 @@ def test_point_navigation_planning_failure_cannot_trigger_motion_recovery():
     assert '<RateController hz="2.0">' in tree
     assert "<ComputePathToPose" in tree
     assert "<FollowPath" in tree
-    assert '<RecoveryNode number_of_retries="4"' in tree
+    assert '<RecoveryNode number_of_retries="1"' in tree
     assert "global_costmap/clear_entirely_global_costmap" in tree
     assert '<Wait wait_duration="1"' in tree
     for unsafe_motion_recovery in ("<Spin", "<BackUp", "<DriveOnHeading"):

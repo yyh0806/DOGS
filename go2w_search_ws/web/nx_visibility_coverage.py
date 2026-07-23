@@ -144,6 +144,8 @@ class VisibilityCoverageTracker:
         visual_gain_weight: float = 0.35,
         path_corridor_half_width_m: float = 0.45,
         obstacle_standoff_m: float = 0.6,
+        minimum_motion_step_m: float = 0.35,
+        turn_swept_radius_m: float = 0.57,
     ) -> None:
         self.camera_hfov_rad = min(
             2.0 * math.pi, max(math.radians(5.0), float(camera_hfov_rad)))
@@ -160,6 +162,10 @@ class VisibilityCoverageTracker:
         self.path_corridor_half_width_m = max(
             0.1, float(path_corridor_half_width_m))
         self.obstacle_standoff_m = max(0.0, float(obstacle_standoff_m))
+        self.minimum_motion_step_m = max(
+            0.05, float(minimum_motion_step_m))
+        self.turn_swept_radius_m = max(
+            self.minimum_motion_step_m, float(turn_swept_radius_m))
         self._observed: set[tuple[int, int]] = set()
         # RLock (not Lock) because observe() calls self.snapshot() internally.
         # The lock lets the en-route / progress helper threads call observe()
@@ -213,9 +219,20 @@ class VisibilityCoverageTracker:
                     "information_gain": (
                         base_gain + visual_gain * self.visual_gain_weight),
                     "adaptive_step_m": path_profile["adaptive_step_m"],
+                    "path_blocked": path_profile["path_blocked"],
                     "scene_complexity": path_profile["scene_complexity"],
                     "forward_clearance_m": path_profile["forward_clearance_m"],
                     "path_clearance_m": path_profile["forward_clearance_m"],
+                    "current_adaptive_step_m": self._last_profile[
+                        "adaptive_step_m"],
+                    "current_path_blocked": self._last_profile[
+                        "path_blocked"],
+                    "current_forward_clearance_m": self._last_profile[
+                        "forward_clearance_m"],
+                    "turn_clearance_m": self._last_profile[
+                        "turn_clearance_m"],
+                    "turn_motion_blocked": self._last_profile[
+                        "turn_motion_blocked"],
                     "heading_change": abs(_angle_delta(candidate_pose[2], pose[2])),
                 })
                 result.append(candidate)
@@ -610,6 +627,7 @@ class VisibilityCoverageTracker:
         if not ranges or increment <= 0.0:
             return self._conservative_profile()
         clearance = range_max
+        turn_clearance = range_max
         corridor_samples = 0
         corridor_hits = 0
         hit_tolerance = max(0.05, range_max * 0.01)
@@ -617,12 +635,13 @@ class VisibilityCoverageTracker:
             angle = angle_min + increment * index
             delta = _angle_delta(angle, relative_bearing)
             cosine = math.cos(delta)
-            if cosine <= 0.0:
-                continue
             value = _finite(raw, range_max)
             if value < range_min:
                 continue
             value = min(range_max, value)
+            turn_clearance = min(turn_clearance, value)
+            if cosine <= 0.0:
+                continue
             forward = value * cosine
             lateral = abs(value * math.sin(delta))
             if lateral > self.path_corridor_half_width_m:
@@ -636,20 +655,31 @@ class VisibilityCoverageTracker:
         complexity = min(1.0, corridor_hits / float(corridor_samples))
         usable_clearance = max(0.0, clearance - self.obstacle_standoff_m)
         step = usable_clearance * (1.0 - 0.25 * complexity)
-        step = min(self.max_step_m, max(self.min_step_m, step))
+        path_blocked = (
+            usable_clearance + 1e-9 < self.minimum_motion_step_m
+            or step + 1e-9 < self.minimum_motion_step_m
+        )
+        step = 0.0 if path_blocked else min(self.max_step_m, step)
         return {
             "scan_usable": True,
             "forward_clearance_m": round(clearance, 3),
             "scene_complexity": round(complexity, 4),
             "adaptive_step_m": round(step, 3),
+            "path_blocked": path_blocked,
+            "turn_clearance_m": round(turn_clearance, 3),
+            "turn_motion_blocked": (
+                turn_clearance + 1e-9 < self.turn_swept_radius_m),
         }
 
     def _conservative_profile(self) -> dict:
         return {
             "scan_usable": False,
-            "forward_clearance_m": self.min_step_m,
+            "forward_clearance_m": 0.0,
             "scene_complexity": 1.0,
-            "adaptive_step_m": self.min_step_m,
+            "adaptive_step_m": 0.0,
+            "path_blocked": True,
+            "turn_clearance_m": 0.0,
+            "turn_motion_blocked": True,
         }
 
     def _bucket(self, x: float, y: float) -> tuple[int, int]:

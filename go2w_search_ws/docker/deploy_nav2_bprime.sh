@@ -137,7 +137,7 @@ echo "[5/7] Verify installed bytes and primary-mode markers"
     install/go2w_nav/share/go2w_nav/config/nav2_params_3d.yaml
   grep -F -q '<RateController hz="2.0">' \
     install/go2w_nav/share/go2w_nav/behavior_trees/navigate_to_pose_dynamic_safe.xml
-  grep -F -q '<RecoveryNode number_of_retries="4"' \
+  grep -F -q '<RecoveryNode number_of_retries="1"' \
     install/go2w_nav/share/go2w_nav/behavior_trees/navigate_to_pose_dynamic_safe.xml
   grep -F -q '<Wait wait_duration="1"/>' \
     install/go2w_nav/share/go2w_nav/behavior_trees/navigate_to_pose_dynamic_safe.xml

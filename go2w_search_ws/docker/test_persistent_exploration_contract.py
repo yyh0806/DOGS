@@ -117,7 +117,10 @@ def test_nav2_periodically_replans_and_retries_without_motion_recovery():
     assert tags.count("FollowPath") == 1
     assert "PipelineSequence" in tags
     assert len(recoveries) == 1
-    assert int(recoveries[0].attrib["number_of_retries"]) >= 3
+    # One bounded refresh is enough to absorb a transient costmap update.
+    # Longer retry loops leave the robot stationary for several seconds when
+    # every DWB trajectory is physically invalid.
+    assert int(recoveries[0].attrib["number_of_retries"]) == 1
     assert len(clears) == 1
     assert clears[0].attrib["service_name"] == (
         "global_costmap/clear_entirely_global_costmap"
@@ -139,6 +142,7 @@ def test_nav2_periodically_replans_and_retries_without_motion_recovery():
 def test_nav2_through_poses_navigator_uses_wait_only_recovery_tree():
     tree = ET.parse(SAFE_THROUGH_POSES_BT).getroot()
     tags = [node.tag for node in tree.iter()]
+    recoveries = [node for node in tree.iter() if node.tag == "RecoveryNode"]
     launch = (ROOT / "src/go2w_nav/launch/nav2_3d.launch.py").read_text(
         encoding="utf-8"
     )
@@ -147,6 +151,8 @@ def test_nav2_through_poses_navigator_uses_wait_only_recovery_tree():
     assert tags.count("ComputePathThroughPoses") == 1
     assert tags.count("FollowPath") == 1
     assert tags.count("Wait") == 1
+    assert len(recoveries) == 1
+    assert int(recoveries[0].attrib["number_of_retries"]) == 1
     for unsafe_motion_recovery in ("Spin", "BackUp", "DriveOnHeading"):
         assert unsafe_motion_recovery not in tags
     assert "navigate_through_poses_dynamic_safe.xml" in launch

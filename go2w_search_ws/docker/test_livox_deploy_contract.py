@@ -186,7 +186,7 @@ def test_nav2_deploy_verifies_payload_and_documents_persistent_owner():
     assert "cmp -s src/go2w_nav/config/nav2_params_3d.yaml" in script
     assert "cmp -s src/go2w_nav/launch/nav2_3d.launch.py" in script
     assert "cmp -s src/go2w_nav/behavior_trees/navigate_to_pose_dynamic_safe.xml" in script
-    assert '<RecoveryNode number_of_retries="4"' in script
+    assert '<RecoveryNode number_of_retries="1"' in script
     assert '<Wait wait_duration="1"/>' in script
     assert "cmp -s /tmp/bprime/map_padding_bridge.py map_padding_bridge.py" in script
     assert "--check-margin 0.5" in script

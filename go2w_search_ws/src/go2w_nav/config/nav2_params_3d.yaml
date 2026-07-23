@@ -120,7 +120,10 @@ controller_server:
       simulate_ahead_time: 2.0
       rotate_to_goal_heading: false
       closed_loop: true
-      debug_trajectory_details: true    # 2026-07-18 重开 debug: DWB No valid 复发(local costmap 0障碍却 No valid 820), 查哪个 critic 拒
+      # Root cause is now captured by the ObstacleFootprint critic contract;
+      # keep per-trajectory diagnostics off during normal exploration.
+      debug_trajectory_details: false
+      publish_evaluation: false
       # Go2W 差速起步 (全向模式: max_vel_y=0.3, vy_samples=10)
       # nx_motion_node clamps autonomous reverse to zero. DWB must therefore
       # sample the same forward-only model that reaches the robot.

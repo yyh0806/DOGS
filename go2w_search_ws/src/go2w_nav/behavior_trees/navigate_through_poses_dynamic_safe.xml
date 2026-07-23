@@ -4,11 +4,11 @@
   The stock Humble NavigateThroughPoses tree requires Spin and BackUp during
   bt_navigator activation. Go2W wheel-mode turns can creep translationally, so
   failures are handled only by clearing the global costmap, holding zero for
-  one second, and retrying a bounded number of times.
+  one second, and retrying once.
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="4" name="BoundedThroughPosesRefresh">
+    <RecoveryNode number_of_retries="1" name="BoundedThroughPosesRefresh">
       <PipelineSequence name="NavigateThroughPosesWithSafeDynamicReplanning">
         <RateController hz="2.0">
           <ReactiveSequence>

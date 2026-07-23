@@ -195,6 +195,51 @@ def test_candidate_step_stops_before_obstacle_inside_lidar_corridor():
     assert ranked[0]["adaptive_step_m"] <= 1.5
 
 
+def test_close_obstacle_marks_path_blocked_instead_of_forcing_one_meter_step():
+    scan = _scan(12.0)
+    center = len(scan["ranges"]) // 2
+    for index in range(center - 3, center + 4):
+        scan["ranges"][index] = 0.45
+
+    snapshot = _tracker().observe(
+        _grid(width=20, height=12),
+        (2.5, 5.5, 0.0),
+        scan,
+    )
+
+    assert snapshot["scan_usable"] is True
+    assert snapshot["forward_clearance_m"] == pytest.approx(0.45, abs=0.02)
+    assert snapshot["adaptive_step_m"] == 0.0
+    assert snapshot["path_blocked"] is True
+    assert snapshot["turn_clearance_m"] == pytest.approx(0.45, abs=0.02)
+    assert snapshot["turn_motion_blocked"] is True
+
+
+def test_ranked_candidate_carries_current_and_turn_clearance_evidence():
+    scan = _scan(12.0)
+    center = len(scan["ranges"]) // 2
+    for index in range(center - 3, center + 4):
+        scan["ranges"][index] = 0.45
+    tracker = _tracker()
+    grid = _grid(width=20, height=12)
+    pose = (2.5, 5.5, 0.0)
+    tracker.observe(grid, pose, scan)
+
+    ranked = tracker.rank_candidates(grid, pose, [{
+        "x": 2.5, "y": 9.5, "yaw": math.pi / 2.0, "size": 10,
+        "information_gain": 10.0, "distance": 4.0,
+        "center_cell": (9, 2),
+    }])
+
+    candidate = ranked[0]
+    assert candidate["current_path_blocked"] is True
+    assert candidate["current_adaptive_step_m"] == 0.0
+    assert candidate["current_forward_clearance_m"] == pytest.approx(
+        0.45, abs=0.02)
+    assert candidate["turn_clearance_m"] == pytest.approx(0.45, abs=0.02)
+    assert candidate["turn_motion_blocked"] is True
+
+
 def test_visual_gain_excludes_already_observed_cells():
     grid = _grid(width=14, height=10)
     candidate = {
@@ -264,9 +309,11 @@ def test_coverage_candidates_do_not_miss_a_narrow_offset_free_corridor():
         min_step_m=1.0,
         max_step_m=4.0,
     )
+    pose = (0.525, 0.525, 0.0)
+    tracker.observe(grid, pose, _scan(2.0, range_max=2.0))
 
     candidates = tracker.coverage_candidates(
-        grid, (0.525, 0.525, 0.0), [], limit=8)
+        grid, pose, [], limit=8)
 
     assert candidates
     assert all(0.35 <= candidate["y"] <= 0.9 for candidate in candidates)
@@ -280,7 +327,9 @@ def test_invalid_or_stale_scan_falls_back_to_conservative_step():
     )
 
     assert snapshot["scan_usable"] is False
-    assert snapshot["adaptive_step_m"] == pytest.approx(1.0)
+    assert snapshot["adaptive_step_m"] == 0.0
+    assert snapshot["path_blocked"] is True
+    assert snapshot["turn_motion_blocked"] is True
 
 
 def test_snapshot_publishes_exact_camera_calibration_and_current_visible_cells():
