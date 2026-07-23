@@ -395,6 +395,24 @@ def test_validate_voice_command_still_accepts_search():
     assert result["task"]["type"] == "search_room"
 
 
+@pytest.mark.parametrize(("utterance", "task_type", "amount"), [
+    ("搜索 全 屋", "search_room", None),
+    ("探索房间", "search_room", None),
+    ("扭个头", "move_relative", 90.0),
+    ("转身", "move_relative", 180.0),
+    ("回头", "move_relative", 180.0),
+])
+def test_validate_voice_command_accepts_common_semantic_variants(
+        utterance, task_type, amount):
+    module = load_voice_console()
+    result = module.validate_voice_command(utterance)
+
+    assert result["ok"] is True
+    assert result["task"]["type"] == task_type
+    if amount is not None:
+        assert result["task"]["params"]["angle_deg"] == amount
+
+
 def test_dedupe_distinguishes_move_distances():
     """前进两米 vs 前进一米 不同 fingerprint, 不互相压制."""
     module = load_voice_console()
@@ -420,6 +438,8 @@ def test_dispatcher_normalizes_unknown_paraphrase_and_sends_admitted_command():
     assert result["ok"] is True
     assert result["original_text"] == "帮我找一下椅子并标出来"
     assert result["normalized_text"] == canonical
+    assert result["normalizer_attempted"] is True
+    assert result["normalizer_status"] == "admitted"
     assert sent == [("http://nx/api/command", canonical)]
     assert normalizer_calls == ["帮我找一下椅子并标出来"]
 
@@ -437,7 +457,39 @@ def test_dispatcher_never_sends_invalid_normalizer_output():
     assert result["reason"] == "unsupported_voice_command"
     assert result["original_text"] == "把系统清理一下"
     assert result["normalized_text"] == "执行系统命令"
+    assert result["normalizer_attempted"] is True
+    assert result["normalizer_status"] == "rejected_by_safety_gate"
     assert sent == []
+
+
+def test_dispatcher_reports_when_llm_fallback_returns_no_proposal():
+    module = load_voice_console()
+    dispatcher = module.SearchCommandDispatcher(
+        normalizer=lambda _text: None,
+        normalizer_mode="fallback",
+    )
+
+    result = dispatcher.admit("模型不认识的说法")
+
+    assert result["ok"] is False
+    assert result["normalizer_attempted"] is True
+    assert result["normalizer_status"] == "no_proposal"
+    assert module.normalizer_feedback(result) == "兜底已调用，但未返回可用规范指令"
+
+
+def test_deterministic_command_reports_that_llm_fallback_was_not_needed():
+    module = load_voice_console()
+    dispatcher = module.SearchCommandDispatcher(
+        normalizer=lambda _text: pytest.fail("deterministic command called LLM"),
+        normalizer_mode="fallback",
+    )
+
+    result = dispatcher.admit("搜索 全 屋")
+
+    assert result["ok"] is True
+    assert result["normalizer_attempted"] is False
+    assert result["normalizer_status"] == "not_needed"
+    assert module.normalizer_feedback(result) is None
 
 
 @pytest.mark.parametrize("proposal", [

@@ -16,6 +16,7 @@ from nx_mission_schema import SearchMissionRequest
 _CURRENT_ROOM = "__current__"
 
 _CURRENT_ROOM_TERMS = (
+    "全屋",
     "整个房间",
     "这个房间",
     "当前房间",
@@ -38,6 +39,7 @@ _NEGATION_TERMS = (
 
 _SEARCH_TERMS = (
     "搜索",
+    "探索",
     "搜寻",
     "搜",
     "寻找",
@@ -145,7 +147,7 @@ _GO_TERMS_RE = r"(?:去|到)"
 _ROOM_SUFFIX_RE = r"(?:里|里面|内|中)?"
 _ROOM_PERSON_SEPARATOR_RE = r"(?:里|里面|内|中|的)*"
 _REQUIRED_ROOM_PERSON_SEPARATOR_RE = r"(?:里|里面|内|中|的)"
-_SEARCH_TERMS_RE = r"(?:搜索|搜寻|寻找|查找|搜|找)"
+_SEARCH_TERMS_RE = r"(?:搜索|探索|搜寻|寻找|查找|搜|找)"
 _PERSON_TARGET_RE = r"(?:所有人员|全部人员|所有人|全部人|人员|人)"
 _PERSON_TARGET_FOLLOW_RE = r"(?=$|一下$|一遍$|吧$|吗$|并?(?:标注|标记|标出来|标出|圈出))"
 _TARGET_FOLLOW_RE = _PERSON_TARGET_FOLLOW_RE
@@ -170,6 +172,12 @@ _BARE_CURRENT_ROOM_FOLLOW_RE = (
     rf"{_ROOM_PERSON_SEPARATOR_RE}(?=$|"
     rf"{_terms_re(_MARK_TERMS)}|{_terms_re(_BARE_CURRENT_ROOM_TARGET_TERMS)})"
 )
+_BARE_FRONTIER_SEARCH_COMMANDS = tuple(
+    f"{verb}{area}{suffix}"
+    for verb in ("搜索", "探索", "搜寻")
+    for area in ("房间", "整个房间", "这个房间", "当前房间", "整间房", "全屋")
+    for suffix in ("", "一下", "一遍")
+)
 
 # 运动指令触发词 (spec §1.1): 用完整词避免"搜索前面房间"误触发前进
 _MOVE_FORWARD_TERMS = ("前进", "向前走", "往前走", "直走")
@@ -181,6 +189,13 @@ _MOVE_LEFT_TERMS = (
 _MOVE_RIGHT_TERMS = (
     "右转", "向右转", "右转弯", "往右转",
     "向右扭头", "往右扭头", "右扭头",
+)
+_BARE_HEAD_TURN_TERMS = (
+    "扭头", "扭个头", "扭头一下", "扭个头一下",
+)
+_BARE_TURN_AROUND_TERMS = (
+    "转身", "转个身", "回头", "掉头", "转过身",
+    "转身一下", "转个身一下", "回头一下", "掉头一下",
 )
 
 _MOVE_DEFAULT_DISTANCE_M = 1.0
@@ -207,8 +222,9 @@ def parse_product_command(text: str) -> dict | None:
     if move is not None:
         return _move_command_result(move)
 
-    # 省略目标时，"搜索房间"按产品约定默认搜索并标注人。
-    if normalized == "搜索房间":
+    # 省略目标时，房间/全屋的搜索或探索都启动同一套全局 frontier
+    # 算法，并按产品约定默认搜索、标注人。
+    if normalized in _BARE_FRONTIER_SEARCH_COMMANDS:
         return _command_result(_CURRENT_ROOM)
 
     if not _contains_any(normalized, _CURRENT_ROOM_EXPLICIT_TERMS):
@@ -538,8 +554,9 @@ def _detect_move_direction(text: str) -> str | None:
         return "left"
     if _contains_any(text, _MOVE_RIGHT_TERMS):
         return "right"
-    # 没有方向的"扭头"按产品约定让整只狗默认左转 90°。
-    if text == "扭头":
+    # 没有方向的"扭头"让整只狗默认左转 90°；"转身/回头/掉头"
+    # 表示原地改变朝向，默认左转 180°。
+    if text in _BARE_HEAD_TURN_TERMS or text in _BARE_TURN_AROUND_TERMS:
         return "left"
     return None
 
@@ -561,7 +578,11 @@ def _parse_move_command(text: str) -> dict | None:
             clamped = True
         return {"mode": "linear", "direction": direction,
                 "distance_m": amount, "clamped": clamped}
-    amount = _extract_amount(text, ("度", "°", "圈")) or _MOVE_DEFAULT_ANGLE_DEG
+    default_angle = (
+        180.0 if text in _BARE_TURN_AROUND_TERMS
+        else _MOVE_DEFAULT_ANGLE_DEG
+    )
+    amount = _extract_amount(text, ("度", "°", "圈")) or default_angle
     return {"mode": "angular", "direction": direction,
             "angle_deg": amount, "clamped": False}
 

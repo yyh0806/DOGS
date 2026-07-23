@@ -419,8 +419,37 @@ def test_bare_search_room_defaults_to_people(utterance):
     assert result["tasks"] == [_expected_task("__current__")]
 
 
+@pytest.mark.parametrize("utterance", (
+    "搜索整个房间",
+    "探索房间",
+    "探索整个房间",
+    "搜索全屋",
+    "探索全屋",
+))
+def test_bare_explore_and_whole_home_phrases_start_frontier_search(utterance):
+    result = parse_product_command(utterance)
+
+    assert result is not None
+    assert result["tasks"] == [_expected_task("__current__")]
+
+
+@pytest.mark.parametrize("utterance", (
+    "探索房间标注所有椅子",
+    "搜索全屋的所有椅子",
+))
+def test_explore_and_whole_home_phrases_preserve_explicit_target(utterance):
+    result = parse_product_command(utterance)
+
+    assert result is not None
+    task = result["tasks"][0]
+    assert task["type"] == "search_room"
+    assert task["params"]["room"] == "__current__"
+    assert task["params"]["target_classes"] == ["chair"]
+
+
 @pytest.mark.parametrize(("utterance", "direction"), [
     ("扭头", "left"),
+    ("扭个头", "left"),
     ("向左扭头", "left"),
     ("往左扭头", "left"),
     ("向右扭头", "right"),
@@ -431,6 +460,22 @@ def test_turn_head_means_turn_the_dog(utterance, direction):
         "mode": "angular",
         "direction": direction,
         "angle_deg": 90.0,
+        "clamped": False,
+    }
+
+
+@pytest.mark.parametrize("utterance", (
+    "转身",
+    "转个身",
+    "回头",
+    "掉头",
+    "转身一下",
+))
+def test_bare_turn_around_phrases_turn_the_dog_180_degrees(utterance):
+    assert _move_task(utterance) == {
+        "mode": "angular",
+        "direction": "left",
+        "angle_deg": 180.0,
         "clamped": False,
     }
 

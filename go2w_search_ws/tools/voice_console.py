@@ -254,10 +254,14 @@ class SearchCommandDispatcher:
 
     @staticmethod
     def _with_admission_metadata(validation: dict, original_text: str,
-                                 normalized_text: str | None) -> dict:
+                                 normalized_text: str | None, *,
+                                 normalizer_attempted: bool,
+                                 normalizer_status: str) -> dict:
         result = dict(validation)
         result["original_text"] = original_text
         result["normalized_text"] = normalized_text
+        result["normalizer_attempted"] = bool(normalizer_attempted)
+        result["normalizer_status"] = str(normalizer_status)
         return result
 
     def admit(self, text: str) -> dict:
@@ -267,13 +271,20 @@ class SearchCommandDispatcher:
 
         if self._normalizer_mode == "off":
             return self._with_admission_metadata(
-                deterministic, original_text, original_text)
+                deterministic, original_text, original_text,
+                normalizer_attempted=False,
+                normalizer_status="disabled")
 
         if self._normalizer_mode == "fallback" and deterministic.get("ok"):
             return self._with_admission_metadata(
-                deterministic, original_text, original_text)
+                deterministic, original_text, original_text,
+                normalizer_attempted=False,
+                normalizer_status="not_needed")
 
         normalized_text = self._normalize(original_text)
+        normalizer_attempted = self._normalizer is not None
+        normalizer_status = (
+            "no_proposal" if normalizer_attempted else "unavailable")
         if self._normalizer_mode == "always" and deterministic.get("ok"):
             metadata_text = original_text
             if normalized_text is not None:
@@ -281,25 +292,38 @@ class SearchCommandDispatcher:
                 if (normalized.get("ok")
                         and normalized.get("fingerprint") == deterministic.get("fingerprint")):
                     metadata_text = normalized["text"]
+                    normalizer_status = "admitted"
+                else:
+                    normalizer_status = "rejected_by_safety_gate"
             return self._with_admission_metadata(
-                deterministic, original_text, metadata_text)
+                deterministic, original_text, metadata_text,
+                normalizer_attempted=normalizer_attempted,
+                normalizer_status=normalizer_status)
 
         if normalized_text is not None:
             normalized = validate_model_proposal(normalized_text)
             if normalized.get("ok"):
                 return self._with_admission_metadata(
-                    normalized, original_text, normalized["text"])
+                    normalized, original_text, normalized["text"],
+                    normalizer_attempted=normalizer_attempted,
+                    normalizer_status="admitted")
             if not deterministic.get("ok"):
                 return self._with_admission_metadata(
-                    normalized, original_text, normalized_text)
+                    normalized, original_text, normalized_text,
+                    normalizer_attempted=normalizer_attempted,
+                    normalizer_status="rejected_by_safety_gate")
 
         # In always mode a known product command remains safe if the local model
         # is unavailable or proposes anything the deterministic parser rejects.
         if deterministic.get("ok"):
             return self._with_admission_metadata(
-                deterministic, original_text, original_text)
+                deterministic, original_text, original_text,
+                normalizer_attempted=normalizer_attempted,
+                normalizer_status=normalizer_status)
         return self._with_admission_metadata(
-            deterministic, original_text, normalized_text)
+            deterministic, original_text, normalized_text,
+            normalizer_attempted=normalizer_attempted,
+            normalizer_status=normalizer_status)
 
     def dispatch(self, api_url: str, text: str) -> dict:
         validation = self.admit(text)
@@ -321,6 +345,8 @@ class SearchCommandDispatcher:
                 "task": validation["task"],
                 "original_text": validation["original_text"],
                 "normalized_text": validation["normalized_text"],
+                "normalizer_attempted": validation["normalizer_attempted"],
+                "normalizer_status": validation["normalizer_status"],
             }
 
         result = dict(self._sender(api_url, validation["text"]) or {})
@@ -328,10 +354,30 @@ class SearchCommandDispatcher:
         result["task"] = validation["task"]
         result["original_text"] = validation["original_text"]
         result["normalized_text"] = validation["normalized_text"]
+        result["normalizer_attempted"] = validation["normalizer_attempted"]
+        result["normalizer_status"] = validation["normalizer_status"]
         if result.get("ok") is True and result.get("accepted") is True:
             self._last_fingerprint = fingerprint
             self._last_accepted_at = now
         return result
+
+
+def normalizer_feedback(result: dict) -> str | None:
+    """Return one concise, user-visible explanation of the LLM fallback."""
+    if not isinstance(result, dict) or not result.get("normalizer_attempted"):
+        return None
+    status = result.get("normalizer_status")
+    if status == "admitted":
+        return f"已归一化为：{result.get('normalized_text') or ''}"
+    if status == "rejected_by_safety_gate":
+        return (
+            "兜底已调用，但输出未通过安全校验："
+            f"{result.get('normalized_text') or '空'}"
+        )
+    if status == "no_proposal":
+        return "兜底已调用，但未返回可用规范指令"
+    return "兜底不可用"
+
 
 # 可选依赖: TTS + WebSocket (缺失则降级, 不阻塞 STT 主功能)
 try:
@@ -770,6 +816,9 @@ def main() -> int:
                         else:
                             result = dispatcher.dispatch(nx_url, text)
                             reason = result.get("reason")
+                            fallback_feedback = normalizer_feedback(result)
+                            if fallback_feedback:
+                                print(f"  [LLM] {fallback_feedback}")
                             if result.get("ok"):
                                 if use_tts:
                                     speak(accepted_acknowledgement(result))

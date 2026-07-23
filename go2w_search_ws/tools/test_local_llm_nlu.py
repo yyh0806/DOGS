@@ -41,6 +41,12 @@ def test_ollama_response_returns_command_and_disables_streaming():
     assert "(0,20]" in prompt
     assert "(0,360]" in prompt
     assert "仅限当前房间" in prompt
+    for semantic_example in (
+        "搜索全屋", "探索房间", "扭头", "转身", "回头",
+        "搜索房间标注所有人", "左转90度", "左转180度",
+    ):
+        assert semantic_example in prompt
+    assert "不得原样输出方括号" in prompt
     for forbidden in ("系统命令", "shell", "坐标", "多个命令", "解释性文字", "工具调用"):
         assert forbidden in prompt
 
