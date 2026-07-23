@@ -50,13 +50,14 @@ def test_core_command_current_room_all_people():
     assert t["params"]["require_photos"] is True      # 拍照
     assert t["params"]["mark_on_map"] is True          # 地图标注
     assert t["params"]["search_strategy"] == "frontier_explore"
-    assert t["params"]["max_radius_m"] == 30.0
-    assert t["params"]["max_time"] == 1800.0
-    assert t["params"]["initial_radius_m"] == 6.0
-    assert t["params"]["radius_step_m"] == 6.0
-    assert t["params"]["tile_size_m"] == 6.0
+    assert t["params"]["max_radius_m"] == 120.0
+    assert t["params"]["max_time"] == 7200.0
+    assert t["params"]["initial_radius_m"] == 16.0
+    assert t["params"]["radius_step_m"] == 16.0
+    assert t["params"]["tile_size_m"] == 16.0
+    assert t["params"]["frontier_spacing_m"] == 1.5
     assert t["params"]["stable_exhaustion_cycles"] == 3
-    assert t["params"]["max_frontiers"] == 200
+    assert t["params"]["max_frontiers"] == 1000
     assert t["params"]["max_plan_probes_per_cycle"] == 12
     assert t["params"]["use_lidar_person_range"] is True
 
@@ -155,8 +156,6 @@ def test_named_room_office():
 # ---- 非房间搜索指令不误判 (严格 VLM 仍会拒绝非搜索任务) ----
 
 NON_ROOM = [
-    "前进两米",
-    "左转90度",
     "停下来",
     "返回起点",
     "",
@@ -165,7 +164,7 @@ NON_ROOM = [
     "跟着前面的人",   # follow 指令, 不是房间搜索
 ]
 
-def test_non_room_commands_return_none():
+def test_unsupported_product_commands_return_none():
     for text in NON_ROOM:
         assert parse_product_command(text) is None, f"非房间搜索指令不应命中: {text!r}"
 

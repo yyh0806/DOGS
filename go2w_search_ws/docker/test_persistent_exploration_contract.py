@@ -49,11 +49,11 @@ def test_online_slam_consumes_the_existing_mid360_scan_once():
         )
 
 
-def test_slam_is_the_only_persistent_frontier_map_source():
+def test_persistent_frontier_map_is_display_only_after_padding():
     bridge = (ROOT / "web/costmap_bridge.py").read_text(encoding="utf-8")
     launch = SLAM_LAUNCH.read_text(encoding="utf-8")
 
-    assert "'/map_frontier'" not in bridge
+    assert "OccupancyGrid, '/map_frontier', self._map_cb" in bridge
     assert "self._frontier_pub" not in bridge
     padding = MAP_PADDING.read_text(encoding="utf-8")
     assert '("map", "/map_frontier_raw")' in launch
@@ -86,16 +86,15 @@ def test_fuser_defaults_to_lio_owned_map_tf_and_keeps_slam_optional():
     assert "self._slam_map_to_odom = _tf_to_mat" in refresh
 
 
-def test_global_costmap_uses_persistent_slam_map_plus_live_obstacles():
+def test_global_costmap_uses_live_obstacles_without_stale_static_authority():
     section = _global_costmap_section()
 
     assert "rolling_window: true" in section
     assert float(re.search(r"^\s+width:\s*([0-9.]+)", section, re.M).group(1)) >= 50
     assert float(re.search(r"^\s+height:\s*([0-9.]+)", section, re.M).group(1)) >= 50
-    assert 'plugins: ["static_layer", "obstacle_layer", "inflation_layer"]' in section
-    assert "static_layer:" in section
-    assert 'map_topic: "/map_frontier"' in section
-    assert "map_subscribe_transient_local: true" in section
+    assert 'plugins: ["obstacle_layer", "inflation_layer"]' in section
+    assert not re.search(r"^\s+static_layer:\s*$", section, re.M)
+    assert not re.search(r"^\s+map_topic:\s*", section, re.M)
     assert "track_unknown_space: true" in section
     assert "topic: /scan_mid360" in section
 

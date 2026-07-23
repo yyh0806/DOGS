@@ -2169,7 +2169,7 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
                 return float(h.get("yaw", yaw0))
 
             def send_cmd(vx, vy, vyaw_v):
-                self.robot.move(vx, vy, vyaw_v, manual=True)
+                self.robot.move(vx, vy, vyaw_v, manual=False)
 
             phase = run_angular_turn(
                 read_yaw, send_cmd, time.sleep, time.monotonic,

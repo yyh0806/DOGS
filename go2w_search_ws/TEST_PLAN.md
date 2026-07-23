@@ -232,3 +232,70 @@ DISCONNECTED
 | 期望 | 狗先停止前进，然后坐下 |
 | 状态转换 | MOVING → SITTING → SEATED |
 | 日志 | `API: sit 入队` → `SITTING: Move(0,0,0) → StopMove → Sit` |
+
+---
+
+## 2026-07-22 语音 / 前端 / 探索 / 视锥联合验收
+
+记录时间：2026-07-22 21:22 +08:00。本节为当前代码树的新鲜证据，不用旧的局部模拟结果替代 NX 实机验收。
+
+### 离线命令与结果
+
+| 门禁 | 命令 | 结果 |
+|---|---|---|
+| Focused Python | `python -m pytest -q web/test_product_command.py web/test_move_executor.py web/test_task_manager_move.py tools/test_local_llm_nlu.py tools/test_voice_console.py web/test_ws_latest.py web/test_visibility_coverage.py web/test_exploration_manager.py web/test_frontier_explore.py web/test_unknown_room_exploration_sim.py docker/test_global_planner_contract.py` | `368 passed in 19.34s` |
+| 地图 JS | `node web/test_map_contract.js` | `map contract tests passed` |
+| Panel JS | `node web/test_panel_nav_state.js` | `panel navigation state tests passed` |
+| 策略仿真 | `python tools/sim_strategy_compare.py` | H1–H9 全部 PASS；选定 `k_time=14.5`；v3 覆盖率 `98.07%`、BFS 路径 `148.25m`、路径转向 `206.67rad`、`67` probes |
+| 行为合同对齐 | `python -m pytest -q web/test_scan_snapshot_contract.py::test_scan_snapshot_stores_laserscan_metadata_timestamp_and_copied_ranges tools/test_locate_anything.py::test_panel_has_locate_overlay_for_boxes_and_explanations web/test_frontier_explore.py::test_send_goal_timeout_uses_configurable_90s_default` | `4 passed in 0.15s` |
+| Verifier TDD | 5 个针对 auth-disabled、MID360 restart order、odom/TF owner、Nav reverse boundary 的用例 | RED `5 failed`；GREEN `5 passed`；相关模块 `83 passed` |
+| Broad | `python -m pytest -q web tools src/go2w_bridge/test docker -k "not test_lidar_topics"` | `1200 passed in 34.18s` |
+| 正式离线发布门禁 | `python tools/verify_release.py` | `architecture: PASS`；`compileall` PASS；`1200 passed in 36.07s`；两套 Node PASS；`offline release gate: PASS` |
+
+本轮对齐的三个陈旧合同：
+
+- 单 frontier 目标不再检查源码字面量 `40.0`；现用真实 `NavigationGateway` 虚拟时钟验证 `GO2W_FRONTIER_NAV_TIMEOUT` 默认 `90.0s`、覆盖值 `12.5s` 生效，且超时实际发送 `navigation_timeout` 取消。
+- scan freshness 已以 `time.monotonic()` 判定，测试同步改为单调时钟，不再用可回跳的墙钟推导 age。
+- Locate WS 框不再直接绘制旧帧，测试锁定 `scheduleLocateOverlay`、`record: true` 和 C13 帧 generation，与 latest-frame 调度一致。
+
+旧基线的 17 个残余失败经逐项核对后均确认为陈旧合同，并按当前权威行为对齐，而不是修改生产参数迎合测试：
+
+- 认证：用户已明确禁用 Token；仍保留 HTTP 先授权决策后读 body 和非通配 CORS 合同，Panel 验证直接 `fetch`。
+- 部署顺序：verifier 解析 `restart_units`，锁定 `livox net → driver → watchdog → go2w-sensor → slam`，不再要求缺少 sensor 的旧字符串。
+- odom/TF：`go2w-sensor` 只发 `/wheel_odom` 且 `publish_odom_tf=false`，`map_odom_fuser` 独占 `/odom` 和 `odom→base_link`。
+- 自主倒车边界：verifier 解析 YAML `min_velocity` 的线速度分量 `0.0`，并锁定 SDK owner=`nav` 时 `max(0.0, velocity[0])`；角速度下限 `-0.5` 不被误判为线性倒车。
+- 地图：持久 SLAM 墙体保持 display-only；Nav 的 50m rolling global costmap 以实时 MID360 obstacle/inflation layer 为规划权威，避免 latched static ghost。
+- 语音：旧 30m 房间和“运动指令返回 None”断言对齐当前 120m 大房间和 `move_relative` 产品合同。
+
+### 发布制品（已构建，未部署）
+
+```text
+path: dist/go2w-16b10d98ce5b-dirty-9c5969fad66d-all.tar.gz
+release_id: 16b10d98ce5b-dirty-9c5969fad66d
+payload_digest: 9c5969fad66dd29f62c2fd6a49874735087039048d3350d286b11efa4f19bade
+SHA-256: 88528CB086120FCCC0B28808E116D19CA77FA45052CD1BA4984A94DE72EBA98E
+files: 114
+archive_bytes: 526481
+unpacked_bytes: 1680788
+```
+
+`python tools/verify_release_artifact.py <artifact>` 严格校验通过。归档目录清单中没有 `test-artifacts/`。
+
+### NX 实机验收（未完成）
+
+目标机已由用户确认为 `192.168.1.105`，但本节不授权部署。后续只能在现场确认急停、场地和狗的姿态后，用同一 release 逐项记录：
+
+1. 语音“往前走”、“往后退”、“左转”、“右转”、“向前走2米”的 canonical task、实际位移/航向、超时与最终停车。
+2. “搜索整个房间，标注人”和“搜索房间，标注所有椅子”的人/椅子框、照片、地图 marker 和去重 ID。
+3. frontier 日志与真实未知格/墙体的一致性，以及“连续 3 轮无可达未知 frontier”的终止证据。
+4. 选点 mean/p95 latency、probes、总路径/转向、控制器实际速度，以及 Panel FPS、WS replacement/reliable depth、断线重连恢复。
+
+### 2026-07-23 实机语音验收更新
+
+用户已完成本机 Vosk + `qwen3:8b` + NX 直发语音验收，并确认语音阶段结束。NX 现场问题修复包括：
+
+- “搜索房间”默认搜索并标注人；“扭头”表示整只狗转向，左右方向短语均进入 `move_relative`。
+- 所有语音任务由 navigation arbiter 的 `nav` owner 接管；后退和原地转向均发布 `/cmd_vel_nav`，不再误走 manual owner。
+- 闭环原地转向按 50ms 周期刷新 nav 速度心跳，避免运动节点 0.3s watchdog 将单次角速度提前归零；结束和超时仍强制发送零速。
+
+上节第 1 项据用户现场确认关闭。第 2–4 项仍属于搜索算法、感知和前端实机验收，不随语音验收自动关闭。

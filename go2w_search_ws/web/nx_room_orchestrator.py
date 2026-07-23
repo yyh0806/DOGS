@@ -2284,9 +2284,9 @@ class RoomSearchOrchestrator:
         capped at ``max_samples``; when full, the OLDEST sample is dropped
         (pop(0)) and the loop CONTINUES, so the most recent ``max_samples``
         observations are always kept. This is critical for production: a
-        single Nav2 goal can run up to 40s — terminating after the first
-        ``max_samples`` (~4.8s at interval=0.4, cap=12) would miss the
-        remaining ~35s of detection opportunities.
+        single Nav2 goal can run for the configured timeout (90s by default)
+        — terminating after the first ``max_samples`` (~4.8s at interval=0.4,
+        cap=12) would miss most detection opportunities during a long leg.
 
         ``max_duration_s``: optional safety deadline. Production callers
         pass None (loop until stop_event is set by the frontier loop after

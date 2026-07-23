@@ -121,8 +121,9 @@ def _new_scan_node(web):
 def test_scan_snapshot_stores_laserscan_metadata_timestamp_and_copied_ranges(monkeypatch):
     web = _load_web_server(monkeypatch)
     node = _new_scan_node(web)
-    ticks = iter([100.0, 100.25, 100.5])
-    monkeypatch.setattr(web.time, "time", lambda: next(ticks))
+    monotonic_ticks = iter([10.0, 10.25, 10.5])
+    monkeypatch.setattr(web.time, "time", lambda: 100.0)
+    monkeypatch.setattr(web.time, "monotonic", lambda: next(monotonic_ticks))
     scan = types.SimpleNamespace(
         ranges=[0.12345, 1.23456, 9.87654],
         angle_min=-1.57,

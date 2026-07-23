@@ -81,6 +81,11 @@ def test_architecture_gate_rejects_missing_safe_first_token_bootstrap(monkeypatc
 
     def read_without_token_bootstrap(root, relative):
         source = original_read(root, relative)
+        if relative == "web/nx_control_auth.py":
+            source = source.replace(
+                'return AuthorizationDecision(True, 200, "auth_disabled")',
+                '# auth-enabled test fixture',
+            )
         if relative == "docker/deploy_release.sh":
             source = source.replace(
                 '"$SCRIPT_DIR/../tools/generate_control_token.py"',
@@ -95,6 +100,8 @@ def test_architecture_gate_rejects_missing_safe_first_token_bootstrap(monkeypatc
 
 
 def test_architecture_gate_rejects_nav_restart_before_mid360_runtime(monkeypatch):
+    assert "Nav2 deploy does not restart the current MID360 runtime first" not in (
+        architecture_violations(ROOT))
     original_read = verify_release._read
 
     def read_with_wrong_restart_order(root, relative):
@@ -103,14 +110,144 @@ def test_architecture_gate_rejects_nav_restart_before_mid360_runtime(monkeypatch
             source = source.replace(
                 'restart_units="livox-mid360-net.service '
                 'livox-mid360-driver.service livox-mid360-watchdog.service '
-                'go2w-slam-nav.service"',
+                'go2w-sensor.service go2w-slam-nav.service"',
                 'restart_units="go2w-slam-nav.service '
                 'livox-mid360-net.service livox-mid360-driver.service '
-                'livox-mid360-watchdog.service"',
+                'livox-mid360-watchdog.service go2w-sensor.service"',
             )
         return source
 
     monkeypatch.setattr(verify_release, "_read", read_with_wrong_restart_order)
+
+    assert "Nav2 deploy does not restart the current MID360 runtime first" in (
+        architecture_violations(ROOT))
+
+
+def test_architecture_gate_accepts_explicit_auth_disabled_panel():
+    problems = architecture_violations(ROOT)
+
+    assert "panel does not send authenticated control requests" not in problems
+
+
+def test_architecture_gate_rejects_dead_auth_disabled_return(monkeypatch):
+    original_read = verify_release._read
+
+    def read_with_dead_auth_return(root, relative):
+        source = original_read(root, relative)
+        if relative == "web/nx_control_auth.py":
+            source = source.replace(
+                '    return AuthorizationDecision(True, 200, "auth_disabled")',
+                '    if False:\n'
+                '        return AuthorizationDecision(True, 200, "auth_disabled")',
+                1,
+            )
+        return source
+
+    monkeypatch.setattr(verify_release, "_read", read_with_dead_auth_return)
+
+    assert "panel does not send authenticated control requests" in (
+        architecture_violations(ROOT))
+
+
+def test_architecture_gate_rejects_sensor_publishing_primary_odom(monkeypatch):
+    assert "sensor/Nav2 odometry ownership is ambiguous" not in (
+        architecture_violations(ROOT))
+    original_read = verify_release._read
+
+    def read_with_duplicate_odom_owner(root, relative):
+        source = original_read(root, relative)
+        if relative == "docker/go2w-sensor.service":
+            source = source.replace(
+                "-p publish_odom_tf:=false -p odom_topic:=/wheel_odom",
+                "-p publish_odom_tf:=true -p odom_topic:=/odom",
+            )
+        return source
+
+    monkeypatch.setattr(verify_release, "_read", read_with_duplicate_odom_owner)
+
+    assert "sensor/Nav2 odometry ownership is ambiguous" in (
+        architecture_violations(ROOT))
+
+
+def test_architecture_gate_rejects_duplicate_unsafe_sensor_params(monkeypatch):
+    original_read = verify_release._read
+
+    def read_with_overridden_sensor_params(root, relative):
+        source = original_read(root, relative)
+        if relative == "docker/go2w-sensor.service":
+            source = source.replace(
+                "-p publish_odom_tf:=false -p odom_topic:=/wheel_odom",
+                "-p publish_odom_tf:=false -p odom_topic:=/wheel_odom "
+                "-p publish_odom_tf:=true -p odom_topic:=/odom",
+                1,
+            )
+        return source
+
+    monkeypatch.setattr(
+        verify_release, "_read", read_with_overridden_sensor_params)
+
+    assert "sensor/Nav2 odometry ownership is ambiguous" in (
+        architecture_violations(ROOT))
+
+
+def test_architecture_gate_rejects_nav_reverse_at_either_boundary(monkeypatch):
+    assert "autonomous reverse is not blocked at both Nav2 and SDK boundaries" not in (
+        architecture_violations(ROOT))
+    original_read = verify_release._read
+
+    def read_with_reverse_enabled(root, relative):
+        source = original_read(root, relative)
+        if relative == "src/go2w_nav/config/nav2_params_3d.yaml":
+            source = source.replace(
+                "min_velocity: [0.0, 0.0, -0.5]",
+                "min_velocity: [-0.1, 0.0, -0.5]",
+            )
+        return source
+
+    monkeypatch.setattr(verify_release, "_read", read_with_reverse_enabled)
+
+    assert "autonomous reverse is not blocked at both Nav2 and SDK boundaries" in (
+        architecture_violations(ROOT))
+
+
+def test_architecture_gate_rejects_sdk_clamp_left_only_in_comment(monkeypatch):
+    original_read = verify_release._read
+
+    def read_with_commented_sdk_clamp(root, relative):
+        source = original_read(root, relative)
+        if relative == "src/go2w_bridge/go2w_bridge/motion_controller.py":
+            source = source.replace(
+                "velocity = (max(0.0, velocity[0]), velocity[1], velocity[2])",
+                "velocity = velocity  # max(0.0, velocity[0])",
+                1,
+            )
+        return source
+
+    monkeypatch.setattr(verify_release, "_read", read_with_commented_sdk_clamp)
+
+    assert "autonomous reverse is not blocked at both Nav2 and SDK boundaries" in (
+        architecture_violations(ROOT))
+
+
+def test_architecture_gate_rejects_restart_units_later_override(monkeypatch):
+    original_read = verify_release._read
+
+    def read_with_late_restart_override(root, relative):
+        source = original_read(root, relative)
+        if relative == "docker/deploy_release.sh":
+            marker = (
+                'restart_units="livox-mid360-net.service '
+                'livox-mid360-driver.service livox-mid360-watchdog.service '
+                'go2w-sensor.service go2w-slam-nav.service"'
+            )
+            source = source.replace(
+                marker,
+                marker + '\nrestart_units="go2w-slam-nav.service"',
+                1,
+            )
+        return source
+
+    monkeypatch.setattr(verify_release, "_read", read_with_late_restart_override)
 
     assert "Nav2 deploy does not restart the current MID360 runtime first" in (
         architecture_violations(ROOT))

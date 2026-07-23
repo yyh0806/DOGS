@@ -132,6 +132,45 @@ def test_backward_relative_move_uses_closed_loop_reverse_not_point_nav(source,
     assert "clearance_margin_m=_REVERSE_CLEARANCE_M" in branch_source
 
 
+def test_angular_relative_move_uses_nav_owned_velocity_channel(source,
+                                                                source_tree):
+    """任务仲裁以 nav owner 激活后，闭环转向必须发布到同一个 nav 通道。"""
+    method = method_source(source, source_tree, "TaskManager",
+                           "_execute_move_relative")
+    tree = ast.parse(textwrap.dedent(method))
+    send_cmd = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "send_cmd"
+    )
+    move_call = next(
+        node for node in ast.walk(send_cmd)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "move"
+    )
+    manual = next(
+        keyword.value for keyword in move_call.keywords
+        if keyword.arg == "manual"
+    )
+    assert isinstance(manual, ast.Constant)
+    assert manual.value is False
+
+
+def test_all_product_voice_tasks_are_owned_by_navigation_arbiter(source,
+                                                                  source_tree):
+    """产品语音入口统一经 task arbiter 激活 nav owner，不得直通 manual。"""
+    admission = method_source(source, source_tree, "TaskManager",
+                              "_admit_command_result")
+    add_list = method_source(source, source_tree, "TaskManager", "add_list")
+    executor = method_source(source, source_tree, "TaskManager",
+                             "_execute_move_relative")
+
+    assert "self.add_list(" in admission
+    assert "self._navigation_arbiter.start_tasks(" in add_list
+    assert "task_mgr.set_navigation_arbiter(navigation_arbiter)" in source
+    assert "manual=True" not in executor
+
+
 def test_bridge_directional_clearance_uses_scan_snapshot_and_age(source,
                                                                   source_tree):
     method = method_source(source, source_tree, "NxRobotBridge",

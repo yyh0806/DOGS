@@ -1297,13 +1297,58 @@ def test_select_next_frontier_alpha_negative_falls_back(monkeypatch):
 # ============================================================================
 # 测试 4: budget 锁定 + en-route observer (Task 1: 导航期间连续 YOLO 标人)
 # ============================================================================
-def test_send_goal_timeout_is_40s_not_120s():
-    """2026-07-15 实测: 单 goal 超时从 120s 调到 40s。锁定防回归。"""
-    import inspect
-    from nx_navigation_gateway import MissionNavigationPort
-    source = inspect.getsource(MissionNavigationPort.send_goal_and_wait)
-    assert "timeout=40.0" in source, (
-        "send_goal_and_wait 应保持 40s 单 goal 超时 (2026-07-15 调整)")
+@pytest.mark.parametrize(
+    ("env_value", "expected_timeout"),
+    [(None, 90.0), ("12.5", 12.5)],
+)
+def test_send_goal_timeout_uses_configurable_90s_default(
+        monkeypatch, env_value, expected_timeout):
+    """Long frontiers get 90s by default and commissioning can override it."""
+    from nx_navigation_gateway import MissionNavigationPort, NavigationGateway
+
+    if env_value is None:
+        monkeypatch.delenv("GO2W_FRONTIER_NAV_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("GO2W_FRONTIER_NAV_TIMEOUT", env_value)
+
+    class NeverTerminalActionPort:
+        def __init__(self):
+            self.canceled = []
+            self.state = {"status": "idle", "drained": True, "healthy": True}
+
+        def submit(self, _x, _y, _yaw):
+            self.state = {
+                "status": "active",
+                "drained": False,
+                "healthy": True,
+                "generation": 1,
+            }
+            return {"ok": True, "generation": 1}
+
+        def cancel(self, reason):
+            self.canceled.append(reason)
+            return True
+
+        def tick(self):
+            return dict(self.state)
+
+        def get_state(self):
+            return dict(self.state)
+
+    clock = [0.0]
+    action = NeverTerminalActionPort()
+    gateway = NavigationGateway(
+        action_port=action,
+        monotonic=lambda: clock[0],
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        poll_interval=200.0,
+    )
+
+    result = MissionNavigationPort(gateway).send_goal_and_wait(36.0, 0.0, 0.0)
+
+    assert result == {"ok": False, "reason": "timeout"}
+    assert clock[0] == pytest.approx(expected_timeout)
+    assert action.canceled == ["navigation_timeout"]
 
 
 def test_frontier_explore_max_time_defaults_1800s(monkeypatch):

@@ -399,8 +399,8 @@ class MissionNavigationPort:
             )
         if not submitted.accepted:
             return {"ok": False, "reason": submitted.reason}
-        # 2026-07-15 实测: 120s 单 goal 超时太长, 卡死的 frontier goal(DWB 不终止)
-        # 会吃掉整个 mission 预算. 40s 足够 6m 半径内正常接近, 卡死则 abort→跳过该 frontier.
+        # 36m+ frontier 在 0.5m/s 下仅直线移动就需要 72s，因此默认给 90s；
+        # 现场可通过 env 缩短/延长，超时仍会 cancel 并跳过该 frontier。
         result = self._gateway.wait_terminal(
             owner=self._owner,
             timeout=float(os.environ.get("GO2W_FRONTIER_NAV_TIMEOUT", "90.0")),

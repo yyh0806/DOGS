@@ -70,6 +70,38 @@ def test_run_angular_turn_succeeds_when_yaw_reaches_target():
     assert sent[-1] == (0.0, 0.0, 0.0)  # 结束: 停
 
 
+def test_run_angular_turn_refreshes_velocity_heartbeat_until_complete():
+    target = math.radians(90)
+    yaw_readings = [0.0, math.radians(10), math.radians(25),
+                    math.radians(50), math.radians(89)]
+    index = {"value": 0}
+    sent = []
+
+    def read_yaw():
+        return yaw_readings[min(index["value"], len(yaw_readings) - 1)]
+
+    def sleep(_seconds):
+        index["value"] += 1
+
+    result = run_angular_turn(
+        read_yaw,
+        lambda vx, vy, vyaw: sent.append((vx, vy, vyaw)),
+        sleep,
+        lambda: 0.0,
+        target,
+        "left",
+        vyaw=0.5,
+        tolerance_rad=math.radians(3),
+        max_duration=10.0,
+    )
+
+    assert result == "succeeded"
+    nonzero = [command for command in sent if command != (0.0, 0.0, 0.0)]
+    assert len(nonzero) >= 3
+    assert all(command == (0.0, 0.0, 0.5) for command in nonzero)
+    assert sent[-1] == (0.0, 0.0, 0.0)
+
+
 def test_run_angular_turn_times_out_when_yaw_never_reaches():
     read_yaw = lambda: 0.0  # 永不动
     sent = []

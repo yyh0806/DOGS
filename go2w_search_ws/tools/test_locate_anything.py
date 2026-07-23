@@ -211,4 +211,6 @@ def test_panel_has_locate_overlay_for_boxes_and_explanations():
     assert "overflow: hidden" in html
     assert "boxes.forEach" in html
     assert "renderLocateOverlay(result)" in html
-    assert "renderLocateOverlay(data.data)" in html
+    assert "scheduleLocateOverlay(data.data" in html
+    assert "record: true" in html
+    assert "expectedGeneration: streamFrameGeneration.c13_vis" in html

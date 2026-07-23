@@ -132,8 +132,12 @@ def run_angular_turn(
         max_duration = (remaining / max(vyaw, 1e-6)) * 2.0 + 1.0
     deadline = monotonic() + max_duration
     try:
-        send_cmd_vel(0.0, 0.0, sign * vyaw)
         while monotonic() < deadline:
+            # MotionController intentionally expires nav commands after 0.3s.
+            # Refresh at the 50ms control cadence so a closed-loop turn keeps
+            # authority until yaw reaches the target instead of moving only
+            # for one watchdog window and then silently timing out.
+            send_cmd_vel(0.0, 0.0, sign * vyaw)
             sleep(0.05)
             if angular_turn_complete(read_yaw(), target_yaw, tolerance_rad):
                 return "succeeded"

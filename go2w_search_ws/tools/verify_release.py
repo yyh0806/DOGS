@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -15,6 +17,117 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _read(root: Path, relative: str) -> str:
     return (root / relative).read_text(encoding="utf-8")
+
+
+def _quoted_shell_assignments(source: str, name: str) -> tuple[tuple[str, ...], ...]:
+    """Return whitespace-delimited words from simple ``name="..."`` lines."""
+    values = re.findall(
+        rf'^\s*{re.escape(name)}="([^"]*)"\s*$', source, re.MULTILINE)
+    return tuple(tuple(value.split()) for value in values)
+
+
+def _literal_shell_if_body(source: str, variable: str, value: str) -> str | None:
+    """Return one simple ``if [ "$variable" = "value" ]`` branch body."""
+    match = re.search(
+        rf'^\s*if \[ "\${re.escape(variable)}" = "{re.escape(value)}" \]; then\s*$'
+        rf'(?P<body>.*?)^\s*fi\s*$',
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    return match.group("body") if match is not None else None
+
+
+def _yaml_numeric_sequence(source: str, name: str) -> tuple[float, ...] | None:
+    match = re.search(
+        rf'^\s*{re.escape(name)}:\s*\[([^\]]+)\]\s*(?:#.*)?$',
+        source,
+        re.MULTILINE,
+    )
+    if match is None:
+        return None
+    try:
+        return tuple(float(item.strip()) for item in match.group(1).split(","))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _ros_parameter_values(source: str, name: str) -> tuple[str, ...]:
+    """Return every ROS ``-p name:=value`` assignment in source order."""
+    return tuple(re.findall(
+        rf'(?:^|\s)-p\s+{re.escape(name)}:=([^\s\'\"]+)', source))
+
+
+def _auth_is_unconditionally_disabled(source: str) -> bool:
+    """Require authorize_request's first executable statement to allow LAN."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, TypeError):
+        return False
+    function = next((
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "authorize_request"
+    ), None)
+    if function is None:
+        return False
+    body = list(function.body)
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    if not body or not isinstance(body[0], ast.Return):
+        return False
+    call = body[0].value
+    if (not isinstance(call, ast.Call)
+            or not isinstance(call.func, ast.Name)
+            or call.func.id != "AuthorizationDecision"
+            or len(call.args) != 3):
+        return False
+    try:
+        return tuple(ast.literal_eval(arg) for arg in call.args) == (
+            True, 200, "auth_disabled")
+    except (ValueError, TypeError):
+        return False
+
+
+def _motion_controller_clamps_nav_reverse(source: str) -> bool:
+    """Recognize the executable nav-owner clamp, ignoring comments/strings."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, TypeError):
+        return False
+    controller = next((
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MotionController"
+    ), None)
+    if controller is None:
+        return False
+    tick = next((
+        node for node in controller.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "tick"
+    ), None)
+    if tick is None:
+        return False
+    for branch in ast.walk(tick):
+        if not isinstance(branch, ast.If):
+            continue
+        try:
+            owner_test = ast.unparse(branch.test) == "owner == 'nav'"
+        except Exception:
+            owner_test = False
+        if not owner_test:
+            continue
+        for statement in branch.body:
+            for node in ast.walk(statement):
+                if (isinstance(node, ast.Assign)
+                        and any(isinstance(target, ast.Name)
+                                and target.id == "velocity"
+                                for target in node.targets)
+                        and ast.unparse(node.value) == (
+                            "(max(0.0, velocity[0]), velocity[1], velocity[2])")):
+                    return True
+    return False
 
 
 def architecture_violations(root: Path = ROOT) -> list[str]:
@@ -33,6 +146,7 @@ def architecture_violations(root: Path = ROOT) -> list[str]:
     ai = _read(root, "web/nx_ai_node.py")
     room = _read(root, "web/nx_room_orchestrator.py")
     panel = _read(root, "web/static/panel.html")
+    control_auth = _read(root, "web/nx_control_auth.py")
     nav_deploy = _read(root, "docker/deploy_nav2_bprime.sh")
     legacy_deploys = {
         "motion": _read(root, "docker/deploy_nx.sh"),
@@ -43,10 +157,13 @@ def architecture_violations(root: Path = ROOT) -> list[str]:
     deploy_release = _read(root, "docker/deploy_release.sh")
     bringup = _read(root, "docker/bringup_slam_nav2.sh")
     nav_unit = _read(root, "docker/go2w-slam-nav.service")
+    sensor_unit = _read(root, "docker/go2w-sensor.service")
     nav_params = _read(root, "src/go2w_nav/config/nav2_params_3d.yaml")
     nav_preflight = _read(root, "tools/nav2_preflight.py")
     motion_controller = _read(
         root, "src/go2w_bridge/go2w_bridge/motion_controller.py")
+    map_odom_fuser = _read(
+        root, "src/go2w_bridge/go2w_bridge/map_odom_fuser.py")
 
     if motion.count("machine = Go2WMotionMachine(") != 1:
         problems.append("motion node must construct exactly one Go2WMotionMachine")
@@ -96,7 +213,11 @@ def architecture_violations(root: Path = ROOT) -> list[str]:
     body_index = web.find("Content-Length", auth_index)
     if auth_index < 0 or body_index < 0 or auth_index > body_index:
         problems.append("control authorization must run before request-body parsing")
-    if "controlFetch(" not in panel or "Authorization" not in panel:
+    auth_disabled = _auth_is_unconditionally_disabled(control_auth)
+    if auth_disabled:
+        if "function controlFetch" not in panel or "return fetch(url, options);" not in panel:
+            problems.append("auth-disabled panel does not send direct control requests")
+    elif "controlFetch(" not in panel or "Authorization" not in panel:
         problems.append("panel does not send authenticated control requests")
     if "Access-Control-Allow-Origin', '*'" in web:
         problems.append("wildcard control CORS is forbidden")
@@ -166,20 +287,27 @@ def architecture_violations(root: Path = ROOT) -> list[str]:
         problems.append("artifact must pass strict local verification before upload")
     token_generator_index = deploy_release.find(
         '"$SCRIPT_DIR/../tools/generate_control_token.py"')
-    if (not (root / "tools/generate_control_token.py").is_file()
-            or "--generate-control-token-file" not in deploy_release
-            or local_verify_index < 0
-            or token_generator_index < 0
-            or preflight_index < 0
-            or not local_verify_index < token_generator_index < preflight_index):
+    if (not auth_disabled
+            and (not (root / "tools/generate_control_token.py").is_file()
+                 or "--generate-control-token-file" not in deploy_release
+                 or local_verify_index < 0
+                 or token_generator_index < 0
+                 or preflight_index < 0
+                 or not local_verify_index < token_generator_index < preflight_index)):
         problems.append(
             "first Web deployment has no safe explicit token bootstrap")
-    nav_restart_units = (
-        'restart_units="livox-mid360-net.service '
-        'livox-mid360-driver.service livox-mid360-watchdog.service '
-        'go2w-slam-nav.service"'
+    nav_restart_order = (
+        "livox-mid360-net.service",
+        "livox-mid360-driver.service",
+        "livox-mid360-watchdog.service",
+        "go2w-sensor.service",
+        "go2w-slam-nav.service",
     )
-    if (nav_restart_units not in deploy_release
+    nav_restart_branch = _literal_shell_if_body(
+        deploy_release, "subsystem", "nav")
+    if (nav_restart_branch is None
+            or _quoted_shell_assignments(nav_restart_branch, "restart_units")
+            != (nav_restart_order,)
             or "for service in $restart_units" not in deploy_release):
         problems.append(
             "Nav2 deploy does not restart the current MID360 runtime first")
@@ -229,15 +357,37 @@ def architecture_violations(root: Path = ROOT) -> list[str]:
         'ln -sfn "$release_dir" "$current.next"')
     if not (0 <= final_prefix < colcon_build < current_switch):
         problems.append("Nav2 colcon build does not use the final release prefix")
-    if ("Conflicts=go2w-sensor.service" not in nav_unit
-            or "After=go2w-sensor.service" not in nav_unit
-            or "systemctl disable go2w-sensor.service" not in deploy_release):
-        problems.append("Nav2 and the fallback sensor can own odom concurrently")
+    sensor_is_wheel_feedback_only = (
+        _ros_parameter_values(sensor_unit, "publish_odom") == ("true",)
+        and _ros_parameter_values(sensor_unit, "publish_odom_tf") == ("false",)
+        and _ros_parameter_values(sensor_unit, "odom_topic") == ("/wheel_odom",)
+    )
+    fuser_owns_primary_odom = all(marker in map_odom_fuser for marker in (
+        "self.create_publisher(Odometry, '/odom', 10)",
+        "TransformBroadcaster(self",
+        "base_tf.child_frame_id = self._base",
+    ))
+    nav_waits_for_wheel_feedback = (
+        "Wants=go2w-sensor.service" in nav_unit
+        and "After=go2w-sensor.service" in nav_unit
+        and 'wait_hz /wheel_odom "$WHEEL_ODOM_MIN_HZ"' in bringup
+    )
+    if not (sensor_is_wheel_feedback_only
+            and fuser_owns_primary_odom
+            and nav_waits_for_wheel_feedback):
+        problems.append("sensor/Nav2 odometry ownership is ambiguous")
     if ("check_tf_topology || warn" in bringup
             or 'die "base_link 双 parent:' not in bringup):
         problems.append("Nav2 bringup does not fail closed on a double-parent TF")
-    if ("min_velocity: [0.0, 0.0, -0.15]" not in nav_params
-            or "max(0.0, velocity[0])" not in motion_controller):
+    min_velocity = _yaml_numeric_sequence(nav_params, "min_velocity")
+    nav_linear_reverse_blocked = (
+        min_velocity is not None
+        and len(min_velocity) == 3
+        and min_velocity[0] >= 0.0
+    )
+    sdk_linear_reverse_blocked = _motion_controller_clamps_nav_reverse(
+        motion_controller)
+    if not (nav_linear_reverse_blocked and sdk_linear_reverse_blocked):
         problems.append("autonomous reverse is not blocked at both Nav2 and SDK boundaries")
     for probe in ("global_costmap_fresh", "costmap_bridge_active"):
         if probe not in nav_preflight:

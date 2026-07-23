@@ -162,8 +162,8 @@ def test_limits_openblas_threads_before_importing_numpy():
     assert assignments_before_numpy.get("OPENBLAS_NUM_THREADS") == "1"
 
 
-def test_global_costmap_keeps_a_fifty_metre_window_over_the_growing_slam_map():
-    """Both endpoints must remain inside the costmap throughout a 20 m leg."""
+def test_global_costmap_keeps_a_fifty_metre_live_obstacle_window():
+    """The rolling live costmap covers a 20 m leg without stale map authority."""
     params = (ROOT / "src/go2w_nav/config/nav2_params_3d.yaml").read_text(
         encoding="utf-8"
     )
@@ -171,8 +171,8 @@ def test_global_costmap_keeps_a_fifty_metre_window_over_the_growing_slam_map():
         "planner_server:", 1
     )[0]
     assert re.search(r"^\s+rolling_window:\s*true\s*(?:#.*)?$", global_section, re.M)
-    assert re.search(r'^\s+map_topic:\s*["\']?/map_frontier["\']?\s*$',
-                     global_section, re.M)
+    assert not re.search(r"^\s+map_topic:", global_section, re.M)
+    assert _costmap_plugins(global_section) == ["obstacle_layer", "inflation_layer"]
     for dimension in ("width", "height"):
         match = re.search(
             rf"^\s+{dimension}:\s*([0-9.]+)", global_section, re.M
@@ -223,9 +223,7 @@ def test_costmaps_use_temporally_stable_mid360_scan_for_marking_and_clearing():
 
     local_section, global_section = _costmap_sections(params)
     assert _costmap_plugins(local_section) == ["obstacle_layer", "inflation_layer"]
-    assert _costmap_plugins(global_section) == [
-        "static_layer", "obstacle_layer", "inflation_layer"
-    ]
+    assert _costmap_plugins(global_section) == ["obstacle_layer", "inflation_layer"]
 
     for section in (local_section, global_section):
         assert re.search(r"^\s+observation_sources:\s*mid360\s*$", section, re.M)
@@ -397,8 +395,9 @@ def test_nav2_uses_bounded_tf_tolerances_and_distinct_lifecycle_manager():
     )
 
     assert "transform_tolerance: 3.5" not in params
-    # FollowPath, both costmaps, the persistent static layer, and wait behavior.
-    assert params.count("transform_tolerance: 0.5") == 5
+    # FollowPath and both live costmaps use bounded transform waits; there is
+    # no persistent static layer in the navigation costmap.
+    assert params.count("transform_tolerance: 0.5") == 4
     assert "'autostart': 'false'" in launch
     assert "name='go2w_lifecycle_manager_navigation'" in launch
     assert "name='lifecycle_manager_navigation'" not in launch
@@ -552,10 +551,17 @@ def test_global_planner_uses_orientation_independent_turning_envelope():
             r'^\s+inflation_radius:\s*([0-9.]+)', global_section, re.M
         ).group(1)
     )
-    # Preserve four centimetres beyond the turning circle so a 5 cm costmap
-    # cell cannot quantize the planned center back into the swept envelope.
+    local_section = _costmap_sections(params)[0]
+    local_inflation = float(
+        re.search(
+            r'^\s+inflation_radius:\s*([0-9.]+)', local_section, re.M
+        ).group(1)
+    )
+    # The global layer keeps the hard turning envelope; the local controller
+    # owns the wider soft-clearance gradient used during motion.
     assert radius >= math.hypot(0.45, 0.32) + 0.04
-    assert inflation >= radius + 0.15
+    assert inflation >= radius
+    assert local_inflation >= radius + 0.10
 
 
 def test_dwb_samples_forward_only_low_speed_approaches():

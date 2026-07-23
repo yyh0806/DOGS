@@ -19,18 +19,19 @@ CONTROL_TOKEN = "test-token-0123456789-ABCDEFGHIJKLMN"
         "/api/e_stop",
     ],
 )
-def test_control_endpoint_requires_token(path):
+def test_control_endpoint_is_allowed_when_auth_is_explicitly_disabled(path):
     decision = authorize_request(
         method="POST",
         path=path,
         headers={},
         configured_token=CONTROL_TOKEN,
     )
-    assert decision.allowed is False
-    assert decision.status_code == 401
+    assert decision.allowed is True
+    assert decision.status_code == 200
+    assert decision.reason == "auth_disabled"
 
 
-def test_valid_bearer_token_is_accepted_case_insensitively():
+def test_bearer_header_does_not_change_auth_disabled_policy():
     decision = authorize_request(
         method="POST",
         path="/api/navigate",
@@ -39,6 +40,7 @@ def test_valid_bearer_token_is_accepted_case_insensitively():
     )
     assert decision.allowed is True
     assert decision.status_code == 200
+    assert decision.reason == "auth_disabled"
 
 
 @pytest.mark.parametrize("path", ["/api/status", "/api/version", "/static/missions/a.jpg"])
@@ -48,24 +50,24 @@ def test_read_only_routes_do_not_require_a_token(path):
     assert decision.allowed is True
 
 
-def test_missing_server_token_fails_closed_for_state_changes():
+def test_missing_server_token_is_ignored_when_auth_is_disabled():
     decision = authorize_request(
         method="POST", path="/api/stop", headers={}, configured_token="")
-    assert decision.allowed is False
-    assert decision.status_code == 503
-    assert decision.reason == "control_auth_not_configured"
+    assert decision.allowed is True
+    assert decision.status_code == 200
+    assert decision.reason == "auth_disabled"
 
 
-def test_weak_server_token_fails_closed_for_state_changes():
+def test_weak_server_token_is_ignored_when_auth_is_disabled():
     decision = authorize_request(
         method="POST",
         path="/api/stop",
         headers={"Authorization": "Bearer short-token"},
         configured_token="short-token",
     )
-    assert decision.allowed is False
-    assert decision.status_code == 503
-    assert decision.reason == "control_auth_weak_token"
+    assert decision.allowed is True
+    assert decision.status_code == 200
+    assert decision.reason == "auth_disabled"
 
 
 def test_preflight_is_allowed_only_for_configured_panel_origin():

@@ -174,8 +174,14 @@ _BARE_CURRENT_ROOM_FOLLOW_RE = (
 # 运动指令触发词 (spec §1.1): 用完整词避免"搜索前面房间"误触发前进
 _MOVE_FORWARD_TERMS = ("前进", "向前走", "往前走", "直走")
 _MOVE_BACKWARD_TERMS = ("后退", "向后走", "往后走", "倒退")
-_MOVE_LEFT_TERMS = ("左转", "向左转", "左转弯", "往左转")
-_MOVE_RIGHT_TERMS = ("右转", "向右转", "右转弯", "往右转")
+_MOVE_LEFT_TERMS = (
+    "左转", "向左转", "左转弯", "往左转",
+    "向左扭头", "往左扭头", "左扭头",
+)
+_MOVE_RIGHT_TERMS = (
+    "右转", "向右转", "右转弯", "往右转",
+    "向右扭头", "往右扭头", "右扭头",
+)
 
 _MOVE_DEFAULT_DISTANCE_M = 1.0
 _MOVE_DEFAULT_ANGLE_DEG = 90.0
@@ -200,6 +206,10 @@ def parse_product_command(text: str) -> dict | None:
     move = _parse_move_command(normalized)
     if move is not None:
         return _move_command_result(move)
+
+    # 省略目标时，"搜索房间"按产品约定默认搜索并标注人。
+    if normalized == "搜索房间":
+        return _command_result(_CURRENT_ROOM)
 
     if not _contains_any(normalized, _CURRENT_ROOM_EXPLICIT_TERMS):
         named_room = _extract_named_room(normalized)
@@ -528,6 +538,9 @@ def _detect_move_direction(text: str) -> str | None:
         return "left"
     if _contains_any(text, _MOVE_RIGHT_TERMS):
         return "right"
+    # 没有方向的"扭头"按产品约定让整只狗默认左转 90°。
+    if text == "扭头":
+        return "left"
     return None
 
 

@@ -411,6 +411,30 @@ def test_requested_voice_current_room_person_search_utterance_contract():
     assert result["tasks"] == [_expected_task("__current__")]
 
 
+@pytest.mark.parametrize("utterance", ("搜索房间", "搜索 房间"))
+def test_bare_search_room_defaults_to_people(utterance):
+    result = parse_product_command(utterance)
+
+    assert result is not None
+    assert result["tasks"] == [_expected_task("__current__")]
+
+
+@pytest.mark.parametrize(("utterance", "direction"), [
+    ("扭头", "left"),
+    ("向左扭头", "left"),
+    ("往左扭头", "left"),
+    ("向右扭头", "right"),
+    ("往右扭头", "right"),
+])
+def test_turn_head_means_turn_the_dog(utterance, direction):
+    assert _move_task(utterance) == {
+        "mode": "angular",
+        "direction": direction,
+        "angle_deg": 90.0,
+        "clamped": False,
+    }
+
+
 def test_requested_voice_current_room_chair_search_utterance_contract():
     result = parse_product_command("搜索房间，标注所有椅子")
 
