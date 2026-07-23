@@ -82,6 +82,7 @@ scp -q "$WS_DIR/web/mock_dog_state_publisher.py" "$NX_USER@$NX_HOST:~/go2w_ws/we
 # 阶段E: 房间级搜索编排 (nx_web_server.py 运行时动态 import 这些; 缺失 → product/person search
 # 被 try-import 优雅降级跳过, 不报错但功能静默失效。务必随 web 层一起部署)
 scp -q "$WS_DIR/web/nx_room_orchestrator.py"     "$NX_USER@$NX_HOST:~/go2w_ws/web/"
+scp -q "$WS_DIR/web/nx_global_search_state.py"   "$NX_USER@$NX_HOST:~/go2w_ws/web/"
 scp -q "$WS_DIR/web/nx_product_command.py"       "$NX_USER@$NX_HOST:~/go2w_ws/web/"
 scp -q "$WS_DIR/web/nx_active_search.py"         "$NX_USER@$NX_HOST:~/go2w_ws/web/"
 scp -q "$WS_DIR/web/nx_person_mission.py"        "$NX_USER@$NX_HOST:~/go2w_ws/web/"

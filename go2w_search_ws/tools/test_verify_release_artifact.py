@@ -41,6 +41,7 @@ def test_completeness_contract_covers_direct_service_and_import_dependencies():
         "web/nx_point_nav.py",
         "web/nx_person_localizer.py",
         "web/nx_frontier_planner.py",
+        "web/nx_global_search_state.py",
         "web/nx_visibility_coverage.py",
         "web/static/panel.html",
         "web/static/map.js",

@@ -27,15 +27,18 @@
     --ws-port 8001   NX WebSocket 端口
 """
 import argparse
+import ipaddress
 import json
 import math
 import os
 import queue
 import re
+import socket
 import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 SAMPLE_RATE = 16000
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -438,10 +441,57 @@ def _on_ws_message(ws, message: str) -> None:
     # 其他 type (frame/scan/locate/vlm/partial) 不播报
 
 
-def _ws_worker(nx_ws_url: str) -> None:
+def validate_bind_address(value: str | None) -> str | None:
+    """Return a normalized IPv4 source address for direct NX connections."""
+    address = str(value or "").strip()
+    if not address:
+        return None
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError as exc:
+        raise ValueError("bind address must be a valid IPv4 address") from exc
+    if parsed.version != 4:
+        raise ValueError("bind address must be an IPv4 address")
+    return str(parsed)
+
+
+def _connect_bound_websocket(nx_ws_url: str, bind_address: str,
+                             *, timeout: float = 5.0):
+    """Open one websocket over a TCP socket bound to the selected PC NIC."""
+    parsed = urlsplit(nx_ws_url)
+    if parsed.scheme != "ws" or not parsed.hostname:
+        raise ValueError("bound websocket URL must use ws:// with a host")
+    port = parsed.port or 80
+    stream = socket.create_connection(
+        (parsed.hostname, port),
+        timeout=timeout,
+        source_address=(validate_bind_address(bind_address), 0),
+    )
+    try:
+        return websocket.create_connection(
+            nx_ws_url, timeout=timeout, socket=stream)
+    except Exception:
+        stream.close()
+        raise
+
+
+def _ws_worker(nx_ws_url: str, bind_address: str | None = None) -> None:
     """后台线程: 连 NX WS, 断开后 2s 自动重连."""
     while True:
+        ws = None
         try:
+            if bind_address:
+                ws = _connect_bound_websocket(nx_ws_url, bind_address)
+                try:
+                    while True:
+                        message = ws.recv()
+                        if message is None:
+                            break
+                        _on_ws_message(ws, message)
+                finally:
+                    ws.close()
+                time.sleep(2)
+                continue
             ws = websocket.WebSocketApp(
                 nx_ws_url,
                 on_message=_on_ws_message,
@@ -457,7 +507,27 @@ def _ws_worker(nx_ws_url: str) -> None:
 # ============================================================================
 # 发指令
 # ============================================================================
-def send_command(nx_url: str, text: str, *, token: str | None = None) -> dict:
+def _bound_requests_session(requests_module, bind_address: str):
+    """Build a requests Session whose sockets originate from one local IP."""
+    address = validate_bind_address(bind_address)
+
+    class SourceAddressAdapter(requests_module.adapters.HTTPAdapter):
+        def init_poolmanager(self, connections, maxsize, block=False,
+                             **pool_kwargs):
+            pool_kwargs["source_address"] = (address, 0)
+            return super().init_poolmanager(
+                connections, maxsize, block=block, **pool_kwargs)
+
+    session = requests_module.Session()
+    session.trust_env = False
+    adapter = SourceAddressAdapter()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def send_command(nx_url: str, text: str, *, token: str | None = None,
+                 bind_address: str | None = None) -> dict:
     """POST /api/command and require feedback-confirmed task admission."""
     try:
         import requests
@@ -467,8 +537,17 @@ def send_command(nx_url: str, text: str, *, token: str | None = None) -> dict:
     try:
         token = load_control_token(environ=os.environ) if token is None else token
         headers = {"Authorization": f"Bearer {token}"} if token else {}
-        r = requests.post(
-            nx_url, json={"text": text}, headers=headers, timeout=5)
+        session = None
+        client = requests
+        try:
+            if bind_address:
+                session = _bound_requests_session(requests, bind_address)
+                client = session
+            r = client.post(
+                nx_url, json={"text": text}, headers=headers, timeout=5)
+        finally:
+            if session is not None:
+                session.close()
         try:
             payload = r.json()
         except (TypeError, ValueError):
@@ -534,6 +613,12 @@ def main() -> int:
                    help="NX IP (默认 GO2W_NX_HOST 或 192.168.43.41)")
     p.add_argument("--port", default="8000", help="NX HTTP 端口")
     p.add_argument("--ws-port", default="8001", help="NX WebSocket 端口")
+    p.add_argument(
+        "--bind-address",
+        default=os.environ.get("GO2W_BIND_ADDRESS", ""),
+        help="PC local IPv4 source address for direct NX connections "
+             "(GO2W_BIND_ADDRESS)",
+    )
     p.add_argument("--model", default=default_model_path(),
                    help="Vosk 中文模型路径")
     p.add_argument("--text", default=None,
@@ -561,6 +646,7 @@ def main() -> int:
     nx_url = f"http://{args.nx}:{args.port}/api/command"
     nx_ws_url = f"ws://{args.nx}:{args.ws_port}"
     try:
+        bind_address = validate_bind_address(args.bind_address)
         control_token = load_control_token(args.token_file)
     except ValueError as exc:
         print(f"[FAIL] {exc}")
@@ -583,7 +669,8 @@ def main() -> int:
                     "and must use /api/chat or /v1/chat/completions")
         dispatcher = SearchCommandDispatcher(
             sender=lambda url, command: send_command(
-                url, command, token=control_token),
+                url, command, token=control_token,
+                bind_address=bind_address),
             dedupe_seconds=args.dedupe_seconds,
             normalizer=normalizer,
             normalizer_mode=args.llm_mode)
@@ -633,7 +720,11 @@ def main() -> int:
 
     # 3. 启动 WS 监听线程 (接收 NX 反馈 → TTS)
     if _HAS_WS:
-        threading.Thread(target=_ws_worker, args=(nx_ws_url,), daemon=True).start()
+        threading.Thread(
+            target=_ws_worker,
+            args=(nx_ws_url, bind_address),
+            daemon=True,
+        ).start()
         print(f"[WS]  连 {nx_ws_url} (接收 NX 反馈)")
     else:
         print("[WS]  websocket-client 未装 (pip install websocket-client), 无 TTS 反馈")

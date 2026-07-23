@@ -664,6 +664,7 @@ function clearTrail() {
 // 速度档位 (偏稳, 后期可调): 前进0.4 后退0.4 转向0.5 平移0.3
 const SPEED = { fwd: 0.4, turn: 0.5, strafe: 0.3 };
 let pressedKeys = new Set();   // 当前按下的控制键
+let _manualMoveActive = false; // 只有本页实际发起过手动运动，释放事件才有权停车
 // _moveInterval 已在顶部 (line 206) 声明, 这里不重复声明
 
 // 按当前 pressedKeys 合成速度并发送 (键盘控制专用)
@@ -683,11 +684,19 @@ function sendMoveFromKeys() {
 // 按钮拖拽控制 (onmousedown 持续, onmouseup/leave 停)
 function move(vx, vy, vyaw) {
   clearInterval(_moveInterval);
+  _manualMoveActive = true;
   controlFetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, { method: 'POST' });
   // RosRobotBridge 每次写stdin即时生效, 但保留低频续发以防丢包 (NX看门狗1s兜底)
   _moveInterval = setInterval(() => controlFetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, { method: 'POST' }), 300);
 }
-function stopMove() { clearInterval(_moveInterval); _moveInterval = null; if (_locateLoopTimer) { clearTimeout(_locateLoopTimer); _locateLoopTimer = null; } controlFetch('/api/manual_stop', { method: 'POST' }); /* 2026-07-18 删 /api/stop: 手动控制按钮(onmouseleave/onmouseup)误触 stopMove 会发 /api/stop 取消导航(operator_stop). 手动停止只需 manual_stop 停 cmd_vel, 不该取消导航. */ }
+function stopMove() {
+  clearInterval(_moveInterval);
+  _moveInterval = null;
+  if (_locateLoopTimer) { clearTimeout(_locateLoopTimer); _locateLoopTimer = null; }
+  if (!_manualMoveActive) return;
+  _manualMoveActive = false;
+  controlFetch('/api/manual_stop', { method: 'POST' });
+}
 function connect() { controlFetch('/api/connect', { method: 'POST' }).then(r => r.json()).then(d => { if (d.ok) { connected = true; updateDogStatus(true); } }); }
 function stand() { controlFetch('/api/stand', { method: 'POST' }); }
 function confirmStand() { controlFetch('/api/confirm_stand', { method: 'POST' }); }

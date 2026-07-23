@@ -248,6 +248,52 @@ function loadPanelLifecycle(overrides = {}) {
   return context.__panelLifecycle;
 }
 
+function loadManualMotionControls() {
+  const html = fs.readFileSync(path.join(__dirname, 'static', 'panel.html'), 'utf8');
+  const start = html.indexOf('const SPEED =');
+  const end = html.indexOf('function connect()', start);
+  assert(start >= 0 && end > start, 'manual motion control block not found');
+
+  const requests = [];
+  const context = {
+    console,
+    controlFetch(url, options) {
+      requests.push({ url, options });
+      return Promise.resolve(response(200, { ok: true }));
+    },
+    setInterval: () => 1,
+    clearInterval: () => {},
+    clearTimeout: () => {},
+  };
+  vm.createContext(context);
+  const exports = `
+    this.__manualMotion = { move, stopMove };
+  `;
+  vm.runInContext(
+    'let _moveInterval = null; let _locateLoopTimer = null;\n' +
+      html.slice(start, end) + exports,
+    context,
+    { filename: 'panel-manual-motion.js' },
+  );
+  return { manualMotion: context.__manualMotion, requests };
+}
+
+function testIdleReleaseEventsCannotParkAutonomousNavigation() {
+  const { manualMotion, requests } = loadManualMotionControls();
+
+  manualMotion.stopMove();
+  assert.deepStrictEqual(requests, [],
+    'blur/leave while manual control is idle must not send manual_stop');
+
+  manualMotion.move(0.4, 0, 0);
+  manualMotion.stopMove();
+  manualMotion.stopMove();
+  assert.deepStrictEqual(requests.map(item => item.url), [
+    '/api/move?vx=0.4&vy=0&vyaw=0',
+    '/api/manual_stop',
+  ], 'an active manual move must still stop exactly once on release');
+}
+
 function fakeTimers() {
   let now = 0;
   let serial = 0;
@@ -605,6 +651,7 @@ async function testPersonMarkerEvidenceLabelShows3dAndDedupProof() {
   await testPureTurnSafetyReasonsAreHumanReadable();
   await testDriveFaultResetButtonUsesBackendGuard();
   await testPersonMarkerEvidenceLabelShows3dAndDedupProof();
+  testIdleReleaseEventsCannotParkAutonomousNavigation();
   await testSocketWatchdogReconnectAndBackoff();
   await testStatusPollerNeverOverlaps();
   await testSlowHttpSnapshotCannotOverwriteNewerRealtimeState();

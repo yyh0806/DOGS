@@ -38,6 +38,7 @@ import uuid
 from nx_mission_schema import MissionValidationError, SearchMissionRequest
 from nx_camera_calibration import resolve_camera_calibration
 from nx_exploration_manager import ExplorationManager
+from nx_global_search_state import infer_entrance_gate
 from nx_visibility_coverage import VisibilityCoverageTracker
 from nx_frontier_planner import (
     find_frontier_clusters as _planner_find_frontier_clusters,
@@ -574,6 +575,9 @@ class RoomSearchOrchestrator:
                     "max_plan_probes_per_cycle", "initial_radius_m",
                     "radius_step_m", "tile_size_m",
                     "stable_exhaustion_cycles",
+                    "exclude_entrance_rear", "entrance_gate",
+                    "min_entrance_gate_width_m",
+                    "max_entrance_gate_width_m",
                 ) if key in params
             }
             params = mission_request.to_task_params()
@@ -1261,6 +1265,42 @@ class RoomSearchOrchestrator:
                 or params.get("room") in {"__current__", "current_room"}
                 else "whole_floor"
             )
+            entrance_gate = params.get("entrance_gate")
+            entrance_setting = params.get("exclude_entrance_rear")
+            entrance_exclusion_enabled = (
+                exploration_mode == "current_room"
+                and (
+                    entrance_gate is not None
+                    or (
+                        entrance_setting is not None
+                        and not self._param_explicitly_false(entrance_setting)
+                    )
+                )
+            )
+            if entrance_exclusion_enabled and not entrance_gate:
+                with map_lock:
+                    gate_map = latest_map_box[0]
+                entrance_gate = infer_entrance_gate(
+                    gate_map,
+                    mission_origin,
+                    min_gate_width_m=self._positive_float(
+                        params.get("min_entrance_gate_width_m"), 0.6),
+                    max_gate_width_m=self._positive_float(
+                        params.get("max_entrance_gate_width_m"), 3.0),
+                )
+            if entrance_exclusion_enabled and not entrance_gate:
+                self._fail(
+                    "entrance_gate_unconfirmed",
+                    room="__frontier__",
+                    stage="mission_origin",
+                    msg=(
+                        "current-room search requires occupied support on "
+                        "both sides of the initial entrance"
+                    ),
+                )
+                task.status = "failed"
+                task.result = {"reason": "entrance_gate_unconfirmed"}
+                return
             visibility_setting = params.get("visibility_aware_exploration")
             visibility_enabled = (
                 exploration_mode == "current_room"
@@ -1303,6 +1343,7 @@ class RoomSearchOrchestrator:
                 mode=exploration_mode,
                 room_radius_m=max_radius,
                 room_polygon=params.get("room_polygon"),
+                entrance_gate=entrance_gate,
                 initial_radius_m=initial_radius,
                 radius_step_m=radius_step,
                 tile_size_m=tile_size,
@@ -1688,6 +1729,8 @@ class RoomSearchOrchestrator:
             exploration_state = exploration.snapshot()
             visibility_state = dict(
                 exploration_state.get("visibility") or {})
+            global_search_state = dict(
+                exploration_state.get("global_search") or {})
             # ROI 限定覆盖率 (review #3): mission_origin 圆或 room_polygon
             with map_lock:
                 final_map = latest_map_box[0]
@@ -1782,6 +1825,17 @@ class RoomSearchOrchestrator:
                 "adaptive_step_m": visibility_state.get(
                     "adaptive_step_m"),
                 "exploration_state": exploration_state,
+                "entrance_gate": exploration_state.get("entrance_gate"),
+                "global_search": global_search_state,
+                "traversable_opening_count": global_search_state.get(
+                    "traversable_opening_count", 0),
+                "opening_components": global_search_state.get(
+                    "opening_components", []),
+                "explainable_coverage_ratio": global_search_state.get(
+                    "explainable_coverage_ratio"),
+                "certified_occluded_unknown_cell_count": (
+                    global_search_state.get(
+                        "certified_occluded_unknown_cell_count", 0)),
                 "coverage_valid": coverage_metrics["coverage_valid"],
                 "explored_ratio": coverage_metrics["explored_ratio"],
                 "bounded_explored_ratio": coverage_metrics.get(
@@ -1838,8 +1892,13 @@ class RoomSearchOrchestrator:
                     **frontier_result,
                 }
                 return
-            self._phase("REPORT", progress=1.0, room="__frontier__",
-                        targets_found=len(markers))
+            self._phase(
+                "REPORT",
+                progress=1.0,
+                room="__frontier__",
+                targets_found=len(markers),
+                **self._exploration_live_fields(exploration),
+            )
             self._finalize_report(task, mission_id, sentry_room,
                                   total_wp=nav_attempts,
                                   visited=len(exploration_state[
@@ -1867,6 +1926,9 @@ class RoomSearchOrchestrator:
             "time_budget_exhausted",
             "distance_budget_exhausted",
             "planning_budget_exhausted",
+            "traversable_opening_blocked",
+            "global_coverage_incomplete",
+            "global_evidence_unverified",
         }
         if completion_reason in budget_reasons:
             return "incomplete"
@@ -3013,6 +3075,7 @@ class RoomSearchOrchestrator:
 
         snapshot = exploration.snapshot()
         visibility = dict(snapshot.get("visibility") or {})
+        global_search = dict(snapshot.get("global_search") or {})
         current = target or snapshot.get("current_goal")
         candidates = []
         if isinstance(current, dict):
@@ -3050,6 +3113,16 @@ class RoomSearchOrchestrator:
             "adaptive_step_m": visibility.get("adaptive_step_m"),
             "active_radius_m": snapshot.get("active_radius_m"),
             "active_tile": snapshot.get("active_tile"),
+            "entrance_gate": snapshot.get("entrance_gate"),
+            "global_search": global_search,
+            "traversable_opening_count": global_search.get(
+                "traversable_opening_count", 0),
+            "opening_components": list(
+                global_search.get("opening_components") or []),
+            "explainable_coverage_ratio": global_search.get(
+                "explainable_coverage_ratio"),
+            "certified_occluded_unknown_cell_count": global_search.get(
+                "certified_occluded_unknown_cell_count", 0),
         }
 
     def _phase(self, phase: str, **extra) -> None:

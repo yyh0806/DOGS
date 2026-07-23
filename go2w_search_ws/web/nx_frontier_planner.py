@@ -8,6 +8,8 @@ import math
 import os
 from typing import Callable, Iterable, Mapping, Optional
 
+from nx_global_search_state import edge_crosses_entrance_gate
+
 
 _NEIGHBORS_8 = (
     (-1, -1), (-1, 0), (-1, 1),
@@ -81,6 +83,7 @@ def _reachable_free_cells(
     robot_x: float,
     robot_y: float,
     seed_search_radius_m: float = 1.0,
+    entrance_gate=None,
 ) -> list[int]:
     """Return the known-free component containing the robot.
 
@@ -105,6 +108,15 @@ def _reachable_free_cells(
             0 <= row < height
             and 0 <= col < width
             and data[row * width + col] == 0
+        )
+
+    def cell_world(index):
+        row, col = divmod(index, width)
+        cell_x = (col + 0.5) * resolution
+        cell_y = (row + 0.5) * resolution
+        return (
+            origin_x + cos_yaw * cell_x - sin_yaw * cell_y,
+            origin_y + sin_yaw * cell_x + cos_yaw * cell_y,
         )
 
     seed = None
@@ -149,6 +161,12 @@ def _reachable_free_cells(
         if row + 1 < height:
             neighbors.append(index + width)
         for neighbor in neighbors:
+            if (
+                entrance_gate is not None
+                and edge_crosses_entrance_gate(
+                    cell_world(index), cell_world(neighbor), entrance_gate)
+            ):
+                continue
             if not discovered[neighbor] and data[neighbor] == 0:
                 discovered[neighbor] = 1
                 queue.append(neighbor)
@@ -163,6 +181,7 @@ def find_frontier_clusters(
     revisit_radius: float = 1.0,
     frontier_spacing_m: float = 1.5,
     max_candidates_per_cluster: int = 64,
+    entrance_gate=None,
 ) -> list[dict]:
     """Return connected free cells bordering unknown occupancy cells.
 
@@ -181,9 +200,22 @@ def find_frontier_clusters(
     except (TypeError, IndexError):
         robot_x = robot_y = 0.0
 
+    cos_yaw = math.cos(origin_yaw)
+    sin_yaw = math.sin(origin_yaw)
+
+    def cell_world(cell):
+        row, col = cell
+        local_x = (col + 0.5) * resolution
+        local_y = (row + 0.5) * resolution
+        return (
+            origin_x + cos_yaw * local_x - sin_yaw * local_y,
+            origin_y + sin_yaw * local_x + cos_yaw * local_y,
+        )
+
     reachable_free = _reachable_free_cells(
         data, width, height, resolution,
-        origin_x, origin_y, origin_yaw, robot_x, robot_y)
+        origin_x, origin_y, origin_yaw, robot_x, robot_y,
+        entrance_gate=entrance_gate)
     cell_count = width * height
     frontier_mask = bytearray(cell_count)
     frontier_count = 0
@@ -195,6 +227,15 @@ def find_frontier_clusters(
             neighbor_col = col + dc
             if (0 <= neighbor_row < height and 0 <= neighbor_col < width
                     and data[neighbor_row * width + neighbor_col] == -1):
+                if (
+                    entrance_gate is not None
+                    and edge_crosses_entrance_gate(
+                        cell_world((row, col)),
+                        cell_world((neighbor_row, neighbor_col)),
+                        entrance_gate,
+                    )
+                ):
+                    continue
                 is_frontier = True
                 break
         if is_frontier:
@@ -225,18 +266,6 @@ def find_frontier_clusters(
                     queue.append(neighbor)
         if len(component) >= max(1, int(min_cluster_size)):
             components.append(component)
-
-    cos_yaw = math.cos(origin_yaw)
-    sin_yaw = math.sin(origin_yaw)
-
-    def cell_world(cell):
-        row, col = cell
-        local_x = (col + 0.5) * resolution
-        local_y = (row + 0.5) * resolution
-        return (
-            origin_x + cos_yaw * local_x - sin_yaw * local_y,
-            origin_y + sin_yaw * local_x + cos_yaw * local_y,
-        )
 
     spacing = _finite_float(frontier_spacing_m, 1.5)
     if spacing <= 0.0:
@@ -398,6 +427,7 @@ def select_frontier_candidates(
     cluster_finder: Callable = find_frontier_clusters,
     frontier_spacing_m: float = 1.5,
     max_candidates_per_cluster: int = 64,
+    entrance_gate=None,
     distance_weight: Optional[float] = None,
     heading_weight: float = 0.0,
     failure_penalty: float = 1.0,
@@ -414,6 +444,8 @@ def select_frontier_candidates(
     if callable_accepts_keyword(cluster_finder, "max_candidates_per_cluster"):
         cluster_kwargs["max_candidates_per_cluster"] = (
             max_candidates_per_cluster)
+    if callable_accepts_keyword(cluster_finder, "entrance_gate"):
+        cluster_kwargs["entrance_gate"] = entrance_gate
     clusters = cluster_finder(
         map_msg, robot_pose, visited, min_cluster_size, revisit_radius,
         **cluster_kwargs)

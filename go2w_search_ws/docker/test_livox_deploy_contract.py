@@ -16,6 +16,12 @@ def test_deploy_web_copies_lidar_and_gimbal_components():
     assert 'web/nx_slam_map.py' in script
 
 
+def test_deploy_web_copies_global_search_state_import_dependency():
+    script = read("docker/deploy_nx_web.sh")
+
+    assert 'web/nx_global_search_state.py' in script
+
+
 def test_deploy_web_installs_livox_driver_services():
     script = read("docker/deploy_nx_web.sh")
     assert 'docker/livox-mid360-net.service' in script

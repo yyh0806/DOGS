@@ -1,4 +1,5 @@
 import http.server
+import socket
 import subprocess
 import sys
 import importlib.util
@@ -43,6 +44,7 @@ def test_voice_console_help_works_without_site_packages():
     assert "--llm-model" in result.stdout
     assert "--llm-mode" in result.stdout
     assert "--llm-timeout" in result.stdout
+    assert "--bind-address" in result.stdout
 
 
 def test_voice_requirements_cover_runtime_imports():
@@ -106,7 +108,7 @@ def test_validate_search_command_rejects_unrelated_and_negated_search():
         }
 
 
-def _serve_admission(payload, status=202):
+def _serve_admission(payload, status=202, *, include_client_ip=False):
     requests = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -116,6 +118,8 @@ def _serve_admission(payload, status=202):
                 "path": self.path,
                 "body": json.loads(self.rfile.read(length).decode("utf-8")),
             }
+            if include_client_ip:
+                request["client_ip"] = self.client_address[0]
             if self.headers.get("Authorization"):
                 request["authorization"] = self.headers["Authorization"]
             requests.append(request)
@@ -196,6 +200,69 @@ def test_send_command_uses_explicit_bearer_token():
 
     assert result["ok"] is True
     assert requests[0]["authorization"] == "Bearer abc_123-XYZ"
+
+
+def test_send_command_can_bind_the_local_source_address():
+    module = load_voice_console()
+    server, thread, requests = _serve_admission(
+        {"ok": True, "accepted": True}, include_client_ip=True)
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/api/command"
+        result = module.send_command(
+            url, "search room", bind_address="127.0.0.1")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(1.0)
+
+    assert result["ok"] is True
+    assert requests[0]["client_ip"] == "127.0.0.1"
+
+
+def test_bound_http_adapter_keeps_the_requested_source_address():
+    import requests
+
+    module = load_voice_console()
+    session = module._bound_requests_session(requests, "127.0.0.1")
+    try:
+        adapter = session.adapters["http://"]
+        assert adapter.poolmanager.connection_pool_kw["source_address"] == (
+            "127.0.0.1", 0)
+        assert session.trust_env is False
+    finally:
+        session.close()
+
+
+def test_bound_websocket_uses_the_requested_source_address(monkeypatch):
+    module = load_voice_console()
+    calls = {}
+
+    class FakeStream:
+        def close(self):
+            calls["stream_closed"] = True
+
+    stream = FakeStream()
+    websocket_connection = object()
+
+    def fake_socket_connection(target, *, timeout, source_address):
+        calls["socket"] = (target, timeout, source_address)
+        return stream
+
+    def fake_websocket_connection(url, **kwargs):
+        calls["websocket"] = (url, kwargs)
+        return websocket_connection
+
+    monkeypatch.setattr(socket, "create_connection", fake_socket_connection)
+    monkeypatch.setattr(module.websocket, "create_connection", fake_websocket_connection)
+
+    result = module._connect_bound_websocket(
+        "ws://192.168.1.105:8001", "192.168.1.102", timeout=3.0)
+
+    assert result is websocket_connection
+    assert calls["socket"] == (
+        ("192.168.1.105", 8001), 3.0, ("192.168.1.102", 0))
+    assert calls["websocket"] == (
+        "ws://192.168.1.105:8001", {"timeout": 3.0, "socket": stream})
 
 
 def test_control_token_file_must_be_one_url_safe_line(tmp_path):

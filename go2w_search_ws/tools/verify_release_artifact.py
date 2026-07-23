@@ -64,6 +64,7 @@ _REQUIRED_PAYLOAD_FILES = frozenset({
     "web/nx_c13_image_node.py",
     "web/nx_control_auth.py",
     "web/nx_frontier_planner.py",
+    "web/nx_global_search_state.py",
     "web/nx_gimbal_node.py",
     "web/nx_lidar_node.py",
     "web/nx_web_server.py",

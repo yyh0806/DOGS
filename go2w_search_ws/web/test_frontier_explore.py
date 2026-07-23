@@ -623,6 +623,7 @@ def test_current_room_frontier_explore_feeds_lidar_c13_visibility_to_state(
         "max_radius_m": 6.0,
         "initial_radius_m": 6.0,
         "stable_exhaustion_cycles": 1,
+        "exclude_entrance_rear": False,
     })
     orchestrator = make_orchestrator(events, FakeNav())
 
@@ -646,6 +647,167 @@ def test_current_room_frontier_explore_feeds_lidar_c13_visibility_to_state(
     ]
     assert live_states
     assert live_states[-1]["coverage_cell_size_m"] == pytest.approx(0.5)
+
+
+def test_current_room_infers_and_reports_the_unique_entrance_gate(monkeypatch):
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(
+        orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+    inferred = []
+    gate = {
+        "center_x": 0.2,
+        "center_y": 0.2,
+        "yaw": 0.0,
+        "width_m": 1.0,
+    }
+
+    def infer_gate(map_msg, mission_origin, **kwargs):
+        inferred.append((map_msg, tuple(mission_origin), dict(kwargs)))
+        return dict(gate)
+
+    class CompleteVisibilityTracker:
+        def __init__(self, **_kwargs):
+            pass
+
+        def observe(self, map_msg, _robot_pose, _scan_snapshot):
+            return self.snapshot(map_msg)
+
+        def rank_candidates(self, _map_msg, _robot_pose, candidates):
+            return list(candidates)
+
+        def snapshot(self, map_msg=None):
+            observed = []
+            if map_msg is not None:
+                width = map_msg.info.width
+                resolution = map_msg.info.resolution
+                observed = [
+                    {
+                        "x": ((index % width) + 0.5) * resolution,
+                        "y": ((index // width) + 0.5) * resolution,
+                    }
+                    for index, value in enumerate(map_msg.data)
+                    if value == 0
+                ]
+            return {
+                "observed_cells": observed,
+                "observed_cell_count": len(observed),
+                "visual_coverage_ratio": 1.0,
+            }
+
+    monkeypatch.setattr(orch_module, "infer_entrance_gate", infer_gate)
+    monkeypatch.setattr(
+        orch_module, "VisibilityCoverageTracker", CompleteVisibilityTracker)
+    monkeypatch.setattr(
+        orch_module, "select_frontier_candidates", lambda *_a, **_k: [])
+    task = FakeTask()
+    task.params.update({
+        "room": "current_room",
+        "stable_exhaustion_cycles": 1,
+        "exclude_entrance_rear": True,
+    })
+    events = []
+    orchestrator = make_orchestrator(events, FakeNav())
+
+    orchestrator.run(task)
+
+    assert inferred
+    assert task.status == "completed"
+    assert task.result["exploration_state"]["entrance_gate"] == gate
+    assert task.result["entrance_gate"] == gate
+    assert task.result["traversable_opening_count"] == 0
+    assert task.result["explainable_coverage_ratio"] == pytest.approx(1.0)
+    live_states = [
+        event["data"] for event in events
+        if event.get("type") == "search_room"
+        and event.get("data", {}).get("entrance_gate") == gate
+    ]
+    assert live_states
+    assert live_states[-1]["traversable_opening_count"] == 0
+    assert live_states[-1]["explainable_coverage_ratio"] == pytest.approx(1.0)
+
+
+def test_current_room_fails_closed_when_entrance_gate_is_unconfirmed(monkeypatch):
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(
+        orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+    monkeypatch.setattr(
+        orch_module, "infer_entrance_gate", lambda *_a, **_k: None)
+    task = FakeTask()
+    task.params.update({
+        "room": "current_room",
+        "exclude_entrance_rear": True,
+    })
+    nav = FakeNav()
+    orchestrator = make_orchestrator([], nav)
+
+    orchestrator.run(task)
+
+    assert task.status == "failed"
+    assert task.result["reason"] == "entrance_gate_unconfirmed"
+    assert nav.calls == []
+
+
+def test_current_room_starts_without_an_entrance_gate_by_default(monkeypatch):
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    monkeypatch.setattr(
+        orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+
+    def unexpected_gate_inference(*_args, **_kwargs):
+        raise AssertionError("default current-room search must not infer an entrance gate")
+
+    class CompleteVisibilityTracker:
+        def __init__(self, **_kwargs):
+            pass
+
+        def observe(self, map_msg, _robot_pose, _scan_snapshot):
+            return self.snapshot(map_msg)
+
+        def rank_candidates(self, _map_msg, _robot_pose, candidates):
+            return list(candidates)
+
+        def snapshot(self, map_msg=None):
+            observed = []
+            if map_msg is not None:
+                width = map_msg.info.width
+                resolution = map_msg.info.resolution
+                observed = [
+                    {
+                        "x": ((index % width) + 0.5) * resolution,
+                        "y": ((index // width) + 0.5) * resolution,
+                    }
+                    for index, value in enumerate(map_msg.data)
+                    if value == 0
+                ]
+            return {
+                "observed_cells": observed,
+                "observed_cell_count": len(observed),
+                "visual_coverage_ratio": 1.0,
+            }
+
+    monkeypatch.setattr(
+        orch_module, "infer_entrance_gate", unexpected_gate_inference)
+    monkeypatch.setattr(
+        orch_module, "VisibilityCoverageTracker", CompleteVisibilityTracker)
+    monkeypatch.setattr(
+        orch_module, "select_frontier_candidates", lambda *_a, **_k: [])
+    task = FakeTask()
+    task.params.update({
+        "room": "current_room",
+        "stable_exhaustion_cycles": 1,
+    })
+    nav = FakeNav()
+    orchestrator = make_orchestrator([], nav)
+
+    orchestrator.run(task)
+
+    assert task.status == "completed"
+    assert task.result["entrance_gate"] is None
+    assert task.result["exploration_state"]["entrance_gate"] is None
+    assert task.result["global_search"]["valid"] is True
+    assert task.result["global_search"]["entrance_excluded_edge_count"] == 0
 
 
 def test_visibility_scan_snapshot_preserves_sensor_geometry_and_freshness():
@@ -1013,6 +1175,7 @@ def test_frontier_explore_reports_dynamic_radius_and_tiles(monkeypatch):
         "frontier_spacing_m": 0.8,
         "stable_exhaustion_cycles": 1,
         "visibility_aware_exploration": False,
+        "exclude_entrance_rear": False,
     })
     orchestrator = make_orchestrator([], FakeNav())
 
@@ -1047,6 +1210,7 @@ def test_frontier_explore_waits_for_stable_exhaustion(monkeypatch):
         "initial_radius_m": 6.0,
         "stable_exhaustion_cycles": 3,
         "visibility_aware_exploration": False,
+        "exclude_entrance_rear": False,
     })
     orchestrator = make_orchestrator([], FakeNav())
 
@@ -1078,6 +1242,7 @@ def test_large_room_defaults_do_not_stop_at_fifteen_waypoints(monkeypatch):
     task.params = SearchMissionRequest.current_room(
         ["person"], request_id="large-room-16").to_task_params()
     task.params["stable_exhaustion_cycles"] = 1
+    task.params["exclude_entrance_rear"] = False
     orchestrator = make_orchestrator([], FakeNav())
 
     orchestrator.run(task)
@@ -1684,6 +1849,23 @@ def test_completion_status_prefers_bounded_room_coverage():
         },
     )
     assert status == "completed"
+
+
+def test_completion_status_is_incomplete_while_a_traversable_opening_is_blocked():
+    orchestrator = make_orchestrator([], FakeNav())
+
+    status = orchestrator._derive_completion_status(
+        "traversable_opening_blocked",
+        {
+            "coverage_valid": True,
+            "roi": {"type": "circle"},
+            "explored_ratio": 1.0,
+            "bounded_explored_ratio": 1.0,
+            "enclosed_unknown_regions": [],
+        },
+    )
+
+    assert status == "incomplete"
 
 
 def test_dynamic_circle_roi_cannot_complete_with_most_area_still_unknown():

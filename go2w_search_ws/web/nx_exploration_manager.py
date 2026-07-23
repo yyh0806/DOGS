@@ -20,6 +20,10 @@ from nx_frontier_planner import (
     score_frontier,
     select_frontier_candidates,
 )
+from nx_global_search_state import (
+    analyze_global_search_state,
+    path_crosses_entrance_gate,
+)
 
 
 def _abs_angle_delta(a: float, b: float) -> float:
@@ -70,6 +74,7 @@ class ExplorationManager:
         mode: str = "current_room",
         room_radius_m: Optional[float] = 6.0,
         room_polygon=None,
+        entrance_gate=None,
         initial_radius_m: Optional[float] = None,
         radius_step_m: float = 6.0,
         tile_size_m: float = 6.0,
@@ -105,6 +110,8 @@ class ExplorationManager:
         failure_penalty: float = 1.0,
         visibility_tracker: Any = None,
         visual_coverage_threshold: float = 0.9,
+        global_coverage_threshold: float = 0.95,
+        global_traversal_clearance_m: float = 0.40,
         coverage_candidate_limit: int = 32,
         candidate_selector: Optional[Callable] = None,
         monotonic: Callable[[], float] = time.monotonic,
@@ -154,6 +161,24 @@ class ExplorationManager:
         self.room_polygon = (
             [(float(x), float(y)) for x, y in room_polygon]
             if room_polygon else None)
+        if entrance_gate is None:
+            self.entrance_gate = None
+        else:
+            try:
+                normalized_gate = {
+                    "center_x": float(entrance_gate["center_x"]),
+                    "center_y": float(entrance_gate["center_y"]),
+                    "yaw": float(entrance_gate["yaw"]),
+                    "width_m": float(entrance_gate["width_m"]),
+                }
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("entrance_gate is invalid") from exc
+            if (
+                normalized_gate["width_m"] <= 0.0
+                or not all(math.isfinite(value) for value in normalized_gate.values())
+            ):
+                raise ValueError("entrance_gate is invalid")
+            self.entrance_gate = normalized_gate
         if self.room_radius_m is None:
             self.initial_radius_m = None
             self._active_radius_m = None
@@ -224,6 +249,10 @@ class ExplorationManager:
         self.visibility_tracker = visibility_tracker
         self.visual_coverage_threshold = min(
             1.0, max(0.0, float(visual_coverage_threshold)))
+        self.global_coverage_threshold = min(
+            1.0, max(0.0, float(global_coverage_threshold)))
+        self.global_traversal_clearance_m = max(
+            0.0, float(global_traversal_clearance_m))
         self.coverage_candidate_limit = max(1, int(coverage_candidate_limit))
         self._candidate_selector = candidate_selector
         self._monotonic = monotonic
@@ -237,6 +266,8 @@ class ExplorationManager:
             (0, 0) if normalized_mode == "current_room" else None)
         self._visited_tiles: set[tuple[int, int]] = set()
         self._exhaustion_streak = 0
+        self._last_exhaustion_revision = None
+        self._global_search_state = {}
         self._distance_m = 0.0
         self._plan_probes = 0
         self._plan_rejections = 0
@@ -395,7 +426,7 @@ class ExplorationManager:
                 return None
 
         self._clear_selected_goal()
-        self._confirm_exhaustion()
+        self._confirm_exhaustion(map_msg)
         return None
 
     def _activate_selected_goal(
@@ -404,6 +435,7 @@ class ExplorationManager:
             [chosen], robot_pose, map_msg)
         self._current_goal = dict(ranked[0])
         self._exhaustion_streak = 0
+        self._last_exhaustion_revision = None
         self._navigation_start_distance = self._distance_from_pose(
             self._current_goal, robot_pose)
         self._navigation_divergence_count = 0
@@ -570,6 +602,8 @@ class ExplorationManager:
         return {
             "mode": self.mode,
             "mission_origin": list(self.mission_origin),
+            "entrance_gate": (
+                dict(self.entrance_gate) if self.entrance_gate else None),
             "map_revision": self._map_revision,
             "initial_radius_m": self.initial_radius_m,
             "active_radius_m": self._active_radius_m,
@@ -607,6 +641,9 @@ class ExplorationManager:
             "max_frontier_standoff_steps": self.max_frontier_standoff_steps,
             "open_space_heading_weight": self.open_space_heading_weight,
             "visual_coverage_threshold": self.visual_coverage_threshold,
+            "global_coverage_threshold": self.global_coverage_threshold,
+            "global_traversal_clearance_m": self.global_traversal_clearance_m,
+            "global_search": dict(self._global_search_state),
             "utility_mode": self.utility_mode,
             "mixed_frontier_weight": self.mixed_frontier_weight,
             "mixed_visual_gain_weight": self.mixed_visual_gain_weight,
@@ -1000,6 +1037,14 @@ class ExplorationManager:
                 return False
         return True
 
+    def _path_respects_entrance_gate(self, path_result: dict) -> bool:
+        if self.entrance_gate is None:
+            return True
+        path = path_result.get("path")
+        if not path:
+            return False
+        return not path_crosses_entrance_gate(path, self.entrance_gate)
+
     def _select_candidates(self, candidate_selector, map_msg, robot_pose):
         selector_kwargs = dict(
             revisit_radius=self.revisit_radius_m,
@@ -1012,6 +1057,11 @@ class ExplorationManager:
             heading_weight=self.heading_weight,
             failure_penalty=self.failure_penalty,
         )
+        if (
+            self.entrance_gate is not None
+            and callable_accepts_keyword(candidate_selector, "entrance_gate")
+        ):
+            selector_kwargs["entrance_gate"] = dict(self.entrance_gate)
         if callable_accepts_keyword(candidate_selector, "frontier_spacing_m"):
             selector_kwargs["frontier_spacing_m"] = self.frontier_spacing_m
         candidates = candidate_selector(
@@ -1507,6 +1557,8 @@ class ExplorationManager:
             return str(result.get("reason") or "unreachable")
         if not self._path_respects_room(result):
             return "path_leaves_room_polygon"
+        if not self._path_respects_entrance_gate(result):
+            return "path_crosses_entrance_gate"
         if not self._path_makes_progress(result):
             return "degenerate_plan"
         if not self._path_endpoint_reaches_goal(result):
@@ -2001,7 +2053,56 @@ class ExplorationManager:
         ))
         return annotated
 
-    def _confirm_exhaustion(self) -> None:
+    def _confirm_exhaustion(self, map_msg=None) -> None:
+        if self.entrance_gate is None and (
+                self.mode != "current_room"
+                or self.visibility_tracker is None):
+            self._exhaustion_streak += 1
+            if self._exhaustion_streak >= self.stable_exhaustion_cycles:
+                self._last_selection_reason = "reachable_frontiers_exhausted"
+            else:
+                self._last_selection_reason = "stability_confirmation_pending"
+            return
+        observed_cells = []
+        observed_cell_size_m = None
+        if self.visibility_tracker is not None:
+            try:
+                visibility = dict(
+                    self.visibility_tracker.snapshot(map_msg) or {})
+                observed_cells = list(
+                    visibility.get("observed_cells") or [])
+                observed_cell_size_m = visibility.get("coverage_cell_size_m")
+            except Exception:
+                observed_cells = []
+        state = analyze_global_search_state(
+            map_msg,
+            mission_origin=self.mission_origin,
+            entrance_gate=self.entrance_gate,
+            observed_cells=observed_cells,
+            observed_cell_size_m=observed_cell_size_m,
+            traversal_clearance_m=self.global_traversal_clearance_m,
+            coverage_threshold=self.global_coverage_threshold,
+        )
+        self._global_search_state = dict(state)
+        if not state.get("valid"):
+            self._exhaustion_streak = 0
+            self._last_exhaustion_revision = None
+            self._last_selection_reason = "global_evidence_unverified"
+            return
+        if int(state.get("traversable_opening_count", 0) or 0) > 0:
+            self._exhaustion_streak = 0
+            self._last_exhaustion_revision = None
+            self._last_selection_reason = "traversable_opening_blocked"
+            return
+        if not state.get("completion_eligible"):
+            self._exhaustion_streak = 0
+            self._last_exhaustion_revision = None
+            self._last_selection_reason = "global_coverage_incomplete"
+            return
+        if self._last_exhaustion_revision == self._map_revision:
+            self._last_selection_reason = "stability_confirmation_pending"
+            return
+        self._last_exhaustion_revision = self._map_revision
         self._exhaustion_streak += 1
         if self._exhaustion_streak >= self.stable_exhaustion_cycles:
             self._last_selection_reason = "reachable_frontiers_exhausted"

@@ -533,8 +533,8 @@ def test_dwb_rejects_trajectories_using_the_full_rectangular_footprint():
     assert "ObstacleFootprint.scale: 0.02" in controller
 
 
-def test_global_planner_uses_orientation_independent_turning_envelope():
-    """Navfn plans robot centers, so its body must cover every local yaw."""
+def test_global_planner_hard_radius_allows_an_0_8m_passage():
+    """Global planning admits 0.8 m gaps; local DWB keeps the full body gate."""
     params = (ROOT / "src/go2w_nav/config/nav2_params_3d.yaml").read_text(
         encoding="utf-8"
     )
@@ -557,11 +557,18 @@ def test_global_planner_uses_orientation_independent_turning_envelope():
             r'^\s+inflation_radius:\s*([0-9.]+)', local_section, re.M
         ).group(1)
     )
-    # The global layer keeps the hard turning envelope; the local controller
-    # owns the wider soft-clearance gradient used during motion.
-    assert radius >= math.hypot(0.45, 0.32) + 0.04
-    assert inflation >= radius
-    assert local_inflation >= radius + 0.10
+    local_footprint = ast.literal_eval(ast.literal_eval(
+        re.search(r'^\s+footprint:\s*(.+)$', local_section, re.M).group(1)
+    ))
+    local_width = max(point[1] for point in local_footprint) - min(
+        point[1] for point in local_footprint
+    )
+
+    assert radius == pytest.approx(0.40)
+    assert 2.0 * radius == pytest.approx(0.80)
+    assert local_width == pytest.approx(0.64)
+    assert inflation == pytest.approx(0.60)
+    assert local_inflation == pytest.approx(0.71)
 
 
 def test_dwb_samples_forward_only_low_speed_approaches():
