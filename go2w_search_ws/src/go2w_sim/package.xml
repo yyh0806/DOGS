@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>go2w_sim</name>
+  <version>0.1.0</version>
+  <description>Gazebo Classic 11 simulation of DOGS Nav2 stack (Livox+FastLIO+Nav2+motion)</description>
+  <maintainer email="nhy@todo.todo">nhy</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>gazebo_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>gazebo_ros</exec_depend>
+  <exec_depend>gazebo_plugins</exec_depend>
+  <exec_depend>pointcloud_to_laserscan</exec_depend>
+  <test_depend>python3-pytest</test_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

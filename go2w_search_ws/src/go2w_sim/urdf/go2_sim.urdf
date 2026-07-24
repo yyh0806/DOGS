@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<!-- MVP M1a: minimal kinematic-base Go2 (no legs; Task 2 adds Livox + IMU sensors).
+     planar_move plugin subscribes /cmd_vel and moves base_link (z constrained). -->
+<robot name="go2_sim">
+  <link name="base_footprint">
+    <inertial><mass value="0.01"/><inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/></inertial>
+  </link>
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+  </joint>
+  <link name="base_link">
+    <inertial>
+      <mass value="6.0"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="0.06" ixy="0" ixz="0" iyy="0.10" iyz="0" izz="0.13"/>
+    </inertial>
+    <visual name="v">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.40 0.20 0.10"/></geometry>
+      <material name="grey"><color rgba="0.3 0.3 0.3 1.0"/></material>
+    </visual>
+    <collision name="c">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.40 0.20 0.10"/></geometry>
+    </collision>
+  </link>
+  <gazebo>
+    <plugin name="planar_move" filename="libgazebo_ros_planar_move.so">
+      <ros>
+        <namespace>/</namespace>
+        <remapping>odom:=/odom_planar</remapping>
+      </ros>
+      <commandTopic>/cmd_vel</commandTopic>
+      <bodyName>base_link</bodyName>
+      <odometryTopic>/odom_planar</odometryTopic>
+      <odometryFrame>odom</odometryFrame>
+      <robotBaseFrame>base_footprint</robotBaseFrame>
+      <updateRate>50.0</updateRate>
+      <leftJoint>base_footprint_joint</leftJoint>
+      <rightJoint>base_footprint_joint</rightJoint>
+      <wheelSeparation>0.3</wheelSeparation>
+      <wheelDiameter>0.1</wheelDiameter>
+    </plugin>
+  </gazebo>
+</robot>
