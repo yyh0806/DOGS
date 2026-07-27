@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- FastRTPS profile: 禁 SHM transport, 强 UDPv4 only.
+     WSL2 上 FastRTPS SHM 多进程并发触发 "open_and_lock_file failed"
+     (fastrtps_portXXXX /dev/shm 锁竞争), 致 publisher/subscriber DDS 发现失败
+     (例 sim_telemetry_bridge /wheel_feedback PUB_COUNT=0). 禁 SHM 走 UDP 稳定.
+     真机 NX 同坑 (memory slam-nav2-bringup-gotchas), 此 profile 通用.
+
+     importer: launch SetEnvironmentVariable(FASTRTPS_DEFAULT_PROFILES_FILE) + shell export.
+     用法:
+       export FASTRTPS_DEFAULT_PROFILES_FILE=$(ros2 pkg prefix go2w_sim)/share/go2w_sim/config/fastudp_profile.xml
+       export RMW_FASTRTPS_USE_QOS_FROM_XML=1   # 可选, 让 QoS 也走 XML
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>udp_only</transport_id>
+        <type>UDPv4</type>
+      </transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="udp_only_profile" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>udp_only</transport_id>
+        </userTransports>
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

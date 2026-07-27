@@ -1,0 +1,79 @@
+<?xml version="1.0"?>
+<!-- M2 多房间: 12x12m, 4 房间 + 中央十字门洞交汇 (每内墙留 2m 门洞).
+     狗从 (0,0) 出生, 经门洞去任一房间; frontier 探索有真内容.
+     bbox x,y∈[-6,6], inflation 0.30m. 静态墙, ODE 50Hz/0.02s.
+     importer: sim_fastlio_bringup.launch.py gzserver world arg (可选). -->
+<sdf version="1.6">
+  <world name="indoor_rooms">
+    <physics name="ode" type="ode">
+      <real_time_update_rate>50.0</real_time_update_rate>
+      <max_step_size>0.02</max_step_size>
+    </physics>
+    <gravity>0 0 -9.80665</gravity>
+    <plugin name="gazebo_ros_state" filename="libgazebo_ros_state.so">
+      <ros><namespace>/</namespace></ros>
+      <update_rate>10.0</update_rate>
+    </plugin>
+    <include><uri>model://sun</uri></include>
+    <model name="ground_plane">
+      <static>true</static><pose>0 0 0 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>50 50</size></plane></geometry>
+          <surface><friction><ode><mu>100</mu><mu2>50</mu2></ode></friction></surface>
+        </collision>
+      </link>
+    </model>
+    <!-- 外墙 12x12 (x,y∈[-6,6]) -->
+    <model name="wall_north"><static>true</static><pose>0 6 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>12.4 0.2 1.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>12.4 0.2 1.0</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+      </link></model>
+    <model name="wall_south"><static>true</static><pose>0 -6 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>12.4 0.2 1.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>12.4 0.2 1.0</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+      </link></model>
+    <model name="wall_east"><static>true</static><pose>6 0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.2 12.4 1.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.2 12.4 1.0</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+      </link></model>
+    <model name="wall_west"><static>true</static><pose>-6 0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.2 12.4 1.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.2 12.4 1.0</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+      </link></model>
+    <!-- 水平内墙 (y=0): 两段, 中间留 2m 门洞 x∈[-1,1] -->
+    <model name="wall_in_h_w"><static>true</static><pose>-3.5 0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>5.0 0.2 1.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>5.0 0.2 1.0</size></box></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient></material></visual>
+      </link></model>
+    <model name="wall_in_h_e"><static>true</static><pose>3.5 0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>5.0 0.2 1.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>5.0 0.2 1.0</size></box></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient></material></visual>
+      </link></model>
+    <!-- 垂直内墙 (x=0): 两段, 中间留 2m 门洞 y∈[-1,1] -->
+    <model name="wall_in_v_s"><static>true</static><pose>0 -3.5 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.2 5.0 1.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.2 5.0 1.0</size></box></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient></material></visual>
+      </link></model>
+    <model name="wall_in_v_n"><static>true</static><pose>0 3.5 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.2 5.0 1.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.2 5.0 1.0</size></box></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient></material></visual>
+      </link></model>
+  </world>
+</sdf>

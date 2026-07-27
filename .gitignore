@@ -33,3 +33,7 @@ costmap.pgm
 go2w_search_ws/web/missions/
 tmp/
 go2w_search_ws/tmp/
+
+# 仿真 SIGFPE workaround 编译产物 (WSL2 glibc ifunc): 源码 mycos.c + mycos.map 入库,
+# .so 由目标机现场 gcc 编译 (见 QUICKSTART.md "仿真模式" Step 4)
+go2w_search_ws/tools/mycos.so
