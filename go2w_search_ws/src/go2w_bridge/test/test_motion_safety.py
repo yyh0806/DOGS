@@ -54,6 +54,51 @@ def test_drive_watchdog_requires_measured_wheel_response():
     assert watchdog.evaluate((0.2, 0.0, 0.0)) == "wheel_no_response"
 
 
+def test_drive_watchdog_uses_longer_wheel_response_grace_than_feedback_timeout():
+    from go2w_bridge.motion_safety import DriveExecutionWatchdog
+
+    clock = Clock()
+    watchdog = DriveExecutionWatchdog(
+        timeout=0.2,
+        response_grace=0.7,
+        min_wheel_speed=0.1,
+        clock=clock,
+    )
+    assert watchdog.observe_feedback(
+        [0.0] * 4, 80, 0, sport_mode=1, sport_progress=0.0) is True
+    assert watchdog.evaluate((0.0, 0.0, 0.15)) is None
+
+    clock.value += 0.64
+    assert watchdog.observe_feedback(
+        [0.0] * 4, 80, 0, sport_mode=1, sport_progress=0.0) is True
+    assert watchdog.evaluate((0.0, 0.0, 0.15)) is None
+
+    clock.value += 0.07
+    assert watchdog.observe_feedback(
+        [0.0] * 4, 80, 0, sport_mode=1, sport_progress=0.0) is True
+    assert watchdog.evaluate((0.0, 0.0, 0.15)) == "wheel_no_response"
+
+
+def test_drive_watchdog_stale_feedback_keeps_short_confirmation_timeout():
+    from go2w_bridge.motion_safety import DriveExecutionWatchdog
+
+    clock = Clock()
+    watchdog = DriveExecutionWatchdog(
+        timeout=0.2,
+        response_grace=0.7,
+        min_wheel_speed=0.1,
+        clock=clock,
+    )
+    assert watchdog.observe_feedback(
+        [0.0] * 4, 80, 0, sport_mode=1, sport_progress=0.0) is True
+    assert watchdog.evaluate((0.2, 0.0, 0.0)) is None
+
+    clock.value += 0.21
+    assert watchdog.evaluate((0.2, 0.0, 0.0)) is None
+    clock.value += 0.21
+    assert watchdog.evaluate((0.2, 0.0, 0.0)) == "wheel_feedback_stale"
+
+
 def test_drive_watchdog_rejects_non_wheel_gait_before_velocity_continues():
     from go2w_bridge.motion_safety import DriveExecutionWatchdog
 

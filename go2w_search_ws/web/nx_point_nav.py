@@ -103,7 +103,7 @@ class PointNavigationController:
         cancel_response_timeout: float = 3.0,
         cancel_terminal_timeout: float = 10.0,
         cancel_max_attempts: int = 3,
-        health_failure_grace: float = 5.0,  # 2026-07-17 候选③: 0.5→5.0 给激活(parked→active, wheel_balance 转换)时间, 避免激活中 ready 短暂 false 立即 motion_unhealthy cancel 打断激活死循环
+        health_failure_grace: float = 60.0,  # 仿真 sim 时钟慢激活久, 5→60 给 grace (原 5s 致 sim 激活超 grace → motion_unhealthy cancel)
         health_check: Optional[Callable[[], Any]] = None,
     ) -> None:
         self._server_timeout = self._positive_timeout(server_timeout, "server_timeout")

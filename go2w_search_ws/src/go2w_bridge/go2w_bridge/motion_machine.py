@@ -183,6 +183,32 @@ class Go2WMotionMachine:
             return []
 
         if intent in (MotionIntent.START_MANUAL, MotionIntent.START_NAV):
+            # A browser key/pointer release leaves the dog standing in
+            # wheel-balance for a short manual idle lease.  Nav may take over
+            # that already-active drive session only after fresh telemetry
+            # proves the wheels are stopped.  This changes logical ownership
+            # without issuing another BalanceStand pose transition.
+            if (
+                intent is MotionIntent.START_NAV
+                and self._session is SessionState.MANUAL_ACTIVE
+                and self._owner == "manual"
+            ):
+                if not self._telemetry_is_fresh():
+                    self._fault = "telemetry_stale"
+                    return []
+                if (
+                    self._physical_mode not in self.WHEEL_MODES
+                    or self._actual_motion is not ActualMotionState.STOPPED
+                ):
+                    self._fault = "session_busy"
+                    return []
+                if not scan_fresh:
+                    self._fault = "nav_scan_stale"
+                    return []
+                self._owner = "nav"
+                self._session = SessionState.NAV_ACTIVE
+                self._fault = None
+                return []
             if self._session is not SessionState.PARKED:
                 self._fault = "session_busy"
                 return []

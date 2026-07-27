@@ -1308,6 +1308,24 @@ def test_status_api_exposes_perception_health_without_copying_frames():
     assert "resolve_camera_calibration" in server
 
 
+def test_web_server_stores_typed_scans_in_observation_synchronizer():
+    server = read("web/nx_web_server.py")
+
+    assert "coerce_laser_scan_snapshot" in server
+    assert "scan=typed_scan" in server
+
+
+def test_panel_has_live_video_fallback_and_inline_favicon():
+    panel = read("web/static/panel.html")
+
+    assert 'rel="icon"' in panel
+    assert "/api/video_frame?source=c13_vis" in panel
+    assert "recordStreamFrame" in panel
+    assert "const probe = new Image()" in panel
+    assert "visibleFrameTimes" in panel
+    assert "currentVisibleFrameRate" in panel
+
+
 def test_status_api_rehydrates_detections_markers_and_ws_health(
     monkeypatch, tmp_path
 ):

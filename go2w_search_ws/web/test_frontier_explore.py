@@ -629,7 +629,8 @@ def test_current_room_frontier_explore_feeds_lidar_c13_visibility_to_state(
 
     orchestrator.run(task)
 
-    assert task.status == "completed"
+    assert task.status == "failed"
+    assert task.result["completion_reason"] == "traversable_opening_blocked"
     assert len(created) == 1
     tracker = created[0]
     assert tracker.kwargs["camera_hfov_rad"] == pytest.approx(
@@ -712,10 +713,11 @@ def test_current_room_infers_and_reports_the_unique_entrance_gate(monkeypatch):
     orchestrator.run(task)
 
     assert inferred
-    assert task.status == "completed"
+    assert task.status == "failed"
+    assert task.result["completion_reason"] == "traversable_opening_blocked"
     assert task.result["exploration_state"]["entrance_gate"] == gate
     assert task.result["entrance_gate"] == gate
-    assert task.result["traversable_opening_count"] == 0
+    assert task.result["traversable_opening_count"] == 1
     assert task.result["explainable_coverage_ratio"] == pytest.approx(1.0)
     live_states = [
         event["data"] for event in events
@@ -723,7 +725,7 @@ def test_current_room_infers_and_reports_the_unique_entrance_gate(monkeypatch):
         and event.get("data", {}).get("entrance_gate") == gate
     ]
     assert live_states
-    assert live_states[-1]["traversable_opening_count"] == 0
+    assert live_states[-1]["traversable_opening_count"] == 1
     assert live_states[-1]["explainable_coverage_ratio"] == pytest.approx(1.0)
 
 
@@ -803,7 +805,8 @@ def test_current_room_starts_without_an_entrance_gate_by_default(monkeypatch):
 
     orchestrator.run(task)
 
-    assert task.status == "completed"
+    assert task.status == "failed"
+    assert task.result["completion_reason"] == "traversable_opening_blocked"
     assert task.result["entrance_gate"] is None
     assert task.result["exploration_state"]["entrance_gate"] is None
     assert task.result["global_search"]["valid"] is True
@@ -1338,9 +1341,9 @@ def test_large_room_defaults_do_not_stop_at_fifteen_waypoints(monkeypatch):
 
     orchestrator.run(task)
 
-    assert task.status == "completed"
+    assert task.status == "failed"
     assert task.result["waypoints_reached"] == 16
-    assert task.result["completion_reason"] == "reachable_frontiers_exhausted"
+    assert task.result["completion_reason"] == "traversable_opening_blocked"
 
 
 def test_frontier_explore_waypoint_budget_does_not_claim_completion(monkeypatch):
@@ -1902,6 +1905,41 @@ def test_build_observation_bundle_feeds_pointcloud_dataclass(monkeypatch, tmp_pa
         "cloud depth evidence lost)")
     assert bundle.cloud.value is fake_cloud, (
         f"expected the fed PointCloudSnapshot back, got {bundle.cloud.value!r}")
+
+
+def test_build_observation_bundle_coerces_legacy_scan_mapping(monkeypatch, tmp_path):
+    """Global sync may already contain web-server dict scans from older code."""
+    if not _ensure_person_deps():
+        pytest.skip("frontier deps not importable")
+    from nx_person_localizer import LaserScanSnapshot
+
+    monkeypatch.setattr(
+        orch_module, "_OccupancyGrid", _make_fake_map().__class__)
+    orch = make_orchestrator(
+        [], FakeNav(), node=None, ai_engine=FakeAi(),
+        with_observation_sync=True,
+    )
+    orch._static_root = tmp_path
+    captured_at = time.time()
+    orch._observation_sync.add_pose(
+        stamp=captured_at, x=0.0, y=0.0, yaw=0.0)
+    orch._observation_sync.add_scan(
+        stamp=captured_at,
+        scan={
+            "angle_min": -math.pi,
+            "angle_increment": math.pi / 180.0,
+            "ranges": [2.0] * 360,
+            "range_min": 0.15,
+            "range_max": 10.0,
+        },
+    )
+    snapshot = FakeAi().get_person_detection_snapshot()
+    snapshot["timestamp"] = captured_at
+
+    bundle_result = orch._build_observation_bundle(snapshot, False)
+
+    assert bundle_result is not None
+    assert isinstance(bundle_result["scan"], LaserScanSnapshot)
 
 
 # ============================================================================

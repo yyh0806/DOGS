@@ -15,12 +15,33 @@ from nx_person_localizer import (  # noqa: E402
     DetectionFrame,
     LaserScanSnapshot,
     PointCloudSnapshot,
+    coerce_laser_scan_snapshot,
     decode_pointcloud_xyz,
     height_at_bearing,
     localize_person_detection,
     localize_target_detection,
     range_at_bearing,
 )
+
+
+def test_scan_mapping_is_coerced_to_typed_snapshot_for_localization():
+    scan = coerce_laser_scan_snapshot({
+        "angle_min": -math.pi,
+        "angle_increment": math.pi / 180.0,
+        "ranges": [2.0] * 360,
+        "range_min": 0.15,
+        "range_max": 10.0,
+        "timestamp": 123.0,
+    })
+
+    assert isinstance(scan, LaserScanSnapshot)
+    assert scan.angle_min == pytest.approx(-math.pi)
+    assert len(scan.ranges) == 360
+    assert coerce_laser_scan_snapshot({
+        "angle_min": 0.0,
+        "angle_increment": 0.0,
+        "ranges": [2.0],
+    }) is None
 
 
 def test_center_bbox_uses_forward_lidar_range():

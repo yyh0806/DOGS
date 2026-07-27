@@ -51,6 +51,26 @@ def test_ollama_response_returns_command_and_disables_streaming():
         assert forbidden in prompt
 
 
+def test_ollama_grounded_seating_alias_becomes_executable_chair_search():
+    module = load_module()
+    normalizer = module.LocalLLMCommandNormalizer(
+        url="http://127.0.0.1:11434/api/chat",
+        model="qwen3:8b",
+        transport=lambda *_args: {
+            "message": {
+                "content": (
+                    '{"command":"搜索当前房间并标注所有可以坐的东西"}'
+                ),
+            },
+        },
+    )
+
+    assert normalizer.normalize(
+        "帮我看看这里有没有可以坐的东西"
+    ) == "搜索房间标注所有椅子"
+    assert "可以坐的东西" in module.SYSTEM_PROMPT
+
+
 def test_openai_compatible_shape_and_body_work():
     module = load_module()
     seen = {}

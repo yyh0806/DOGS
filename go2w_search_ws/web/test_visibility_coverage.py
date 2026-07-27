@@ -240,6 +240,175 @@ def test_ranked_candidate_carries_current_and_turn_clearance_evidence():
     assert candidate["turn_motion_blocked"] is True
 
 
+def _grid_with_terminal_side_obstacle(candidate_x, candidate_y):
+    resolution = 0.1
+    width = height = 100
+    data = [0] * (width * height)
+    obstacle_col = int(candidate_x / resolution)
+    obstacle_row = int((candidate_y + 0.45) / resolution)
+    data[obstacle_row * width + obstacle_col] = 100
+    return _grid(width, height, resolution=resolution, data=data)
+
+
+def _grid_with_known_corridor(*, known_end_x):
+    """0.8 m known-free corridor surrounded by walls and unknown space."""
+    resolution = 0.1
+    width = height = 100
+    data = [-1] * (width * height)
+    start_col = 10
+    end_col = int(known_end_x / resolution)
+    for col in range(start_col, end_col):
+        for row in range(46, 54):
+            data[row * width + col] = 0
+        data[45 * width + col] = 100
+        data[54 * width + col] = 100
+    return _grid(width, height, resolution=resolution, data=data)
+
+
+def test_terminal_egress_stops_before_unknown_frontier_boundary():
+    tracker = _tracker(
+        obstacle_standoff_m=0.6,
+        minimum_motion_step_m=0.35,
+        turn_swept_radius_m=0.57,
+    )
+    pose = (2.0, 5.0, 0.0)
+    candidate_x = 5.85
+    grid = _grid_with_known_corridor(known_end_x=6.0)
+    tracker.observe(grid, pose, _scan(7.0))
+
+    candidate = tracker.rank_candidates(grid, pose, [{
+        "x": candidate_x,
+        "y": pose[1],
+        "yaw": math.pi,
+        "size": 10,
+        "information_gain": 10.0,
+        "distance": candidate_x - pose[0],
+        "center_cell": (50, 58),
+    }])[0]
+
+    assert candidate["terminal_arrival_heading_rad"] == pytest.approx(0.0)
+    assert candidate["terminal_turn_blocked"] is True
+    assert candidate["terminal_known_forward_margin_m"] < 0.35
+    assert candidate["terminal_egress_limited"] is True
+    assert 0.35 <= candidate["terminal_safe_step_m"] < candidate["distance"]
+
+
+def test_terminal_egress_keeps_0_8m_known_corridor_with_forward_exit():
+    tracker = _tracker(
+        obstacle_standoff_m=0.6,
+        minimum_motion_step_m=0.35,
+        turn_swept_radius_m=0.57,
+    )
+    pose = (2.0, 5.0, 0.0)
+    candidate_x = 4.0
+    grid = _grid_with_known_corridor(known_end_x=7.0)
+    tracker.observe(grid, pose, _scan(7.0))
+
+    candidate = tracker.rank_candidates(grid, pose, [{
+        "x": candidate_x,
+        "y": pose[1],
+        "yaw": math.pi,
+        "size": 10,
+        "information_gain": 10.0,
+        "distance": candidate_x - pose[0],
+        "center_cell": (50, 40),
+    }])[0]
+
+    assert candidate["terminal_turn_blocked"] is True
+    assert candidate["terminal_known_forward_margin_m"] >= 0.35
+    assert candidate["terminal_egress_safe"] is True
+    assert candidate["terminal_safe_step_m"] == pytest.approx(
+        candidate["distance"])
+
+
+def test_terminal_egress_shortens_goal_when_turn_and_forward_exit_are_blocked():
+    tracker = _tracker(
+        obstacle_standoff_m=0.6,
+        minimum_motion_step_m=0.35,
+        turn_swept_radius_m=0.57,
+    )
+    pose = (2.0, 5.0, 0.0)
+    candidate_x = 4.3
+    scan = _scan(3.0)
+    grid = _grid_with_terminal_side_obstacle(candidate_x, pose[1])
+    tracker.observe(grid, pose, scan)
+
+    candidate = tracker.rank_candidates(grid, pose, [{
+        "x": candidate_x,
+        "y": pose[1],
+        "yaw": 0.0,
+        "size": 10,
+        "information_gain": 10.0,
+        "distance": candidate_x - pose[0],
+        "center_cell": (50, 43),
+    }])[0]
+
+    assert candidate["terminal_turn_blocked"] is True
+    assert candidate["terminal_forward_margin_m"] < 0.35
+    assert candidate["terminal_egress_limited"] is True
+    assert candidate["terminal_safe_step_m"] == pytest.approx(
+        candidate["forward_clearance_m"] - 0.6 - 0.35,
+        abs=0.01,
+    )
+    assert candidate["terminal_safe_step_m"] < candidate["distance"]
+
+
+def test_terminal_egress_rejects_goal_when_no_safe_step_remains():
+    tracker = _tracker(
+        obstacle_standoff_m=0.6,
+        minimum_motion_step_m=0.35,
+        turn_swept_radius_m=0.57,
+    )
+    pose = (2.0, 5.0, 0.0)
+    candidate_x = 3.0
+    scan = _scan(0.8)
+    grid = _grid_with_terminal_side_obstacle(candidate_x, pose[1])
+    tracker.observe(grid, pose, scan)
+
+    candidate = tracker.rank_candidates(grid, pose, [{
+        "x": candidate_x,
+        "y": pose[1],
+        "yaw": 0.0,
+        "size": 10,
+        "information_gain": 10.0,
+        "distance": candidate_x - pose[0],
+        "center_cell": (50, 30),
+    }])[0]
+
+    assert candidate["terminal_safe_step_m"] == 0.0
+    assert candidate["terminal_egress_safe"] is False
+
+
+def test_terminal_egress_allows_narrow_corridor_with_forward_continuation():
+    tracker = _tracker(
+        obstacle_standoff_m=0.6,
+        minimum_motion_step_m=0.35,
+        turn_swept_radius_m=0.57,
+    )
+    pose = (2.0, 5.0, 0.0)
+    candidate_x = 4.0
+    scan = _scan(3.2)
+    grid = _grid_with_terminal_side_obstacle(candidate_x, pose[1])
+    tracker.observe(grid, pose, scan)
+
+    candidate = tracker.rank_candidates(grid, pose, [{
+        "x": candidate_x,
+        "y": pose[1],
+        "yaw": 0.0,
+        "size": 10,
+        "information_gain": 10.0,
+        "distance": candidate_x - pose[0],
+        "center_cell": (50, 40),
+    }])[0]
+
+    assert candidate["terminal_turn_blocked"] is True
+    assert candidate["terminal_forward_margin_m"] >= 0.35
+    assert candidate["terminal_egress_safe"] is True
+    assert candidate["terminal_egress_limited"] is False
+    assert candidate["terminal_safe_step_m"] == pytest.approx(
+        candidate["distance"])
+
+
 def test_visual_gain_excludes_already_observed_cells():
     grid = _grid(width=14, height=10)
     candidate = {

@@ -10,7 +10,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from nav_health_gate import load_fresh, satisfied
-from nav_health_supervisor import atomic_write, stamp_age_snapshot, topic_snapshot
+from nav_health_supervisor import (
+    atomic_write,
+    lifecycle_query_expired,
+    stamp_age_snapshot,
+    topic_snapshot,
+)
 
 
 def test_topic_snapshot_reports_rate_and_age():
@@ -27,6 +32,11 @@ def test_stamp_age_snapshot_requires_history_and_reports_p95():
     assert report["stamp_samples"] == 20
     assert report["stamp_median_sec"] == pytest.approx(0.05)
     assert report["stamp_p95_sec"] == pytest.approx(0.40)
+
+
+def test_lifecycle_query_expiry_recovers_across_nav2_service_restart():
+    assert lifecycle_query_expired(10.0, 10.9, timeout=1.0) is False
+    assert lifecycle_query_expired(10.0, 11.0, timeout=1.0) is True
 
 
 def test_atomic_snapshot_and_all_gate_types(tmp_path):

@@ -110,6 +110,35 @@ class FakeRobot:
         }
 
 
+class FakeTimer:
+    def __init__(self, delay, callback):
+        self.delay = delay
+        self.callback = callback
+        self.daemon = False
+        self.started = False
+        self.cancelled = False
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        if not self.cancelled:
+            self.callback()
+
+
+class FakeTimerFactory:
+    def __init__(self):
+        self.timers = []
+
+    def __call__(self, delay, callback):
+        timer = FakeTimer(delay, callback)
+        self.timers.append(timer)
+        return timer
+
+
 def load_arbiter():
     from nx_navigation_arbiter import NavigationArbiter
 
@@ -322,6 +351,73 @@ def test_repeated_key_press_release_never_creates_pose_transition_storm():
     assert [event[0] for event in events].count("drive_start") == 1
     assert [event[0] for event in events].count("drive_park") == 0
     assert [event[0] for event in events].count("robot_stop") == 25
+
+
+def test_manual_release_parks_and_releases_owner_after_idle_lease():
+    events = []
+    timers = FakeTimerFactory()
+    point = FakePointNav(events)
+    tasks = FakeTaskManager(events)
+    robot = FakeRobot(events)
+    arbiter = load_arbiter()(
+        point,
+        tasks,
+        robot,
+        transition_timeout=0.05,
+        manual_idle_timeout=0.8,
+        timer_factory=timers,
+    )
+    arbiter.run_manual_action("manual_move", lambda: None)
+    events.clear()
+
+    result = arbiter.release_manual("manual_release")
+
+    assert result["ok"] is True
+    assert events == [("robot_stop",)]
+    assert arbiter.get_motion_owner() == "manual"
+    assert len(timers.timers) == 1
+    assert timers.timers[0].delay == pytest.approx(0.8)
+    assert timers.timers[0].daemon is True
+    assert timers.timers[0].started is True
+
+    timers.timers[0].fire()
+
+    assert events == [
+        ("robot_stop",),
+        ("drive_park", "manual_idle_timeout"),
+    ]
+    assert arbiter.get_motion_owner() is None
+    assert robot.session == "parked"
+
+
+def test_new_manual_command_cancels_pending_idle_lease():
+    events = []
+    timers = FakeTimerFactory()
+    point = FakePointNav(events)
+    tasks = FakeTaskManager(events)
+    robot = FakeRobot(events)
+    arbiter = load_arbiter()(
+        point,
+        tasks,
+        robot,
+        transition_timeout=0.05,
+        manual_idle_timeout=0.8,
+        timer_factory=timers,
+    )
+    arbiter.run_manual_action("manual_move", lambda: None)
+    arbiter.release_manual("manual_release")
+    pending = timers.timers[0]
+    events.clear()
+
+    result = arbiter.run_manual_action(
+        "manual_move", lambda: events.append(("manual_command",)))
+    pending.fire()
+
+    assert result["ok"] is True
+    assert pending.cancelled is True
+    assert events == [("manual_command",)]
+    assert arbiter.get_motion_owner() == "manual"
+    assert robot.session == "active"
 
 
 def test_point_goal_handoffs_manual_wheel_session_to_nav_without_pose_switch():

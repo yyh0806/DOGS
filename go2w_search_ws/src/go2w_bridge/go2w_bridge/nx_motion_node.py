@@ -98,6 +98,8 @@ class NxMotionNode(Node):
             _parameter_value(self, "nav_cmd_timeout", 0.3))
         self._drive_response_timeout = float(
             _parameter_value(self, "drive_response_timeout", 0.6))
+        self._drive_response_grace = float(
+            _parameter_value(self, "drive_response_grace", 1.0))
         self._min_wheel_response = float(
             _parameter_value(self, "min_wheel_response", 0.15))
         self._minimum_battery_soc = float(
@@ -128,7 +130,15 @@ class NxMotionNode(Node):
         self._max_turn_flips = int(
             _parameter_value(self, "nav_max_turn_flips", 3))
 
-        clock = time.monotonic
+        # 仿真 use_sim_time=true 时 /wheel_feedback /scan stamp 是 sim 时间,
+        # motion clock 需匹配 (time.monotonic wall 会致 age 巨大 → telemetry_stale).
+        # GO2W_SIM 用 ROS sim clock; 真机 time.monotonic (wall) 不变.
+        import os as _os_clock
+        if _os_clock.environ.get('GO2W_SIM'):
+            _node_clock = self.get_clock()
+            clock = lambda: _node_clock.now().nanoseconds * 1e-9
+        else:
+            clock = time.monotonic
         machine = Go2WMotionMachine(
             now=clock,
             stop_profile=_stop_profile_from_environment(),
@@ -146,6 +156,7 @@ class NxMotionNode(Node):
         )
         drive_watchdog = DriveExecutionWatchdog(
             timeout=self._drive_response_timeout,
+            response_grace=self._drive_response_grace,
             min_wheel_speed=self._min_wheel_response,
             clock=clock,
         )
@@ -187,7 +198,8 @@ class NxMotionNode(Node):
         self._drive_feedback_sub = self.create_subscription(
             String, "/wheel_feedback", self._on_drive_feedback, 10)
         self._scan_sub = self.create_subscription(
-            LaserScan, "/scan_mid360", self._on_scan, 10)
+            LaserScan, "/scan_mid360", self._on_scan,
+            rclpy.qos.qos_profile_sensor_data)
         self._cmd_vel_sub = self.create_subscription(
             Twist, '/cmd_vel', self._on_cmd_vel, 10)
         self._nav_cmd_vel_sub = self.create_subscription(
@@ -196,7 +208,20 @@ class NxMotionNode(Node):
             String, "/motion_session", self._on_motion_session, 10)
         self._cmd_pose_sub = self.create_subscription(
             String, "/cmd_pose", self._on_cmd_pose, 10)
-        self._state_timer = self.create_timer(0.5, self._publish_state)
+        # wall publisher thread: GO2W_SIM 时 sim time 随 gzserver CPU 慢 (~2Hz),
+        # create_timer 0.5s sim → /dog_state 发布间隔 ~12s wall → web dog_state_stale
+        # → activatable=false → 拒绝导航. 独立 wall thread 固定 0.5s wall 发布
+        # (rclpy Node 无 create_wall_timer, 用 threading 替代, publisher 线程安全).
+        def _state_publish_loop():
+            while rclpy.ok():
+                try:
+                    self._publish_state()
+                except Exception:
+                    pass
+                time.sleep(0.5)
+        self._state_thread = threading.Thread(
+            target=_state_publish_loop, name="motion-state-pub", daemon=True)
+        self._state_thread.start()
 
         self.get_logger().info(
             "motion v4 started in BOOT_HOLD; actor owns all SDK effects; "
@@ -278,11 +303,19 @@ class NxMotionNode(Node):
 
     def _try_initialize_sdk(self):
         adapter = None
+        self.get_logger().info(f"GO2W_SIM env check: {os.environ.get('GO2W_SIM')!r}")
         try:
-            adapter = SportGatewayClient(
-                self._gateway_socket,
-                timeout=self._sdk_call_timeout,
-            )
+            if os.environ.get('GO2W_SIM'):
+                # Real-fidelity sim (spec 2026-07-25 §3): replace sport-lease
+                # socket transport with planar_move /cmd_vel adapter. Upper
+                # state machine (machine/controller/safety/watchdog) unchanged.
+                from go2w_sim.nodes.sim_sport_gateway import SimSportGateway
+                adapter = SimSportGateway(self)
+            else:
+                adapter = SportGatewayClient(
+                    self._gateway_socket,
+                    timeout=self._sdk_call_timeout,
+                )
             initialized = adapter.initialize()
             if (initialized.code != 0
                     or initialized.motion_service != "ai-w"):

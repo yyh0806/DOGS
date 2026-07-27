@@ -208,11 +208,87 @@ class VisibilityCoverageTracker:
                     _finite(candidate.get("y")),
                     _finite(candidate.get("yaw")),
                 )
+                candidate_distance = math.hypot(
+                    candidate_pose[0] - pose[0],
+                    candidate_pose[1] - pose[1],
+                )
                 visible = self._visible_buckets(grid, candidate_pose, None)
                 visual_gain = len(visible.difference(self._observed))
                 base_gain = _finite(candidate.get(
                     "information_gain", candidate.get("size", 0.0)))
                 path_profile = self._candidate_path_profile(pose, candidate_pose)
+                terminal_arrival_heading = (
+                    math.atan2(
+                        candidate_pose[1] - pose[1],
+                        candidate_pose[0] - pose[0],
+                    )
+                    if candidate_distance > 1e-9
+                    else candidate_pose[2]
+                )
+                terminal_pose = (
+                    candidate_pose[0],
+                    candidate_pose[1],
+                    terminal_arrival_heading,
+                )
+                terminal_turn_clearance = self._terminal_turn_clearance(
+                    grid, terminal_pose)
+                terminal_turn_blocked = (
+                    terminal_turn_clearance + 1e-9
+                    < self.turn_swept_radius_m)
+                scan_forward_margin = max(
+                    0.0,
+                    path_profile["forward_clearance_m"]
+                    - candidate_distance
+                    - self.obstacle_standoff_m,
+                )
+                terminal_known_forward_margin = (
+                    self._terminal_known_forward_margin(
+                        grid, terminal_pose, terminal_arrival_heading)
+                )
+                terminal_forward_margin = min(
+                    scan_forward_margin,
+                    terminal_known_forward_margin,
+                )
+                map_turn_clearance = self._terminal_turn_clearance(
+                    grid, terminal_pose, include_live_scan=False)
+                map_egress_safe = (
+                    map_turn_clearance + 1e-9 >= self.turn_swept_radius_m
+                    or terminal_known_forward_margin + 1e-9
+                    >= self.minimum_motion_step_m
+                )
+                terminal_egress_safe = (
+                    not terminal_turn_blocked
+                    or terminal_forward_margin + 1e-9
+                    >= self.minimum_motion_step_m
+                )
+                terminal_safe_step = candidate_distance
+                if not terminal_egress_safe:
+                    scan_safe_step = max(
+                        0.0,
+                        min(
+                            candidate_distance,
+                            path_profile["forward_clearance_m"]
+                            - self.obstacle_standoff_m
+                            - self.minimum_motion_step_m,
+                        ),
+                    )
+                    map_safe_step = (
+                        candidate_distance
+                        if map_egress_safe
+                        else self._terminal_known_safe_step(
+                            grid,
+                            pose,
+                            terminal_arrival_heading,
+                            candidate_distance,
+                        )
+                    )
+                    terminal_safe_step = min(
+                        scan_safe_step, map_safe_step)
+                    if (
+                        terminal_safe_step + 1e-9
+                        < self.minimum_motion_step_m
+                    ):
+                        terminal_safe_step = 0.0
                 candidate.update({
                     "base_information_gain": base_gain,
                     "visual_gain": int(visual_gain),
@@ -233,6 +309,19 @@ class VisibilityCoverageTracker:
                         "turn_clearance_m"],
                     "turn_motion_blocked": self._last_profile[
                         "turn_motion_blocked"],
+                    "terminal_turn_clearance_m": round(
+                        terminal_turn_clearance, 3),
+                    "terminal_turn_blocked": terminal_turn_blocked,
+                    "terminal_arrival_heading_rad": round(
+                        terminal_arrival_heading, 6),
+                    "terminal_known_forward_margin_m": round(
+                        terminal_known_forward_margin, 3),
+                    "terminal_forward_margin_m": round(
+                        terminal_forward_margin, 3),
+                    "terminal_safe_step_m": round(terminal_safe_step, 3),
+                    "terminal_egress_safe": terminal_egress_safe,
+                    "terminal_egress_limited": (
+                        terminal_safe_step + 1e-9 < candidate_distance),
                     "heading_change": abs(_angle_delta(candidate_pose[2], pose[2])),
                 })
                 result.append(candidate)
@@ -616,6 +705,156 @@ class VisibilityCoverageTracker:
             candidate_pose[1] - pose[1], candidate_pose[0] - pose[0])
         return self._path_profile(
             self._last_scan, _angle_delta(bearing, pose[2]))
+
+    def _terminal_turn_clearance(
+        self,
+        grid: _Grid,
+        candidate_pose: tuple[float, float, float],
+        *,
+        include_live_scan: bool = True,
+    ) -> float:
+        """Estimate swept-turn clearance at a future endpoint.
+
+        The global path proves that the robot center can reach a pose, but it
+        does not prove that the Go2W can turn or leave after arrival. Unknown
+        cells are unsafe *terminal turn space*, but they are not permanent
+        walls: the planner may stop earlier, scan them, and advance again.
+        A narrow known-free corridor remains eligible through the separate
+        forward-continuation check.
+        """
+
+        candidate_x, candidate_y = candidate_pose[:2]
+        clearance = max(self.visual_range_m, self.turn_swept_radius_m)
+        cell = grid.world_to_cell(candidate_x, candidate_y)
+        if cell is not None:
+            radius_cells = max(
+                1,
+                int(math.ceil(
+                    (self.turn_swept_radius_m + grid.resolution)
+                    / grid.resolution)),
+            )
+            half_diagonal = grid.resolution * math.sqrt(2.0) * 0.5
+            for row in range(
+                    max(0, cell[0] - radius_cells),
+                    min(grid.height, cell[0] + radius_cells + 1)):
+                for col in range(
+                        max(0, cell[1] - radius_cells),
+                        min(grid.width, cell[1] + radius_cells + 1)):
+                    if grid.value(row, col) == 0:
+                        continue
+                    obstacle_x, obstacle_y = grid.cell_to_world(row, col)
+                    distance = max(
+                        0.0,
+                        math.hypot(
+                            obstacle_x - candidate_x,
+                            obstacle_y - candidate_y,
+                        ) - half_diagonal,
+                    )
+                    clearance = min(clearance, distance)
+
+        if not include_live_scan:
+            return clearance
+        scan = self._last_scan
+        scan_pose = self._last_pose
+        if scan is None or scan_pose is None or not self._scan_usable(scan):
+            return clearance
+        ranges = list(_field(scan, "ranges", []) or [])
+        angle_min = _finite(_field(scan, "angle_min", 0.0))
+        increment = _finite(_field(scan, "angle_increment", 0.0))
+        range_min = max(0.0, _finite(_field(scan, "range_min", 0.0)))
+        range_max = max(range_min, _finite(
+            _field(scan, "range_max", self.visual_range_m),
+            self.visual_range_m))
+        hit_tolerance = max(0.05, range_max * 0.01)
+        for index, raw in enumerate(ranges):
+            value = _finite(raw, range_max)
+            if (
+                value < range_min
+                or value >= range_max - hit_tolerance
+            ):
+                continue
+            angle = scan_pose[2] + angle_min + increment * index
+            obstacle_x = scan_pose[0] + value * math.cos(angle)
+            obstacle_y = scan_pose[1] + value * math.sin(angle)
+            clearance = min(
+                clearance,
+                math.hypot(
+                    obstacle_x - candidate_x,
+                    obstacle_y - candidate_y,
+                ),
+            )
+        return clearance
+
+    def _terminal_known_forward_margin(
+        self,
+        grid: _Grid,
+        candidate_pose: tuple[float, float, float],
+        heading: float,
+    ) -> float:
+        """Known-free centerline available after an endpoint.
+
+        Unknown/uncertain cells end the certified margin without becoming a
+        wall. Known occupied cells additionally reserve obstacle standoff.
+        """
+
+        start_x, start_y = candidate_pose[:2]
+        start_cell = grid.world_to_cell(start_x, start_y)
+        if start_cell is None or grid.value(*start_cell) != 0:
+            return 0.0
+        step = max(0.02, grid.resolution * 0.5)
+        limit = max(
+            self.max_step_m,
+            self.turn_swept_radius_m + self.minimum_motion_step_m,
+        )
+        known_margin = 0.0
+        blocked_by_occupied = False
+        distance = step
+        while distance <= limit + 1e-9:
+            cell = grid.world_to_cell(
+                start_x + distance * math.cos(heading),
+                start_y + distance * math.sin(heading),
+            )
+            if cell is None:
+                break
+            value = grid.value(*cell)
+            if value != 0:
+                blocked_by_occupied = value >= self.obstacle_threshold
+                break
+            known_margin = distance
+            distance += step
+        if blocked_by_occupied:
+            known_margin = max(
+                0.0, known_margin - self.obstacle_standoff_m)
+        return known_margin
+
+    def _terminal_known_safe_step(
+        self,
+        grid: _Grid,
+        pose: tuple[float, float, float],
+        arrival_heading: float,
+        candidate_distance: float,
+    ) -> float:
+        """Find the furthest map-certified stopping point on the approach."""
+
+        decrement = max(0.05, min(0.15, grid.resolution))
+        distance = max(0.0, float(candidate_distance))
+        while distance + 1e-9 >= self.minimum_motion_step_m:
+            terminal_pose = (
+                pose[0] + distance * math.cos(arrival_heading),
+                pose[1] + distance * math.sin(arrival_heading),
+                arrival_heading,
+            )
+            turn_clearance = self._terminal_turn_clearance(
+                grid, terminal_pose, include_live_scan=False)
+            forward_margin = self._terminal_known_forward_margin(
+                grid, terminal_pose, arrival_heading)
+            if (
+                turn_clearance + 1e-9 >= self.turn_swept_radius_m
+                or forward_margin + 1e-9 >= self.minimum_motion_step_m
+            ):
+                return max(0.0, distance)
+            distance -= decrement
+        return 0.0
 
     def _path_profile(self, scan: Any, relative_bearing: float) -> dict:
         ranges = list(_field(scan, "ranges", []) or [])

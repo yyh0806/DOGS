@@ -329,6 +329,53 @@ def test_manager_confirms_closed_boundary_on_three_distinct_map_revisions():
     assert state["global_search"]["completion_eligible"] is True
 
 
+def test_manager_stops_on_closed_95_percent_map_before_probing_noise_frontier():
+    from nx_exploration_manager import ExplorationManager
+
+    map_msg = _grid(far_door_open=False)
+    mission_origin = (2.5, 5.5, 0.0)
+    gate = _api().infer_entrance_gate(map_msg, mission_origin)
+
+    class FailIfProbed:
+        def __init__(self):
+            self.calls = 0
+
+        def compute_path_to_pose(self, *_args, **_kwargs):
+            self.calls += 1
+            raise AssertionError("closed global map must stop before Nav2 probe")
+
+    nav = FailIfProbed()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=mission_origin,
+        entrance_gate=gate,
+        mode="current_room",
+        room_radius_m=20.0,
+        initial_radius_m=20.0,
+        stable_exhaustion_cycles=1,
+        visibility_tracker=_CompleteVisibility(),
+        candidate_selector=lambda *_args, **_kwargs: [{
+            "x": 4.5,
+            "y": 5.5,
+            "yaw": 0.0,
+            "size": 1,
+            "information_gain": 1.0,
+            "distance": 1.0,
+            "center_cell": (5, 4),
+        }],
+        reject_map_edge=False,
+    )
+    manager._visibility_snapshot = {
+        "visual_coverage_ratio": 1.0,
+    }
+
+    assert manager.choose_next(map_msg, (3.5, 5.5, 0.0)) is None
+    state = manager.snapshot()
+    assert nav.calls == 0
+    assert state["last_selection_reason"] == "reachable_frontiers_exhausted"
+    assert state["global_search"]["completion_eligible"] is True
+
+
 def test_global_search_default_traversable_width_is_0_8m():
     map_msg = _grid(far_door_open=False)
     mission_origin = (2.5, 5.5, 0.0)
@@ -344,6 +391,35 @@ def test_global_search_default_traversable_width_is_0_8m():
 
     assert state["traversal_clearance_m"] == pytest.approx(0.40)
     assert manager.snapshot()["global_traversal_clearance_m"] == pytest.approx(0.40)
+
+
+def test_reachable_free_map_edge_is_an_open_boundary_not_a_wall():
+    width = height = 10
+    map_msg = SimpleNamespace(
+        header=SimpleNamespace(stamp=SimpleNamespace(sec=1, nanosec=0)),
+        info=SimpleNamespace(
+            resolution=0.1,
+            width=width,
+            height=height,
+            origin=SimpleNamespace(
+                position=SimpleNamespace(x=0.0, y=0.0),
+                orientation=SimpleNamespace(
+                    x=0.0, y=0.0, z=0.0, w=1.0),
+            ),
+        ),
+        data=[0] * (width * height),
+    )
+
+    state = _api().analyze_global_search_state(
+        map_msg,
+        mission_origin=(0.5, 0.5, 0.0),
+        entrance_gate=None,
+        observed_cells=_all_known_free_centers(map_msg),
+        traversal_clearance_m=0.0,
+    )
+
+    assert state["traversable_opening_count"] > 0
+    assert state["completion_eligible"] is False
 
 
 def test_global_search_without_an_entrance_gate_uses_an_arbitrary_start_pose():
@@ -418,4 +494,5 @@ def test_visibility_cells_cover_their_full_area_on_a_finer_occupancy_grid():
 
     assert state["observed_reachable_free_cell_count"] == 100
     assert state["explainable_coverage_ratio"] == pytest.approx(1.0)
-    assert state["completion_eligible"] is True
+    assert state["traversable_opening_count"] > 0
+    assert state["completion_eligible"] is False

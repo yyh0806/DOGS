@@ -88,6 +88,18 @@ def test_motion_policy_retries_until_gateway_mode_check_is_healthy():
     assert "adapter.close()" in body
 
 
+def test_motion_node_separates_wheel_response_grace_from_feedback_timeout():
+    source, tree = parse_node()
+    init = next(
+        item for item in ast.walk(tree)
+        if isinstance(item, ast.FunctionDef) and item.name == "__init__")
+    body = ast.unparse(init)
+
+    assert "drive_response_timeout', 0.6" in body
+    assert "drive_response_grace', 1.0" in body
+    assert "response_grace=self._drive_response_grace" in body
+
+
 def test_startup_and_shutdown_have_no_automatic_unload_command():
     source, tree = parse_node()
     assert "Damp" not in source

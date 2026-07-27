@@ -79,7 +79,10 @@ from nx_navigation_gateway import (
 )
 from nx_navigation_arbiter import NavigationArbiter
 from nx_camera_calibration import resolve_camera_calibration
-from nx_person_localizer import decode_pointcloud_xyz
+from nx_person_localizer import (
+    coerce_laser_scan_snapshot,
+    decode_pointcloud_xyz,
+)
 from nx_motion_intent import build_motion_intent
 from nx_ws_latest import (
     LatestValueOutbox,
@@ -542,7 +545,15 @@ def _systemctl_services_active(names):
     systemctl is-active 接受多 unit, stdout 每行一个状态 (active/inactive/failed/
     activating/...), exit code 仅当全 active 才 0 (故用 stdout 解析, 不看 rc).
     局部 import subprocess: 顶部未导入 (与 /api/clear_all 端点一致).
+
+    GO2W_SIM: 仿真用 ros2 launch 起进程 (非 systemd 服务), systemctl 全 inactive.
+    返回全 "active" 让 get_service_status 的 color 走 flow_alive 分支 (基于真实
+    话题数据 imu_count/scan_count/loc_healthy), 而非 systemd 部署状态. 真机不设
+    GO2W_SIM 走原 systemctl 逻辑.
     """
+    import os
+    if os.environ.get('GO2W_SIM'):
+        return {n: "active" for n in names}
     import subprocess  # 局部: 顶部未 import (见 /api/clear_all 同模式)
     try:
         r = subprocess.run(
@@ -629,17 +640,19 @@ class NxWebNode(Node):
         self._imu_sub = self.create_subscription(
             Imu, '/livox/imu', self._on_imu, 10)
         self._scan_sub = self.create_subscription(
-            LaserScan, '/scan_mid360', self._on_scan, 10)
+            # sensor_data (best-effort) 兼容 relay 输入 (best-effort) + 真机 reliable pub.
+            LaserScan, '/scan_mid360', self._on_scan, qos_profile_sensor_data)
         self._pointcloud_sub = self.create_subscription(
             PointCloud2, '/mid360/points_nav', self._on_pointcloud,
             qos_profile_sensor_data)
         self._localization_sub = self.create_subscription(
-            Odometry, '/localization_pose', self._on_localization_pose, 10)
+            Odometry, '/localization_pose', self._on_localization_pose,
+            qos_profile_sensor_data)
         # Diagnostic-only pose from the dog-mounted MID360 LIO.  Navigation
         # continues to use /localization_pose in map; exposing /odom lets the
         # operator distinguish LIO motion from SLAM map correction.
         self._lio_odometry_sub = self.create_subscription(
-            Odometry, '/odom', self._on_lio_odometry, 10)
+            Odometry, '/odom', self._on_lio_odometry, qos_profile_sensor_data)
 
         # ---- 订阅缓存 (Lock 保护, H2.2) ----
         self._lock = threading.RLock()
@@ -820,7 +833,9 @@ class NxWebNode(Node):
             self._scan_count += 1
         synchronizer = getattr(self, "observation_sync", None)
         if stamp is not None and synchronizer is not None:
-            synchronizer.add_scan(stamp=stamp, scan=scan_snapshot)
+            typed_scan = coerce_laser_scan_snapshot(scan_snapshot)
+            if typed_scan is not None:
+                synchronizer.add_scan(stamp=stamp, scan=typed_scan)
 
     def _on_pointcloud(self, msg: PointCloud2):
         # Retain the ROS message and decode only when a person observation
@@ -3262,7 +3277,18 @@ def main():
 
     # C13 云台双流桥接 (独立 daemon 线程拉 vis+ir RTSP → type=gimbal 推前端)
     gimbal_bridge = None
-    if GIMBAL_OK and GimbalRtspBridge is not None:
+    if os.environ.get('GO2W_SIM'):
+        # 仿真: URDF 相机 /sim_camera/image_raw → WS type=gimbal (替 C13 RTSP GimbalRtspBridge)
+        try:
+            from nx_sim_video_node import SimVideoBridge
+            gimbal_bridge = SimVideoBridge(node, ws_broadcast)
+            gimbal_bridge.start()
+            robot._gimbal_bridge = gimbal_bridge
+            logger.info("仿真视频桥已启动 (/sim_camera/image_raw → type=gimbal)")
+        except Exception as e:
+            logger.error(f"仿真视频桥启动失败: {e}")
+            gimbal_bridge = None
+    elif GIMBAL_OK and GimbalRtspBridge is not None:
         try:
             gimbal_bridge = GimbalRtspBridge(ws_broadcast)
             gimbal_bridge.start()

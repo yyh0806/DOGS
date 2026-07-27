@@ -3,7 +3,7 @@
 import math
 from dataclasses import dataclass
 from statistics import median
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -24,6 +24,45 @@ class LaserScanSnapshot:
     ranges: Sequence[float]
     range_min: float = 0.15
     range_max: float = 10.0
+
+
+def coerce_laser_scan_snapshot(value: Any) -> LaserScanSnapshot | None:
+    """Convert a ROS-free scan mapping/object into the localizer contract."""
+
+    if value is None:
+        return None
+
+    def field(name, default=None):
+        if isinstance(value, dict):
+            return value.get(name, default)
+        return getattr(value, name, default)
+
+    try:
+        angle_min = float(field("angle_min"))
+        angle_increment = float(field("angle_increment"))
+        range_min = float(field("range_min", 0.15))
+        range_max = float(field("range_max", 10.0))
+        ranges = list(field("ranges", []) or [])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        not math.isfinite(angle_min)
+        or not math.isfinite(angle_increment)
+        or angle_increment <= 0.0
+        or not math.isfinite(range_min)
+        or range_min <= 0.0
+        or not math.isfinite(range_max)
+        or range_max <= range_min
+        or not ranges
+    ):
+        return None
+    return LaserScanSnapshot(
+        angle_min=angle_min,
+        angle_increment=angle_increment,
+        ranges=ranges,
+        range_min=range_min,
+        range_max=range_max,
+    )
 
 
 @dataclass(frozen=True)

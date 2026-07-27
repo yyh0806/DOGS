@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="data:,">
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <title>Go2W 搜索控制台</title>
 <style>
@@ -302,9 +303,13 @@ async function controlFetch(url, options = {}) {
   // 前端不再弹窗索要令牌、不发 Bearer (用户要求去掉权限 token 限制)。
   return fetch(url, options);
 }
-let connected = false, frameCount = 0, lastFpsTime = Date.now(), _moveInterval = null, _locateLoopTimer = null;
+let connected = false, _moveInterval = null, _locateLoopTimer = null;
+let lastVisFrameAt = 0, videoFallbackInFlight = false, latestPerceptionHealthy = false;
+let visibleFrameTimes = [];
+const VISIBLE_FPS_WINDOW_MS = 3000;
 let latestDetections = [];
 let latestDetectionsBySource = {};
+let missionTargetMarkers = [];
 let latestLocateResult = null, latestLocateTs = 0;
 const LOCATE_TTL_MS = 30000;  // locate worker 后台 ~5-21s/帧异步推; TTL 30s 防 worker 挂了残留陈旧框
 const _LOCATE_GENERIC = new Set(['', 'object', 'objects']);  // CLI grounding 无 class 时的泛化占位
@@ -355,11 +360,39 @@ const NAV_REASON_LABELS = {
   motion_state_not_drivable: '当前运动状态禁止导航',
   battery_low: '电量低于导航门限',
   release_mismatch: 'Web 与运动节点版本不一致，禁止移动',
+  motion_trapped: '运动受困',
 };
 
 function navigationReasonLabel(reason) {
   const normalized = String(reason || '').trim();
   return NAV_REASON_LABELS[normalized] || normalized;
+}
+
+function preferredDetectionResults(liveDetections, missionMarkers) {
+  const live = Array.isArray(liveDetections) ? liveDetections : [];
+  if (live.length) return live;
+  return Array.isArray(missionMarkers) ? missionMarkers : [];
+}
+
+function roomSearchStatus(roomNav) {
+  if (!roomNav || typeof roomNav !== 'object') return null;
+  const search = roomNav.search_state && typeof roomNav.search_state === 'object'
+    ? roomNav.search_state : {};
+  const phase = String(search.phase || roomNav.phase || '').toUpperCase();
+  const completionReason = String(
+    search.completion_reason || roomNav.completion_reason || roomNav.reason || '',
+  );
+  if (phase !== 'FAILED' && !['aborted', 'failed'].includes(
+    String(roomNav.status || '').toLowerCase())) return null;
+  const reason = completionReason || 'search_failed';
+  let message = `搜索失败 · ${navigationReasonLabel(reason) || '未知原因'}`;
+  const trap = search.motion_trap && typeof search.motion_trap === 'object'
+    ? search.motion_trap : {};
+  const forward = finiteNavNumber(trap.forward_clearance_m);
+  const turn = finiteNavNumber(trap.turn_clearance_m);
+  if (forward !== null) message += ` · 前向 ${forward.toFixed(2)}m`;
+  if (turn !== null) message += ` · 转向 ${turn.toFixed(2)}m`;
+  return { status: 'failed', reason, message };
 }
 
 function finiteNavNumber(value) {
@@ -512,6 +545,13 @@ function applyRoomNavigationState(roomNav) {
     observed_cells: report.observed_cells,
     visited_viewpoints: report.visited_viewpoints,
     coverage_ratio: report.coverage_ratio,
+    visual_coverage_ratio: report.visual_coverage_ratio,
+    explored_ratio: report.explored_ratio,
+    bounded_explored_ratio: report.bounded_explored_ratio,
+    global_search: report.global_search,
+    completion_reason: report.completion_reason,
+    completion_status: report.completion_status,
+    motion_trap: report.motion_trap,
     coverage_threshold: report.coverage_threshold,
     visual_range_m: report.visual_range_m,
     coverage_cell_size_m: report.coverage_cell_size_m,
@@ -519,10 +559,10 @@ function applyRoomNavigationState(roomNav) {
     scene_complexity: report.scene_complexity,
     forward_clearance_m: report.forward_clearance_m,
   } : (roomNav.search_state || {});
-  map.update({
-    target_markers: filterDetectionResults(markers),
-    room_search: roomSearch,
-  });
+  updateMissionTargetMarkers(markers);
+  map.update({ room_search: roomSearch });
+  const status = roomSearchStatus({ ...roomNav, search_state: roomSearch });
+  if (status) setNavStatusChip(status.status, status.message);
   return true;
 }
 
@@ -956,7 +996,8 @@ function taskHTML(t) {
 function updateDetList(dets) {
   const el = document.getElementById('detList');
   if (!el) return;
-  dets = filterDetectionResults(dets);
+  dets = preferredDetectionResults(
+    filterDetectionResults(dets), missionTargetMarkers);
   if (Array.isArray(dets) && dets.some(d => d && (d.crop_url || d.frame_url))) {
     updateDetectionListRich(dets);
     return;
@@ -1018,7 +1059,8 @@ function safeSnapshotUrl(url) {
 function updateDetectionListRich(dets) {
   const el = document.getElementById('detList');
   if (!el) return;
-  dets = filterDetectionResults(dets);
+  dets = preferredDetectionResults(
+    filterDetectionResults(dets), missionTargetMarkers);
   if (!Array.isArray(dets) || !dets.length) {
     el.innerHTML = '<div class="det-empty">无检测</div>';
     return;
@@ -1068,7 +1110,17 @@ function closeDetectionSnapshot(event) {
 
 function updateDetectionBadge() {
   const badge = document.getElementById('detBadge');
-  if (badge) badge.textContent = latestDetections.length + ' 目标';
+  const displayed = preferredDetectionResults(
+    latestDetections, missionTargetMarkers);
+  if (badge) badge.textContent = displayed.length + ' 目标';
+}
+
+function updateMissionTargetMarkers(markers) {
+  missionTargetMarkers = filterDetectionResults(markers);
+  if (map) map.update({ target_markers: missionTargetMarkers });
+  updateDetectionBadge();
+  updateDetList(missionTargetMarkers);
+  return missionTargetMarkers;
 }
 
 function detectionStreamFromPayload(payload, source) {
@@ -1121,15 +1173,38 @@ function scheduleLocateOverlay(result, options = {}) {
   );
 }
 
-function setStreamImage(source, base64Payload) {
+function recordStreamFrame(source) {
+  if (source !== 'c13_vis') return;
+  const now = Date.now();
+  lastVisFrameAt = now;
+  visibleFrameTimes.push(now);
+  visibleFrameTimes = visibleFrameTimes.filter(
+    timestamp => now - timestamp <= VISIBLE_FPS_WINDOW_MS);
+}
+
+function currentVisibleFrameRate(now = Date.now()) {
+  visibleFrameTimes = visibleFrameTimes.filter(
+    timestamp => now - timestamp <= VISIBLE_FPS_WINDOW_MS);
+  if (!visibleFrameTimes.length || now - lastVisFrameAt > 1500) return null;
+  if (visibleFrameTimes.length === 1) return 1;
+  const elapsed = (
+    visibleFrameTimes[visibleFrameTimes.length - 1] - visibleFrameTimes[0]
+  ) / 1000;
+  if (elapsed <= 0) return 1;
+  return Math.max(1, Math.round((visibleFrameTimes.length - 1) / elapsed));
+}
+
+function setStreamImageSource(source, imageSource, onSettled = null) {
   const view = DETECTION_VIEWS[source];
-  if (!view || !base64Payload) return false;
+  if (!view || !imageSource) return false;
   const img = document.getElementById(view.imgId);
   if (!img) return false;
   const generation = (streamFrameGeneration[source] || 0) + 1;
   streamFrameGeneration[source] = generation;
   img.onload = () => {
+    if (typeof onSettled === 'function') onSettled(true);
     if (generation !== streamFrameGeneration[source]) return;
+    recordStreamFrame(source);
     const detections = latestDetectionsBySource[source] || [];
     if (detections.length) {
       scheduleDetectionOverlay({ detections }, source, generation);
@@ -1138,10 +1213,34 @@ function setStreamImage(source, base64Payload) {
       scheduleLocateOverlay(latestLocateResult, { expectedGeneration: generation });
     }
   };
-  img.src = `data:image/${source === 'c13_ir' ? 'jpeg' : 'jpeg'};base64,${base64Payload}`;
+  img.onerror = () => {
+    if (typeof onSettled === 'function') onSettled(false);
+  };
+  img.src = imageSource;
   img.style.display = 'block';
   const empty = document.getElementById(view.emptyId);
   if (empty) empty.style.display = 'none';
+  return true;
+}
+
+function setStreamImage(source, base64Payload) {
+  if (!base64Payload) return false;
+  return setStreamImageSource(
+    source, `data:image/jpeg;base64,${base64Payload}`);
+}
+
+function refreshVideoFrameFallback(now = Date.now()) {
+  if (videoFallbackInFlight || now - lastVisFrameAt < 1500) return false;
+  videoFallbackInFlight = true;
+  const source = `/api/video_frame?source=c13_vis&t=${encodeURIComponent(now)}`;
+  const probe = new Image();
+  probe.onload = () => {
+    videoFallbackInFlight = false;
+    if (Date.now() - lastVisFrameAt < 1500) return;
+    setStreamImageSource('c13_vis', source);
+  };
+  probe.onerror = () => { videoFallbackInFlight = false; };
+  probe.src = source;
   return true;
 }
 
@@ -1591,7 +1690,18 @@ function updateStreamHealthMetadata(snapshot) {
   const perception = snapshot && snapshot.perception;
   const videoMeta = document.getElementById('videoMeta');
   if (videoMeta && perception && typeof perception === 'object') {
-    videoMeta.title = `perception: ${perception.status || perception.state || 'unknown'}`;
+    const source = String(perception.source || '感知');
+    const age = Number(perception.age_sec);
+    latestPerceptionHealthy = (
+      perception.healthy === true && perception.frame_available === true);
+    videoMeta.textContent = latestPerceptionHealthy
+      ? `${source} · 实时${Number.isFinite(age) ? ` · ${age.toFixed(2)}s` : ''}`
+      : `感知异常 · ${perception.reason || 'unknown'}`;
+    videoMeta.title = [
+      `perception: ${latestPerceptionHealthy ? 'healthy' : 'unhealthy'}`,
+      `reason: ${perception.reason || 'unknown'}`,
+      `source: ${source}`,
+    ].join(' · ');
   }
 }
 
@@ -1615,8 +1725,8 @@ function applyStatusSnapshot(snapshot, epoch = navConnectionEpoch) {
     const filtered = cacheDetectionSnapshot(detections);
     updateDetList(filtered);
   }
-  if (Array.isArray(snapshot.target_markers) && map) {
-    map.update({ target_markers: filterDetectionResults(snapshot.target_markers) });
+  if (Array.isArray(snapshot.target_markers)) {
+    updateMissionTargetMarkers(snapshot.target_markers);
   }
   updateStreamHealthMetadata(snapshot);
   const nxDot = document.getElementById('nxDot');
@@ -1690,7 +1800,6 @@ function handleSocketMessage(socket, socketEpoch, e) {
         // C13 云台双流 (可见光+红外合并推送)
         if (data.vis) {
           setStreamImage('c13_vis', data.vis);
-          frameCount++;
           if (latestLocateResult) {
             if (Date.now() - latestLocateTs > LOCATE_TTL_MS) { latestLocateResult = null; document.getElementById('locateOverlay').innerHTML = ''; }
           }
@@ -1746,8 +1855,7 @@ function handleSocketMessage(socket, socketEpoch, e) {
         const markers = filterDetectionResults(
           data.data && Array.isArray(data.data.markers) ? data.data.markers : [],
         );
-        if (map) map.update({ target_markers: markers });
-        updateDetList(markers);
+        updateMissionTargetMarkers(markers);
       } else if (data.type === 'search_room') {
         if (map) map.update({ room_search: data.data || {} });
         // Toggle the layered-coverage legend while a frontier mission is live.
@@ -1771,6 +1879,13 @@ function handleSocketMessage(socket, socketEpoch, e) {
             observed_cells: report.observed_cells,
             visited_viewpoints: report.visited_viewpoints,
             coverage_ratio: report.coverage_ratio,
+            visual_coverage_ratio: report.visual_coverage_ratio,
+            explored_ratio: report.explored_ratio,
+            bounded_explored_ratio: report.bounded_explored_ratio,
+            global_search: report.global_search,
+            completion_reason: report.completion_reason,
+            completion_status: report.completion_status,
+            motion_trap: report.motion_trap,
             coverage_threshold: report.coverage_threshold,
             visual_range_m: report.visual_range_m,
             coverage_cell_size_m: report.coverage_cell_size_m,
@@ -1779,7 +1894,7 @@ function handleSocketMessage(socket, socketEpoch, e) {
             forward_clearance_m: report.forward_clearance_m,
           },
         });
-        updateDetList(detections);
+        updateMissionTargetMarkers(detections);
         console.log('[任务报告]', report);
       }
     } catch (err) { console.error('[WS] parse', err); }
@@ -1832,9 +1947,12 @@ panelStatusPoller.start(0);
 // FPS
 setInterval(() => {
   const now = Date.now();
-  document.getElementById('fpsBadge').textContent = Math.round(frameCount / ((now - lastFpsTime) / 1000)) + ' FPS';
-  frameCount = 0; lastFpsTime = now;
+  const frameRate = currentVisibleFrameRate(now);
+  document.getElementById('fpsBadge').textContent = frameRate !== null
+    ? frameRate + ' FPS'
+    : (latestPerceptionHealthy ? '等待视频帧' : '-- FPS');
 }, 1000);
+setInterval(() => { refreshVideoFrameFallback(); }, 500);
 
 window.addEventListener('blur', () => { pressedKeys.clear(); resetKeyHighlight(); stopMove(); });
 window.addEventListener('resize', () => {

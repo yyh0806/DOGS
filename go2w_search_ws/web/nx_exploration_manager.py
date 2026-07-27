@@ -384,6 +384,25 @@ class ExplorationManager:
             return None
 
         self._map_revision = map_revision(map_msg)
+        # Once the map is visually mature, evaluate the actual global closure
+        # before spending more time on residual/noisy frontier probes. This is
+        # intentionally gated by the cached visual ratio so full-map topology
+        # analysis is not added to every early planning cycle.
+        if self.mode == "current_room" and self.visibility_tracker is not None:
+            visibility = self._visibility_snapshot_snapshot()
+            try:
+                visual_ratio = float(
+                    visibility.get("visual_coverage_ratio", 0.0))
+            except (TypeError, ValueError, OverflowError):
+                visual_ratio = 0.0
+            if (
+                math.isfinite(visual_ratio)
+                and visual_ratio + 1e-12 >= self.global_coverage_threshold
+            ):
+                self._confirm_exhaustion(map_msg)
+                if self._global_search_state.get("completion_eligible"):
+                    self._clear_selected_goal()
+                    return None
         candidate_selector = (
             self._candidate_selector or select_frontier_candidates)
         candidates = self._select_candidates(
@@ -569,7 +588,8 @@ class ExplorationManager:
         motion_trapped = False
         if (
                 normalized_reason in {
-                    "nav2_aborted", "controller_abort", "controller_failed"}
+                    "aborted", "nav2_aborted",
+                    "controller_abort", "controller_failed"}
                 and start_pose is not None
                 and robot_pose is not None):
             try:
@@ -772,9 +792,18 @@ class ExplorationManager:
         # plan 端点不达 goal), 1 次即应排除候选. 加速 spatial count 累积达
         # max_failures_per_cell, 避免退化点被反复 probe (实测 (0.047,-0.062)
         # 被重试 8 次/20 probe 浪费 40%).
-        increment = (max(1, self.max_failures_per_cell)
-                     if reason == "degenerate_plan" else 1)
-        record["count"] = int(record.get("count", 0)) + increment
+        hard_failure_reasons = {
+            "aborted",
+            "nav2_aborted",
+            "controller_abort",
+            "controller_failed",
+            "degenerate_plan",
+        }
+        prior_count = int(record.get("count", 0))
+        if reason in hard_failure_reasons:
+            record["count"] = max(prior_count, self.max_failures_per_cell)
+        else:
+            record["count"] = prior_count + 1
         self._spatial_failures[spatial_key] = record
         while len(self._spatial_failures) > self.max_spatial_failure_entries:
             self._spatial_failures.popitem(last=False)
@@ -902,6 +931,14 @@ class ExplorationManager:
                 "current_adaptive_step_m", adaptive_step))
         except (TypeError, ValueError, OverflowError):
             current_adaptive_step = 0.0
+        terminal_safe_step_present = "terminal_safe_step_m" in candidate
+        terminal_egress_limited = bool(
+            candidate.get("terminal_egress_limited", False))
+        try:
+            terminal_safe_step = float(candidate.get(
+                "terminal_safe_step_m", distance))
+        except (TypeError, ValueError, OverflowError):
+            terminal_safe_step = 0.0
         if (
                 turn_motion_blocked
                 and heading_change > self.local_turn_threshold_rad + 1e-9):
@@ -927,6 +964,35 @@ class ExplorationManager:
                 "staging_reason": "turn_clearance_blocked",
             })
             return [staging] if self._approach_within_bounds(staging) else []
+        if terminal_safe_step_present:
+            if (
+                    not math.isfinite(terminal_safe_step)
+                    or terminal_safe_step + 1e-9 < self.min_goal_distance_m):
+                return []
+            if terminal_egress_limited:
+                if terminal_safe_step + 1e-9 >= distance:
+                    return []
+                ratio = terminal_safe_step / distance
+                egress_limited = dict(candidate)
+                egress_limited.update({
+                    "x": robot_x + (frontier_x - robot_x) * ratio,
+                    "y": robot_y + (frontier_y - robot_y) * ratio,
+                    "frontier_x": frontier_x,
+                    "frontier_y": frontier_y,
+                    "approach_terminal_egress_m": terminal_safe_step,
+                })
+                return (
+                    [egress_limited]
+                    if self._approach_within_bounds(egress_limited)
+                    else []
+                )
+            if adaptive_step > terminal_safe_step + 1e-9:
+                # The physical frontier is safe, but a LiDAR lookahead beyond
+                # it has not passed terminal-clearance validation.  Keep the
+                # proven endpoint instead of extending into a one-way pose.
+                capped = dict(candidate)
+                capped["approach_terminal_egress_m"] = distance
+                return [capped] if self._approach_within_bounds(capped) else []
         if path_blocked:
             return []
         open_lidar_corridor = (

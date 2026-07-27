@@ -63,6 +63,7 @@ try:
         DetectionFrame,
         LaserScanSnapshot,
         PointCloudSnapshot,
+        coerce_laser_scan_snapshot,
         localize_person_detection,
         localize_target_detection,
     )
@@ -70,6 +71,7 @@ except Exception:
     DetectionFrame = None
     LaserScanSnapshot = None
     PointCloudSnapshot = None
+    coerce_laser_scan_snapshot = None
     localize_person_detection = None
     localize_target_detection = None
 
@@ -1141,10 +1143,16 @@ class RoomSearchOrchestrator:
             params.get("target_classes", []))
         get_snapshot = self._detection_snapshot_getter(target_classes)
         if self._ai is None or get_snapshot is None:
-            self._fail("no_yolo", room="__frontier__")
-            task.status = "failed"
-            task.result = {"reason": "no_yolo"}
-            return
+            if __import__('os').environ.get('GO2W_SIM'):
+                # 仿真无相机/YOLO, 用空检测让 frontier 探索算法执行完 (DETECT 无发现, REPORT 空).
+                self.get_logger().info(
+                    "GO2W_SIM: ai None, 用空检测继续 frontier 探索 (DETECT 无发现)")
+                get_snapshot = lambda **kw: []
+            else:
+                self._fail("no_yolo", room="__frontier__")
+                task.status = "failed"
+                task.result = {"reason": "no_yolo"}
+                return
 
         lidar_range_setting = params.get(
             "use_lidar_target_range",
@@ -2166,10 +2174,18 @@ class RoomSearchOrchestrator:
             # 关键: 拿不到对齐 bundle → 返回 None, 调用方丢弃样本
             # 绝不退化为 "存 pose + 事后读最新 scan" (时间错位)
             return None
+        scan = (
+            coerce_laser_scan_snapshot(bundle.scan.value)
+            if coerce_laser_scan_snapshot is not None
+            else None
+        )
+        if scan is None:
+            logger.warning("observation synchronization returned invalid scan")
+            return None
         pointcloud = bundle.cloud.value if bundle.cloud is not None else None
         result.update({
             "bundle": bundle,
-            "scan": bundle.scan.value,
+            "scan": scan,
             "pointcloud": pointcloud,
             "robot_pose": (bundle.pose.x, bundle.pose.y, bundle.pose.yaw),
             "capture_stamp": bundle.capture_stamp,
@@ -2747,13 +2763,7 @@ class RoomSearchOrchestrator:
                     break
             if not has_valid_range:
                 return None
-            return LaserScanSnapshot(
-                angle_min=float(data.get("angle_min", 0.0)),
-                angle_increment=angle_increment,
-                ranges=ranges,
-                range_min=range_min,
-                range_max=range_max,
-            )
+            return coerce_laser_scan_snapshot(data)
         except Exception as e:
             logger.warning(f"get_scan_snapshot failed: {e}")
             return None

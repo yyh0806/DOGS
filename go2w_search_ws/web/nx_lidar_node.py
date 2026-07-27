@@ -168,9 +168,29 @@ class LidarBridge:
         (imu/scan/odom 标准 msg 正常, 独立 python 订阅也正常, 唯独挂 NxWebNode 不触发 _cb
         → _latest_png 终身空 → 前端无雷达)。独立 context 隔离 = 等价独立 python 订阅路径,
         实测能收; 同进程多 *context* 不冲突 (冲突的是同 context 多 spin)。
+
+        GO2W_SIM: 仿真订 /mid360/points_nav (PointCloud2 标准 msg, 无 CustomMsg 反序列化
+        问题), 用主 context 即可. 独立 context 在 WSL2 DDS 发现不稳 (同 wheel_feedback
+        PUB_COUNT=0 根因). 真机不设 GO2W_SIM 走独立 context (避 livox CustomMsg 主 context
+        反序列化失败).
         """
         if not _LIDAR_OK:
             logger.warning("[lidar] rclpy/livox msg 缺失, 不启动雷达点云展示")
+            return
+        import os
+        if os.environ.get('GO2W_SIM'):
+            try:
+                self._node = node  # 主 NxWebNode (PointCloud2 标准 msg 无反序列化问题)
+                self._subscription = self._node.create_subscription(
+                    PointCloud2, "/mid360/points_nav", self._cb,
+                    qos_profile_sensor_data,
+                )
+            except Exception as e:
+                logger.error(f"[lidar] GO2W_SIM 订阅失败: {e}")
+                return
+            self._running = True
+            threading.Thread(target=self._bcast_thread, daemon=True, name="lidar_bc").start()
+            logger.info(f"[lidar] GO2W_SIM 主 context 订阅 /mid360/points_nav ({_FPS}fps, ±{_RANGE}m)")
             return
         try:
             from rclpy.executors import SingleThreadedExecutor

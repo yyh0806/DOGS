@@ -234,12 +234,32 @@ def test_explicit_nav_activation_requires_scan_and_feedback(machine, samples):
     assert machine.snapshot().velocity_authorized is True
 
 
-def test_manual_and_nav_ownership_are_mutually_exclusive(machine, samples):
+def test_stopped_manual_session_handoffs_to_nav_without_pose_effect(
+        machine, samples):
     park_from_mode6(machine, samples)
     machine.request(MotionIntent.START_MANUAL)
     machine.observe(samples.make(raw_mode=1))
 
     assert machine.snapshot().session is SessionState.MANUAL_ACTIVE
+    assert machine.request(MotionIntent.START_NAV, scan_fresh=True) == []
+    snapshot = machine.snapshot()
+    assert snapshot.session is SessionState.NAV_ACTIVE
+    assert snapshot.owner == "nav"
+    assert snapshot.fault is None
+    assert snapshot.velocity_authorized is True
+
+
+def test_moving_manual_session_rejects_nav_handoff(machine, samples):
+    park_from_mode6(machine, samples)
+    machine.request(MotionIntent.START_MANUAL)
+    machine.observe(samples.make(raw_mode=1))
+    machine.observe(samples.make(
+        raw_mode=1,
+        wheel_dq=(0.3, 0.3, 0.3, 0.3),
+    ))
+
+    assert machine.snapshot().session is SessionState.MANUAL_ACTIVE
+    assert machine.snapshot().actual_motion is ActualMotionState.MOVING
     assert machine.request(MotionIntent.START_NAV, scan_fresh=True) == []
     assert machine.snapshot().session is SessionState.MANUAL_ACTIVE
     assert machine.snapshot().fault == "session_busy"

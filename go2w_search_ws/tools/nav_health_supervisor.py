@@ -27,6 +27,7 @@ LIFECYCLE_NODES = (
     "controller_server", "smoother_server", "planner_server",
     "behavior_server", "bt_navigator", "velocity_smoother",
 )
+LIFECYCLE_QUERY_TIMEOUT_SEC = 2.0
 
 
 def topic_snapshot(samples: deque[float], now: float) -> dict:
@@ -54,6 +55,16 @@ def stamp_age_snapshot(samples: deque[float]) -> dict:
         "stamp_median_sec": median(ordered),
         "stamp_p95_sec": ordered[p95_index],
     }
+
+
+def lifecycle_query_expired(
+    started_at: float,
+    now: float,
+    *,
+    timeout: float = LIFECYCLE_QUERY_TIMEOUT_SEC,
+) -> bool:
+    """Return whether a lifecycle request must be replaced after a restart."""
+    return float(now) - float(started_at) >= float(timeout)
 
 
 def atomic_write(path: Path, data: dict) -> None:
@@ -140,16 +151,31 @@ def run(state_file: Path) -> None:
             if now - last_poll >= 0.5:
                 last_poll = now
                 for name, client in clients.items():
-                    future = pending.get(name)
-                    if future is not None and future.done():
-                        try:
-                            current = future.result().current_state
-                            lifecycle[name] = {"id": int(current.id), "label": str(current.label)}
-                        except Exception as exc:
-                            lifecycle[name] = {"id": None, "label": "error", "error": str(exc)}
-                        pending.pop(name, None)
+                    pending_request = pending.get(name)
+                    if pending_request is not None:
+                        future, started_at = pending_request
+                        if future.done():
+                            try:
+                                current = future.result().current_state
+                                lifecycle[name] = {
+                                    "id": int(current.id),
+                                    "label": str(current.label),
+                                }
+                            except Exception as exc:
+                                lifecycle[name] = {
+                                    "id": None,
+                                    "label": "error",
+                                    "error": str(exc),
+                                }
+                            pending.pop(name, None)
+                        elif lifecycle_query_expired(started_at, now):
+                            future.cancel()
+                            pending.pop(name, None)
                     if name not in pending and client.service_is_ready():
-                        pending[name] = client.call_async(GetState.Request())
+                        pending[name] = (
+                            client.call_async(GetState.Request()),
+                            now,
+                        )
                 tf_state = {}
                 for parent, child in (("camera_init", "body"), ("odom", "base_link"), ("map", "odom"), ("map", "base_link")):
                     try:

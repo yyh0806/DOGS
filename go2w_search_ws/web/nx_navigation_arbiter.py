@@ -32,6 +32,8 @@ class NavigationArbiter:
         poll_interval: float = 0.05,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        manual_idle_timeout: float = 0.8,
+        timer_factory: Optional[Callable[[float, Callable[[], None]], Any]] = None,
     ) -> None:
         self._point_nav = point_nav
         self._tasks = task_manager
@@ -43,13 +45,19 @@ class NavigationArbiter:
             drive_activation_timeout, "drive_activation_timeout"
         )
         self._poll_interval = self._positive(poll_interval, "poll_interval")
+        self._manual_idle_timeout = self._positive(
+            manual_idle_timeout, "manual_idle_timeout"
+        )
         self._monotonic = monotonic
         self._sleep = sleep
+        self._timer_factory = timer_factory or threading.Timer
         self._lock = threading.RLock()
         self._emergency_lock = threading.Lock()
         self._emergency_epoch = 0
         self._stopping = False
         self._motion_owner: Optional[str] = None
+        self._manual_idle_timer: Optional[Any] = None
+        self._manual_idle_generation = 0
 
     def get_motion_owner(self) -> Optional[str]:
         """Return the serialized producer name for request-edge auditing."""
@@ -59,6 +67,37 @@ class NavigationArbiter:
     def _read_emergency_epoch(self) -> int:
         with self._emergency_lock:
             return self._emergency_epoch
+
+    def _cancel_manual_idle_timer_locked(self) -> None:
+        self._manual_idle_generation += 1
+        timer = self._manual_idle_timer
+        self._manual_idle_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _expire_manual_idle(self, generation: int) -> None:
+        with self._lock:
+            if (
+                generation != self._manual_idle_generation
+                or self._stopping
+                or self._motion_owner != "manual"
+            ):
+                return
+            self._manual_idle_timer = None
+            self._motion_owner = None
+            if not self._park_drive("manual_idle_timeout"):
+                self._emergency_stop()
+
+    def _schedule_manual_idle_park_locked(self) -> None:
+        self._cancel_manual_idle_timer_locked()
+        generation = self._manual_idle_generation
+        timer = self._timer_factory(
+            self._manual_idle_timeout,
+            lambda: self._expire_manual_idle(generation),
+        )
+        timer.daemon = True
+        self._manual_idle_timer = timer
+        timer.start()
 
     @staticmethod
     def _positive(value: Any, name: str) -> float:
@@ -554,6 +593,7 @@ class NavigationArbiter:
     def run_manual_action(self, reason: str, action: Callable[[], Any]) -> dict:
         """Activate one manual session; held-key refreshes reuse ownership."""
         with self._lock:
+            self._cancel_manual_idle_timer_locked()
             admission_epoch = self._read_emergency_epoch()
             if self._stopping:
                 return {"ok": False, "reason": "shutting_down"}
@@ -582,6 +622,7 @@ class NavigationArbiter:
     def stop_manual(self, reason: str = "operator_stop") -> dict:
         """Zero immediately, cancel other owners when needed, then park once."""
         with self._lock:
+            self._cancel_manual_idle_timer_locked()
             if self._motion_owner != "manual":
                 drained = self.cancel_all_and_drain(reason)
                 if not drained["ok"]:
@@ -599,6 +640,7 @@ class NavigationArbiter:
     def stop_all(self, reason: str = "operator_stop") -> dict:
         """Globally cancel navigation/tasks, publish zero, and park once."""
         with self._lock:
+            self._cancel_manual_idle_timer_locked()
             drained = self.cancel_all_and_drain(reason)
             if not drained["ok"]:
                 return drained
@@ -613,14 +655,15 @@ class NavigationArbiter:
             return {"ok": True, "phase": "parking"}
 
     def release_manual(self, reason: str = "manual_release") -> dict:
-        """Zero manual velocity without changing the physical drive mode.
+        """Zero manual velocity and keep a short reusable wheel-mode lease.
 
         Browser blur, key-up, and pointer-up belong to the manual controller.
         They must never be interpreted as requests to cancel Nav2 or a room
         search which may currently own the drive session.  They also must not
-        park an owned wheel session: rapid key press/release cycles would then
-        alternate BalanceStand and StandUp before either transition can settle.
-        Explicit operator stop/stand remains the only manual path that parks.
+        immediately park an owned wheel session: rapid key press/release cycles
+        would then alternate BalanceStand and StandUp before either transition
+        can settle.  The lease is parked automatically if no new manual command
+        or navigation handoff arrives before the idle timeout.
         """
         with self._lock:
             if self._motion_owner != "manual":
@@ -635,11 +678,13 @@ class NavigationArbiter:
             except Exception:
                 self._emergency_stop()
                 return {"ok": False, "reason": "manual_stop_error"}
+            self._schedule_manual_idle_park_locked()
             return {
                 "ok": True,
                 "phase": "idle",
                 "owner": "manual",
                 "reason": reason,
+                "lease_timeout_sec": self._manual_idle_timeout,
             }
 
     def emergency_stop(self, reason: str = "emergency_stop") -> dict:
@@ -651,6 +696,7 @@ class NavigationArbiter:
             self._emergency_epoch += 1
         self._emergency_stop()
         with self._lock:
+            self._cancel_manual_idle_timer_locked()
             try:
                 self._point_nav.cancel(reason)
             except Exception:
@@ -665,6 +711,7 @@ class NavigationArbiter:
         """Seal admissions and drain PointNav plus room/task ownership."""
         with self._lock:
             self._stopping = True
+            self._cancel_manual_idle_timer_locked()
             try:
                 self._point_nav.stop()
             except Exception:

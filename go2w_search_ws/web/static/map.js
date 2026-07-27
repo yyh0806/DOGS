@@ -36,6 +36,10 @@ class Go2WMap {
         candidateViewpoints: [], visitedViewpoints: [], observedCells: [], visibleCells: [],
         visibleCellsAvailable: false,
         coverageRatio: 0, coverageThreshold: 0.9, visualRangeM: 0,
+        visualCoverageRatio: 0, exploredRatio: 0,
+        boundedExploredRatio: 0, explainableCoverageRatio: 0,
+        closureConfirmed: false, traversableOpeningCount: 0,
+        completionReason: '', completionStatus: '', motionTrap: {},
         cameraHfovDeg: null, cameraYawOffsetDeg: null,
         coverageCellSizeM: 0.5, adaptiveStepM: 0,
         sceneComplexity: 1, forwardClearanceM: 0,
@@ -147,6 +151,10 @@ class Go2WMap {
       candidateViewpoints: [], visitedViewpoints: [], observedCells: [], visibleCells: [],
       visibleCellsAvailable: false,
       coverageRatio: 0, coverageThreshold: 0.9, visualRangeM: 0,
+      visualCoverageRatio: 0, exploredRatio: 0,
+      boundedExploredRatio: 0, explainableCoverageRatio: 0,
+      closureConfirmed: false, traversableOpeningCount: 0,
+      completionReason: '', completionStatus: '', motionTrap: {},
       cameraHfovDeg: null, cameraYawOffsetDeg: null,
       coverageCellSizeM: 0.5, adaptiveStepM: 0,
       sceneComplexity: 1, forwardClearanceM: 0,
@@ -173,6 +181,12 @@ class Go2WMap {
       const parsed = Number(value);
       return Number.isFinite(parsed) ? parsed : null;
     };
+    const globalSearch = has('global_search')
+      && src.global_search && typeof src.global_search === 'object'
+      ? src.global_search
+      : (base.globalSearch || {});
+    const legacyCoverage = Math.max(0, Math.min(1, has('coverage_ratio')
+      ? finiteOr(src.coverage_ratio, 0) : finiteOr(base.coverageRatio, 0)));
     this.slam.roomSearch = {
       missionId: incomingMissionId || String(base.missionId || ''),
       phase: has('phase') ? String(src.phase || '') : String(base.phase || ''),
@@ -188,8 +202,30 @@ class Go2WMap {
         ? finitePointList(src.visible_cells) : (base.visibleCells || []),
       visibleCellsAvailable: has('visible_cells')
         ? true : base.visibleCellsAvailable === true,
-      coverageRatio: Math.max(0, Math.min(1, has('coverage_ratio')
-        ? finiteOr(src.coverage_ratio, 0) : finiteOr(base.coverageRatio, 0))),
+      coverageRatio: legacyCoverage,
+      visualCoverageRatio: Math.max(0, Math.min(1, has('visual_coverage_ratio')
+        ? finiteOr(src.visual_coverage_ratio, legacyCoverage)
+        : finiteOr(base.visualCoverageRatio, legacyCoverage))),
+      exploredRatio: Math.max(0, Math.min(1, has('explored_ratio')
+        ? finiteOr(src.explored_ratio, 0) : finiteOr(base.exploredRatio, 0))),
+      boundedExploredRatio: Math.max(0, Math.min(1, has('bounded_explored_ratio')
+        ? finiteOr(src.bounded_explored_ratio, 0)
+        : finiteOr(base.boundedExploredRatio, 0))),
+      explainableCoverageRatio: Math.max(0, Math.min(1,
+        finiteOr(globalSearch.explainable_coverage_ratio,
+          finiteOr(base.explainableCoverageRatio, 0)))),
+      closureConfirmed: globalSearch.completion_eligible === true,
+      traversableOpeningCount: Math.max(0, Math.round(
+        finiteOr(globalSearch.traversable_opening_count,
+          finiteOr(base.traversableOpeningCount, 0)))),
+      completionReason: has('completion_reason')
+        ? String(src.completion_reason || '') : String(base.completionReason || ''),
+      completionStatus: has('completion_status')
+        ? String(src.completion_status || '') : String(base.completionStatus || ''),
+      motionTrap: has('motion_trap') && src.motion_trap
+        && typeof src.motion_trap === 'object'
+        ? { ...src.motion_trap } : { ...(base.motionTrap || {}) },
+      globalSearch: { ...globalSearch },
       coverageThreshold: Math.max(0, Math.min(1, has('coverage_threshold')
         ? finiteOr(src.coverage_threshold, 0.9) : finiteOr(base.coverageThreshold, 0.9))),
       visualRangeM: Math.max(0, has('visual_range_m')
@@ -847,6 +883,16 @@ class Go2WMap {
     // }
     // 2. 实时扫描
     const rx = toX(s.robotX), ry = toY(s.robotY);
+    // 狗 marker (红圆 + 白边 + 朝向箭头) — 明显显示狗位置 + 移动方向
+    ctx.fillStyle = '#ff1744';
+    ctx.beginPath(); ctx.arc(rx, ry, 7, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2; ctx.stroke();
+    const _dogYaw = s.robotYaw || 0;
+    ctx.strokeStyle = '#ff1744'; ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(rx, ry);
+    ctx.lineTo(rx + Math.cos(_dogYaw) * 16, ry - Math.sin(_dogYaw) * 16);
+    ctx.stroke();
     if (s.scanPoints.length) {
       ctx.strokeStyle = 'rgba(0,230,118,0.12)'; ctx.lineWidth = 0.5;
       ctx.beginPath();
@@ -860,6 +906,12 @@ class Go2WMap {
       }
     }
     // 3. 产品房间搜索: 已观察覆盖、房间边界、候选/已访问视点
+    const completionStatus = String(
+      roomSearch.completionStatus || '').trim().toLowerCase();
+    const phaseLabel = completionStatus === 'incomplete'
+      ? '未完成'
+      : (['complete', 'completed'].includes(completionStatus)
+        ? '完成' : (roomSearch.phase || 'SEARCH'));
     if (roomArea) {
       ctx.strokeStyle = '#7e57c2'; ctx.lineWidth = 2;
       ctx.setLineDash([8, 4]);
@@ -871,17 +923,25 @@ class Go2WMap {
       );
       ctx.setLineDash([]);
       ctx.fillStyle = '#b39ddb'; ctx.font = '10px sans-serif';
-      const pct = Math.round((roomSearch.coverageRatio || 0) * 100);
+      const visualPct = Math.round(
+        (roomSearch.visualCoverageRatio || roomSearch.coverageRatio || 0) * 100);
+      const exploredPct = Math.round((roomSearch.exploredRatio || 0) * 100);
+      const closure = roomSearch.closureConfirmed
+        ? '闭合已确认' : '闭合未确认';
       ctx.fillText(
-        `${roomSearch.room || '房间'} · ${roomSearch.phase || 'SEARCH'} · 覆盖 ${pct}%`,
+        `${roomSearch.room || '房间'} · ${phaseLabel} · 视觉 ${visualPct}% · 全局 ${exploredPct}% · ${closure}`,
         toX(roomArea.origin_x) + 4,
         toY(roomArea.origin_y + roomArea.height) + 13,
       );
     } else if (roomSearch.phase) {
       ctx.fillStyle = '#b39ddb'; ctx.font = '10px sans-serif';
-      const pct = Math.round((roomSearch.coverageRatio || 0) * 100);
+      const visualPct = Math.round(
+        (roomSearch.visualCoverageRatio || roomSearch.coverageRatio || 0) * 100);
+      const exploredPct = Math.round((roomSearch.exploredRatio || 0) * 100);
+      const closure = roomSearch.closureConfirmed
+        ? '闭合已确认' : '闭合未确认';
       ctx.fillText(
-        `${roomSearch.phase} · 覆盖 ${pct}% · 步长 ${(roomSearch.adaptiveStepM || 0).toFixed(1)}m`,
+        `${phaseLabel} · 视觉 ${visualPct}% · 全局 ${exploredPct}% · ${closure} · 步长 ${(roomSearch.adaptiveStepM || 0).toFixed(1)}m`,
         12,
         18,
       );

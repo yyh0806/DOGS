@@ -286,14 +286,25 @@ class DriveExecutionWatchdog:
     ZERO = (0.0, 0.0, 0.0)
     WHEEL_INDICES = (12, 13, 14, 15)
 
-    def __init__(self, timeout, min_wheel_speed, clock):
+    def __init__(
+        self,
+        timeout,
+        min_wheel_speed,
+        clock,
+        response_grace=None,
+    ):
         timeout = float(timeout)
         min_wheel_speed = float(min_wheel_speed)
+        response_grace = (
+            timeout if response_grace is None else float(response_grace))
         if not math.isfinite(timeout) or timeout <= 0.0:
             raise ValueError("drive timeout must be finite and positive")
         if not math.isfinite(min_wheel_speed) or min_wheel_speed <= 0.0:
             raise ValueError("minimum wheel speed must be finite and positive")
+        if not math.isfinite(response_grace) or response_grace <= 0.0:
+            raise ValueError("drive response grace must be finite and positive")
         self._timeout = timeout
+        self._response_grace = response_grace
         self._min_wheel_speed = min_wheel_speed
         self._clock = clock
         self._lock = threading.Lock()
@@ -305,6 +316,7 @@ class DriveExecutionWatchdog:
         self._sport_progress = None
         self._gait_type = None
         self._no_response_since = None
+        self._pending_fault_reason = None
 
     def observe_low_state(self, message):
         try:
@@ -385,6 +397,7 @@ class DriveExecutionWatchdog:
                 reason = "wheel_feedback_invalid"
             elif values == self.ZERO:
                 self._no_response_since = None
+                self._pending_fault_reason = None
                 return None
             elif self._gait_type not in (None, 0):
                 # Go2-W wheel locomotion under MotionSwitcher ``ai-w`` reports
@@ -392,6 +405,7 @@ class DriveExecutionWatchdog:
                 # behaviors and must never coexist with an authorized wheel
                 # velocity command.
                 self._no_response_since = None
+                self._pending_fault_reason = None
                 return "unexpected_gait"
             elif (
                 self._last_feedback is None
@@ -405,17 +419,29 @@ class DriveExecutionWatchdog:
                 reason = "wheel_no_response"
             else:
                 self._no_response_since = None
+                self._pending_fault_reason = None
                 return None
-            if self._no_response_since is None or now < self._no_response_since:
+            if (
+                self._no_response_since is None
+                or now < self._no_response_since
+                or self._pending_fault_reason != reason
+            ):
                 self._no_response_since = now
+                self._pending_fault_reason = reason
                 return None
-            if now - self._no_response_since > self._timeout:
+            confirmation_timeout = (
+                self._response_grace
+                if reason == "wheel_no_response"
+                else self._timeout
+            )
+            if now - self._no_response_since > confirmation_timeout:
                 return reason
             return None
 
     def reset(self):
         with self._lock:
             self._no_response_since = None
+            self._pending_fault_reason = None
 
     def snapshot(self):
         with self._lock:
@@ -426,4 +452,7 @@ class DriveExecutionWatchdog:
                 "sport_mode": self._sport_mode,
                 "sport_progress": self._sport_progress,
                 "gait_type": self._gait_type,
+                "feedback_timeout": self._timeout,
+                "response_grace": self._response_grace,
+                "pending_fault_reason": self._pending_fault_reason,
             }

@@ -50,6 +50,8 @@ function loadNavigationStateMachine() {
       resetDriveFault,
       resetNavOrderingForNewConnection,
       personMarkerEvidenceLabel,
+      preferredDetectionResults,
+      roomSearchStatus,
       setMap(value) { map = value; },
       setFetch(value) { __setFetch(value); },
       state() {
@@ -226,6 +228,8 @@ function loadPanelLifecycle(overrides = {}) {
     clearTimeout,
     requestAnimationFrame: callback => setTimeout(callback, 0),
     cancelAnimationFrame: clearTimeout,
+    latestPerceptionHealthy: false,
+    updateMissionTargetMarkers: () => {},
     document: { getElementById: () => null },
     ...overrides,
   };
@@ -515,6 +519,10 @@ async function testStatusSnapshotRehydratesAllStateAndRejectsOldEpoch() {
     applyRoomNavigationState: value => calls.push(['room-nav', value]),
     updatePoseInfo: (localization, odometry) => calls.push(['pose', localization, odometry]),
     updateDetList: value => calls.push(['detections', value]),
+    updateMissionTargetMarkers: value => {
+      calls.push(['mission-targets', value]);
+      map.update({ target_markers: value });
+    },
     updateDetectionBadge: () => calls.push(['detection-badge']),
     renderDetectionStreams: value => calls.push(['overlay-render', value]),
     document: {
@@ -537,12 +545,16 @@ async function testStatusSnapshotRehydratesAllStateAndRejectsOldEpoch() {
     target_markers: [{ class: 'person', confidence: 0.9, x: 1, y: 2 }],
     services: { nav2: { state: 'active', color: 'green', label: 'Nav2' } },
     stats: { ws_connected_clients: 1, ws_reliable_depth: 0, ws_stream_replaced: 5 },
+    perception: {
+      healthy: true, reason: 'ok', source: 'c13_vis',
+      age_sec: 0.08, frame_available: true,
+    },
   };
 
   assert.strictEqual(lifecycle.applyStatusSnapshot(snapshot, 3), false);
   assert.strictEqual(calls.length, 0, 'stale connection epoch must not rehydrate the page');
   assert.strictEqual(lifecycle.applyStatusSnapshot(snapshot, 4), true);
-  for (const kind of ['dog-status', 'dog-state', 'tasks', 'navigation', 'point-nav', 'room-nav', 'pose', 'detections', 'detection-badge', 'map']) {
+  for (const kind of ['dog-status', 'dog-state', 'tasks', 'navigation', 'point-nav', 'room-nav', 'pose', 'detections', 'detection-badge', 'mission-targets', 'map']) {
     assert(calls.some(call => call[0] === kind), `missing ${kind} rehydration: ${JSON.stringify(calls)}`);
   }
   assert(!calls.some(call => call[0] === 'overlay-render'),
@@ -552,6 +564,29 @@ async function testStatusSnapshotRehydratesAllStateAndRejectsOldEpoch() {
   assert(elements.get('svcBar').innerHTML.includes('Nav2'));
   assert.strictEqual(elements.get('nxDot').dataset.wsClients, '1');
   assert(elements.get('nxDot').title.includes('stream replacements 5'));
+  assert(elements.get('videoMeta').textContent.includes('c13_vis'));
+  assert(elements.get('videoMeta').textContent.includes('实时'));
+}
+
+function testMissionTargetsSurviveAnEmptyLiveFrameAndSearchFailureWins() {
+  const { nav } = loadNavigationStateMachine();
+  const markers = [{ id: 'person_001', class: 'person', confidence: 0.95 }];
+
+  assert.deepStrictEqual(
+    JSON.parse(JSON.stringify(nav.preferredDetectionResults([], markers))),
+    markers,
+  );
+  const status = nav.roomSearchStatus({
+    reason: 'nav2_aborted',
+    search_state: {
+      phase: 'FAILED',
+      completion_reason: 'motion_trapped',
+      motion_trap: { forward_clearance_m: 0.468, turn_clearance_m: 0.474 },
+    },
+  });
+  assert.strictEqual(status.status, 'failed');
+  assert(status.message.includes('运动受困'));
+  assert(status.message.includes('前向 0.47m'));
 }
 
 function testInlinePanelScriptParsesAsJavaScript() {
@@ -659,6 +694,7 @@ async function testPersonMarkerEvidenceLabelShows3dAndDedupProof() {
   await testNewestOverlayGenerationWins();
   testHttpDetectionCacheInvalidatesQueuedOldOverlay();
   await testStatusSnapshotRehydratesAllStateAndRejectsOldEpoch();
+  testMissionTargetsSurviveAnEmptyLiveFrameAndSearchFailureWins();
   testInlinePanelScriptParsesAsJavaScript();
   testGimbalRenderingWaitsForTheNewImageOnload();
   console.log('panel navigation state tests passed');

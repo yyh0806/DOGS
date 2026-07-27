@@ -22,7 +22,7 @@ SYSTEM_PROMPT = """你是机器狗语音指令规范化器，只能返回一个�
 允许的移动指令只有四种完整格式：前进[<距离>米]、后退[<距离>米]、左转[<角度>度]、右转[<角度>度]，方括号内整体可省略。省略时距离默认为 1 米、角度默认为 90 度；写数值时必须同时写单位。距离范围必须为 (0,20] 米，角度范围必须为 (0,360] 度。
 上述方括号只是说明可选部分，不得原样输出方括号。例如应输出“左转180度”，不能输出“左转[180度]”。
 搜索仅限当前房间，完整格式为“搜索房间标注所有<目标>”或“搜索当前房间并标注所有<目标>”；不得指定其他房间。
-语义映射示例：“搜索全屋”“探索房间”“探索整个房间”都输出“搜索房间标注所有人”；“扭头”输出“左转90度”；“转身”“回头”“掉头”都输出“左转180度”。
+语义映射示例：“搜索全屋”“探索房间”“探索整个房间”都输出“搜索房间标注所有人”；“可以坐的东西”“座位”输出“搜索房间标注所有椅子”；“扭头”输出“左转90度”；“转身”“回头”“掉头”都输出“左转180度”。
 必须拒绝 shell 或系统命令、坐标或导航点、多个命令或串联动作、解释性文字或其他 prose、函数或工具调用。不得输出这些内容的一部分。
 无法安全归一化时 command 必须为 null。只输出严格 JSON：{"command": string|null}；禁止额外字段、Markdown 或任何其他文字。"""
 
@@ -30,6 +30,25 @@ _FENCED_JSON = re.compile(
     r"\A```(?:json)?[ \t]*\r?\n(?P<body>(?:(?!```).)*)\r?\n```[ \t]*\Z",
     re.DOTALL | re.IGNORECASE,
 )
+_GROUNDED_SEARCH_ALIASES = {
+    "可以坐的东西": "椅子",
+    "可坐的东西": "椅子",
+    "能坐的东西": "椅子",
+    "座位": "椅子",
+}
+_CURRENT_ROOM_SEARCH = re.compile(
+    r"\A搜索(?:当前)?房间(?:并)?标注所有(?P<target>[^，。；,;]+)\Z")
+
+
+def _canonicalize_grounded_search_alias(command: str) -> str:
+    compact = re.sub(r"\s+", "", str(command or "").strip())
+    match = _CURRENT_ROOM_SEARCH.fullmatch(compact)
+    if match is None:
+        return command
+    canonical_target = _GROUNDED_SEARCH_ALIASES.get(match.group("target"))
+    if canonical_target is None:
+        return command
+    return f"搜索房间标注所有{canonical_target}"
 
 
 def _endpoint_kind(url: str) -> str | None:
@@ -98,7 +117,7 @@ def _parse_content(content: object) -> str | None:
     command = command.strip()
     if not command or len(command) > MAX_COMMAND_CHARS:
         return None
-    return command
+    return _canonicalize_grounded_search_alias(command)
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):

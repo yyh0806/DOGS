@@ -526,13 +526,23 @@ function testRoomSearchCoverageAndViewpointsRenderOnMap() {
   const { map, ctx } = createMap();
   map.update({
     room_search: {
-      phase: 'ACTIVE_SEARCH',
+      phase: 'DONE',
       room: '客厅',
       room_area: { origin_x: 1, origin_y: 2, width: 4, height: 3, spacing: 1 },
       candidate_viewpoints: [{ x: 2, y: 3 }, { x: 4, y: 4 }],
       visited_viewpoints: [{ x: 2, y: 3 }],
       observed_cells: [{ x: 1, y: 2 }, { x: 2, y: 2 }],
       coverage_ratio: 0.5,
+      visual_coverage_ratio: 0.99,
+      explored_ratio: 0.24,
+      bounded_explored_ratio: 0.98,
+      completion_reason: 'motion_trapped',
+      completion_status: 'incomplete',
+      global_search: {
+        explainable_coverage_ratio: 0.96,
+        traversable_opening_count: 1,
+        completion_eligible: false,
+      },
       coverage_threshold: 0.9,
       visual_range_m: 2.5,
     },
@@ -540,6 +550,11 @@ function testRoomSearchCoverageAndViewpointsRenderOnMap() {
   map._draw();
 
   assert.strictEqual(map.slam.roomSearch.coverageRatio, 0.5);
+  assert.strictEqual(map.slam.roomSearch.visualCoverageRatio, 0.99);
+  assert.strictEqual(map.slam.roomSearch.exploredRatio, 0.24);
+  assert.strictEqual(map.slam.roomSearch.explainableCoverageRatio, 0.96);
+  assert.strictEqual(map.slam.roomSearch.closureConfirmed, false);
+  assert.strictEqual(map.slam.roomSearch.completionReason, 'motion_trapped');
   assert.strictEqual(map.slam.roomSearch.observedCells.length, 2);
   assert(
     ctx.ops.some(op => op.type === 'strokeRect' && op.strokeStyle === '#7e57c2'),
@@ -554,8 +569,13 @@ function testRoomSearchCoverageAndViewpointsRenderOnMap() {
     'expected visited viewpoint markers',
   );
   assert(
-    ctx.ops.some(op => op.type === 'fillText' && op.text.includes('覆盖 50%')),
-    'expected coverage label',
+    ctx.ops.some(op => op.type === 'fillText'
+      && op.text.includes('未完成')
+      && !op.text.includes('DONE')
+      && op.text.includes('视觉 99%')
+      && op.text.includes('全局 24%')
+      && op.text.includes('闭合未确认')),
+    'expected distinct visual/global/closure label',
   );
 }
 
@@ -812,7 +832,7 @@ function testPanelFiltersDetectionResultsBelowEightyPercent() {
     'panel should share one confidence filter across result views',
   );
   assert(
-    panel.includes('target_markers: filterDetectionResults(markers)'),
+    panel.includes('updateMissionTargetMarkers(markers)'),
     'map markers must exclude low-confidence detections',
   );
 }
@@ -822,13 +842,29 @@ function testPanelForwardsGenericTargetMarkerEventsIntoMap() {
   const branch = panel.indexOf("data.type === 'target_markers'");
   assert(branch >= 0, 'target_markers WebSocket branch missing');
   assert(
-    panel.indexOf('target_markers: markers', branch) > branch,
+    panel.indexOf('updateMissionTargetMarkers(markers)', branch) > branch,
     'generic target markers must be forwarded to the map renderer',
   );
   const reportBranch = panel.indexOf("data.type === 'mission_report'");
   assert(
     panel.indexOf('target_markers: detections', reportBranch) > reportBranch,
     'mission report detections must be forwarded as generic target markers',
+  );
+}
+
+function testPanelPreservesMissionTargetsAndExplainsSearchFailure() {
+  const panel = fs.readFileSync(path.join(__dirname, 'static', 'panel.html'), 'utf8');
+  assert(
+    panel.includes('function preferredDetectionResults('),
+    'mission results need a fallback when the current frame is empty',
+  );
+  assert(
+    panel.includes('function updateMissionTargetMarkers('),
+    'mission target markers need state separate from instantaneous detections',
+  );
+  assert(
+    panel.includes("motion_trapped: '运动受困'"),
+    'search failure must explain motion_trapped instead of generic nav2_aborted',
   );
 }
 
@@ -863,4 +899,5 @@ testPanelForwardsSearchRoomProgressIntoMap();
 testStatusPollingRefreshesRoomSearchWhenWebSocketStateIsDropped();
 testPanelFiltersDetectionResultsBelowEightyPercent();
 testPanelForwardsGenericTargetMarkerEventsIntoMap();
+testPanelPreservesMissionTargetsAndExplainsSearchFailure();
 console.log('map contract tests passed');

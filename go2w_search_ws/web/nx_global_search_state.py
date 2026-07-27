@@ -453,6 +453,19 @@ def analyze_global_search_state(
         for dr, dc in _NEIGHBORS_8:
             neighbor = (cell[0] + dr, cell[1] + dc)
             if not grid.in_bounds(neighbor):
+                # A rolling/global map edge is not a physical wall. Reachable
+                # free space touching it remains an exploration opening unless
+                # that exact graph edge is the explicitly excluded entrance.
+                if (
+                    gate is None
+                    or not _segment_crossing(
+                        start,
+                        grid.cell_center(neighbor),
+                        gate,
+                        rearward_only=False,
+                    )
+                ):
+                    frontier_cells.add(cell)
                 continue
             if neighbor in occupied:
                 occupied_boundary.add(neighbor)

@@ -69,7 +69,8 @@ class _VisibilityTracker:
             coverage_ratio=0.25, path_blocked=False,
             current_adaptive_step_m=None, current_path_blocked=None,
             current_forward_clearance_m=None, turn_clearance_m=8.0,
-            turn_motion_blocked=False):
+            turn_motion_blocked=False, terminal_safe_step_m=None,
+            terminal_egress_safe=True, terminal_egress_limited=False):
         self.adaptive_step_m = float(adaptive_step_m)
         self.scene_complexity = float(scene_complexity)
         self.path_blocked = bool(path_blocked)
@@ -85,6 +86,11 @@ class _VisibilityTracker:
             else current_forward_clearance_m)
         self.turn_clearance_m = float(turn_clearance_m)
         self.turn_motion_blocked = bool(turn_motion_blocked)
+        self.terminal_safe_step_m = (
+            None if terminal_safe_step_m is None
+            else float(terminal_safe_step_m))
+        self.terminal_egress_safe = bool(terminal_egress_safe)
+        self.terminal_egress_limited = bool(terminal_egress_limited)
         self.gains = dict(gains or {})
         self._coverage_candidates = list(coverage_candidates or [])
         self._lidar_candidates = list(lidar_candidates or [])
@@ -100,7 +106,7 @@ class _VisibilityTracker:
         for source in candidates:
             candidate = dict(source)
             gain = float(self.gains.get(float(candidate["x"]), 0.0))
-            candidate.update({
+            evidence = {
                 "base_information_gain": float(
                     candidate.get("information_gain", candidate.get("size", 0.0))),
                 "visual_gain": gain,
@@ -120,7 +126,21 @@ class _VisibilityTracker:
                     math.sin(float(candidate["yaw"]) - float(robot_pose[2])),
                     math.cos(float(candidate["yaw"]) - float(robot_pose[2])),
                 )),
-            })
+            }
+            if (
+                    self.terminal_safe_step_m is not None
+                    or "terminal_safe_step_m" in candidate):
+                evidence.update({
+                    "terminal_safe_step_m": float(candidate.get(
+                        "terminal_safe_step_m",
+                        self.terminal_safe_step_m)),
+                    "terminal_egress_safe": bool(candidate.get(
+                        "terminal_egress_safe", self.terminal_egress_safe)),
+                    "terminal_egress_limited": bool(candidate.get(
+                        "terminal_egress_limited",
+                        self.terminal_egress_limited)),
+                })
+            candidate.update(evidence)
             ranked.append(candidate)
         return ranked
 
@@ -1279,6 +1299,68 @@ def test_same_spatial_frontier_is_bounded_across_rapid_map_revisions():
     assert len(nav.probes) == probes_before_revision_churn
 
 
+@pytest.mark.parametrize("reason", [
+    "aborted",
+    "nav2_aborted",
+    "controller_abort",
+    "controller_failed",
+])
+def test_controller_hard_failure_blocks_same_world_frontier_immediately(reason):
+    frontier = {
+        "x": 2.0, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 2), "distance": 2.0,
+        "information_gain": 10.0, "score": 10.0,
+    }
+    nav = _PlannerPort()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=8.0,
+        initial_radius_m=8.0,
+        max_failures_per_cell=2,
+        stable_exhaustion_cycles=1,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+    pose = (0.0, 0.0, 0.0)
+
+    selected = manager.choose_next(_two_room_map(1), pose)
+    assert selected is not None
+    manager.mark_navigation_failed(reason, selected, robot_pose=pose)
+    probes_after_first_attempt = len(nav.probes)
+
+    assert manager.choose_next(_two_room_map(2), pose) is None
+    assert len(nav.probes) == probes_after_first_attempt
+
+
+def test_navigation_timeout_keeps_one_bounded_retry():
+    frontier = {
+        "x": 2.0, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 2), "distance": 2.0,
+        "information_gain": 10.0, "score": 10.0,
+    }
+    nav = _PlannerPort()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=8.0,
+        initial_radius_m=8.0,
+        max_failures_per_cell=2,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+    pose = (0.0, 0.0, 0.0)
+
+    selected = manager.choose_next(_two_room_map(1), pose)
+    assert selected is not None
+    manager.mark_navigation_failed("timeout", selected, robot_pose=pose)
+
+    assert manager.choose_next(_two_room_map(2), pose) is not None
+    assert len(nav.probes) == 2
+
+
 def test_same_world_frontier_is_bounded_when_grid_origin_shifts():
     """Growing SLAM maps may reindex a fixed world point every revision."""
     nav = _PlannerPort(blocked_x=(1.0,))
@@ -1621,6 +1703,76 @@ def test_locally_blocked_start_reports_motion_trapped_without_nav2_probe():
     assert snapshot["motion_trap"]["forward_clearance_m"] == pytest.approx(0.45)
 
 
+def test_terminal_egress_limited_candidate_only_probes_shortened_safe_goal():
+    tracker = _VisibilityTracker(
+        adaptive_step_m=4.0,
+        terminal_safe_step_m=1.2,
+        terminal_egress_safe=False,
+        terminal_egress_limited=True,
+    )
+    frontier = {
+        "x": 4.0, "y": 0.0, "yaw": 0.0, "size": 20,
+        "center_cell": (0, 8), "distance": 4.0,
+        "information_gain": 20.0, "score": 20.0,
+    }
+    nav = _PlannerPort()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=8.0,
+        initial_radius_m=8.0,
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(1.2)
+    assert selected["approach_terminal_egress_m"] == pytest.approx(1.2)
+    assert nav.probes
+    assert all(probe[0] <= 1.2 for probe in nav.probes)
+
+
+def test_terminal_egress_impossible_candidate_is_skipped_for_safe_frontier():
+    tracker = _VisibilityTracker(adaptive_step_m=4.0)
+    blocked = {
+        "x": 4.0, "y": 0.0, "yaw": 0.0, "size": 30,
+        "center_cell": (0, 8), "distance": 4.0,
+        "information_gain": 30.0, "score": 30.0,
+        "terminal_safe_step_m": 0.0,
+        "terminal_egress_safe": False,
+        "terminal_egress_limited": True,
+    }
+    safe = {
+        "x": 2.0, "y": 0.0, "yaw": 0.0, "size": 10,
+        "center_cell": (0, 4), "distance": 2.0,
+        "information_gain": 10.0, "score": 10.0,
+        "terminal_safe_step_m": 2.0,
+        "terminal_egress_safe": True,
+        "terminal_egress_limited": False,
+    }
+    nav = _PlannerPort()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=8.0,
+        initial_radius_m=8.0,
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(blocked), dict(safe)],
+        reject_map_edge=False,
+    )
+
+    selected = manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+
+    assert selected is not None
+    assert selected["x"] == pytest.approx(2.0)
+    assert not any(probe[0] == pytest.approx(4.0) for probe in nav.probes)
+
+
 def test_blocked_turn_uses_one_clearance_capped_straight_staging_probe():
     tracker = _VisibilityTracker(
         adaptive_step_m=4.0,
@@ -1663,7 +1815,8 @@ def test_blocked_turn_uses_one_clearance_capped_straight_staging_probe():
     ])
 
 
-def test_first_zero_progress_nav2_abort_becomes_motion_trapped():
+@pytest.mark.parametrize("abort_reason", ["nav2_aborted", "aborted"])
+def test_first_zero_progress_nav2_abort_becomes_motion_trapped(abort_reason):
     tracker = _VisibilityTracker(
         adaptive_step_m=4.0,
         gains={4.0: 20.0},
@@ -1695,7 +1848,7 @@ def test_first_zero_progress_nav2_abort_becomes_motion_trapped():
     manager.observe_environment(_two_room_map(), (0.0, 0.0, 0.0), None)
 
     reason = manager.mark_navigation_failed(
-        "nav2_aborted", selected, robot_pose=(0.0, 0.0, 0.0))
+        abort_reason, selected, robot_pose=(0.0, 0.0, 0.0))
 
     assert reason == "motion_trapped"
     assert manager.snapshot()["last_selection_reason"] == "motion_trapped"
