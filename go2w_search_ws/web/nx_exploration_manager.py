@@ -1756,6 +1756,24 @@ class ExplorationManager:
             if best is not None:
                 optimized_count += 1
                 _, yaw, vg, hc = best
+                # D-yaw-optional (攻"到达后原地踏步转向"根因):
+                # GO2W_FRONTIER_YAW_OPTIONAL=1 时, 大转向(>默认30°)仅在 visual_gain
+                # 提升超过阈值才执行, 否则 goal yaw=robot_yaw (Nav2 到达不强制转,
+                # 把转向延迟到下一个 goal 行进中完成 → 体感流畅, 不丢 visual_gain
+                # 显著的大转向). 默认 off 保 v3 行为.
+                if (str(os.environ.get("GO2W_FRONTIER_YAW_OPTIONAL", "0")).strip()
+                        in ("1", "true", "True", "yes")
+                        and hc > math.radians(float(os.environ.get(
+                            "GO2W_FRONTIER_YAW_LARGE_TURN_DEG", "30.0")))):
+                    robot_yaw_vg = float(
+                        self.visibility_tracker.visual_gain_at(
+                            map_msg, cx, cy, robot_yaw)
+                    ) if self.visibility_tracker is not None else 0.0
+                    if (float(vg) - robot_yaw_vg) < float(os.environ.get(
+                            "GO2W_FRONTIER_YAW_MIN_GAIN", "20.0")):
+                        yaw = robot_yaw
+                        vg = robot_yaw_vg
+                        hc = 0.0
                 cand["yaw"] = yaw
                 cand["visual_gain"] = vg
                 cand["heading_change"] = hc
