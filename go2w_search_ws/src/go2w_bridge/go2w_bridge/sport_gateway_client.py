@@ -8,7 +8,7 @@ import threading
 from typing import Optional
 
 try:
-    from .motion_types import CommandReceipt, Effect
+    from .motion_types import CommandReceipt, Effect, InitializationResult
     from .sport_gateway_protocol import (
         GatewayRequest,
         MAX_FRAME_BYTES,
@@ -19,9 +19,8 @@ try:
         decode_response,
         encode_frame,
     )
-    from .unitree_sport_adapter import InitializationResult
 except ImportError:  # Direct-file compatibility deployment on the NX.
-    from motion_types import CommandReceipt, Effect
+    from motion_types import CommandReceipt, Effect, InitializationResult
     from sport_gateway_protocol import (
         GatewayRequest,
         MAX_FRAME_BYTES,
@@ -32,7 +31,6 @@ except ImportError:  # Direct-file compatibility deployment on the NX.
         decode_response,
         encode_frame,
     )
-    from unitree_sport_adapter import InitializationResult
 
 
 class SportGatewayClient:

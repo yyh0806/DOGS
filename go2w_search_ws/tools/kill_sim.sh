@@ -17,7 +17,6 @@ for pat in \
   'topic_tools.*relay' \
   'nx_motion_node' \
   'nx_web_server' \
-  'motion_sdk_mock' \
   'sim_telemetry_bridge' \
   'sim_odom_tf' \
   'sim_amcl_to_odom' \

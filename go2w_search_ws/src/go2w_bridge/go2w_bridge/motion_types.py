@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import math
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 
 class PhysicalMode(Enum):
@@ -132,6 +132,23 @@ class CommandReceipt:
     @property
     def transport_ok(self) -> bool:
         return self.code == 0
+
+
+@dataclass(frozen=True)
+class InitializationResult:
+    """Result of acquiring or probing the sport motion service.
+
+    Returned by motion-service adapters (SportGatewayClient on real hardware,
+    SimSportGateway under GO2W_SIM) so the motion controller can decide whether
+    lease acquisition succeeded and which service mode is currently active.
+    Relocated here from unitree_sport_adapter.py when the dead
+    UnitreeSportAdapter class was removed; the dataclass stays the single
+    initialization vocabulary shared by every adapter implementation.
+    """
+
+    code: int
+    motion_service: Optional[str]
+    raw_mode: Any = None
 
 
 class Go2WModeProfile:

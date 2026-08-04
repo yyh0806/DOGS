@@ -16,7 +16,6 @@ setup(
     description='Gazebo Classic 11 simulation of DOGS Nav2 stack',
     license='MIT', tests_require=['pytest'],
     entry_points={'console_scripts': [
-        'motion_sdk_mock = go2w_sim.nodes.motion_sdk_mock:main',
         'sim_telemetry_bridge = go2w_sim.nodes.sim_telemetry_bridge:main',
         'sim_odom_tf = go2w_sim.nodes.sim_odom_tf:main',
         'sim_amcl_to_odom = go2w_sim.nodes.sim_amcl_to_odom:main',

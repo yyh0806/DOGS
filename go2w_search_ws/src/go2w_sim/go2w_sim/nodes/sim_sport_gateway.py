@@ -21,11 +21,9 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 
 try:
-    from go2w_bridge.motion_types import CommandReceipt, Effect
-    from go2w_bridge.unitree_sport_adapter import InitializationResult
+    from go2w_bridge.motion_types import CommandReceipt, Effect, InitializationResult
 except ImportError:  # Direct-file / pytest without colcon install
-    from motion_types import CommandReceipt, Effect
-    from unitree_sport_adapter import InitializationResult
+    from motion_types import CommandReceipt, Effect, InitializationResult
 
 
 class SimSportGateway:

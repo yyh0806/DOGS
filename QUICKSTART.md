@@ -92,7 +92,7 @@ export GO2W_WEB_DIR="$PWD/web"     # 覆盖 launch 里默认的 WSL2 /mnt/c 路�
 ros2 launch go2w_sim sim_full_bringup.launch.py
 ```
 
-这一条命令会拉起：gzserver + go2 URDF + FastLIO + Nav2 + slam_toolbox + motion_sdk_mock + sim_telemetry_bridge + nx_web_server + nx_sim_video_node。
+这一条命令会拉起：gzserver + go2 URDF + FastLIO + Nav2 + slam_toolbox + sim_telemetry_bridge + nx_web_server + nx_sim_video_node。
 
 ### Step 7 — 打开浏览器
 
