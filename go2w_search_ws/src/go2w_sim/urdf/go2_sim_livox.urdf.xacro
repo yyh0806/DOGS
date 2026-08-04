@@ -1,0 +1,144 @@
+<?xml version="1.0"?>
+<!-- 真机一致仿真 URDF (spec 2026-07-25-real-fidelity §2/§9 Task 6.3):
+     Task1 kinematic-base (base_footprint + base_link + planar_move /cmd_vel→/odom_planar)
+     + Livox MID360 (libros2_livox.so 发 livox_ros_driver2/msg/CustomMsg, 玫瑰扫描,
+       FastLIO 零改消费 /livox/lidar)
+     + IMU (libgazebo_ros_imu_sensor.so, /livox/imu, Gazebo 原生 m/s² 含重力;
+       ×9.80665 只在实机 lddc.cpp:493, 仿真不走该路径).
+
+     唯一简化 = 运动模型 (四足步态固件 → kinematic-base planar_move).
+     感知栈 (Livox + IMU) 与真机一致, 话题同名. -->
+<robot name="go2_sim" xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <!-- ===== kinematic-base (from Task1 go2_sim.urdf) ===== -->
+  <link name="base_footprint">
+    <inertial>
+      <mass value="0.01"/>
+      <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/>
+    </inertial>
+  </link>
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+  </joint>
+  <link name="base_link">
+    <inertial>
+      <mass value="6.0"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="0.06" ixy="0" ixz="0" iyy="0.10" iyz="0" izz="0.13"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.40 0.20 0.10"/></geometry>
+      <material name="grey"><color rgba="0.3 0.3 0.3 1.0"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.40 0.20 0.10"/></geometry>
+    </collision>
+  </link>
+  <gazebo>
+    <plugin name="planar_move" filename="libgazebo_ros_planar_move.so">
+      <ros>
+        <namespace>/</namespace>
+        <remapping>odom:=/odom_planar</remapping>
+      </ros>
+      <commandTopic>/cmd_vel</commandTopic>
+      <bodyName>base_link</bodyName>
+      <odometryTopic>/odom_planar</odometryTopic>
+      <odometryFrame>odom</odometryFrame>
+      <robotBaseFrame>base_footprint</robotBaseFrame>
+      <updateRate>50.0</updateRate>
+      <leftJoint>base_footprint_joint</leftJoint>
+      <rightJoint>base_footprint_joint</rightJoint>
+      <wheelSeparation>0.3</wheelSeparation>
+      <wheelDiameter>0.1</wheelDiameter>
+    </plugin>
+  </gazebo>
+
+  <!-- ===== Livox MID360 (CustomMsg, FastLIO 零改消费) =====
+       mid360.xacro macro: samples=40000, noise_stddev=0.01, range 0.1-200,
+       csv=scan_mode/mid360.csv (玫瑰扫描), update_rate=10. -->
+  <xacro:include filename="$(find ros2_livox_simulation)/urdf/mid360.xacro"/>
+  <xacro:mid360 name="livox_frame" parent="base_link" topic="/livox/lidar">
+    <origin xyz="0 0 0.10" rpy="0 0 0"/>
+  </xacro:mid360>
+
+  <!-- ===== IMU (Gazebo 原生 m/s² 含重力, 无 ×9.80665) ===== -->
+  <link name="imu_link">
+    <inertial>
+      <mass value="0.001"/>
+      <inertia ixx="1e-9" ixy="0" ixz="0" iyy="1e-9" iyz="0" izz="1e-9"/>
+    </inertial>
+  </link>
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+  </joint>
+  <gazebo reference="imu_link">
+    <gravity>true</gravity>
+    <sensor name="imu_sensor" type="imu">
+      <always_on>true</always_on>
+      <update_rate>200</update_rate>
+      <imu>
+        <angular_velocity>
+          <x><noise type="gaussian"><mean>0.0</mean><stddev>2e-4</stddev></noise></x>
+          <y><noise type="gaussian"><mean>0.0</mean><stddev>2e-4</stddev></noise></y>
+          <z><noise type="gaussian"><mean>0.0</mean><stddev>2e-4</stddev></noise></z>
+        </angular_velocity>
+        <linear_acceleration>
+          <x><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-2</stddev></noise></x>
+          <y><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-2</stddev></noise></y>
+          <z><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-2</stddev></noise></z>
+        </linear_acceleration>
+      </imu>
+      <plugin name="imu_plugin" filename="libgazebo_ros_imu_sensor.so">
+        <ros>
+          <namespace>/</namespace>
+          <remapping>~/out:=/livox/imu</remapping>
+        </ros>
+        <frame_name>imu_link</frame_name>
+        <initial_orientation_as_reference>false</initial_orientation_as_reference>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <!-- ===== 仿真相机 (libgazebo_ros_camera, gzserver SIGFPE 已修 ifunc LD_PRELOAD) =====
+       发 /sim_camera/image_raw (640x480 10Hz) 供 web 视频桥显示. 真机用 C13 RTSP. -->
+  <link name="camera_link">
+    <inertial>
+      <mass value="0.01"/>
+      <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/>
+    </inertial>
+  </link>
+  <joint name="camera_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+    <origin xyz="0.20 0 0.10" rpy="0 0 0"/>
+  </joint>
+  <gazebo reference="camera_link">
+    <sensor type="camera" name="sim_camera">
+      <always_on>true</always_on>
+      <update_rate>10</update_rate>
+      <camera>
+        <horizontal_fov>1.3962634</horizontal_fov>
+        <image>
+          <width>640</width>
+          <height>480</height>
+          <format>R8G8B8</format>
+        </image>
+        <clip><near>0.1</near><far>100</far></clip>
+      </camera>
+      <plugin name="sim_camera_plugin" filename="libgazebo_ros_camera.so">
+        <ros>
+          <namespace>/</namespace>
+          <remapping>image_raw:=/sim_camera/image_raw</remapping>
+          <remapping>camera_info:=/sim_camera/camera_info</remapping>
+        </ros>
+        <frame_name>camera_link</frame_name>
+      </plugin>
+    </sensor>
+  </gazebo>
+</robot>

@@ -1,0 +1,31 @@
+[Unit]
+Description=Livox MID360 ROS2 Driver (/livox/lidar + /livox/imu)
+Documentation=https://github.com/Livox-SDK/livox_ros_driver2
+Requires=livox-mid360-net.service
+After=livox-mid360-net.service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=nx
+# 2026-07-16 livox 丢帧修复: Nice=-10 让雷达 UDP 接收线程 (producer) 优先级 ≥
+# consumer (fastlio NI=-5)，修正原方向反的非对称，减少被抢占导致的 socket buffer 溢出。
+# 注意: 主因是 rmem 太小 (见 99-go2w-rmem.conf)，Nice 仅为加固。详见 memory livox-rmem-drop。
+Nice=-10
+Environment=HOME=/home/nx
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=ROS_DOMAIN_ID=0
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/nx/go2w/current/payload/docker/fastdds_udp.xml
+WorkingDirectory=/home/nx/ws_livox
+ExecStartPre=/bin/bash -c 'test -f /home/nx/ws_livox/install/setup.bash'
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 300); do [ "$(/usr/bin/timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ] && exit 0; /usr/bin/sleep 1; done; echo "MID360 startup blocked: NTP not synchronized in 300s (livox host-time stamps would jump on NTP sync and diverge FastLIO, see fastlio-ntp-jump-divergence)" >&2; exit 1'
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/nx/ws_livox/install/setup.bash && exec ros2 launch livox_ros_driver2 msg_MID360_launch.py'
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStartSec=120
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

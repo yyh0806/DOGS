@@ -1,0 +1,5 @@
+--- a/src/FAST_LIO_ROS2/src/laserMapping.cpp
++++ b/src/FAST_LIO_ROS2/src/laserMapping.cpp
+@@ -932,1 +932,1 @@ private:
+-            latest_livox_qos.best_effort();
++            latest_livox_qos.reliable();

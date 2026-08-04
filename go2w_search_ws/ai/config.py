@@ -45,6 +45,31 @@ YOLO_MODEL_PATH = os.environ.get("GO2W_YOLO_MODEL", "yolov8n.pt")
 YOLO_CONFIDENCE = float(os.environ.get("GO2W_YOLO_CONF", "0.45"))
 
 # ============================================================================
+# 阶段B: NX 上的模型路径 + 视频流参数 (spec-stage-b §7.3)
+# ----------------------------------------------------------------------------
+# 这些默认值专给 nx_ai_node.py 用; 不改上面的 PC 路径 (C1.7 ai/ 只增量加常量)。
+# env 覆盖, 部署时 systemd 传 GO2W_YOLO_ENGINE=/path/to/yolov8n.engine 等。
+# ============================================================================
+
+# TensorRT engine / ONNX 降级链 (engine > onnx > pt, spec §4.2)
+YOLO_ENGINE_PATH = os.environ.get("GO2W_YOLO_ENGINE", "models/yolov8n.engine")
+YOLO_ONNX_PATH = os.environ.get("GO2W_YOLO_ONNX", "models/yolov8n.onnx")
+
+# VLM 模型在 NX 上的位置 (Qwen2.5-VL-3B-Instruct, GB 级, 不入库)
+VLM_MODEL_NAME_NX = os.environ.get(
+    "GO2W_VLM_MODEL_NX",
+    "/home/nx/models/Qwen/Qwen2___5-VL-3B-Instruct",
+)
+
+# VLM 空闲卸载超时 (秒, 决策 2: 60s 空闲 unload 腾显存)
+VLM_IDLE_TIMEOUT = float(os.environ.get("GO2W_VLM_IDLE", "60"))
+
+# 视频流参数 (决策 3: JPEG q50 + 720p + 8fps)
+VIDEO_JPEG_QUALITY = int(os.environ.get("GO2W_VIDEO_JPEG_QUALITY", "50"))
+VIDEO_TARGET_WIDTH = int(os.environ.get("GO2W_VIDEO_WIDTH", "1280"))   # 720p 宽
+VIDEO_TARGET_HEIGHT = int(os.environ.get("GO2W_VIDEO_HEIGHT", "720"))  # 720p 高
+
+# ============================================================================
 # 音频配置
 # ============================================================================
 

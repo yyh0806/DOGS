@@ -1,0 +1,108 @@
+# SLAM Toolbox 在线配置 —— 无预建图 frontier 探索 (阶段G plan 2026-07-03 §3.2)
+#
+# 复用 slam_toolbox.yaml 大部分项, 关键差异 (frontier 探索需要新鲜地图):
+#   scan_topic: /scan_mid360  (MID360 经 pointcloud_to_laserscan 压的 2D scan,
+#                              不覆盖 nx_sensor 的 /scan)
+#   map_topic:  /map_frontier (不覆盖 mapping 模式的 /map, orchestrator 订这个)
+#   map_update_interval: 1.0  (比 mapping 模式 slam_toolbox.yaml 的 2.0 更频繁, frontier 要新鲜地图;
+#                              NX 算力紧不能太小, 1.0 是平衡值)
+#   minimum_time_interval: 0.5
+#   resolution: 0.05         (5cm, 与 Nav2 costmap resolution 对齐)
+#
+# ⚠️ 头号风险 (决策 4, 与 slam_toolbox.yaml 一致): use_sensor_data_qos=false
+#    pointcloud_to_laserscan_node 发 RELIABLE, slam_toolbox 默认 BEST_EFFORT,
+#    QoS 不匹配会静默收不到 scan, /map_frontier 一直空。必须 false。
+
+slam_toolbox:
+  ros__parameters:
+    # ============================================================
+    # Frame 架构 (与 slam_toolbox.yaml 一致, 单实例运行)
+    # ============================================================
+    odom_frame: odom
+    map_frame: map          # Nav2 global_costmap.global_frame + orchestrator goal frame
+    base_frame: base_link
+    scan_topic: /scan_mid360   # MID360 经 pointcloud_to_laserscan 压的 2D scan
+    # FAST_LIO/fuser owns map->odom.  SLAM Toolbox may build the grid but must
+    # never inject scan-matching corrections into the navigation TF chain.
+    transform_publish_period: 0.0
+
+    # ============================================================
+    # ⚠️ 头号风险 (决策 4): QoS 匹配 pointcloud_to_laserscan 发布端
+    # ============================================================
+    # pointcloud_to_laserscan_node 发 RELIABLE QoS (默认)。
+    # slam_toolbox 默认 use_sensor_data_qos=true (BEST_EFFORT),
+    # QoS 不匹配 → 静默收不到 scan, /map_frontier 一直空, 无任何报错。
+    # 修复: 显式设 false, 切回 RELIABLE。
+    use_sensor_data_qos: false
+
+    use_scan_matching: false
+    use_scan_barycenter: true
+
+    # ============================================================
+    # 运动阈值 (与 slam_toolbox.yaml 一致, 室内合理)
+    # ============================================================
+    minimum_travel_distance: 0.3
+    minimum_travel_heading: 0.3
+
+    # ============================================================
+    # 扫描缓冲 + 范围
+    # ============================================================
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 8.0
+    min_laser_range: 0.2
+    max_laser_range: 8.0
+    minimum_score: 0.0
+
+    # ============================================================
+    # 匹配 / loop closing (沿用 slam_toolbox.yaml)
+    # ============================================================
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+    loop_search_maximum_distance: 3.0
+    do_loop_closing: false
+    loop_match_minimum_chain_size: 3
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+    # 搜索空间
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+    loop_search_space_dimension: 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    # 惩罚
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+
+    # 角度搜索
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true
+
+    # ============================================================
+    # 地图更新 (frontier 探索关键参数, 比默认更频繁)
+    # ============================================================
+    map_update_interval: 1.0        # 1Hz /map_frontier 发布, frontier 检测要新鲜地图
+                                    # (NX 算力紧, 不取 slam_toolbox upstream 默认 0.5; 1.0 是平衡值)
+    resolution: 0.05                # 5cm, 与 Nav2 costmap resolution 0.05 对齐
+    minimum_time_interval: 0.5
+    transform_timeout: 0.2
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+    enable_interactive_mode: false
+
+    # ============================================================
+    # 求解器 (Ceres, 沿用 slam_toolbox.yaml)
+    # ============================================================
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None

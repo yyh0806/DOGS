@@ -1,281 +1,148 @@
 # Go2W Search & Discover
 
-通过一条指令让 Go2W 轮足机器狗自动搜索指定区域，发现并报告目标。
+通过前端（及未来的语音）让 Unitree Go2W 轮足机器狗自动搜索区域、发现并报告目标。
 
-## 系统架构
+> ⚠️ **权威文档声明**：本文件仅作快速入口。
+> - 项目**真实结构与文件状态** → [`docs/PROJECT_STRUCTURE.md`](docs/PROJECT_STRUCTURE.md)
+> - **技术决策与实测结论** → [`docs/TECH_DECISIONS.md`](docs/TECH_DECISIONS.md)
+> - 其余 `docs/*.md` 多为阶段性记录，阅读时注意时效（部分已被推翻，见各文首注明）。
+
+---
+
+## 系统架构（NX 中心化 — 迁移进行中）
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                   Jetson Xavier NX (车载)                     │
-│                                                              │
-│  ┌──────────────────┐  ROS2  ┌──────────────────┐           │
-│  │  search_commander │◄──────►│   go2w_bridge     │           │
-│  │  (Rust/rclrs)     │        │   (Python)        │           │
-│  │                   │        │                    │           │
-│  │  · 路径规划       │ 话题   │  · SDK→ROS2 桥接  │           │
-│  │  · 导航控制       │◄──────►│  · 速度指令转发   │           │
-│  │  · 任务管理       │        │  · 状态发布       │           │
-│  └────────┬─────────┘        └────────┬──────────┘           │
-│           │                            │ DDS/CycloneDDS       │
-│  ┌────────┴─────────┐                 │                      │
-│  │  go2w_detector    │                 │                      │
-│  │  (Python)         │                 │                      │
-│  │                    │                 │                      │
-│  │  · YOLO 检测      │                 │                      │
-│  │  · TensorRT FP16  │                 │                      │
-│  │  · 摄像头流       │                 │                      │
-│  └──────────────────┘                 │                      │
-│                                        │                      │
-│              ROS2 Galactic + CycloneDDS│                      │
-└────────────────────────────────────────┼─────────────────────┘
-                                         │ USB-Ethernet
-                                ┌────────┴──────────┐
-                                │   Unitree Go2W     │
-                                │   192.168.123.161  │
-                                │                    │
-                                │  · 前置摄像头      │
-                                │  · mid-360 LiDAR   │
-                                │  · IMU             │
-                                │  · 轮式/步行模式   │
-                                └───────────────────┘
+┌── PC (仅前端 UI + 高层指令) ────────────────────┐
+│  浏览器 → web/panel.py (HTTP:8000 / WS:8001)     │
+│  [迁移目标: panel 重活迁 NX, PC 退化为瘦客户端]   │
+└────────────────────┬────────────────────────────┘
+                     │ ROS2 Humble DDS (手机热点, 只传低频状态/指令)
+                     ▼
+┌── 载荷 NX (Orin NX 16GB, Ubuntu 22.04, Humble) ──┐  ← 所有重活在此
+│  nx_motion_node   持 lease 控狗 (systemd 自启)     │
+│  nx_sensor_node   读狗 IMU/雷达 → /imu /scan /odom │
+│  [迁移中] FAST_LIO + Nav2 + YOLO/VLM              │
+└────────────────────┬────────────────────────────┘
+                     │ USB 转网口 (192.168.123.100/24)
+                     │ unitree_sdk2py / CycloneDDS
+                     ▼
+          狗主控 192.168.123.161 (出厂系统, 只收 SDK 指令)
 ```
 
-## 硬件需求
+**核心原则**（详见 [`docs/REFACTOR_NX_CENTRIC.md`](docs/REFACTOR_NX_CENTRIC.md)）：
+- **NX 本机闭环**：感知 → 建图 → 规划 → 控狗 全在 NX，零跨网延迟
+- **lease 钉在 NX**：压制狗主控残留乱跑程序；PC↔NX 热点断了，NX 看门狗仍会自动停狗
+- **热点只传低频数据**：状态/指令（KB 级），不传点云/视频流
+
+> 技术栈：**ROS2 Humble + Python**（非 Rust/Galactic；早期 README 的 Rust 描述已废弃）。
+
+---
+
+## 硬件
 
 | 组件 | 说明 |
 |------|------|
-| Unitree Go2W | 轮足版机器狗 |
-| Jetson Xavier NX | 16GB，运行 ROS2 + YOLO |
-| USB-Ethernet 转接器 | RTL8156B 千兆，连接 Go2W |
-| DC 供电线 | Go2W 外部 12V 供电 → NX |
-| 3D 打印支架 | 固定 NX 到 Go2W 背部 |
+| Unitree Go2W | 轮足版机器狗（主控 192.168.123.161） |
+| Jetson Orin NX 16GB | 载荷，跑 ROS2 Humble + 全部重活 |
+| USB-Ethernet (AX88179) | NX → 狗主控，192.168.123.100/24（nmcli 持久化, con-name: go2-dog） |
+| MID360 LiDAR (USB 版) | 接 NX，建图用（⚠️ USB 供电问题排查中，见 TROUBLESHOOTING 问题7） |
 
-详细接线方案见 `hardware/SETUP_GUIDE.md`。
+接线/IP/网卡清单见 [`hardware/SETUP_GUIDE.md`](hardware/SETUP_GUIDE.md) 与 [`docs/REFACTOR.md`](docs/REFACTOR.md) 第五节。
 
-## 快速开始
+---
 
-### 1. Jetson NX 部署 (首次)
+## 当前能力状态
 
-```bash
-# 克隆项目到 Jetson NX
-cd ~
-git clone <repo_url> go2w_search_ws
-cd go2w_search_ws
-
-# 一键部署 (安装 ROS2 + Rust + 依赖 + 编译)
-chmod +x setup_jetson.sh
-./setup_jetson.sh
-```
-
-### 2. 连接 Go2W
-
-```bash
-# 确认网络连通
-ping 192.168.123.161
-
-# 确认 RTSP 摄像头流
-ffplay rtsp://192.168.123.161:8554/camera
-```
-
-### 3. 一条指令启动搜索
-
-```bash
-# 加载环境
-source install/setup.bash
-
-# 搜索 10x10 米区域，割草机模式
-ros2 launch go2w_bringup search.launch.py \
-    area_width:=10.0 area_height:=10.0 pattern:=lawnmower
-```
-
-任务启动后自动:
-1. Go2W 站立 → 切换轮式模式
-2. 生成搜索路径 (航点)
-3. 逐航点导航 + 实时检测
-4. 发现目标 → 记录位置 + 保存图片
-5. 搜索完成 → 返回起点 → 生成报告
-
-### 4. 交互控制
-
-```bash
-# 手动触发搜索 (launch 启动后)
-ros2 service call /go2w/start_search go2w_interfaces/srv/StartSearch \
-    "{width: 20.0, height: 15.0, pattern: 'lawnmower', spacing: 2.0, target_classes: ['person']}"
-
-# 查看任务状态
-ros2 topic echo /go2w/mission_status
-
-# 查看检测结果
-ros2 topic echo /go2w/detections
-
-# 手动停止
-ros2 service call /go2w/stop_search go2w_interfaces/srv/StopSearch \
-    "{mission_id: '', return_to_start: true}"
-```
-
-## 项目结构
-
-```
-go2w_search_ws/
-├── src/
-│   ├── go2w_interfaces/           # ROS2 自定义消息/服务
-│   │   ├── msg/
-│   │   │   ├── SearchArea.msg     # 搜索区域
-│   │   │   ├── Waypoint.msg       # 航点
-│   │   │   ├── PathPlan.msg       # 路径规划
-│   │   │   ├── TargetDetection.msg# 目标检测
-│   │   │   ├── MissionStatus.msg  # 任务状态
-│   │   │   ├── RobotState.msg     # 机器人状态
-│   │   │   └── MissionReport.msg  # 任务报告
-│   │   └── srv/
-│   │       ├── StartSearch.srv    # 开始搜索
-│   │       └── StopSearch.srv     # 停止搜索
-│   │
-│   ├── go2w_search_rust/          # Rust 核心节点
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── commander_main.rs  # 指挥节点入口
-│   │       ├── planner.rs         # 路径规划 (割草机/螺旋)
-│   │       ├── navigator.rs       # 导航控制
-│   │       └── types.rs           # 类型定义
-│   │
-│   ├── go2w_bridge/               # Go2W SDK 桥接 (Python)
-│   │   └── go2w_bridge/
-│   │       ├── bridge_node.py     # ROS2 桥接节点
-│   │       └── sport_client.py    # Go2W 运动控制封装
-│   │
-│   ├── go2w_detector/             # 目标检测 (Python)
-│   │   └── go2w_detector/
-│   │       └── detector_node.py   # YOLO + TensorRT 节点
-│   │
-│   └── go2w_bringup/              # 启动配置
-│       ├── launch/
-│       │   └── search.launch.py   # 一键启动文件
-│       └── config/
-│           └── default.yaml       # 默认参数
-│
-├── hardware/
-│   └── SETUP_GUIDE.md             # 硬件安装指南
-│
-├── setup_jetson.sh                # Jetson NX 一键部署
-└── README.md
-```
-
-## ROS2 话题/服务接口
-
-### 话题
-
-| 话题 | 类型 | 方向 | 说明 |
-|------|------|------|------|
-| `/go2w/cmd_vel` | geometry_msgs/Twist | Commander → Bridge | 速度指令 |
-| `/go2w/robot_state` | go2w_interfaces/RobotState | Bridge → Commander | 机器人位姿/速度 |
-| `/go2w/detections` | go2w_interfaces/TargetDetection | Detector → Commander | 检测到的目标 |
-| `/go2w/mission_status` | go2w_interfaces/MissionStatus | Commander 发布 | 任务进度 |
-| `/go2w/path_plan` | go2w_interfaces/PathPlan | Commander 发布 | 规划路径 |
-| `/go2w/mission_report` | go2w_interfaces/MissionReport | Commander 发布 | 最终报告 |
-
-### 服务
-
-| 服务 | 类型 | 说明 |
+| 能力 | 状态 | 说明 |
 |------|------|------|
-| `/go2w/start_search` | go2w_interfaces/StartSearch | 启动搜索任务 |
-| `/go2w/stop_search` | go2w_interfaces/StopSearch | 停止搜索任务 |
+| Web 前端（键盘/按钮） | ✅ | `web/panel.py` + `static/panel.html` |
+| 站立 / 坐下 / 急停 | ✅ | `nx_motion_node` |
+| 狗轮式移动 | ⏳ 待实车 | _do_stand 已加回 BalanceStand（对齐 panel.py），硬件装完验证 |
+| 乱跑 / 后滑防护 | ✅ | systemd 崩溃自启 + 看门狗超时停狗 |
+| YOLO 检测 | ✅ | `ai/detector.py`（当前在 PC，待迁 NX） |
+| 地图/雷达显示 | ⚠️ | `nx_sensor_node` 数据流 |
+| VLM 指令解析 | ⚠️ | `ai/vlm.py`，模型加载失败时降级关键词匹配 |
+| 语音控制 | ⏳ | `ai/voice.py` 待修（暂后置） |
+| FAST_LIO 建图 | ⏳ | 待 MID360 供电解决后落地 |
+| Nav2 自主导航 | ⏳ | 依赖建图 + 移动 |
+| 自动搜索/跟踪 | ⏳ | 依赖 Nav2 |
 
-## 搜索模式
+---
 
-### 割草机模式 (Lawnmower)
+## 项目结构（精简版）
 
+> 完整逐文件状态见 [`docs/PROJECT_STRUCTURE.md`](docs/PROJECT_STRUCTURE.md)。
+
+| 路径 | 状态 | 说明 |
+|------|------|------|
+| `web/panel.py` + `static/panel.html` + `static/map.js` | ✅ 活跃 | 当前前端后端 + 页面 |
+| `ai/`（detector / vlm / tracker / config） | ✅ 活跃 | AI 推理（待迁 NX） |
+| `src/go2w_bridge/nx_motion_node.py` | ✅ 活跃 | NX 控狗（systemd 服务） |
+| `src/go2w_bridge/nx_sensor_node.py` | ✅ 活跃 | NX 读狗传感器 |
+| `docker/`（deploy_nx.sh, go2w-motion.service） | ✅ 活跃 | NX 部署 + systemd |
+| `src/go2w_interfaces/` | 💤 休眠 | msg/srv，NX 多节点通信将启用 |
+| `src/go2w_nav/` | 💤 休眠 | Nav2 配置，迁移目标载体 |
+| `src/go2w_orchestrator/` | 💤 休眠 | 任务编排，迁移目标载体 |
+| `src/go2w_detector/` | 💤 休眠 | YOLO ROS 节点，迁移目标载体 |
+| `src/go2w_bringup/` | 💤 休眠 | launch，迁移目标载体 |
+| `web/server.py`、`static/index.html` | ❌ 废弃 | panel.py 的前身（老单体） |
+| `src/go2w_bridge/bridge_node.py`、`sport_client.py` | ❌ 废弃 | 老 PC 直连狗桥（被 NX 架构取代） |
+
+> - 💤 **休眠** = 当前不在运行链路，但是 NX 中心化迁移的**目标载体**，**勿删**。
+> - ❌ **废弃** = 已被取代，待清理（清理前会再次确认无引用）。
+
+---
+
+## 快速开始（阶段A：web 通信层上移 NX）
+
+> 阶段A 起，web 服务（`web/nx_web_server.py`，内嵌 rclpy）跑在载荷 NX 上，PC 摆脱 `go2w_humble` Docker 容器，浏览器直连 `http://<NX_IP>:8000`。PC 端不再需要 rclpy / 容器 / `dog_state.json` 文件桥。详见 [`gan-harness/spec.md`](gan-harness/spec.md)。
+
+**NX 端**（一次性部署）：
+```bash
+NX_HOST=<NX_IP> bash docker/deploy_nx.sh        # 控狗服务 go2w-motion (lease 持有)
+NX_HOST=<NX_IP> bash docker/deploy_nx_web.sh    # web 服务 go2w-web (HTTP:8000 + WS:8001)
 ```
-→ → → → → → → → → →
-                    |
-← ← ← ← ← ← ← ← ← ←
-|
-→ → → → → → → → → →
-                    |
-← ← ← ← ← ← ← ← ← ←
-```
+两者开机自启（systemd `enabled`）。web 服务依赖控狗服务（`go2w-web.service` 设 `After=go2w-motion.service`）。
 
-- 适合矩形区域
-- 效率最高，覆盖均匀
-- 行间距可配置 (默认 2.5m)
-
-### 螺旋模式 (Spiral)
-
-```
-    ┌───────────┐
-    │ → → → → ┐ │
-    │ ┌─────┐ │ │
-    │ │ → → ┘ │ │
-    │ └───────┘ │
-    └───────────┘
-```
-
-- 从中心向外扩展
-- 适合不确定目标大致位置的情况
-
-## 检测能力
-
-- **模型**: YOLOv8n (默认) / YOLOv8s / 自定义模型
-- **加速**: TensorRT FP16 on Jetson NX (~25ms/帧, ~40 FPS)
-- **类别**: COCO 80类 (person, car, dog 等) 或自定义
-- **输出**: 目标类别、置信度、边界框、机器人位置、标注图片
-
-## 配置修改
-
-编辑 `src/go2w_bringup/config/default.yaml`:
-
-```yaml
-# 修改检测目标类别
-detector:
-  ros__parameters:
-    target_classes: ["person", "car", "truck"]
-    confidence: 0.5
-
-# 修改移动速度
-commander:
-  ros__parameters:
-    drive_speed: 1.5    # 降低速度增加安全性
-    waypoint_tolerance: 0.3
+**PC 端**（每次开机，只开浏览器）：
+```bash
+cd go2w_search_ws
+bash web/start_pc_browser.sh    # 只提示浏览器打开 http://<NX_IP>:8000
 ```
 
-## 开发
+**验证**（NX 上跑，8 项全 PASS，不依赖狗硬件）：
+```bash
+bash web/verify_nx_web.sh       # 启 nx_web + mock，跑 curl + WS 断言
+```
+
+> 退役链路（PC fallback，可回滚）：`web/start_ros2.sh.legacy`（原 PC 容器 + panel.py 路径）、`web/cmd_publisher.py`、`web/ros_to_json.py`、`web/panel.py` 均保留不删。
+
+---
+
+## PC 本地语音指令
+
+`tools/voice_console.py` 的本地流程为：Vosk 离线识别 → 确定性产品指令解析 →（仅在需要时）本地 LLM 归一化 → 再次确定性校验 → NX `/api/command`。先用文本 dry-run 检查配置：
 
 ```bash
-# 仅编译特定包
-colcon build --packages-select go2w_interfaces
-colcon build --packages-select go2w_bridge
-
-# Rust 单独编译
-cd src/go2w_search_rust
-cargo build --release
-cargo test
-
-# 运行单元测试
-colcon test --packages-select go2w_search_rust
-
-# 查看日志
-ros2 topic echo /rosout
+python tools/voice_console.py --text "帮我找一下椅子并标出来" --no-auto-send \
+  --llm-url http://127.0.0.1:11434/api/chat \
+  --llm-model qwen2.5:3b --llm-mode fallback --llm-timeout 5
 ```
 
-## 常见问题
+Ollama 使用 `/api/chat`；其他本地 OpenAI 兼容服务使用完整的 `/v1/chat/completions` 地址，例如 `http://127.0.0.1:8080/v1/chat/completions`。对应环境变量为 `GO2W_LOCAL_LLM_URL`、`GO2W_LOCAL_LLM_MODEL`、`GO2W_LOCAL_LLM_MODE` 和 `GO2W_LOCAL_LLM_TIMEOUT`。模式可选 `off`、`fallback`（默认，仅在确定性解析失败时调用）和 `always`；URL 留空会彻底禁用 LLM 请求。
 
-**Q: 连接 Go2W 失败**
-- 检查 USB-Ethernet 是否识别: `ip link`
-- 检查 IP 配置: `ip addr show`
-- 确认 ping 通: `ping 192.168.123.161`
-- 检查 CycloneDDS 网卡配置
+安全边界：本地模型没有直接控制权，只能提出一个规范中文移动或“当前房间搜索”指令；任何输出都必须重新通过 `validate_voice_command`，并继续接受 NX 端解析与任务准入检查。自动发送仍要求控制 Token；首次调试建议始终保留 `--no-auto-send`。
 
-**Q: 摄像头无画面**
-- 检查 RTSP 流: `ffplay rtsp://192.168.123.161:8554/camera`
-- 确认 Go2W 已开机且网络连通
-- 尝试重启 Go2W
+---
 
-**Q: TensorRT 导出失败**
-- 确保 JetPack 完整安装
-- 先用 PyTorch 模型运行: `use_tensorrt: false`
-- 手动导出: `python3 -c "from ultralytics import YOLO; YOLO('yolov8n.pt').export(format='engine', half=True)"`
+## 架构演进方向
 
-**Q: Rust 编译失败**
-- 确认 ros2_rust 已克隆到 src/
-- 检查 Rust 版本: `rustc --version` (需要 1.60+)
-- 先构建 go2w_interfaces 再构建 Rust 包
+正在从「PC 跑重活」迁移到「NX 跑所有重活，PC 仅 UI」。分阶段路线与并行分工见
+[`docs/REFACTOR_NX_CENTRIC.md`](docs/REFACTOR_NX_CENTRIC.md) 与
+[`docs/TECH_DECISIONS.md`](docs/TECH_DECISIONS.md) 第四节。
+
+## 关键决策与踩坑
+
+- [`docs/DECISIONS.md`](docs/DECISIONS.md) — 架构/部署决策
+- [`docs/TECH_DECISIONS.md`](docs/TECH_DECISIONS.md) — 技术调研结论（移动控制 / FAST_LIO / Nav2）
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — 实测踩坑（网卡 / DDS 版本 / USB 供电等）

@@ -1,0 +1,14 @@
+/* mycos.map: version script for mycos.so LD_PRELOAD (见 mycos.c 头注释).
+ * 把 cos/sin/sincos/cosf/sinf 钉到 GLIBC_2.2.5 版本, 让泰勒实现覆盖 glibc ifunc.
+ * 编译: gcc -shared -fPIC -O2 -Wl,--version-script=mycos.map -o mycos.so mycos.c -lm
+ */
+GLIBC_2.2.5 {
+    global:
+        cos;
+        sin;
+        sincos;
+        cosf;
+        sinf;
+    local:
+        *;
+};

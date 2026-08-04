@@ -1,0 +1,23 @@
+[Unit]
+Description=Livox MID360 雷达网络配置 (host IP 192.168.1.200/32 + 主机路由到雷达)
+Documentation=https://github.com/Livox-SDK/livox_ros_driver2
+# 网卡名 enx207bd2edf780 = USB-网口转换器 MAC(20:7b:d2:ed:f7:80) 决定,
+# 换转换器要改这里。也可改成按 MAC 匹配(udev) 但当前硬编码够用。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=LIVOX_INTERFACE=enx207bd2edf780
+EnvironmentFile=-/etc/go2w/hardware.env
+# 等 USB-网口转换器枚举到位 (插拔后最多等 30s)
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do [ -e "/sys/class/net/${LIVOX_INTERFACE}" ] && exit 0; sleep 1; done; echo "MID360 interface ${LIVOX_INTERFACE} not found" >&2; exit 1'
+# 关键: /32 不抢 WiFi 的 192.168.1.0/24 路由 (配 /24 会断 SSH, 见 memory mid360-livox-online)
+ExecStart=/bin/bash -c 'ip link set "$LIVOX_INTERFACE" up; ip addr replace 192.168.1.200/32 dev "$LIVOX_INTERFACE"; ip route replace 192.168.1.160/32 dev "$LIVOX_INTERFACE" metric 50'
+ExecStop=/bin/bash -c 'ip route del 192.168.1.160/32 dev "$LIVOX_INTERFACE" 2>/dev/null || true; ip addr del 192.168.1.200/32 dev "$LIVOX_INTERFACE" 2>/dev/null || true'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

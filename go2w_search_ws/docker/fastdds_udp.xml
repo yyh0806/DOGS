@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- FastRTPS / FastDDS profile: 禁 SHM transport, 只用 UDPv4 (rmw_fastrtps_cpp 读).
+
+背景 (memory slam-nav2-bringup-gotchas 坑2):
+  多个 systemd transient 启停后, FastRTPS 的 SHM segment 会损坏 → 长驻进程订阅
+  静默失效 (ros2 topic hz 测得到, 应用层收不到)。症状: web imu_count=0 /
+  costmap 报 TF two-trees 但 tf2_echo 能查到。临时修是 sudo rm -f /dev/shm/fastrtps*;
+  本 profile 是根治 — 全 participant 禁 SHM, 全走 UDP loopback (NX 上所有节点同机).
+
+用法:
+  export FASTRTPS_DEFAULT_PROFILES_FILE=/home/nx/go2w_ws/docker/fastdds_udp.xml
+  (或 bringup_slam_nav2.sh 的 no-shm 选项 自动注入给 fastlio/nav2 transient)
+
+代价: 点云 (/livox/lidar 大数据) 走 UDP loopback 比 SHM 略慢, NX 实测可接受
+  (10Hz MID360 ~24MB/s, UDP localhost 带宽充足). 仅 SHM 反复损坏时切此模式.
+
+注意: 用此 profile 的 participant 仍能与用默认 SHM+UDP 的 participant (livox/
+  sensor/motion/web service) 通过 UDP 通信 — builtin transport 交集是 UDP.
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>udp_only</transport_id>
+      <type>UDPv4</type>
+    </transport_descriptor>
+  </transport_descriptors>
+
+  <participant profile_name="udp_only_profile" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>udp_only</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>

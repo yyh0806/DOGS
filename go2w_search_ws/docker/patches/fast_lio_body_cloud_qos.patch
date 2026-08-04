@@ -1,0 +1,8 @@
+--- a/src/FAST_LIO_ROS2/src/laserMapping.cpp
++++ b/src/FAST_LIO_ROS2/src/laserMapping.cpp
+@@ -948,1 +948,4 @@ private:
+-        pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
++        auto latest_body_cloud_qos = rclcpp::SensorDataQoS();
++        latest_body_cloud_qos.keep_last(1);
++        latest_body_cloud_qos.best_effort();
++        pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", latest_body_cloud_qos);

@@ -14,5 +14,14 @@ __pycache__/
 build/
 install/
 
+# 本机/NX 控制凭据
+control-token*.txt
+
 # 模型文件 (太大, 单独管理)
 *.pt
+
+# 阶段B: TensorRT engine / ONNX 不入库 (大文件 + 设备绑定, spec-stage-b §7.3)
+models/*.engine
+models/*.onnx
+# Qwen2.5-VL 模型 (GB 级, 不入库, 部署时单独传到 NX)
+models/Qwen/

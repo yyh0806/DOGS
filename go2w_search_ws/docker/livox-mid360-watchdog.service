@@ -1,0 +1,20 @@
+[Unit]
+Description=Livox MID360 ROS topic stream watchdog
+After=network-online.target
+After=livox-mid360-driver.service
+Wants=livox-mid360-driver.service
+
+[Service]
+Type=simple
+User=root
+Environment=PYTHONUNBUFFERED=1
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=ROS_DOMAIN_ID=0
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/nx/go2w/current/payload/docker/fastdds_udp.xml
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/nx/ws_livox/install/setup.bash && exec /usr/bin/python3 /home/nx/go2w/current/payload/tools/livox_stream_watchdog.py'
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

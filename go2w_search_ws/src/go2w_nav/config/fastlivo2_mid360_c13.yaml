@@ -1,0 +1,115 @@
+# ============================================================
+# Fast-LIVO2 配置: MID360 (向下倾斜 20°) + C13 可见光相机
+# ============================================================
+# 嫁接自 FastLIO mid360.yaml (~/ws_livox/src/FAST_LIO_ROS2/config/mid360.yaml),
+# 新增相机段 (img_topic + T_lc 外参)。LIVO 同发 /Odometry + camera_init→body TF,
+# 下游 map_odom_fuser / nav2 / p2l 完全不动 (跟 FastLIO 同出口)。
+#
+# ⚠️ 20° 倾斜的编码位置 (核心, 改错 LIVO 发散):
+#   - extrinsic_T / extrinsic_R (LiDAR→IMU): **不改**。MID360 是密封模组,
+#     LiDAR 与内置 BMI088 IMU 出厂轴系对齐 → R=I, T=模组内固定小偏移。
+#     整个模组倾斜 20° 时 LiDAR 和 IMU 一起斜, 相对关系不变。
+#   - T_lc (LiDAR→Camera 外参, 下方 camera 段): **20° 编码在这里**。
+#     相机若水平装、雷达斜 20°, 则 T_lc 含这 20° 相对转角。实测标定后覆盖 (见 runbook)。
+#   - body→base_link TF (底盘水平 vs 模组倾斜): 见 bringup_livo.sh 的 static_transform_publisher。
+#
+# ⚠️ 仓库选型 (决策 3): Fast-LIVO2 官方 HKU-MARS/FAST_LIVO2 是 ROS1。
+#   不同 ROS2 移植的字段名略有差异 (img_topic vs image_topic, T_lc vs extrinsic_T_cam)。
+#   本文件用 FAST_LIVO2 官方字段名; 若移植改名, 连通后 sed 对齐 (runbook 记)。
+# ============================================================
+
+# ---- Topics (对齐本仓库约定) ----
+lid_topic: "/livox/lidar"        # livox CustomMsg (livox-mid360-driver 发, 10Hz)
+imu_topic: "/livox/imu"          # livox IMU (同驱动发, 200Hz)
+img_topic: "/c13/image_raw"      # ★ 新增: nx_c13_image_node.py 发的可见光 Image (30fps, bgr8)
+# camera_info_topic: "/c13/camera_info"  # 部分移植需要; 官方 FAST_LIVO2 走 camera_intrinsic YAML
+
+# ---- 通用 ----
+time_sync_en: false              # false=用 msg.header.stamp (本仓库 header.stamp 已对齐 IMU 时钟域);
+                                # true=强制重新对齐 (本节点已打正确戳, 不需要)
+time_offset_lidar2imu: 0.0      # MID360 模组内 LiDAR/IMU 硬件同步, 零偏移
+
+# ---- 雷达 (MID360, 跟 FastLIO mid360.yaml 一致) ----
+lidar:
+  lid: 1                         # Livox CustomMsg
+  LiDARtype: 1                   # MID360 =Livox 系
+  scan_rate: 10                  # MID360 10Hz
+  fov_degree: 360                # MID360 全向 (实际 360° 水平 × ~59° 垂直)
+  min_distance: 0.5
+  max_distance: 50.0
+  # 倾斜 20° 不影响这些 (雷达自身 fov/distance 不变, 只是安装姿态变了)
+
+# ---- IMU (MID360 内置 BMI088) ----
+imu:
+  imu_freq: 200                  # /livox/imu 标称 200Hz
+  # BMI088 噪声参数 (跟 FastLIO mid360.yaml 一致, 工厂值)
+  acc_n: 0.1                     # 加速度计噪声密度 (m/s²/√Hz)
+  gyr_n: 0.01                    # 陀螺仪噪声密度 (rad/s/√Hz)
+  acc_w: 0.001                   # 加速度计零偏游走
+  gyr_w: 0.0001                  # 陀螺仪零偏游走
+
+# ---- LiDAR→IMU 外参 (MID360 模组内, 出厂值, 不改!) ----
+# 整个模组倾斜 20° 不改这里 (LiDAR 和 IMU 一起斜, 相对关系不变)
+extrinsic_T: [ 0.011, 0.02329, -0.04412 ]   # LiDAR→IMU 平移 (m), MID360 出厂
+extrinsic_R: [ 1, 0, 0,
+               0, 1, 0,
+               0, 0, 1 ]                     # LiDAR→IMU 旋转 (单位阵, MID360 轴系对齐)
+
+# ============================================================
+# ★★★ Camera 段 (LIVO 相对 FastLIO 唯一新输入) ★★★
+# ============================================================
+# 相机内参走独立 YAML (FAST_LIVO2 官方约定): 同目录的 c13_intrinsic.yaml
+# (deploy_fastlivo2.sh 把两 yaml 都拷到 ~/ws_livox/src/FAST_LIVO2/config/, 故此处用相对同目录名)
+# 连通后用 ros2 camera_calibrator 实测覆盖 (见 runbook §3)。
+camera_intrinsic_file: "c13_intrinsic.yaml"
+
+# ---- ★ LiDAR→Camera 外参 T_lc (20° 倾斜的编码点) ★ ----
+# 预填默认: 相机水平装在狗头部, 雷达向下俯仰 20° (绕 Y 轴 pitch=-20°, 鼻子朝下扫前方地面)。
+# T_lc = T(LiDAR→Camera) = inv(T(Camera→LiDAR)) = inv(Ry(-20°)) = Ry(+20°):
+#   "雷达低头 -20° 的逆" — 把 LiDAR 系点 (其 forward 朝下 20°) 转回水平相机系。
+#
+# Ry(+20°) = [ cos20  0  sin20]   ≈ [ 0.9397  0  0.3420]
+#            [   0    1    0  ]      [   0     1    0   ]
+#            [-sin20  0  cos20]      [-0.3420  0  0.9397]
+#
+# ███████████████████████████████████████████████████████████████
+# █ ★ 贡献位 (决策 1, 连通后必物理确认):                       █
+# █ 下方矩阵是 Ry(+20°) = inv(雷达低头 -20°), 适用于:          █
+# █   - T_lc 约定 = LiDAR→Camera (字段名 extrinsic_R_LiDAR2CAM)  █
+# █   - 雷达 pitch=-20° (低头), 相机水平                       █
+# █ ⚠️ 若你的 LIVO 移植把 T_lc 定义成 Camera→LiDAR, 翻转符号    █
+# █    成 Ry(-20°) (swap [0,2] 与 [2,0] 的 sin 项符号):        █
+# █      Ry(-20°) = [ 0.9397  0 -0.3420]                       █
+# █                 [   0     1   0    ]                       █
+# █                 [ 0.3420  0  0.9397]                       █
+# █ ⚠️ 若 20° 是 roll (绕 X, 雷达侧倾) 而非 pitch, 改用 R_roll: █
+# █      R_roll(20°) = [1  0       0     ]                     █
+# █                   [0  cos20   -sin20]                      █
+# █                   [0  sin20    cos20]                      █
+# █ 平移 extrinsic_T_LiDAR2CAM: 相机相对 LiDAR 的物理位置 (测狗实体, m)。 █
+# ███████████████████████████████████████████████████████████████
+extrinsic_R_LiDAR2CAM: [ 0.9397,  0,      0.3420,
+                         0,       1,      0,
+                        -0.3420,  0,      0.9397 ]   # Ry(+20°) = inv(雷达低头 -20°), 待物理确认
+extrinsic_T_LiDAR2CAM: [ 0.10,    0,      0.05 ]      # 相机在 LiDAR 前 10cm 上 5cm (待实测)
+
+# ---- 视觉前端 ----
+camera:
+  img_freq: 30                   # C13 可见光 30fps (nx_c13_image_node 发)
+  img_width: 1280
+  img_height: 720
+  encoding: "bgr8"               # 匹配 nx_c13_image_node.py 的 msg.encoding (零拷贝)
+  # LIVO 视觉约束放行阈值 (跟 FAST_LIVO2 默认)
+  max_image_processor_freq: 30   # 视觉处理上限 (超此降采样)
+  blind: 0.5                     # 近距离盲区 (跟雷达一致, 避近物畸变像素)
+
+# ---- 建图/状态估计 (跟 FastLIO mid360.yaml 一致基线) ----
+max_iter: 4                      # ESKF 迭代次数
+grid_size: 0.5                   # voxel 下采样
+cube_len: 1000.0
+det_range: 50.0
+ave_point_thresh: 100            # 降采样后每 voxel 最少点数 (LIVO 视觉辅助, 可低于纯 LIO)
+
+# ---- 可视化 (RViz, NX 上一般关) ----
+publish_max_pose: 50             # 位姿发布上限 (Hz)
+visualize: false                 # NX 上关 RViz (省 GPU 给 NVDEC)

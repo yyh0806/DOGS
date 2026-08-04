@@ -1,0 +1,58 @@
+--- a/src/FAST_LIO_ROS2/src/laserMapping.cpp
++++ b/src/FAST_LIO_ROS2/src/laserMapping.cpp
+@@ -562,17 +562,49 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
+     // Obstacle navigation needs angular coverage, not every deskewed return.
+     // Bound DDS serialization and UDP loopback traffic so adding Nav2's
+     // participants cannot push the pose estimator seconds behind real time.
+-    constexpr int max_body_cloud_points = 3000;
++    // angular_stratified_body_cloud: preserve directions and vertical layers
++    // instead of taking a fixed index stride through Livox's deterministic
++    // scan pattern (which left entire LaserScan sectors empty).
++    constexpr int azimuth_bins = 360;
++    constexpr int elevation_bins = 8;
++    constexpr int max_body_cloud_points = azimuth_bins * elevation_bins;
+     const int source_size = feats_undistort->points.size();
+-    const int stride = std::max(
+-        1, (source_size + max_body_cloud_points - 1) / max_body_cloud_points);
+-    const int size = (source_size + stride - 1) / stride;
++    std::vector<int> selected(max_body_cloud_points, -1);
++    std::vector<float> selected_range_sq(
++        max_body_cloud_points, std::numeric_limits<float>::infinity());
++    for (int source_index = 0; source_index < source_size; ++source_index)
++    {
++        const auto & point = feats_undistort->points[source_index];
++        const float horizontal = std::hypot(point.x, point.y);
++        const float range_sq = horizontal * horizontal + point.z * point.z;
++        if (!std::isfinite(range_sq) || range_sq <= 0.0F) continue;
++        const float azimuth = std::atan2(point.y, point.x);
++        int azimuth_index = static_cast<int>(
++            (azimuth + static_cast<float>(M_PI)) * azimuth_bins /
++            static_cast<float>(2.0 * M_PI));
++        azimuth_index = std::max(0, std::min(azimuth_bins - 1, azimuth_index));
++        // z/r is monotonic with elevation angle and avoids a second atan2.
++        const float elevation_unit = std::max(
++            -1.0F, std::min(1.0F, point.z / std::sqrt(range_sq)));
++        int elevation_index = static_cast<int>(
++            (elevation_unit + 1.0F) * 0.5F * elevation_bins);
++        elevation_index = std::max(
++            0, std::min(elevation_bins - 1, elevation_index));
++        const int cell = azimuth_index * elevation_bins + elevation_index;
++        if (range_sq < selected_range_sq[cell]) {
++            selected_range_sq[cell] = range_sq;
++            selected[cell] = source_index;
++        }
++    }
++    const int size = static_cast<int>(std::count_if(
++        selected.begin(), selected.end(), [](int index) {return index >= 0;}));
+     PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
+ 
+     int output_index = 0;
+-    for (int source_index = 0; source_index < source_size;
+-         source_index += stride, ++output_index)
++    for (const int source_index : selected)
+     {
++        if (source_index < 0) continue;
+         RGBpointBodyLidarToIMU(&feats_undistort->points[source_index], \
+                             &laserCloudIMUBody->points[output_index]);
++        ++output_index;
+     }

@@ -1,0 +1,31 @@
+[Unit]
+Description=Go2W persistent SLAM, Nav2 and exploration bringup
+Wants=network-online.target go2w-web.service
+Wants=costmap-bridge.service
+Wants=go2w-motion.service
+Wants=go2w-sensor.service
+Wants=livox-mid360-driver.service
+Wants=livox-mid360-watchdog.service
+After=network-online.target go2w-web.service
+After=livox-mid360-driver.service go2w-motion.service
+After=go2w-sensor.service
+
+[Service]
+Type=oneshot
+User=nx
+EnvironmentFile=-/etc/go2w/release.env
+EnvironmentFile=-/etc/go2w/hardware.env
+Environment=HOME=/home/nx
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=ROS_DOMAIN_ID=0
+WorkingDirectory=/home/nx/go2w/current/payload
+ExecStart=/bin/bash /home/nx/go2w/current/payload/docker/bringup_slam_nav2.sh --no-shm
+ExecStopPost=-+/usr/bin/systemctl stop nav2-3d.service slam-online.service mid360-nav-bridge.service map-odom-fuser.service fastlio.service map-padding.service nav-health-supervisor.service
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=600
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

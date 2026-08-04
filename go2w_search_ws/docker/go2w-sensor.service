@@ -1,0 +1,30 @@
+[Unit]
+Description=Go2W NX Sensor Node (读狗 IMU/雷达 → /imu /scan /odom, 只读不控狗)
+After=go2w-motion.service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=nx
+EnvironmentFile=-/etc/go2w/release.env
+Environment=LD_LIBRARY_PATH=/home/nx/CycloneDDS/lib
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/nx/go2w/current/payload/docker/fastdds_udp.xml
+Environment=HOME=/home/nx
+Environment=DOG_INTERFACE=enxc8a362616c4c
+EnvironmentFile=-/etc/go2w/hardware.env
+# reboot 时序坑根治: USB 网卡(enxc8a362616c4c)晚于 network-online.target 枚举,
+# ChannelFactory 是进程级单例不重试 → 网卡没就绪时 Init 失败 → /scan /imu /odom 全空.
+# 等 60s 网卡就绪再启动; 超时 exit 1 触发 Restart=always 重试
+# (单次等 60s, 天然避开默认 start-limit 10s/5次, 狗没插线时持续重试不放弃).
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do [ "$(cat "/sys/class/net/${DOG_INTERFACE}/operstate" 2>/dev/null)" = "up" ] && ping -c 1 -W 1 192.168.123.161 >/dev/null 2>&1 && exit 0; sleep 1; done; echo "[wait-dog] ${DOG_INTERFACE} 链路/狗主控 161 60s 未就绪，sensor 保持未启动" >&2; exit 1'
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec python3 -u /home/nx/go2w/current/payload/src/go2w_bridge/go2w_bridge/nx_sensor_node.py --ros-args -p publish_imu:=false -p publish_scan:=false -p publish_odom:=true -p publish_odom_tf:=false -p odom_topic:=/wheel_odom'
+WorkingDirectory=/home/nx/go2w/current/payload
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

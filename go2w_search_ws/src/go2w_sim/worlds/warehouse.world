@@ -1,0 +1,90 @@
+<?xml version="1.0"?>
+<!-- 大厂房仿真场景: 50x50m 开放空间 + 4 外墙(25m 远不挡近) + 6 柱子(货架/机器障碍).
+     狗从 (0,0) 出生, 大空间导航 + frontier 探索有真内容. 相机看远处墙(非近挡).
+     bbox x,y∈[-25,25], 外墙 25m 远, 柱子 2x2m 间隔 ~10m (开放空间充足).
+     importer: sim_full_bringup.launch.py world arg (restart_sim warehouse). -->
+<sdf version="1.6">
+  <world name="warehouse">
+    <physics name="ode" type="ode">
+      <real_time_update_rate>50.0</real_time_update_rate>
+      <max_step_size>0.05</max_step_size>
+    </physics>
+    <gravity>0 0 -9.80665</gravity>
+    <plugin name="gazebo_ros_state" filename="libgazebo_ros_state.so">
+      <ros><namespace>/</namespace></ros>
+      <update_rate>10.0</update_rate>
+    </plugin>
+    <include><uri>model://sun</uri></include>
+    <model name="ground_plane">
+      <static>true</static><pose>0 0 0 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+          <surface><friction><ode><mu>100</mu><mu2>50</mu2></ode></friction></surface>
+        </collision>
+      </link>
+    </model>
+    <!-- 外墙 50x50 (x,y∈[-25,25], 高 3m 厂房) -->
+    <model name="wall_north"><static>true</static><pose>0 25 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>50.4 0.2 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>50.4 0.2 3.0</size></box></geometry>
+          <material><ambient>0.7 0.7 0.7 1</ambient></material></visual>
+      </link></model>
+    <model name="wall_south"><static>true</static><pose>0 -25 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>50.4 0.2 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>50.4 0.2 3.0</size></box></geometry>
+          <material><ambient>0.7 0.7 0.7 1</ambient></material></visual>
+      </link></model>
+    <model name="wall_east"><static>true</static><pose>25 0 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.2 50.4 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.2 50.4 3.0</size></box></geometry>
+          <material><ambient>0.7 0.7 0.7 1</ambient></material></visual>
+      </link></model>
+    <model name="wall_west"><static>true</static><pose>-25 0 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.2 50.4 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.2 50.4 3.0</size></box></geometry>
+          <material><ambient>0.7 0.7 0.7 1</ambient></material></visual>
+      </link></model>
+    <!-- 柱子/货架 (2x2m box 高 3m, 间隔 ~10m, 障碍但开放空间充足) -->
+    <model name="pillar_1"><static>true</static><pose>10 10 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>2.0 2.0 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>2.0 2.0 3.0</size></box></geometry>
+          <material><ambient>0.4 0.4 0.5 1</ambient></material></visual>
+      </link></model>
+    <model name="pillar_2"><static>true</static><pose>-10 10 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>2.0 2.0 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>2.0 2.0 3.0</size></box></geometry>
+          <material><ambient>0.4 0.4 0.5 1</ambient></material></visual>
+      </link></model>
+    <model name="pillar_3"><static>true</static><pose>10 -10 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>2.0 2.0 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>2.0 2.0 3.0</size></box></geometry>
+          <material><ambient>0.4 0.4 0.5 1</ambient></material></visual>
+      </link></model>
+    <model name="pillar_4"><static>true</static><pose>-10 -10 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>2.0 2.0 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>2.0 2.0 3.0</size></box></geometry>
+          <material><ambient>0.4 0.4 0.5 1</ambient></material></visual>
+      </link></model>
+    <model name="pillar_5"><static>true</static><pose>15 -5 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>2.0 2.0 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>2.0 2.0 3.0</size></box></geometry>
+          <material><ambient>0.4 0.4 0.5 1</ambient></material></visual>
+      </link></model>
+    <model name="pillar_6"><static>true</static><pose>-15 5 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>2.0 2.0 3.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>2.0 2.0 3.0</size></box></geometry>
+          <material><ambient>0.4 0.4 0.5 1</ambient></material></visual>
+      </link></model>
+  </world>
+</sdf>

@@ -1,0 +1,27 @@
+<!--
+  Continuously replan around live obstacles without autonomous recovery motion.
+
+  Go2W wheel-mode turns have a measured translational creep, so generic Nav2
+  Spin/BackUp recovery actions are unsafe here. A transient planner failure is
+  handled only by clearing the global costmap, holding zero for 1 s, and
+  retrying once. The 2 Hz planning branch refreshes the
+  path after /scan_mid360 changes the global obstacle layer.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="1" name="BoundedPlanningRefresh">
+      <PipelineSequence name="NavigateWithSafeDynamicReplanning">
+        <RateController hz="2.0">
+          <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+        </RateController>
+        <FollowPath path="{path}" controller_id="FollowPath"
+                    goal_checker_id="general_goal_checker"/>
+      </PipelineSequence>
+      <Sequence name="RefreshGlobalCostmapWithoutMotion">
+        <ClearEntireCostmap name="ClearGlobalCostmap"
+                            service_name="global_costmap/clear_entirely_global_costmap"/>
+        <Wait wait_duration="1"/>
+      </Sequence>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

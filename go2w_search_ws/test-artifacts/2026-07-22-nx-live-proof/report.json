@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "target": "http://192.168.1.105:8000/",
+  "controller_wlan_ipv4": "192.168.1.102",
+  "release_id": "9de381624a60-dirty-d63dc9e5ee2b",
+  "real_nx_only": true,
+  "commands_sent": false,
+  "services_changed": false,
+  "duration_seconds": 86.1937,
+  "checks": {
+    "real_camera_map_pose_task_visible": "PASS",
+    "no_refresh_live_progress_60s": "FAIL",
+    "browser_disconnect_rehydrate": "PASS_WITH_DEGRADED_TRANSITION",
+    "calibrated_current_frustum": "FAIL_NOT_DEPLOYED"
+  },
+  "performance": {
+    "map_update_calls": 24,
+    "map_draw_calls": 16634,
+    "draw_calls_per_second": 193.0,
+    "draw_calls_per_map_update": 693.1,
+    "websocket_ready_state_at_end": 1,
+    "websocket_buffered_amount_bytes_at_end": 0,
+    "new_visible_loads": 0,
+    "new_infrared_loads": 0,
+    "new_mid360_loads": 0,
+    "fps_badge_at_end": "0 FPS",
+    "canvas_pose_at_end": [9.17, -3.06, 0.26],
+    "header_pose_at_end": [2.33, -4.97, -2.6005]
+  },
+  "deployment_gap": {
+    "remote_map_has_camera_frustum": false,
+    "remote_map_has_dirty_scheduler": false,
+    "remote_panel_has_socket_lifecycle": false,
+    "remote_panel_has_status_poller": false
+  },
+  "details": "summary.json",
+  "human_report": "README.md",
+  "screenshots": [
+    "nx-live-start.png",
+    "nx-live-after-reconnect.png",
+    "nx-live-current-map-frustum.png"
+  ],
+  "overall_status": "FAIL_CURRENT_NX_DEPLOYMENT_REPRODUCES_STALE_UI_AND_LACKS_NEW_FRUSTUM_ASSET"
+}

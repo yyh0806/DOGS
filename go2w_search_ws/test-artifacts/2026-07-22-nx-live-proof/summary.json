@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "test": "NX live production panel browser acceptance",
+  "target": {
+    "panel_url": "http://192.168.1.105:8000/",
+    "websocket_url": "ws://192.168.1.105:8001",
+    "controller_wlan_ipv4": "192.168.1.102",
+    "release_id": "9de381624a60-dirty-d63dc9e5ee2b",
+    "motion_release_id": "9de381624a60-dirty-d63dc9e5ee2b",
+    "release_consistent": true
+  },
+  "safety": {
+    "motion_or_search_commands_sent_by_acceptance": false,
+    "nx_services_stopped_or_restarted": false,
+    "pre_existing_active_task_observed": {
+      "id": "ef8e96fe",
+      "type": "search_room",
+      "mission_id": "02b189f7-3918-498a-be26-c4d4e9b1c915",
+      "status": "active"
+    }
+  },
+  "results": {
+    "connectivity_and_real_feeds": {
+      "status": "PASS",
+      "http_status": 200,
+      "initial_websocket_ready_state": 1,
+      "visible_camera": {"width": 640, "height": 360},
+      "infrared_camera": {"width": 256, "height": 205},
+      "mid360_birdseye": {"width": 400, "height": 400},
+      "slam_source": "ros2_nx"
+    },
+    "no_refresh_live_progress_for_at_least_60_seconds": {
+      "status": "FAIL",
+      "wall_duration_seconds": 86.1937,
+      "one_second_samples_recorded": 52,
+      "websocket_ready_state_at_end": 1,
+      "browser_websocket_buffered_amount_bytes_at_end": 0,
+      "map_update_calls": 24,
+      "map_draw_calls": 16634,
+      "map_update_calls_per_second": 0.2784,
+      "map_draw_calls_per_second": 193.0,
+      "draw_calls_per_map_update": 693.1,
+      "new_image_loads": {"visible": 0, "infrared": 0, "mid360": 0},
+      "fps_badge_at_end": "0 FPS",
+      "canvas_map_pose_at_end": {"x": 9.17, "y": -3.06, "yaw_rad": 0.26},
+      "authoritative_header_pose_at_end": "map: x=2.33 y=-4.97 yaw=-149 deg; LIO odom: x=2.33 y=-4.97 yaw=-149 deg",
+      "timer_lag_max_ms_upper_bound": 33418.5,
+      "failure": "The open WebSocket did not keep the map/video surfaces current. The canvas pose diverged materially from the HTTP-polled header pose while redraw work continued at an excessive rate."
+    },
+    "browser_only_disconnect_and_rehydrate": {
+      "status": "PASS_WITH_DEGRADED_TRANSITION",
+      "method": "Playwright browser context offline, then online; no NX service action",
+      "offline_page": "chrome-error://chromewebdata/ ERR_INTERNET_DISCONNECTED",
+      "automatic_recovery_observed_within_seconds": 10,
+      "manual_reload_or_goto_after_online": false,
+      "websocket_ready_state_after_recovery": 1,
+      "rehydrated": {
+        "visible_camera": {"width": 640, "height": 360},
+        "infrared_camera": {"width": 256, "height": 205},
+        "map_wall_points": 4268,
+        "map_trail_points": 250,
+        "room_search_phase": "FRONTIER_DETECT",
+        "task_restored": true
+      },
+      "limitation": "The page temporarily became a browser network error document, so the recovery was a document reload rather than in-place socket healing. MID360 was initially 0x0 after recovery and appeared later."
+    },
+    "current_live_frustum": {
+      "status": "FAIL_NOT_DEPLOYED",
+      "runtime_camera_frustum_method_type": "undefined",
+      "runtime_room_search_has_camera_hfov": false,
+      "runtime_room_search_has_camera_yaw_offset": false,
+      "remote_map_has_camera_frustum_method": false,
+      "remote_map_has_dirty_scheduler": false,
+      "remote_panel_has_socket_lifecycle": false,
+      "remote_panel_has_status_poller": false,
+      "remote_map_sha256": "1ebdfc92389d2967a756cfc6fb0a06511dc19b2b21c773b75be382538d1ca6e3",
+      "local_map_sha256": "f10d22b51ce1a64752077b3f4823c3671e6690e2fe7a07d0bb79bff97d3b3910",
+      "failure": "The NX production asset is older than the checked-out frustum/dirty-render implementation, so the calibrated current-orientation frustum cannot be validated on this deployment."
+    }
+  },
+  "latest_read_only_nx_status": {
+    "captured_at": "2026-07-22T21:30:22.4560595+08:00",
+    "connected": true,
+    "localization_count": 8026,
+    "scan_count": 8065,
+    "odom_count": 8026,
+    "localization_age_sec": 0.0817,
+    "localization_healthy": true,
+    "navigation_ready": true,
+    "all_displayed_services_active": true
+  },
+  "artifacts": [
+    {
+      "file": "nx-live-start.png",
+      "sha256": "77c9aea38961136546c23f771f622f3589204c152ee1e37532c710945c6ebe79"
+    },
+    {
+      "file": "nx-live-after-reconnect.png",
+      "sha256": "1d8f8163a375e87dc90368239ff16ec871072b8a914a4b92b5780223666cf8b8"
+    },
+    {
+      "file": "nx-live-current-map-frustum.png",
+      "sha256": "eaa88d005b7e18b761b32c451857d7bf29fbcab7e061b62befeeac678942f93f"
+    }
+  ],
+  "overall_status": "FAIL_CURRENT_NX_DEPLOYMENT_REPRODUCES_STALE_UI_AND_LACKS_NEW_FRUSTUM_ASSET"
+}

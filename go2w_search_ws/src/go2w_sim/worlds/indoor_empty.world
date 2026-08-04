@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<!-- MVP M1a: 10x10m empty room, 4 perimeter walls (box 0.2m thick, 1m high).
+     bbox for coverage ground-truth: x in [-5,5], y in [-5,5], inflation 0.30m. -->
+<sdf version="1.6">
+  <world name="indoor_empty">
+    <physics name="ode" type="ode">
+      <real_time_update_rate>50.0</real_time_update_rate>
+      <max_step_size>0.02</max_step_size>
+    </physics>
+    <gravity>0 0 -9.80665</gravity>
+    <plugin name="gazebo_ros_state" filename="libgazebo_ros_state.so">
+      <ros><namespace>/</namespace></ros>
+      <update_rate>10.0</update_rate>
+    </plugin>
+    <include><uri>model://sun</uri></include>
+    <model name="ground_plane">
+      <static>true</static>
+      <pose>0 0 0 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>50 50</size></plane></geometry>
+          <surface><friction><ode><mu>100</mu><mu2>50</mu2></ode></friction></surface>
+        </collision>
+      </link>
+    </model>
+    <model name="wall_north"><static>true</static><pose>0 5 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>10.4 0.2 1.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>10.4 0.2 1.0</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+      </link></model>
+    <model name="wall_south"><static>true</static><pose>0 -5 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>10.4 0.2 1.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>10.4 0.2 1.0</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+      </link></model>
+    <model name="wall_east"><static>true</static><pose>5 0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.2 10.4 1.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.2 10.4 1.0</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+      </link></model>
+    <model name="wall_west"><static>true</static><pose>-5 0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.2 10.4 1.0</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.2 10.4 1.0</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient></material></visual>
+      </link></model>
+  </world>
+</sdf>

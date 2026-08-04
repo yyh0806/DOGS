@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="data:,">
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <title>Go2W 搜索控制台</title>
 <style>
@@ -19,6 +20,14 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
 .status-dot.warn { background: #ff9800; }
 .status-dot.off { background: #666; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* nav2 链路服务状态灯条: 绿=active+数据活, 黄=active但数据停, 红=inactive */
+.svc-bar { display: flex; gap: 9px; align-items: center; margin-left: 14px; padding-left: 14px; border-left: 1px solid #2a2a2a; flex-wrap: wrap; }
+.svc-item { font-size: 10px; color: #888; display: inline-flex; align-items: center; cursor: help; white-space: nowrap; }
+.svc-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 3px; background: #666; flex-shrink: 0; }
+.svc-dot.green { background: #4caf50; }
+.svc-dot.yellow { background: #ff9800; }
+.svc-dot.red { background: #f44336; box-shadow: 0 0 4px rgba(244,67,54,0.6); }
 .pose-info { font-size: 11px; color: #aaa; font-family: monospace; }
 
 /* 主体: 左地图 + 右栏 */
@@ -28,9 +37,14 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
 .map-pane { flex: 6; display: flex; flex-direction: column; border-right: 1px solid #2a2a2a; position: relative; }
 .map-toolbar { background: #111; border-bottom: 1px solid #2a2a2a; padding: 6px 12px; display: flex; align-items: center; gap: 8px; flex-shrink: 0; font-size: 11px; }
 .map-toolbar .label { color: #666; }
+.nav-status { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 2px 8px; border: 1px solid #303942; border-radius: 999px; color: #90a4ae; background: rgba(10,21,32,0.72); font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; }
+.nav-status.pending, .nav-status.waiting_server, .nav-status.waiting_health, .nav-status.canceling { color: #ffb300; border-color: rgba(255,179,0,0.48); }
+.nav-status.active { color: #00e5ff; border-color: rgba(0,229,255,0.52); }
+.nav-status.succeeded { color: #81c784; border-color: rgba(76,175,80,0.52); }
+.nav-status.rejected, .nav-status.aborted, .nav-status.failed, .nav-status.timed_out, .nav-status.canceled, .nav-status.cancel_failed, .nav-status.server_unavailable, .nav-status.error { color: #ef9a9a; border-color: rgba(239,83,80,0.52); }
 .map-canvas-wrap { flex: 1; position: relative; background: #0a1520; overflow: hidden; }
 #mapCanvas { width: 100%; height: 100%; display: block; cursor: crosshair; }
-.map-hint { position: absolute; bottom: 8px; left: 12px; font-size: 10px; color: #546e7a; pointer-events: none; }
+.map-hint { position: absolute; bottom: 8px; right: 12px; font-size: 10px; color: #546e7a; pointer-events: none; }
 .map-source { position: absolute; top: 8px; right: 12px; font-size: 10px; color: #546e7a; background: rgba(0,0,0,0.4); padding: 2px 8px; border-radius: 3px; pointer-events: none; }
 
 /* 右栏 (40%) */
@@ -40,17 +54,33 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
 
 /* 视频 */
 .video-section { flex: 0 0 auto; }
-.video-wrap { background: #000; position: relative; width: 100%; height: 200px; display: flex; align-items: center; justify-content: center; }
+.video-wrap { background: #000; position: relative; width: 100%; height: 200px; display: flex; align-items: center; justify-content: center; overflow: hidden; }
 .video-wrap img { max-width: 100%; max-height: 100%; object-fit: contain; }
-.video-overlay { position: absolute; top: 6px; left: 6px; display: flex; gap: 6px; }
+.video-overlay { position: absolute; top: 6px; left: 6px; display: flex; gap: 6px; z-index: 3; }
+.locate-overlay { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+.locate-box { position: absolute; border: 2px solid #00e5ff; border-radius: 2px; box-shadow: 0 0 0 1px rgba(0,0,0,0.65), 0 0 16px rgba(0,229,255,0.45); }
+.locate-box-label { position: absolute; left: -2px; top: -23px; max-width: 220px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; background: rgba(0,0,0,0.82); color: #e0f7fa; border: 1px solid rgba(0,229,255,0.7); border-radius: 3px; padding: 2px 6px; font-size: 11px; line-height: 16px; }
+.locate-note { position: absolute; left: 8px; right: 8px; bottom: 8px; background: rgba(0,0,0,0.78); color: #ffd54f; border: 1px solid rgba(255,213,79,0.45); border-radius: 4px; padding: 5px 7px; font-size: 11px; line-height: 16px; }
+.detect-overlay { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+.detect-box { position: absolute; border: 2px solid #ff1744; border-radius: 2px; box-shadow: 0 0 0 1px rgba(0,0,0,0.65), 0 0 12px rgba(255,23,68,0.45); }
+.detect-box-label { position: absolute; left: -2px; top: -21px; max-width: 180px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; background: rgba(0,0,0,0.82); color: #ffebee; border: 1px solid rgba(255,23,68,0.7); border-radius: 3px; padding: 2px 5px; font-size: 10px; line-height: 15px; }
 .badge { background: rgba(0,0,0,0.7); padding: 2px 7px; border-radius: 3px; font-size: 10px; }
 .badge.green { color: #4caf50; } .badge.orange { color: #ff9800; }
 .no-video { color: #555; font-size: 12px; }
 
-/* 检测列表 */
-.det-list { padding: 6px 14px; max-height: 90px; overflow-y: auto; }
-.det-item { font-size: 11px; color: #ff8a80; padding: 2px 0; display: flex; justify-content: space-between; }
+/* 检测列表 (地图左下浮窗 — Q1=a: 截图列表挪到地图上; 避开 map-source 右上 / map-hint 右下) */
+.det-list { position: absolute; left: 8px; bottom: 8px; width: 230px; max-height: 45%; overflow-y: auto; background: rgba(8,14,22,0.82); border: 1px solid #2a3a48; border-radius: 5px; padding: 5px 8px; z-index: 4; backdrop-filter: blur(2px); }
+.det-item { font-size: 11px; color: #ff8a80; padding: 3px 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.det-left { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.det-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.det-thumb { width: 42px; height: 30px; object-fit: cover; border: 1px solid #333; border-radius: 3px; background: #080808; cursor: pointer; flex-shrink: 0; }
+.det-meta { color: #bbb; white-space: nowrap; }
 .det-empty { color: #555; font-size: 11px; text-align: center; padding: 8px; }
+.snapshot-modal { position: fixed; inset: 0; z-index: 30; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,0.82); padding: 24px; }
+.snapshot-modal.open { display: flex; }
+.snapshot-modal-inner { max-width: min(92vw, 1100px); max-height: 88vh; display: flex; flex-direction: column; gap: 8px; }
+.snapshot-modal img { max-width: 100%; max-height: 78vh; object-fit: contain; background: #000; border: 1px solid #333; }
+.snapshot-modal-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; color: #ddd; font-size: 12px; }
 
 /* 任务队列 */
 .task-section { flex: 1; }
@@ -85,6 +115,10 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
 .search-form { display: flex; gap: 6px; margin-top: 6px; align-items: center; font-size: 11px; flex-wrap: wrap; }
 .search-form input { width: 42px; padding: 3px 5px; background: #1a1a1a; border: 1px solid #333; border-radius: 3px; color: #fff; font-size: 11px; text-align: center; }
 .search-form .lbl { color: #666; }
+.locate-form { display: flex; gap: 6px; margin-top: 6px; align-items: center; font-size: 11px; flex-wrap: wrap; }
+.locate-form input { width: min(240px, 58vw); padding: 3px 6px; background: #1a1a1a; border: 1px solid #333; border-radius: 3px; color: #fff; font-size: 11px; outline: none; }
+.locate-form input:focus { border-color: #1565c0; }
+.locate-form .lbl { color: #666; }
 
 /* 动作按钮栏 */
 .action-row { padding: 8px 14px; display: flex; align-items: center; gap: 10px; }
@@ -114,6 +148,7 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
       <span class="status-item"><span class="status-dot off" id="nxDot"></span>NX</span>
       <span class="status-item"><span class="status-dot off" id="slamDot"></span>SLAM</span>
     </div>
+    <div class="svc-bar" id="svcBar" title="Nav2 导航链路: 绿=active+数据流活, 黄=active但数据停, 红=inactive"></div>
   </div>
   <div class="pose-info" id="poseInfo">位姿: --</div>
 </header>
@@ -123,30 +158,57 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
   <div class="map-pane">
     <div class="map-toolbar">
       <span class="label">地图</span>
+      <span class="nav-status idle" id="navStatus">导航 · 待命</span>
+      <span class="label" title="橙色为 MID360 累积建图；红色为 Nav2 致命障碍；蓝色为膨胀避障区">MID360 建图 · Nav2 实时障碍</span>
       <button class="btn" style="padding:3px 9px;font-size:11px;" onclick="clearRegion()">清除选区</button>
-      <button class="btn" style="padding:3px 9px;font-size:11px;" onclick="clearTrail()">清空轨迹</button>
-      <span class="label" style="margin-left:auto;">提示: 地图上拖框选搜索区域</span>
+      <button class="btn" style="padding:3px 9px;font-size:11px;" onclick="clearTrail()">清除地图+轨迹</button>
+      <button class="btn" id="cmViewBtn" style="padding:3px 9px;font-size:11px;" title="切换 local_costmap(狗避障用,默认) / global_costmap(规划用,看ghost对比)" onclick="if(map){map.setShowGlobalCostmap(!map._showGlobalCostmap);this.textContent=map._showGlobalCostmap?'规划图':'避障图'}">避障图</button>
+      <span class="label" style="margin-left:auto;">单击导航 · 拖框选搜索区域</span>
     </div>
     <div class="map-canvas-wrap">
       <canvas id="mapCanvas"></canvas>
       <div class="map-source" id="mapSource">SLAM: 未连接</div>
-      <div class="map-hint">世界坐标系 (米) · 网格=1m · 拖框选区</div>
+      <div class="map-hint">map 坐标系 (米) · 单击前往 · 拖框选区</div>
+      <div class="map-legend" id="mapLegend" style="position:absolute;top:8px;right:8px;background:rgba(8,16,24,0.78);color:#cfe3ff;padding:6px 9px;border-radius:6px;font-size:10px;line-height:1.55;pointer-events:none;display:none;z-index:5;">
+        <div><span style="display:inline-block;width:10px;height:10px;background:rgba(0,230,118,0.55);border:1px solid #00e676;margin-right:5px;vertical-align:middle;"></span>视锥已扫过(看过)</div>
+        <div><span style="display:inline-block;width:10px;height:10px;background:#2a4a6b;margin-right:5px;vertical-align:middle;border:1px solid #3a5a7b;"></span>SLAM 已建图(走过)</div>
+        <div><span style="display:inline-block;width:10px;height:10px;background:rgba(3,10,18,0.86);margin-right:5px;vertical-align:middle;border:1px solid #1a2a3a;"></span>未探索(深雾)</div>
+      </div>
+      <div class="det-list" id="detList"><div class="det-empty">无检测</div></div>
     </div>
   </div>
 
   <!-- 右栏: 视频+检测 / 任务 -->
   <div class="right-pane">
     <div class="section video-section">
-      <div class="section-header">相机 <span id="videoMeta">--</span></div>
-      <div class="video-wrap">
+      <div class="section-header">云台 C13 (可见光+红外) <span id="videoMeta">--</span></div>
+      <div class="video-wrap" id="visVideoWrap">
         <div class="video-overlay">
+          <span class="badge green">可见光</span>
           <span class="badge green" id="fpsBadge">-- FPS</span>
           <span class="badge orange" id="detBadge">0 目标</span>
         </div>
         <span class="no-video" id="noVideo">等待视频...</span>
         <img id="videoImg" style="display:none" />
+        <div class="detect-overlay" id="detectOverlay"></div>
+        <div class="locate-overlay" id="locateOverlay"></div>
       </div>
-      <div class="det-list" id="detList"><div class="det-empty">无检测</div></div>
+      <div class="video-wrap" style="height:130px;border-top:1px solid #2a2a2a;">
+        <div class="video-overlay">
+          <span class="badge" style="color:#ff5722;">红外</span>
+        </div>
+        <span class="no-video" id="noIrVideo">等待红外...</span>
+        <img id="irImg" style="display:none" />
+        <div class="detect-overlay" id="irDetectOverlay"></div>
+      </div>
+    </div>
+
+    <div class="section" style="flex:0 0 auto;">
+      <div class="section-header">雷达 MID360 鸟瞰 <span id="lidarMeta" style="font-weight:400;color:#555;">--</span></div>
+      <div style="background:#000;padding:4px;display:flex;justify-content:center;">
+        <img id="lidarImg" style="max-width:100%;max-height:220px;display:none;" />
+        <span class="no-video" id="noLidar">等待雷达...</span>
+      </div>
     </div>
 
     <div class="section task-section">
@@ -157,10 +219,21 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
 </div>
 
 <!-- 底部: 指令 + 搜索表单 + 动作 -->
+<div class="snapshot-modal" id="snapshotModal" onclick="closeDetectionSnapshot(event)">
+  <div class="snapshot-modal-inner">
+    <div class="snapshot-modal-bar">
+      <span id="snapshotTitle">Detection snapshot</span>
+      <button class="btn" style="padding:3px 9px;font-size:11px;" onclick="closeDetectionSnapshot(event)">关闭</button>
+    </div>
+    <img id="snapshotImg" alt="Detection snapshot" />
+  </div>
+</div>
+
 <div class="bottom">
   <div class="cmd-row">
     <div class="cmd-input-wrap">
       <input class="cmd-input" id="cmdInput" placeholder="输入指令: 搜索前方10x10米找红色背包..." onkeydown="if(event.key==='Enter')sendCmd()" />
+      <button class="btn" id="voiceBtn" title="语音输入 (需 Chrome/Edge + 联网; 识别后回车确认发送)" onclick="toggleVoice()" style="padding:3px 10px;">🎤</button>
       <button class="btn primary" onclick="sendCmd()">发送</button>
     </div>
     <div class="search-form">
@@ -170,22 +243,39 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
       <span class="lbl">间距</span><input type="number" id="searchSpacing" value="2" step="0.5">
       <button class="btn" style="padding:3px 10px;" onclick="searchByForm()">从当前位置搜索</button>
     </div>
+    <div class="locate-form">
+      <span class="lbl">目标定位</span>
+      <input id="locateInput" value="所有可见物体" onkeydown="if(event.key==='Enter')locateTarget()" />
+      <button class="btn" style="padding:3px 10px;" onclick="locateTarget()">定位</button>
+      <button class="btn" id="locateLoopBtn" style="padding:3px 10px;" onclick="toggleLocateLoop()">持续扫描</button>
+    </div>
     <div class="quick-cmds">
       <span class="quick-btn" onclick="quickCmd('搜索区域')">用选区搜索</span>
       <span class="quick-btn" onclick="quickCmd('前进两米')">前进</span>
       <span class="quick-btn" onclick="quickCmd('后退一米')">后退</span>
       <span class="quick-btn" onclick="quickCmd('左转90度')">左转</span>
       <span class="quick-btn" onclick="quickCmd('右转90度')">右转</span>
+      <span class="quick-btn" onclick="quickCmd('前进')">前进1米</span>
+      <span class="quick-btn" onclick="quickCmd('后退')">后退1米</span>
+      <span class="quick-btn" onclick="quickCmd('左转')">左转90°</span>
+      <span class="quick-btn" onclick="quickCmd('右转')">右转90°</span>
       <span class="quick-btn" onclick="quickCmd('停下来')">停止</span>
       <span class="quick-btn" onclick="quickCmd('返回起点')">返回</span>
+      <span class="quick-btn" style="background:#1976d2;color:#fff;" title="一键测端到端: NLU → search_room task (无需麦克风)" onclick="quickCmd('去搜索这个房间，把所有人标注出来')">🎤 房间搜人</span>
+      <span class="quick-btn" style="background:#2e7d32;color:#fff;" title="直接 /api/search_room 绕过 NLU: 搜人" onclick="searchRoom(['person'])">搜人</span>
+      <span class="quick-btn" style="background:#2e7d32;color:#fff;" title="搜桌椅 (多类)" onclick="searchRoom(['dining table','chair'])">搜桌椅</span>
+      <span class="quick-btn" style="background:#2e7d32;color:#fff;" title="搜所有物体 (18 类室内清单)" onclick="searchRoom('all_objects')">搜物体</span>
     </div>
   </div>
   <div class="action-row">
     <div class="ctrl-group">
-      <button class="btn primary" onclick="connect()">连接并站立</button>
+      <button class="btn primary" style="background:#2e7d32;" onclick="searchRoom()" title="搜索当前房间: frontier 探索全屋 + YOLO best-effort 标注可见人员 (v2, 直接 /api/search_room 不经 NLU)">🔍 搜索房间</button>
       <button class="btn" onclick="stand()">站立</button>
-      <button class="btn" onclick="sit()">坐下</button>
-      <button class="btn danger" onclick="eStop()">急停</button>
+      <button class="btn" id="confirmStandBtn" onclick="confirmStand()" disabled>确认站立</button>
+      <button class="btn" id="balanceBtn" onclick="enterBalance()" disabled>进入平衡</button>
+      <button class="btn" id="confirmBalanceBtn" onclick="confirmBalance()" disabled>确认平衡</button>
+      <button class="btn primary" onclick="activateDog()" title="激活狗进入轮式可导航态 (parked→active); 进入轮式平衡时轮子可能小幅移动, 请确保场地空旷">激活</button>
+      <!-- 2026-07-18 删急停按钮: 用户要求去掉 (导航取消误判为急停); 急停改用遥控器或键盘(空格已取消). eStop() 函数保留备用. -->
     </div>
     <div class="divider"></div>
     <button class="btn" onclick="openFoxglove()" title="另开 Foxglove 看 nav2 原生数据">Foxglove</button>
@@ -198,14 +288,377 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
       <button class="btn move-btn" id="kD" title="D/→ 右转" onmousedown="move(0,0,-0.5)" onmouseup="stopMove()" onmouseleave="stopMove()" ontouchstart="move(0,0,-0.5)" ontouchend="stopMove()">↻</button>
     </div>
   </div>
-  <div class="key-hint">键盘: <b>W/↑</b>前进 <b>S/↓</b>后退 <b>A/←</b>左转 <b>D/→</b>右转 <b>Q</b>左平移 <b>E</b>右平移 <b>1</b>站立 <b>2</b>坐下 <b>空格</b>急停 · (输入框聚焦时不响应)</div>
+  <div class="key-hint">键盘: <b>W/↑</b>前进 <b>S/↓</b>后退 <b>A/←</b>左转 <b>D/→</b>右转 <b>Q</b>左平移 <b>E</b>右平移 <b>1</b>站立 <b>2</b>坐下 · (急停请点按钮, 空格已取消避免误触) · (输入框聚焦时不响应)</div>
 </div>
 
 <script src="/map.js"></script>
 <script>
-let ws, connected = false, frameCount = 0, lastFpsTime = Date.now(), _moveInterval = null;
+function configureGo2WControlToken(token) {
+  const value = String(token || '').trim();
+  if (value) localStorage.setItem('go2wControlToken', value);
+  else localStorage.removeItem('go2wControlToken');
+}
+async function controlFetch(url, options = {}) {
+  // Auth disabled (2026-07-16): 后端 nx_control_auth.authorize_request 永远放行,
+  // 前端不再弹窗索要令牌、不发 Bearer (用户要求去掉权限 token 限制)。
+  return fetch(url, options);
+}
+let connected = false, _moveInterval = null, _locateLoopTimer = null;
+let lastVisFrameAt = 0, videoFallbackInFlight = false, latestPerceptionHealthy = false;
+let visibleFrameTimes = [];
+const VISIBLE_FPS_WINDOW_MS = 3000;
 let latestDetections = [];
+let latestDetectionsBySource = {};
+let missionTargetMarkers = [];
+let latestLocateResult = null, latestLocateTs = 0;
+const LOCATE_TTL_MS = 30000;  // locate worker 后台 ~5-21s/帧异步推; TTL 30s 防 worker 挂了残留陈旧框
+const _LOCATE_GENERIC = new Set(['', 'object', 'objects']);  // CLI grounding 无 class 时的泛化占位
+const DETECTION_MIN_CONFIDENCE = 0.8;
+function filterDetectionResults(detections) {
+  if (!Array.isArray(detections)) return [];
+  return detections.filter(detection => {
+    const confidence = Number(detection && (
+      detection.confidence ?? detection.score ?? detection.probability ?? 0
+    ));
+    return Number.isFinite(confidence) && confidence >= DETECTION_MIN_CONFIDENCE;
+  });
+}
+function _isGenericClass(s) { return _LOCATE_GENERIC.has((s || '').toLowerCase()); }
+const DETECTION_VIEWS = {
+  c13_vis: { overlayId: 'detectOverlay', imgId: 'videoImg', emptyId: 'noVideo' },
+  c13_ir: { overlayId: 'irDetectOverlay', imgId: 'irImg', emptyId: 'noIrVideo' }
+};
+const overlayFrameScheduler = createLatestFrameScheduler();
+const streamFrameGeneration = { c13_vis: 0, c13_ir: 0 };
 let map = null;
+let latestNavigationReadiness = {
+  ready: false,
+  reason: 'status_not_received',
+  drive_fault_reset_available: false,
+};
+let navRequestSerial = 0;
+let navRequestPending = false;
+let lastNavGeneration = -1;
+let lastNavUpdatedMonotonic = -Infinity;
+let navConnectionEpoch = 0;
+const NAV_REQUEST_TIMEOUT_MS = 5000;
+const POINT_GOAL_MAX_DISTANCE = 20.0;
+
+const NAV_STATUS_LABELS = {
+  idle: '待命', pending: '目标已发送', waiting_server: '等待 Nav2', waiting_health: '等待定位',
+  active: '行进中', canceling: '正在停车', succeeded: '已到达', rejected: '目标被拒绝',
+  aborted: '导航中止', failed: '导航失败', timed_out: '导航超时', canceled: '已取消',
+  cancel_failed: '停车失败', server_unavailable: 'Nav2 不可用', error: '控制器异常', stopped: '已停止',
+};
+const NAV_REASON_LABELS = {
+  pure_turn_clearance: '转向扫掠范围内有障碍（需要约 0.95m 净空）',
+  pure_turn_oscillation: '左右转向振荡，安全门已锁零',
+  nav2_aborted: 'Nav2 控制器中止',
+  nav_scan_stale: 'MID360 导航扫描已失鲜',
+  localization_stale: '定位数据已失鲜',
+  drive_session_parked: '轮驱会话尚未激活',
+  motion_state_not_drivable: '当前运动状态禁止导航',
+  battery_low: '电量低于导航门限',
+  release_mismatch: 'Web 与运动节点版本不一致，禁止移动',
+  motion_trapped: '运动受困',
+};
+
+function navigationReasonLabel(reason) {
+  const normalized = String(reason || '').trim();
+  return NAV_REASON_LABELS[normalized] || normalized;
+}
+
+function preferredDetectionResults(liveDetections, missionMarkers) {
+  const live = Array.isArray(liveDetections) ? liveDetections : [];
+  if (live.length) return live;
+  return Array.isArray(missionMarkers) ? missionMarkers : [];
+}
+
+function roomSearchStatus(roomNav) {
+  if (!roomNav || typeof roomNav !== 'object') return null;
+  const search = roomNav.search_state && typeof roomNav.search_state === 'object'
+    ? roomNav.search_state : {};
+  const phase = String(search.phase || roomNav.phase || '').toUpperCase();
+  const completionReason = String(
+    search.completion_reason || roomNav.completion_reason || roomNav.reason || '',
+  );
+  if (phase !== 'FAILED' && !['aborted', 'failed'].includes(
+    String(roomNav.status || '').toLowerCase())) return null;
+  const reason = completionReason || 'search_failed';
+  let message = `搜索失败 · ${navigationReasonLabel(reason) || '未知原因'}`;
+  const trap = search.motion_trap && typeof search.motion_trap === 'object'
+    ? search.motion_trap : {};
+  const forward = finiteNavNumber(trap.forward_clearance_m);
+  const turn = finiteNavNumber(trap.turn_clearance_m);
+  if (forward !== null) message += ` · 前向 ${forward.toFixed(2)}m`;
+  if (turn !== null) message += ` · 转向 ${turn.toFixed(2)}m`;
+  return { status: 'failed', reason, message };
+}
+
+function finiteNavNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const normalized = Number(value);
+  return Number.isFinite(normalized) ? normalized : null;
+}
+
+function updatePoseInfo(localization, odometry = null) {
+  const el = document.getElementById('poseInfo');
+  if (!el || !localization || localization.healthy !== true) return false;
+  const x = finiteNavNumber(localization.x);
+  const y = finiteNavNumber(localization.y);
+  const yaw = finiteNavNumber(localization.yaw);
+  if (x === null || y === null || yaw === null) return false;
+  let text = `map: x=${x.toFixed(2)} y=${y.toFixed(2)} yaw=${(yaw * 180 / Math.PI).toFixed(0)}°`;
+  if (odometry && odometry.healthy === true) {
+    const ox = finiteNavNumber(odometry.x);
+    const oy = finiteNavNumber(odometry.y);
+    const oyaw = finiteNavNumber(odometry.yaw);
+    if (ox !== null && oy !== null && oyaw !== null) {
+      text += ` · LIO odom: x=${ox.toFixed(2)} y=${oy.toFixed(2)} yaw=${(oyaw * 180 / Math.PI).toFixed(0)}°`;
+    }
+  }
+  el.textContent = text;
+  return true;
+}
+
+function resetNavOrderingForNewConnection() {
+  // 新 WebSocket 连接是后端实例边界：使旧 HTTP 回包失效，并允许 generation 从 0 重建。
+  navConnectionEpoch += 1;
+  navRequestSerial += 1;
+  navRequestPending = false;
+  lastNavGeneration = -1;
+  lastNavUpdatedMonotonic = -Infinity;
+  return navConnectionEpoch;
+}
+
+function setNavStatusChip(status, message = '') {
+  const el = document.getElementById('navStatus');
+  if (!el) return;
+  const normalized = String(status || 'idle');
+  el.className = `nav-status ${normalized}`;
+  el.textContent = `导航 · ${message || NAV_STATUS_LABELS[normalized] || normalized}`;
+}
+
+function applyNavigationReadiness(state) {
+  if (!state || typeof state !== 'object') return false;
+  latestNavigationReadiness = { ...state, ready: state.ready === true };
+  const resetButton = document.getElementById('resetDriveFaultBtn');
+  if (resetButton) {
+    resetButton.disabled = state.drive_fault_reset_available !== true;
+    resetButton.title = resetButton.disabled
+      ? 'Only available after a recoverable wheel fault when mode 6 is locked and all wheels are still'
+      : 'Clear the recoverable wheel fault without restarting SLAM/Nav2';
+  }
+  return true;
+}
+
+async function resetDriveFault() {
+  const button = document.getElementById('resetDriveFaultBtn');
+  if (!latestNavigationReadiness.drive_fault_reset_available) return false;
+  if (button) button.disabled = true;
+  setNavStatusChip('waiting_health', '正在安全复位轮驱故障');
+  try {
+    const response = await controlFetch('/api/reset_drive_fault', { method: 'POST' });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.message || payload.reason || `HTTP ${response.status}`);
+    }
+    latestNavigationReadiness = {
+      ready: false,
+      reason: 'waiting_for_fresh_motion_state',
+      drive_fault_reset_available: false,
+    };
+    setNavStatusChip('waiting_health', '复位命令已发送，等待新的运动状态');
+    return true;
+  } catch (error) {
+    setNavStatusChip('failed', error && error.message ? error.message : '轮驱故障复位失败');
+    if (button) button.disabled = !latestNavigationReadiness.drive_fault_reset_available;
+    return false;
+  }
+}
+
+/** 应用 WS/状态轮询的权威导航状态；generation + monotonic 双门禁防乱序回退。 */
+function applyNavState(state, source = 'ws') {
+  if (!state || typeof state !== 'object') return false;
+  const previousGeneration = lastNavGeneration;
+  const generation = finiteNavNumber(state.generation);
+  const updated = finiteNavNumber(state.updated_monotonic);
+  const hasGeneration = generation !== null;
+  const hasUpdated = updated !== null;
+
+  if (hasGeneration && generation < lastNavGeneration) return false;
+  // 新点击尚未拿到本次 HTTP generation 时，任何外部状态都可能属于被替换的旧目标。
+  if (navRequestPending && source !== 'http') return false;
+  if (hasGeneration && generation === lastNavGeneration) {
+    if (hasUpdated && updated < lastNavUpdatedMonotonic) return false;
+    // HTTP 202 只带 pending 摘要，不能把已经 active/terminal 的 WS 状态倒退。
+    if (!hasUpdated && lastNavUpdatedMonotonic > -Infinity) return false;
+  }
+  if (hasGeneration && generation > lastNavGeneration) {
+    lastNavGeneration = generation;
+    lastNavUpdatedMonotonic = -Infinity;
+  }
+  if (hasUpdated) lastNavUpdatedMonotonic = updated;
+  if (navRequestPending && hasGeneration && generation > previousGeneration) {
+    navRequestPending = false;
+  }
+
+  const status = String(state.status || 'idle');
+  const nested = state.goal && typeof state.goal === 'object' ? state.goal : {};
+  const x = finiteNavNumber(state.x !== undefined ? state.x : nested.x);
+  const y = finiteNavNumber(state.y !== undefined ? state.y : nested.y);
+  const yaw = finiteNavNumber(state.yaw !== undefined ? state.yaw : nested.yaw);
+  if (map) {
+    if (x !== null && y !== null && yaw !== null) {
+      map.setNavGoal({ ...nested, ...state, x, y, yaw, frame_id: 'map' });
+    } else if (status === 'idle') {
+      map.clearNavGoal();
+    }
+  }
+  const reasonText = navigationReasonLabel(state.reason);
+  const targetText = reasonText
+    ? `${NAV_STATUS_LABELS[status] || status} · ${reasonText}`
+    : (x !== null && y !== null
+      ? `${NAV_STATUS_LABELS[status] || status} · ${x.toFixed(2)}, ${y.toFixed(2)}m`
+      : (state.message || NAV_STATUS_LABELS[status] || status));
+  setNavStatusChip(status, targetText);
+  return true;
+}
+
+function applyNavStateForEpoch(state, source, epoch) {
+  if (epoch !== navConnectionEpoch) return false;
+  return applyNavState(state, source);
+}
+
+function applyRoomNavigationState(roomNav) {
+  if (!map || !roomNav || typeof roomNav !== 'object') return false;
+  const report = roomNav.last_report && typeof roomNav.last_report === 'object'
+    ? roomNav.last_report : null;
+  const markers = Array.isArray(roomNav.target_markers)
+    ? roomNav.target_markers
+    : (report && Array.isArray(report.detections) ? report.detections : []);
+  const roomSearch = report ? {
+    mission_id: report.mission_id,
+    phase: report.status === 'completed' ? 'DONE' : String(report.status || '').toUpperCase(),
+    room: report.room,
+    room_area: report.area,
+    observed_cells: report.observed_cells,
+    visited_viewpoints: report.visited_viewpoints,
+    coverage_ratio: report.coverage_ratio,
+    visual_coverage_ratio: report.visual_coverage_ratio,
+    explored_ratio: report.explored_ratio,
+    bounded_explored_ratio: report.bounded_explored_ratio,
+    global_search: report.global_search,
+    completion_reason: report.completion_reason,
+    completion_status: report.completion_status,
+    motion_trap: report.motion_trap,
+    coverage_threshold: report.coverage_threshold,
+    visual_range_m: report.visual_range_m,
+    coverage_cell_size_m: report.coverage_cell_size_m,
+    adaptive_step_m: report.adaptive_step_m,
+    scene_complexity: report.scene_complexity,
+    forward_clearance_m: report.forward_clearance_m,
+  } : (roomNav.search_state || {});
+  updateMissionTargetMarkers(markers);
+  map.update({ room_search: roomSearch });
+  const status = roomSearchStatus({ ...roomNav, search_state: roomSearch });
+  if (status) setNavStatusChip(status.status, status.message);
+  return true;
+}
+
+/** 地图点选 → map-frame NavigateToPose；目标朝向默认指向点击位置。 */
+async function sendNavGoal(point) {
+  if (!map || !point) return;
+  // Parked sessions may be activated by /api/navigate.  Other unhealthy
+  // states must never emit a control request from the browser.
+  if (latestNavigationReadiness.ready !== true
+      && latestNavigationReadiness.activatable !== true) {
+    setNavStatusChip(
+      'waiting_health',
+      navigationReasonLabel(latestNavigationReadiness.reason) || '导航尚未就绪',
+    );
+    return;
+  }
+  // JS ready 守卫已移除 (2026-07-16): 后端 /api/navigate 用 activatable 判定, 会自动激活 drive session;
+  // 前端 ready 过严造成死锁 (ready 要求 drive session 已 active, 但只有发 /api/navigate 才会激活它).
+  const x = Number(point.x), y = Number(point.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+  const dx = x - Number(map.slam.robotX || 0);
+  const dy = y - Number(map.slam.robotY || 0);
+  if (Math.hypot(dx, dy) > POINT_GOAL_MAX_DISTANCE) {
+    setNavStatusChip('failed', `目标超过 ${POINT_GOAL_MAX_DISTANCE.toFixed(0)}m 安全范围`);
+    return;
+  }
+  const yaw = Math.hypot(dx, dy) > 1e-6 ? Math.atan2(dy, dx) : Number(map.slam.robotYaw || 0);
+  const serial = ++navRequestSerial;
+  navRequestPending = true;
+  map.setNavGoal({ generation: lastNavGeneration, status: 'pending', x, y, yaw, frame_id: 'map' });
+  setNavStatusChip('pending', `发送中 · ${x.toFixed(2)}, ${y.toFixed(2)}m`);
+
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => abortController.abort(), NAV_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await controlFetch('/api/navigate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ x, y, yaw, frame_id: 'map' }),
+      signal: abortController.signal,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (serial !== navRequestSerial) return;
+    navRequestPending = false;
+    if (!response.ok || !payload.ok) {
+      throw new Error(
+        payload.msg || navigationReasonLabel(payload.reason) || `HTTP ${response.status}`,
+      );
+    }
+    applyNavState({
+      ...(payload.goal || { x, y, yaw, frame_id: 'map' }),
+      generation: payload.generation,
+      status: 'pending',
+    }, 'http');
+  } catch (error) {
+    if (serial !== navRequestSerial) return;
+    navRequestPending = false;
+    const message = error && error.name === 'AbortError'
+      ? '请求超时'
+      : (error && error.message ? error.message : '请求失败');
+    map.setNavGoal({ generation: lastNavGeneration, status: 'failed', x, y, yaw, frame_id: 'map' });
+    setNavStatusChip('failed', message);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function personMarkerEvidenceLabel(marker) {
+  const m = marker || {};
+  const x = Number(m.world_x !== undefined ? m.world_x : m.x);
+  const y = Number(m.world_y !== undefined ? m.world_y : m.y);
+  const z = Number(m.world_z !== undefined ? m.world_z : m.z);
+  const parts = [];
+  if (Number.isFinite(x) && Number.isFinite(y)) {
+    const coords = (m.position_dimension === 3 && Number.isFinite(z))
+      ? `${x.toFixed(2)}, ${y.toFixed(2)}, ${z.toFixed(2)}`
+      : `${x.toFixed(2)}, ${y.toFixed(2)}`;
+    parts.push(`map (${coords})`);
+  }
+  if (m.position_dimension === 3 && m.height_source === 'mid360_pointcloud') {
+    parts.push('MID360 三维');
+  } else if (Number.isFinite(x) && Number.isFinite(y)) {
+    parts.push('二维定位');
+  }
+  const observations = Number(m.observation_count);
+  if (Number.isFinite(observations) && observations > 0) {
+    parts.push(`${Math.round(observations)} 次观测`);
+  }
+  const dedupLabels = {
+    appearance_spatial: '外观+位置去重',
+    spatial: '位置去重',
+    new_track: '新人物',
+  };
+  if (dedupLabels[m.dedup_method]) parts.push(dedupLabels[m.dedup_method]);
+  return parts.join(' · ');
+}
 
 // ---- 地图初始化 ----
 function initMap() {
@@ -215,17 +668,43 @@ function initMap() {
       document.getElementById('searchW').value = region.w.toFixed(1);
       document.getElementById('searchH').value = region.h.toFixed(1);
       console.log('[选区]', region);
-    }
+    },
+    onSelectGoal: sendNavGoal,
   });
+  // 点地图上 person 标记 → 弹该目标的检测截图 (复用 detection snapshot modal — Q1=b)
+  map.onSelectMarker = (m) => {
+    const url = String((m && (m.frame_url || m.crop_url || m.photo_url || m.raw_url)) || '');
+    if (!url) return;
+    const baseLabel = String((m && (m.label_zh || m.label || m.class || m.name)) || '检测目标');
+    const evidence = personMarkerEvidenceLabel(m);
+    const label = evidence ? `${baseLabel} · ${evidence}` : baseLabel;
+    openDetectionSnapshot(url, label);
+  };
   map.start();
 }
 function clearRegion() { if (map) map.clearRegion(); }
-function clearTrail() { if (map) { map.slam.trail = []; } }
+function clearTrail() {
+  if (map) {
+    map.slam.trail = [];
+    // 2026-07-18 清规划路线虚线 + 目标点 (原只清 trail, plan/goal 留前端 = "清不掉")。
+    // costmap_bridge 持续推 /plan, 但清地图时导航会被 abort (clear_entirely 致 path
+    // 失效), nav2 停发 /plan, 前端 plan=null 保持; 若导航仍在跑 /plan 灌回属预期。
+    map.slam.plan = null;
+    if (map.slam.goal) { map.slam.goal = null; }
+    if (typeof map._markDirty === 'function') map._markDirty();
+  }
+  // 联动后端清 _trail (轨迹源头) + nav2 costmap (clearEntirely service);
+  // 否则前端清了, 下一帧 WS 又把后端 _trail 灌回 = 轨迹"清不掉"。
+  controlFetch('/api/clear_all', { method: 'POST' }).then(r => r.json()).then(d => {
+    console.log('clear_all:', d);
+  }).catch(e => console.warn('clear_all failed:', e));
+}
 
 // ---- 运动控制 ----
 // 速度档位 (偏稳, 后期可调): 前进0.4 后退0.4 转向0.5 平移0.3
 const SPEED = { fwd: 0.4, turn: 0.5, strafe: 0.3 };
 let pressedKeys = new Set();   // 当前按下的控制键
+let _manualMoveActive = false; // 只有本页实际发起过手动运动，释放事件才有权停车
 // _moveInterval 已在顶部 (line 206) 声明, 这里不重复声明
 
 // 按当前 pressedKeys 合成速度并发送 (键盘控制专用)
@@ -239,21 +718,33 @@ function sendMoveFromKeys() {
   if (pressedKeys.has('e')) vy  -= SPEED.strafe;
   // 多键组合直接发合成速度; 全松开则停
   if (vx === 0 && vy === 0 && vyaw === 0) stopMove();
-  else fetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, { method: 'POST' }).catch(() => {});
+  else move(vx, vy, vyaw);
 }
 
 // 按钮拖拽控制 (onmousedown 持续, onmouseup/leave 停)
 function move(vx, vy, vyaw) {
   clearInterval(_moveInterval);
-  fetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, { method: 'POST' });
+  _manualMoveActive = true;
+  controlFetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, { method: 'POST' });
   // RosRobotBridge 每次写stdin即时生效, 但保留低频续发以防丢包 (NX看门狗1s兜底)
-  _moveInterval = setInterval(() => fetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, { method: 'POST' }), 300);
+  _moveInterval = setInterval(() => controlFetch(`/api/move?vx=${vx}&vy=${vy}&vyaw=${vyaw}`, { method: 'POST' }), 300);
 }
-function stopMove() { clearInterval(_moveInterval); _moveInterval = null; fetch('/api/stop', { method: 'POST' }); }
-function connect() { fetch('/api/connect', { method: 'POST' }).then(r => r.json()).then(d => { if (d.ok) { connected = true; updateDogStatus(true); } }); }
-function stand() { fetch('/api/stand', { method: 'POST' }); }
-function sit() { fetch('/api/sit', { method: 'POST' }); }
-function eStop() { clearInterval(_moveInterval); _moveInterval = null; pressedKeys.clear(); resetKeyHighlight(); fetch('/api/e_stop', { method: 'POST' }); }
+function stopMove() {
+  clearInterval(_moveInterval);
+  _moveInterval = null;
+  if (_locateLoopTimer) { clearTimeout(_locateLoopTimer); _locateLoopTimer = null; }
+  if (!_manualMoveActive) return;
+  _manualMoveActive = false;
+  controlFetch('/api/manual_stop', { method: 'POST' });
+}
+function connect() { controlFetch('/api/connect', { method: 'POST' }).then(r => r.json()).then(d => { if (d.ok) { connected = true; updateDogStatus(true); } }); }
+function stand() { controlFetch('/api/stand', { method: 'POST' }); }
+function confirmStand() { controlFetch('/api/confirm_stand', { method: 'POST' }); }
+function enterBalance() { controlFetch('/api/balance', { method: 'POST' }); }
+function confirmBalance() { controlFetch('/api/confirm_balance', { method: 'POST' }); }
+function sit() { controlFetch('/api/sit', { method: 'POST' }); }
+function eStop() { clearInterval(_moveInterval); _moveInterval = null; if (_locateLoopTimer) { clearTimeout(_locateLoopTimer); _locateLoopTimer = null; } pressedKeys.clear(); resetKeyHighlight(); controlFetch('/api/e_stop', { method: 'POST' }); }
+function activateDog() { controlFetch('/api/activate', { method: 'POST' }).then(r => r.json()).then(d => { console.log('activate:', d); }).catch(e => console.warn('activate failed:', e)); }
 
 // ---- 键盘控制 ----
 const KEY_MAP = {
@@ -282,7 +773,8 @@ document.addEventListener('keydown', (e) => {
     highlightKey(KEY_MAP[k], true);
     sendMoveFromKeys();
   } else if (k === ' ' || k === 'spacebar') {
-    e.preventDefault(); eStop();     // 空格急停
+    // 2026-07-18 取消空格急停 (用户误触导致 operator_stop 取消导航); 急停请点按钮或调 /api/e_stop
+    // e.preventDefault(); eStop();
   } else if (k === '1' || k === 'pageup') { stand(); }
   else if (k === '2' || k === 'pagedown') { sit(); }
 });
@@ -305,17 +797,135 @@ function sendCmd() {
   const text = input.value.trim();
   if (!text) return;
   input.value = '';
-  fetch('/api/command', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+  controlFetch('/api/command', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
 }
 function quickCmd(text) { document.getElementById('cmdInput').value = text; sendCmd(); }
+// 搜索当前房间 (v2 frontier 探索 + YOLO 标人): 直接调 /api/search_room, 绕过 NLU 解析 (比 🎤 quick-btn 更可靠)
+function searchRoom(targetClasses) {
+  let tc = targetClasses || ['person'];
+  if (tc === 'all_objects') {
+    tc = ['person','chair','couch','dining table','bed','tv','laptop','refrigerator','microwave','oven','book','clock','vase','potted plant','backpack','bottle','cup','bowl'];
+  }
+  controlFetch('/api/search_room', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ room: 'current_room', target_classes: tc, max_frontiers: 100 })
+  }).then(r => r.json()).then(d => {
+    const el = document.getElementById('taskCount');
+    if (d.ok) {
+      if (el) el.textContent = '房间搜索已启动 (frontier 探索)';
+      console.log('search_room admitted:', d.mission_request && d.mission_request.request_id);
+    } else {
+      if (el) el.textContent = '搜索启动失败: ' + (d.reason || '未知');
+      console.warn('search_room rejected:', d);
+    }
+  }).catch(e => console.warn('search_room error:', e));
+}
+
+// ---- 语音输入 (浏览器 Web Speech API: PC 本地识别后发给 NX, 走 /api/command → parse_product_command) ----
+// 对抗性设计:
+//   1. 浏览器不支持 (Firefox 无 webkitSpeechRecognition) → alert + 文本输入降级
+//   2. 非 HTTPS/localhost → Chrome 可能拒绝 (onerror not-allowed 明确提示), 不静默失败
+//   3. STT 误识别 → 不自动发送, 填入 cmdInput 让用户回车确认 (狗的动作需人工放行)
+//   4. 二次点击 → stop 而非重启 (isRecognizing 状态保护)
+//   5. 网络错误 → Web Speech API 走在线服务需联网, onerror network 明确提示
+let _voiceRec = null;
+function toggleVoice() {
+  const btn = document.getElementById('voiceBtn');
+  if (_voiceRec && _voiceRec.isRecognizing) { _voiceRec.stop(); return; }
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    alert('浏览器不支持语音识别 (需 Chrome 或 Edge)。请用文本输入指令, 或点"房间搜人"快捷按钮测端到端。');
+    return;
+  }
+  if (window.location.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(window.location.hostname)) {
+    console.warn('[voice] 非 HTTPS/localhost, Chrome 可能拒绝语音识别。若失败请用文本输入, 或给 NX 部署 HTTPS 反代。');
+  }
+  if (!_voiceRec) {
+    _voiceRec = new SR();
+    _voiceRec.lang = 'zh-CN';
+    _voiceRec.continuous = false;
+    _voiceRec.interimResults = false;
+    _voiceRec.maxAlternatives = 1;
+    _voiceRec.onresult = (e) => {
+      const text = e.results[0][0].transcript;
+      const input = document.getElementById('cmdInput');
+      input.value = text;            // 填入输入框, 不自动发送 (STT 可能误识别)
+      input.focus();
+      console.log('[voice] 识别结果 (回车确认发送):', text);
+    };
+    _voiceRec.onerror = (e) => {
+      const msg = { 'not-allowed': '麦克风权限被拒, 或非安全上下文 (语音识别需 HTTPS 或 localhost)',
+                    'no-speech': '没听到语音, 请重试',
+                    'network': '网络错误 (Web Speech API 需联网)',
+                    'aborted': '已取消' }[e.error] || `语音错误: ${e.error}`;
+      console.error('[voice]', msg);
+      if (e.error !== 'aborted' && e.error !== 'no-speech') alert(msg);
+    };
+    _voiceRec.onend = () => {
+      _voiceRec.isRecognizing = false;
+      btn.textContent = '🎤'; btn.style.background = '';
+    };
+  }
+  try {
+    _voiceRec.isRecognizing = true;
+    _voiceRec.start();
+    btn.textContent = '⏹'; btn.style.background = '#d32f2f';
+  } catch (e) {
+    _voiceRec.isRecognizing = false;
+    console.error('[voice] start failed', e);
+  }
+}
 
 // 表单搜索: 从狗当前位置起, 按输入的宽高搜索
 function searchByForm() {
   const w = parseFloat(document.getElementById('searchW').value) || 8;
   const h = parseFloat(document.getElementById('searchH').value) || 8;
   const sp = parseFloat(document.getElementById('searchSpacing').value) || 2;
-  fetch(`/api/search?width=${w}&height=${h}&spacing=${sp}`, { method: 'POST' })
+  controlFetch(`/api/search?width=${w}&height=${h}&spacing=${sp}`, { method: 'POST' })
     .then(r => r.json()).then(d => { if (d.ok) { document.getElementById('taskCount').textContent = '搜索已启动'; } });
+}
+
+function toggleLocateLoop() {
+  const btn = document.getElementById('locateLoopBtn');
+  if (_locateLoopTimer) {
+    clearTimeout(_locateLoopTimer); _locateLoopTimer = null;
+    btn.textContent = '持续扫描'; btn.style.background = '';
+    return;
+  }
+  const target = (document.getElementById('locateInput').value || '所有可见物体').trim();
+  btn.textContent = '停止扫描'; btn.style.background = '#d32f2f';
+  const tick = async () => {
+    if (!_locateLoopTimer) return;
+    try { await controlFetch(`/api/locate?target=${encodeURIComponent(target)}`, { method: 'POST' }); }
+    catch (e) {}
+    if (_locateLoopTimer) _locateLoopTimer = setTimeout(tick, 2000);
+  };
+  _locateLoopTimer = setTimeout(tick, 0);
+}
+
+function locateTarget() {
+  const input = document.getElementById('locateInput');
+  const target = (input.value || '').trim();
+  if (!target) return;
+  const meta = document.getElementById('videoMeta');
+  if (meta) meta.textContent = `定位中: ${target}`;
+  controlFetch(`/api/locate?target=${encodeURIComponent(target)}`, { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      const result = d.result || {};
+      result.target = d.target || result.target || target;
+      if (Array.isArray(result.detections)) updateDetList(result.detections);
+      renderLocateOverlay(result);
+      if (meta) {
+        const status = result.description || result.status || d.msg || (result.found ? 'found' : 'no detections');
+        meta.textContent = result.found ? `定位: ${d.target || target}` : `定位未命中: ${status}`;
+      }
+    })
+    .catch(() => {
+      showLocateNote('LocateAnything: 请求未完成');
+      if (meta) meta.textContent = '定位失败: 请求未完成';
+    });
 }
 
 function openFoxglove() {
@@ -331,17 +941,25 @@ function updateDogStatus(on) {
   dot.className = 'status-dot ' + (on ? 'on' : 'off');
 }
 function updateDogState(state) {
-  // state: STOPPED/MOVING/STANDING/SITTING/SEATED/EMERGENCY/UNKNOWN
+  // state: STOPPED/MOVING/STANDING/STAND_UNCONFIRMED/STOOD/BALANCE_UNCONFIRMED/SITTING/SEATED/EMERGENCY/UNKNOWN
   const el = document.getElementById('dogStateLabel');
   if (!el) return;
   const colors = { STOPPED:'#4caf50', MOVING:'#ff9800', STANDING:'#2196f3',
-                   SITTING:'#ff9800', SEATED:'#888', EMERGENCY:'#f44336', UNKNOWN:'#666' };
+                   STAND_UNCONFIRMED:'#ff9800', SITTING:'#ff9800', SEATED:'#888',
+                   STOOD:'#2196f3', BALANCE_UNCONFIRMED:'#ff9800',
+                   EMERGENCY:'#f44336', FAULT:'#ff9800', UNKNOWN:'#666' };
   el.textContent = state || '--';
   el.style.color = colors[state] || '#888';
   // 急停时狗状态点变红闪烁
   const dot = document.getElementById('dogDot');
   if (state === 'EMERGENCY') dot.className = 'status-dot warn';
   else if (state && state !== 'UNKNOWN') dot.className = 'status-dot on';
+  const confirmBtn = document.getElementById('confirmStandBtn');
+  if (confirmBtn) confirmBtn.disabled = state !== 'STAND_UNCONFIRMED';
+  const balanceBtn = document.getElementById('balanceBtn');
+  if (balanceBtn) balanceBtn.disabled = state !== 'STOOD';
+  const confirmBalanceBtn = document.getElementById('confirmBalanceBtn');
+  if (confirmBalanceBtn) confirmBalanceBtn.disabled = state !== 'BALANCE_UNCONFIRMED';
 }
 function updateSlamStatus(source) {
   const dot = document.getElementById('slamDot');
@@ -362,94 +980,995 @@ function updateTasks(data) {
   el.innerHTML = html;
   countEl.textContent = `${pending.length} 待执行`;
 }
+function _escapeHTML(value) {
+  return String(value).replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
 function taskHTML(t) {
-  const icons = { navigate: '→', search_area: '◎', follow: '◎', move: '→', stop: '■', return_home: '↩', observe: '◎', wait: '◎' };
-  const typeNames = { navigate: '导航', search_area: '区域搜索', follow: '跟踪', move: '移动', stop: '停止', return_home: '返回', observe: '观察', wait: '等待' };
-  return `<div class="task-item"><div class="task-icon ${t.status}">${icons[t.type] || '?'}</div><div class="task-info"><div class="task-type">${typeNames[t.type] || t.type}</div><div class="task-params">${JSON.stringify(t.params).slice(0, 48)}</div></div><span class="task-status ${t.status}">${t.status}</span></div>`;
+  const icons = { navigate: '→', search_area: '◎', search_room: '⌂', follow: '◎', move: '→', stop: '■', return_home: '↩', observe: '◎', wait: '◎' };
+  const typeNames = { navigate: '导航', search_area: '区域搜索', search_room: '房间搜索', follow: '跟踪', move: '移动', stop: '停止', return_home: '返回', observe: '观察', wait: '等待' };
+  const status = _escapeHTML(t.status);
+  const typeName = _escapeHTML(typeNames[t.type] || t.type);
+  const params = _escapeHTML(JSON.stringify(t.params)).slice(0, 48);
+  return `<div class="task-item"><div class="task-icon ${status}">${icons[t.type] || '?'}</div><div class="task-info"><div class="task-type">${typeName}</div><div class="task-params">${params}</div></div><span class="task-status ${status}">${status}</span></div>`;
 }
 function updateDetList(dets) {
   const el = document.getElementById('detList');
-  if (!dets || !dets.length) { el.innerHTML = '<div class="det-empty">无检测</div>'; return; }
-  el.innerHTML = dets.map(d => `<div class="det-item"><span>${d.class}</span><span>${Math.round(d.confidence * 100)}%</span></div>`).join('');
+  if (!el) return;
+  dets = preferredDetectionResults(
+    filterDetectionResults(dets), missionTargetMarkers);
+  if (Array.isArray(dets) && dets.some(d => d && (d.crop_url || d.frame_url))) {
+    updateDetectionListRich(dets);
+    return;
+  }
+  const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+  const personNumber = (d, fallback) => {
+    const rawId = d.person_id ?? d.id ?? '';
+    const match = String(rawId).match(/(\d+)$/);
+    return match ? String(Number(match[1])) : String(fallback + 1);
+  };
+  const displayLabel = (d, index) => {
+    const raw = String(d.label_zh || d.label || d.class || d.name || d.type || '').trim();
+    const key = String(d.class || d.label || d.type || '').toLowerCase();
+    const isPerson = d.person_id !== undefined || key === 'person' || key === 'people' || key === 'person_marker';
+    if (isPerson) return `人${personNumber(d, index)}`;
+    if (key === 'dining table' || key === 'table') return `桌子${personNumber(d, index)}`;
+    return raw || '目标';
+  };
+  const displayMeta = (d) => {
+    const conf = Number(d.confidence ?? d.score ?? d.probability);
+    if (Number.isFinite(conf)) return `${Math.round(conf * 100)}%`;
+    if (d.position_quality) return d.position_quality;
+    if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) return `${Number(d.x).toFixed(1)}, ${Number(d.y).toFixed(1)}`;
+    return '';
+  };
+  const safePhotoUrl = (d) => {
+    const url = d.photo_url || d.crop_url || d.raw_url || '';
+    return /^\s*javascript:/i.test(url) ? '' : url;
+  };
+  if (!Array.isArray(dets) || !dets.length) { el.innerHTML = '<div class="det-empty">无检测</div>'; return; }
+  el.innerHTML = dets.map((d, index) => {
+    const photoUrl = safePhotoUrl(d);
+    const photo = photoUrl ? ` <a href="${escapeHtml(photoUrl)}" target="_blank" rel="noopener">照片</a>` : '';
+    return `<div class="det-item"><span>${escapeHtml(displayLabel(d, index))}${photo}</span><span>${escapeHtml(displayMeta(d))}</span></div>`;
+  }).join('');
 }
 
+function detectionLabel(d, index) {
+  const raw = String(d.label_zh || d.label || d.class || d.name || 'target').trim();
+  const key = String(d.class || d.label || '').toLowerCase();
+  const zhMap = { person: '人', chair: '椅子', table: '桌子', desk: '桌子', bottle: '瓶子', cup: '杯子', backpack: '背包', bag: '包', car: '车' };
+  const label = zhMap[key] || raw || '目标';
+  return `${label}${index >= 0 ? ` ${index + 1}` : ''}`;
+}
+
+function detectionSourceLabel(source) {
+  const key = String(source || '').toLowerCase();
+  const map = { c13_vis: '可见光', c13_ir: '红外', mock: '模拟' };
+  return map[key] || key || '';
+}
+
+function safeSnapshotUrl(url) {
+  const value = String(url || '');
+  return /^\s*javascript:/i.test(value) ? '' : value;
+}
+
+function updateDetectionListRich(dets) {
+  const el = document.getElementById('detList');
+  if (!el) return;
+  dets = preferredDetectionResults(
+    filterDetectionResults(dets), missionTargetMarkers);
+  if (!Array.isArray(dets) || !dets.length) {
+    el.innerHTML = '<div class="det-empty">无检测</div>';
+    return;
+  }
+  el.innerHTML = dets.slice(0, 8).map((d, index) => {
+    const cropUrl = safeSnapshotUrl(d.crop_url);
+    const frameUrl = safeSnapshotUrl(d.frame_url || d.crop_url);
+    const label = _escapeHTML(detectionLabel(d, index));
+    const conf = Number(d.confidence ?? d.score ?? 0);
+    const range = Number(d.range_m ?? d.range);
+    const metaParts = [];
+    const sourceLabel = detectionSourceLabel(d.source);
+    if (sourceLabel) metaParts.push(sourceLabel);
+    if (Number.isFinite(conf) && conf > 0) metaParts.push(`${Math.round(conf * 100)}%`);
+    if (Number.isFinite(range) && range > 0) metaParts.push(`${range.toFixed(1)}m`);
+    const evidence = personMarkerEvidenceLabel(d);
+    if (evidence) metaParts.push(evidence);
+    const meta = _escapeHTML(metaParts.join(' · '));
+    const thumb = cropUrl
+      ? `<img class="det-thumb" src="${_escapeHTML(cropUrl)}" alt="${label}" data-frame-url="${_escapeHTML(frameUrl)}" data-title="${label}" onclick="openDetectionSnapshot(this.dataset.frameUrl,this.dataset.title)">`
+      : '';
+    return `<div class="det-item"><div class="det-left">${thumb}<span class="det-name">${label}</span></div><span class="det-meta">${meta}</span></div>`;
+  }).join('');
+}
+
+function openDetectionSnapshot(url, title) {
+  const safeUrl = safeSnapshotUrl(url);
+  if (!safeUrl) return;
+  const modal = document.getElementById('snapshotModal');
+  const img = document.getElementById('snapshotImg');
+  const label = document.getElementById('snapshotTitle');
+  if (!modal || !img) return;
+  img.src = safeUrl;
+  if (label) label.textContent = title || 'Detection snapshot';
+  modal.classList.add('open');
+}
+
+function closeDetectionSnapshot(event) {
+  if (event) {
+    const modal = document.getElementById('snapshotModal');
+    if (event.target !== modal && !event.target.closest('.snapshot-modal-bar .btn')) return;
+    event.stopPropagation();
+  }
+  const modal = document.getElementById('snapshotModal');
+  if (modal) modal.classList.remove('open');
+}
+
+function updateDetectionBadge() {
+  const badge = document.getElementById('detBadge');
+  const displayed = preferredDetectionResults(
+    latestDetections, missionTargetMarkers);
+  if (badge) badge.textContent = displayed.length + ' 目标';
+}
+
+function updateMissionTargetMarkers(markers) {
+  missionTargetMarkers = filterDetectionResults(markers);
+  if (map) map.update({ target_markers: missionTargetMarkers });
+  updateDetectionBadge();
+  updateDetList(missionTargetMarkers);
+  return missionTargetMarkers;
+}
+
+function detectionStreamFromPayload(payload, source) {
+  if (payload && Array.isArray(payload.streams)) {
+    const stream = payload.streams.find(s => String(s.source || '') === source);
+    return stream
+      ? { ...stream, detections: filterDetectionResults(stream.detections) }
+      : { source, detections: [] };
+  }
+  const all = filterDetectionResults(
+    Array.isArray(payload) ? payload : (payload && payload.detections),
+  );
+  const hasSource = all.some(d => d && d.source);
+  const dets = source && hasSource ? all.filter(d => String(d.source || '') === source) : all;
+  return {
+    source: source || (payload && payload.source) || 'c13_vis',
+    frame_width: payload && payload.frame_width,
+    frame_height: payload && payload.frame_height,
+    detections: dets,
+  };
+}
+
+function scheduleDetectionOverlay(payload, source = 'c13_vis', expectedGeneration = null) {
+  return overlayFrameScheduler.schedule(
+    `detection:${source}`,
+    { payload, expectedGeneration },
+    latest => {
+      if (latest.expectedGeneration !== null
+          && latest.expectedGeneration !== streamFrameGeneration[source]) return;
+      renderDetectionOverlay(latest.payload, source);
+    },
+  );
+}
+
+function scheduleLocateOverlay(result, options = {}) {
+  const record = options.record === true;
+  if (record) {
+    latestLocateResult = result || null;
+    if (result) latestLocateTs = Date.now();
+  }
+  const generation = options.expectedGeneration === undefined
+    ? streamFrameGeneration.c13_vis : options.expectedGeneration;
+  return overlayFrameScheduler.schedule(
+    'locate:c13_vis',
+    { result: result || null, generation },
+    latest => {
+      if (latest.generation !== streamFrameGeneration.c13_vis) return;
+      renderLocateOverlay(latest.result, false);
+    },
+  );
+}
+
+function recordStreamFrame(source) {
+  if (source !== 'c13_vis') return;
+  const now = Date.now();
+  lastVisFrameAt = now;
+  visibleFrameTimes.push(now);
+  visibleFrameTimes = visibleFrameTimes.filter(
+    timestamp => now - timestamp <= VISIBLE_FPS_WINDOW_MS);
+}
+
+function currentVisibleFrameRate(now = Date.now()) {
+  visibleFrameTimes = visibleFrameTimes.filter(
+    timestamp => now - timestamp <= VISIBLE_FPS_WINDOW_MS);
+  if (!visibleFrameTimes.length || now - lastVisFrameAt > 1500) return null;
+  if (visibleFrameTimes.length === 1) return 1;
+  const elapsed = (
+    visibleFrameTimes[visibleFrameTimes.length - 1] - visibleFrameTimes[0]
+  ) / 1000;
+  if (elapsed <= 0) return 1;
+  return Math.max(1, Math.round((visibleFrameTimes.length - 1) / elapsed));
+}
+
+function setStreamImageSource(source, imageSource, onSettled = null) {
+  const view = DETECTION_VIEWS[source];
+  if (!view || !imageSource) return false;
+  const img = document.getElementById(view.imgId);
+  if (!img) return false;
+  const generation = (streamFrameGeneration[source] || 0) + 1;
+  streamFrameGeneration[source] = generation;
+  img.onload = () => {
+    if (typeof onSettled === 'function') onSettled(true);
+    if (generation !== streamFrameGeneration[source]) return;
+    recordStreamFrame(source);
+    const detections = latestDetectionsBySource[source] || [];
+    if (detections.length) {
+      scheduleDetectionOverlay({ detections }, source, generation);
+    }
+    if (source === 'c13_vis' && latestLocateResult) {
+      scheduleLocateOverlay(latestLocateResult, { expectedGeneration: generation });
+    }
+  };
+  img.onerror = () => {
+    if (typeof onSettled === 'function') onSettled(false);
+  };
+  img.src = imageSource;
+  img.style.display = 'block';
+  const empty = document.getElementById(view.emptyId);
+  if (empty) empty.style.display = 'none';
+  return true;
+}
+
+function setStreamImage(source, base64Payload) {
+  if (!base64Payload) return false;
+  return setStreamImageSource(
+    source, `data:image/jpeg;base64,${base64Payload}`);
+}
+
+function refreshVideoFrameFallback(now = Date.now()) {
+  if (videoFallbackInFlight || now - lastVisFrameAt < 1500) return false;
+  videoFallbackInFlight = true;
+  const source = `/api/video_frame?source=c13_vis&t=${encodeURIComponent(now)}`;
+  const probe = new Image();
+  probe.onload = () => {
+    videoFallbackInFlight = false;
+    if (Date.now() - lastVisFrameAt < 1500) return;
+    setStreamImageSource('c13_vis', source);
+  };
+  probe.onerror = () => { videoFallbackInFlight = false; };
+  probe.src = source;
+  return true;
+}
+
+function renderDetectionOverlay(payload, source = 'c13_vis') {
+  const view = DETECTION_VIEWS[source] || DETECTION_VIEWS.c13_vis;
+  const overlay = document.getElementById(view.overlayId);
+  if (!overlay) return;
+  const stream = detectionStreamFromPayload(payload, source);
+  const dets = filterDetectionResults(stream.detections);
+  latestDetectionsBySource[source] = dets;
+  latestDetections = Object.values(latestDetectionsBySource).flat();
+  overlay.innerHTML = '';
+  updateDetectionBadge();
+  if (!dets.length) return;
+
+  const img = document.getElementById(view.imgId);
+  const wrap = overlay.parentElement;
+  if (!img || !wrap) return;
+  const imgRect = img.getBoundingClientRect();
+  const wrapRect = wrap.getBoundingClientRect();
+  if (imgRect.width <= 0 || imgRect.height <= 0) return;
+
+  dets.forEach((d, index) => {
+    if (!Array.isArray(d.bbox) || d.bbox.length < 4) return;
+    const frameW = Number(d.frame_width || stream.frame_width) || 0;
+    const frameH = Number(d.frame_height || stream.frame_height) || 0;
+    if (frameW <= 0 || frameH <= 0) return;
+    const [x1, y1, x2, y2] = clampBox(d.bbox, frameW, frameH);
+    if (x2 <= x1 || y2 <= y1) return;
+    const left = imgRect.left - wrapRect.left + (x1 / frameW) * imgRect.width;
+    const top = imgRect.top - wrapRect.top + (y1 / frameH) * imgRect.height;
+    const width = Math.max(2, ((x2 - x1) / frameW) * imgRect.width);
+    const height = Math.max(2, ((y2 - y1) / frameH) * imgRect.height);
+    const box = document.createElement('div');
+    box.className = 'detect-box';
+    box.style.left = `${left}px`;
+    box.style.top = `${top}px`;
+    box.style.width = `${width}px`;
+    box.style.height = `${height}px`;
+    const label = document.createElement('div');
+    label.className = 'detect-box-label';
+    const conf = Number(d.confidence ?? 0);
+    label.textContent = `${detectionLabel(d, index)}${Number.isFinite(conf) && conf > 0 ? ` ${Math.round(conf * 100)}%` : ''}`;
+    box.appendChild(label);
+    overlay.appendChild(box);
+  });
+}
+
+function renderDetectionStreams(payload) {
+  const streams = payload && Array.isArray(payload.streams) && payload.streams.length
+    ? payload.streams
+    : [detectionStreamFromPayload(payload, (payload && payload.source) || 'c13_vis')];
+  latestDetectionsBySource = {};
+  const renderedOverlays = new Set();
+  for (const source of Object.keys(DETECTION_VIEWS)) {
+    const stream = streams.find(s => String(s.source || '') === source) || { source, detections: [] };
+    const view = DETECTION_VIEWS[source];
+    const dets = Array.isArray(stream.detections) ? stream.detections : [];
+    if (view && renderedOverlays.has(view.overlayId) && !dets.length) continue;
+    scheduleDetectionOverlay(stream, source, streamFrameGeneration[source]);
+    if (view) renderedOverlays.add(view.overlayId);
+  }
+  latestDetections = Array.isArray(payload && payload.detections)
+    ? filterDetectionResults(payload.detections)
+    : Object.values(latestDetectionsBySource).flat();
+  updateDetectionBadge();
+}
+
+function collectLocateBoxes(result) {
+  if (!result) return [];
+  const dets = filterDetectionResults(result.detections);
+  const boxes = dets
+    .filter(d => Array.isArray(d.bbox) && d.bbox.length >= 4)
+    .map(d => {
+      const _c = d.class || d.label || '';
+      return {
+        bbox: d.bbox,
+        label: _isGenericClass(_c) ? (result.target || _c || 'object') : _c,  // M3: CLI 泛化占位时 fallback target
+        labelZh: d.label_zh || result.label_zh || '',
+        confidence: d.confidence || result.confidence || 0,
+        frameWidth: d.frame_width || result.frame_width,
+        frameHeight: d.frame_height || result.frame_height,
+      };
+    });
+  if (boxes.length) return boxes;
+  if (Array.isArray(result.bbox) && result.bbox.length >= 4
+      && filterDetectionResults([result]).length) {
+    return [{
+      bbox: result.bbox,
+      label: result.label || result.target || 'object',
+      labelZh: result.label_zh || '',
+      confidence: result.confidence || 0,
+      frameWidth: result.frame_width,
+      frameHeight: result.frame_height,
+    }];
+  }
+  return [];
+}
+
+function clampBox(bbox, frameW, frameH) {
+  const [rawX1, rawY1, rawX2, rawY2] = bbox.map(Number);
+  const x1 = Math.max(0, Math.min(frameW, rawX1));
+  const y1 = Math.max(0, Math.min(frameH, rawY1));
+  const x2 = Math.max(0, Math.min(frameW, rawX2));
+  const y2 = Math.max(0, Math.min(frameH, rawY2));
+  return [Math.min(x1, x2), Math.min(y1, y2), Math.max(x1, x2), Math.max(y1, y2)];
+}
+
+function displayLocateLabel(boxData, index, total) {
+  const rawZh = (boxData.labelZh || boxData.label_zh || '').trim();
+  const raw = String(boxData.label || boxData.class || 'object').trim();
+  const key = raw.toLowerCase();
+  const zhMap = {
+    object: '物体',
+    objects: '物体',
+    person: '人',
+    people: '人',
+    'person wearing white clothes': '白衣人',
+    'person wearing black clothes': '黑衣人',
+    'person wearing blue clothes': '蓝衣人',
+    'person wearing red clothes': '红衣人',
+    chair: '椅子',
+    table: '桌子',
+    desk: '桌子',
+    door: '门',
+    window: '窗户',
+    car: '车',
+    vehicle: '车',
+    backpack: '背包',
+    bag: '包',
+    box: '箱子',
+    bottle: '瓶子',
+    cup: '杯子',
+    screen: '屏幕',
+  };
+  const _isGenT = (s) => _LOCATE_GENERIC.has((s || '').toLowerCase()) || /所有|全部|可见|东西/.test(s || '');
+  const label = (!_isGenT(rawZh) && rawZh) ? rawZh : (zhMap[key] || (!_isGenT(raw) ? raw : '') || '目标');
+  return total > 1 ? `${label} ${index + 1}` : label;
+}
+
+function showLocateNote(text) {
+  const overlay = document.getElementById('locateOverlay');
+  if (!overlay) return;
+  overlay.innerHTML = '';
+  const note = document.createElement('div');
+  note.className = 'locate-note';
+  note.textContent = text;
+  overlay.appendChild(note);
+}
+
+function renderLocateOverlay(result, record = true) {
+  if (record) {
+    latestLocateResult = result || null;
+    if (result) latestLocateTs = Date.now();  // M3: 刷新 TTL 时间戳
+  }
+  const overlay = document.getElementById('locateOverlay');
+  if (!overlay) return;
+  overlay.innerHTML = '';
+  if (!result) return;
+
+  const boxes = collectLocateBoxes(result);
+  if (!result.found || !boxes.length) {
+    const target = result.target ? `: ${result.target}` : '';
+    const status = result.description || result.status || 'no detections';
+    showLocateNote(`LocateAnything${target} - ${status}`);
+    return;
+  }
+
+  const img = document.getElementById('videoImg');
+  const wrap = overlay.parentElement;
+  if (!img || !wrap) {
+    showLocateNote('LocateAnything: 缺少可见光画面，无法画框');
+    return;
+  }
+
+  const imgRect = img.getBoundingClientRect();
+  const wrapRect = wrap.getBoundingClientRect();
+  if (imgRect.width <= 0 || imgRect.height <= 0) {
+    showLocateNote('LocateAnything: 等待视频帧');
+    return;
+  }
+
+  let drawn = 0;
+  boxes.forEach((boxData, index) => {
+    const frameW = Number(boxData.frameWidth) || 0;
+    const frameH = Number(boxData.frameHeight) || 0;
+    if (frameW <= 0 || frameH <= 0) return;
+    const [x1, y1, x2, y2] = clampBox(boxData.bbox, frameW, frameH);
+    if (x2 <= x1 || y2 <= y1) return;
+    const left = imgRect.left - wrapRect.left + (x1 / frameW) * imgRect.width;
+    const top = imgRect.top - wrapRect.top + (y1 / frameH) * imgRect.height;
+    const width = Math.max(2, ((x2 - x1) / frameW) * imgRect.width);
+    const height = Math.max(2, ((y2 - y1) / frameH) * imgRect.height);
+    const box = document.createElement('div');
+    box.className = 'locate-box';
+    box.style.left = `${left}px`;
+    box.style.top = `${top}px`;
+    box.style.width = `${width}px`;
+    box.style.height = `${height}px`;
+
+    const label = document.createElement('div');
+    label.className = 'locate-box-label';
+    const conf = (boxData.confidence && boxData.confidence < 0.999) ? ` ${Math.round(boxData.confidence * 100)}%` : '';  // M3: 默认 1.0 (CLI 不给真实 conf) 不显示, 避免 "100%" 误导
+    label.textContent = `${displayLocateLabel(boxData, index, boxes.length)}${conf}`;
+    box.appendChild(label);
+    overlay.appendChild(box);
+    drawn++;
+  });
+  if (!drawn) showLocateNote('LocateAnything: 缺少图像尺寸，无法画框');
+}
+
+// ---- Panel lifecycle helpers ----
+function computeWsReconnectDelay(attempt, randomValue = Math.random()) {
+  const exponent = Math.max(0, Math.min(20, Number(attempt) || 0));
+  const base = Math.min(10000, 500 * (2 ** exponent));
+  const jitter = 0.8 + 0.4 * Math.max(0, Math.min(1, Number(randomValue) || 0));
+  return Math.min(10000, Math.max(0, Math.round(base * jitter)));
+}
+
+function createLatestFrameScheduler(runtime = {}) {
+  const requestFrame = runtime.requestFrame || requestAnimationFrame;
+  const cancelFrame = runtime.cancelFrame || cancelAnimationFrame;
+  const states = new Map();
+  return {
+    schedule(source, payload, render) {
+      const key = String(source || 'default');
+      const state = states.get(key) || {
+        generation: 0, epoch: 0, rafId: null, payload: null, render: null,
+      };
+      state.generation += 1;
+      state.payload = payload;
+      state.render = render;
+      states.set(key, state);
+      if (state.rafId === null) {
+        const scheduledEpoch = state.epoch;
+        state.rafId = requestFrame(() => {
+          if (state.epoch !== scheduledEpoch) return;
+          state.rafId = null;
+          const latestPayload = state.payload;
+          const latestRender = state.render;
+          state.payload = null;
+          if (typeof latestRender === 'function') latestRender(latestPayload);
+        });
+      }
+      return state.generation;
+    },
+    isCurrent(source, generation) {
+      const state = states.get(String(source || 'default'));
+      return !!state && state.generation === generation;
+    },
+    cancel(source) {
+      const state = states.get(String(source || 'default'));
+      if (!state) return;
+      state.epoch += 1;
+      state.generation += 1;
+      if (state.rafId !== null) cancelFrame(state.rafId);
+      state.rafId = null;
+      state.payload = null;
+      state.render = null;
+    },
+  };
+}
+
+function createStatusPoller(runtime) {
+  const setTimer = runtime.setTimeoutFn || setTimeout;
+  const clearTimer = runtime.clearTimeoutFn || clearTimeout;
+  const intervalMs = Number(runtime.intervalMs) || 3000;
+  const timeoutMs = Number(runtime.timeoutMs) || 2500;
+  let timer = null;
+  let running = false;
+  let stopped = true;
+  let controller = null;
+  const schedule = delay => {
+    if (stopped || timer !== null) return;
+    timer = setTimer(() => { timer = null; void poll(); }, Math.max(0, delay));
+  };
+  const poll = async () => {
+    if (stopped || running) return;
+    running = true;
+    const epoch = runtime.getEpoch();
+    const realtimeVersion = runtime.getVersion ? runtime.getVersion() : null;
+    controller = new AbortController();
+    const timeout = setTimer(() => controller.abort(), timeoutMs);
+    try {
+      const snapshot = await runtime.fetchStatus(controller.signal);
+      const versionCurrent = !runtime.getVersion
+        || realtimeVersion === runtime.getVersion();
+      if (!stopped && epoch === runtime.getEpoch() && versionCurrent) {
+        runtime.applySnapshot(snapshot, epoch);
+      }
+    } catch (error) {
+      if (runtime.onError) runtime.onError(error, epoch);
+    } finally {
+      clearTimer(timeout);
+      controller = null;
+      running = false;
+      schedule(intervalMs);
+    }
+  };
+  return {
+    start(delay = 0) { if (!stopped) return; stopped = false; schedule(delay); },
+    stop() {
+      stopped = true;
+      if (timer !== null) clearTimer(timer);
+      timer = null;
+      if (controller) controller.abort();
+    },
+    poll,
+    state: () => ({ running, scheduled: timer !== null }),
+  };
+}
+
+function createSocketLifecycle(runtime) {
+  const setTimer = runtime.setTimeoutFn || setTimeout;
+  const clearTimer = runtime.clearTimeoutFn || clearTimeout;
+  const setEvery = runtime.setIntervalFn || setInterval;
+  const clearEvery = runtime.clearIntervalFn || clearInterval;
+  const now = runtime.now || (() => Date.now());
+  const random = runtime.random || (() => Math.random());
+  let socket = null;
+  let reconnectTimer = null;
+  let watchdog = null;
+  let attempt = 0;
+  let lastMessageAt = 0;
+  const scheduleReconnect = () => {
+    if (reconnectTimer !== null) return;
+    const delay = Math.max(1000, computeWsReconnectDelay(attempt, random()));
+    attempt = Math.min(20, attempt + 1);
+    reconnectTimer = setTimer(() => { reconnectTimer = null; connect(); }, delay);
+  };
+  const connect = () => {
+    if (socket && (socket.readyState === 0 || socket.readyState === 1)) return socket;
+    const current = runtime.createSocket(runtime.url);
+    socket = current;
+    let closeHandled = false;
+    if (runtime.onSocket) runtime.onSocket(current);
+    current.onopen = () => {
+      if (reconnectTimer !== null) clearTimer(reconnectTimer);
+      reconnectTimer = null;
+      attempt = 0;
+      lastMessageAt = now();
+      if (watchdog !== null) clearEvery(watchdog);
+      watchdog = setEvery(() => {
+        if (current.readyState === 1 && now() - lastMessageAt >= 6000) {
+          current.close(4000, 'stale websocket');
+        }
+      }, 2000);
+      if (runtime.onOpen) runtime.onOpen(current);
+    };
+    current.onmessage = event => {
+      lastMessageAt = now();
+      if (runtime.onMessage) runtime.onMessage(current, event);
+    };
+    current.onclose = event => {
+      if (closeHandled) return;
+      closeHandled = true;
+      if (watchdog !== null) clearEvery(watchdog);
+      watchdog = null;
+      if (runtime.onClose) runtime.onClose(current, event);
+      scheduleReconnect();
+    };
+    return current;
+  };
+  return { connect, state: () => ({ socket, attempt, reconnectScheduled: reconnectTimer !== null }) };
+}
+
+// ---- Realtime lifecycle core (kept deterministic for browser tests) ----
+const STATUS_POLL_INTERVAL_MS = 3000;
+const STATUS_REQUEST_TIMEOUT_MS = 2500;
+let ws = null;
+let lastWsMessageAt = 0;
+let statusRequestPromise = null;
+let statusRequestController = null;
+let statusRequestToken = 0;
+let realtimeStateVersion = 0;
+
+function markRealtimeStateUpdate() {
+  realtimeStateVersion += 1;
+  return realtimeStateVersion;
+}
+
+const STATUS_OVERLAP_WS_TYPES = new Set([
+  'status', 'tasks', 'nav_goal', 'detections', 'locate',
+  'target_markers', 'person_markers', 'search_room', 'mission_report',
+]);
+
+function wsMessageOverlapsStatus(type) {
+  return STATUS_OVERLAP_WS_TYPES.has(String(type || ''));
+}
+
+function cacheDetectionSnapshot(detections) {
+  const filtered = filterDetectionResults(detections);
+  const nextBySource = {};
+  const sources = Object.keys(DETECTION_VIEWS);
+  for (const source of sources) {
+    overlayFrameScheduler.cancel(`detection:${source}`);
+    nextBySource[source] = [];
+  }
+  for (const detection of filtered) {
+    const requested = String((detection && detection.source) || '');
+    const source = sources.includes(requested) ? requested : 'c13_vis';
+    if (nextBySource[source]) nextBySource[source].push(detection);
+  }
+  latestDetectionsBySource = nextBySource;
+  latestDetections = filtered.slice();
+  updateDetectionBadge();
+  // HTTP status contains metadata but no frame identity.  Clear stale boxes
+  // now and let the next matching image onload paint the cached detections.
+  for (const view of Object.values(DETECTION_VIEWS)) {
+    const overlay = document.getElementById(view.overlayId);
+    if (overlay) overlay.innerHTML = '';
+  }
+  return filtered;
+}
+
+function updateServiceBar(services) {
+  if (!services || typeof services !== 'object') return;
+  const bar = document.getElementById('svcBar');
+  if (!bar) return;
+  let html = '';
+  for (const [name, info] of Object.entries(services)) {
+    const item = info || {};
+    html += `<span class="svc-item" title="${name}: ${item.state || ''}"><span class="svc-dot ${item.color || ''}"></span>${item.label || name}</span>`;
+  }
+  bar.innerHTML = html;
+}
+
+function updateStreamHealthMetadata(snapshot) {
+  const stats = snapshot && snapshot.stats && typeof snapshot.stats === 'object'
+    ? snapshot.stats : {};
+  const dot = document.getElementById('nxDot');
+  if (dot) {
+    const clients = Number(stats.ws_connected_clients);
+    const depth = Number(stats.ws_reliable_depth);
+    const replaced = Number(stats.ws_stream_replaced);
+    const parts = [];
+    if (Number.isFinite(clients)) parts.push(`WS clients ${clients}`);
+    if (Number.isFinite(depth)) parts.push(`reliable queue ${depth}`);
+    if (Number.isFinite(replaced)) parts.push(`stream replacements ${replaced}`);
+    if (parts.length) dot.title = parts.join(' · ');
+    if (dot.dataset) {
+      if (Number.isFinite(clients)) dot.dataset.wsClients = String(clients);
+      if (Number.isFinite(depth)) dot.dataset.wsReliableDepth = String(depth);
+      if (Number.isFinite(replaced)) dot.dataset.wsStreamReplaced = String(replaced);
+    }
+  }
+  const perception = snapshot && snapshot.perception;
+  const videoMeta = document.getElementById('videoMeta');
+  if (videoMeta && perception && typeof perception === 'object') {
+    const source = String(perception.source || '感知');
+    const age = Number(perception.age_sec);
+    latestPerceptionHealthy = (
+      perception.healthy === true && perception.frame_available === true);
+    videoMeta.textContent = latestPerceptionHealthy
+      ? `${source} · 实时${Number.isFinite(age) ? ` · ${age.toFixed(2)}s` : ''}`
+      : `感知异常 · ${perception.reason || 'unknown'}`;
+    videoMeta.title = [
+      `perception: ${latestPerceptionHealthy ? 'healthy' : 'unhealthy'}`,
+      `reason: ${perception.reason || 'unknown'}`,
+      `source: ${source}`,
+    ].join(' · ');
+  }
+}
+
+function applyStatusSnapshot(snapshot, epoch = navConnectionEpoch) {
+  if (!snapshot || typeof snapshot !== 'object' || epoch !== navConnectionEpoch) return false;
+  if (snapshot.connected !== undefined) {
+    connected = snapshot.connected === true;
+    updateDogStatus(connected);
+  }
+  if (snapshot.dog_state) updateDogState(snapshot.dog_state);
+  if (snapshot.tasks) updateTasks(snapshot.tasks);
+  if (snapshot.navigation) applyNavigationReadiness(snapshot.navigation);
+  if (snapshot.point_nav) applyNavStateForEpoch(snapshot.point_nav, 'status', epoch);
+  if (snapshot.room_nav) applyRoomNavigationState(snapshot.room_nav);
+  updatePoseInfo(snapshot.localization, snapshot.odometry);
+  if (snapshot.services) updateServiceBar(snapshot.services);
+  const detections = Array.isArray(snapshot.det_list)
+    ? snapshot.det_list
+    : (Array.isArray(snapshot.detections) ? snapshot.detections : null);
+  if (detections) {
+    const filtered = cacheDetectionSnapshot(detections);
+    updateDetList(filtered);
+  }
+  if (Array.isArray(snapshot.target_markers)) {
+    updateMissionTargetMarkers(snapshot.target_markers);
+  }
+  updateStreamHealthMetadata(snapshot);
+  const nxDot = document.getElementById('nxDot');
+  if (nxDot) nxDot.className = 'status-dot on';
+  return true;
+}
+
+async function refreshStatusSnapshot(epoch, replaceInFlight = false) {
+  if (replaceInFlight && statusRequestController) statusRequestController.abort();
+  if (statusRequestPromise && !replaceInFlight) return statusRequestPromise;
+  const token = ++statusRequestToken;
+  const requestRealtimeVersion = realtimeStateVersion;
+  const controller = new AbortController();
+  statusRequestController = controller;
+  const timeoutId = setTimeout(() => controller.abort(), STATUS_REQUEST_TIMEOUT_MS);
+  const request = (async () => {
+    try {
+      const response = await fetch('/api/status', { signal: controller.signal });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const snapshot = await response.json();
+      if (requestRealtimeVersion === realtimeStateVersion) {
+        applyStatusSnapshot(snapshot, epoch);
+      }
+      return snapshot;
+    } finally {
+      clearTimeout(timeoutId);
+      if (token === statusRequestToken) {
+        statusRequestPromise = null;
+        statusRequestController = null;
+      }
+    }
+  })();
+  statusRequestPromise = request;
+  return request;
+}
+
+const panelStatusPoller = createStatusPoller({
+  fetchStatus: async signal => {
+    const response = await fetch('/api/status', { signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  },
+  applySnapshot: (snapshot, epoch) => applyStatusSnapshot(snapshot, epoch),
+  getEpoch: () => navConnectionEpoch,
+  getVersion: () => realtimeStateVersion,
+  onError: (_error, epoch) => {
+    if (epoch !== navConnectionEpoch) return;
+    const dot = document.getElementById('nxDot');
+    if (dot) dot.className = 'status-dot off';
+  },
+  timeoutMs: STATUS_REQUEST_TIMEOUT_MS,
+  intervalMs: STATUS_POLL_INTERVAL_MS,
+});
+
 // ---- WebSocket ----
-function connectWS() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const wsUrl = `${proto}://${location.hostname}:8001`;
-  ws = new WebSocket(wsUrl);
-  ws.onmessage = (e) => {
+function handleSocketMessage(socket, socketEpoch, e) {
+    if (ws !== socket || socketEpoch !== navConnectionEpoch) return;
+    lastWsMessageAt = Date.now();
     try {
       const data = JSON.parse(e.data);
-      if (data.type === 'frame') {
-        const img = document.getElementById('videoImg');
-        img.src = 'data:image/jpeg;base64,' + data.data;
-        img.style.display = 'block';
-        document.getElementById('noVideo').style.display = 'none';
-        document.getElementById('detBadge').textContent = (data.detections || 0) + ' 目标';
-        frameCount++;
+      if (wsMessageOverlapsStatus(data.type)) markRealtimeStateUpdate();
+      if (data.type === 'lidar') {
+        const li = document.getElementById('lidarImg');
+        li.src = 'data:image/png;base64,' + data.data;
+        li.style.display = 'block';
+        document.getElementById('noLidar').style.display = 'none';
+        if (map && data.points) map.addLocalObstaclePoints(data.points);
+        const meta = document.getElementById('lidarMeta');
+        if (meta && data.points) meta.textContent = data.points.length + ' pts';
+      } else if (data.type === 'gimbal') {
+        // C13 云台双流 (可见光+红外合并推送)
+        if (data.vis) {
+          setStreamImage('c13_vis', data.vis);
+          if (latestLocateResult) {
+            if (Date.now() - latestLocateTs > LOCATE_TTL_MS) { latestLocateResult = null; document.getElementById('locateOverlay').innerHTML = ''; }
+          }
+        }
+        if (data.ir) {
+          setStreamImage('c13_ir', data.ir);
+        }
+      } else if (data.type === 'detections') {
+        const payload = data.data || {};
+        const dets = filterDetectionResults(payload.detections);
+        renderDetectionStreams(payload);
+        updateDetectionListRich(dets);
+      } else if (data.type === 'costmap') {
+        if (map) map.update({ costmap: data.data });
+      } else if (data.type === 'costmap_global') {
+        if (map) map.update({ costmap_global: data.data });
+      } else if (data.type === 'occupancy_map') {
+        if (map) map.update({ occupancy_map: data.data });
+      } else if (data.type === 'plan') {
+        if (map) map.update({ plan: data.data });
       } else if (data.type === 'slam') {
         if (map) map.update(data.data);
         updateSlamStatus(data.data.slam_source);
-        const d = data.data;
-        document.getElementById('poseInfo').textContent = `位姿: x=${d.x.toFixed(2)} y=${d.y.toFixed(2)} yaw=${(d.yaw * 180 / Math.PI).toFixed(0)}°`;
+      } else if (data.type === 'nav_goal') {
+        applyNavStateForEpoch(data.data, 'ws', socketEpoch);
       } else if (data.type === 'status') {
-        if (data.tasks) updateTasks(data.tasks);
-        if (data.connected !== undefined) { connected = data.connected; updateDogStatus(connected); }
-        if (data.dog_state) updateDogState(data.dog_state);
-        if (data.det_list) updateDetList(data.det_list);
+        applyStatusSnapshot(data, socketEpoch);
       } else if (data.type === 'tasks') {
         updateTasks(data.data);
       } else if (data.type === 'vlm') {
         if (data.data.response) console.log('[VLM]', data.data.response);
+      } else if (data.type === 'locate') {
+        latestLocateTs = Date.now();  // 每次 locate 都刷新 ts (worker 活着, 防 TTL 误清)
+        if (data.data && data.data.detections) updateDetList(data.data.detections);
+        // 有框才重画 (更新 latestLocateResult); 无框保留上次框 (hold last result, 不闪烁)
+        const _hasBox = !!(data.data && (data.data.found || (data.data.detections && data.data.detections.length)));
+        if (_hasBox && data.data) {
+          scheduleLocateOverlay(data.data, {
+            record: true,
+            expectedGeneration: streamFrameGeneration.c13_vis,
+          });
+        }
+        const meta = document.getElementById('videoMeta');
+        if (meta && data.data) {
+          meta.textContent = data.data.found
+            ? `定位: ${data.data.target || ''} (${(data.data.detections || []).length} 框)`
+            : `定位未命中(保留上次框): ${data.data.status || '--'}`;
+        }
       } else if (data.type === 'search') {
         // 搜索发现目标 → 在地图标记 (detMarks 已在 slam 里)
         if (data.data && data.data.found) console.log('[搜索发现]', data.data.found);
+      } else if (data.type === 'target_markers' || data.type === 'person_markers') {
+        const markers = filterDetectionResults(
+          data.data && Array.isArray(data.data.markers) ? data.data.markers : [],
+        );
+        updateMissionTargetMarkers(markers);
+      } else if (data.type === 'search_room') {
+        if (map) map.update({ room_search: data.data || {} });
+        // Toggle the layered-coverage legend while a frontier mission is live.
+        const legend = document.getElementById('mapLegend');
+        if (legend) {
+          const phase = data.data && data.data.phase;
+          const active = phase && !['DONE', 'REPORT', 'FAILED', ''].includes(phase);
+          legend.style.display = active ? 'block' : 'none';
+        }
+        console.log('[房间搜索]', data.data || {});
+      } else if (data.type === 'mission_report') {
+        const report = data.data || {};
+        const detections = filterDetectionResults(report.detections);
+        if (map) map.update({
+          target_markers: detections,
+          room_search: {
+            mission_id: report.mission_id,
+            phase: report.status === 'completed' ? 'DONE' : String(report.status || 'REPORT').toUpperCase(),
+            room: report.room,
+            room_area: report.area,
+            observed_cells: report.observed_cells,
+            visited_viewpoints: report.visited_viewpoints,
+            coverage_ratio: report.coverage_ratio,
+            visual_coverage_ratio: report.visual_coverage_ratio,
+            explored_ratio: report.explored_ratio,
+            bounded_explored_ratio: report.bounded_explored_ratio,
+            global_search: report.global_search,
+            completion_reason: report.completion_reason,
+            completion_status: report.completion_status,
+            motion_trap: report.motion_trap,
+            coverage_threshold: report.coverage_threshold,
+            visual_range_m: report.visual_range_m,
+            coverage_cell_size_m: report.coverage_cell_size_m,
+            adaptive_step_m: report.adaptive_step_m,
+            scene_complexity: report.scene_complexity,
+            forward_clearance_m: report.forward_clearance_m,
+          },
+        });
+        updateMissionTargetMarkers(detections);
+        console.log('[任务报告]', report);
       }
     } catch (err) { console.error('[WS] parse', err); }
-  };
-  ws.onclose = () => { clearInterval(_moveInterval); _moveInterval = null; setTimeout(connectWS, 2000); };
+}
+
+const socketEpochs = new WeakMap();
+let panelSocketLifecycle = null;
+function connectWS() {
+  if (!panelSocketLifecycle) {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    panelSocketLifecycle = createSocketLifecycle({
+      url: `${proto}://${location.hostname}:8001`,
+      createSocket: url => new WebSocket(url),
+      onSocket: socket => {
+        ws = socket;
+        socket.onerror = () => {
+          if (ws === socket && socket.readyState !== WebSocket.CLOSED) socket.close();
+        };
+      },
+      onOpen: socket => {
+        if (ws !== socket) return;
+        lastWsMessageAt = Date.now();
+        const epoch = resetNavOrderingForNewConnection();
+        socketEpochs.set(socket, epoch);
+        panelStatusPoller.stop();
+        refreshStatusSnapshot(epoch, true)
+          .catch(() => {})
+          .finally(() => panelStatusPoller.start(STATUS_POLL_INTERVAL_MS));
+      },
+      onMessage: (socket, event) => {
+        lastWsMessageAt = Date.now();
+        handleSocketMessage(socket, socketEpochs.get(socket), event);
+      },
+      onClose: socket => {
+        if (ws !== socket) return;
+        ws = null;
+        clearInterval(_moveInterval); _moveInterval = null;
+        if (_locateLoopTimer) { clearTimeout(_locateLoopTimer); _locateLoopTimer = null; }
+      },
+    });
+  }
+  return panelSocketLifecycle.connect();
 }
 
 // ---- 启动 ----
 initMap();
 connectWS();
-fetch('/api/stop', { method: 'POST' }); // 加载即停止, 防重连残留运动
+panelStatusPoller.start(0);
 
 // FPS
 setInterval(() => {
   const now = Date.now();
-  document.getElementById('fpsBadge').textContent = Math.round(frameCount / ((now - lastFpsTime) / 1000)) + ' FPS';
-  frameCount = 0; lastFpsTime = now;
+  const frameRate = currentVisibleFrameRate(now);
+  document.getElementById('fpsBadge').textContent = frameRate !== null
+    ? frameRate + ' FPS'
+    : (latestPerceptionHealthy ? '等待视频帧' : '-- FPS');
 }, 1000);
+setInterval(() => { refreshVideoFrameFallback(); }, 500);
 
-// 状态轮询
-setInterval(() => {
-  fetch('/api/status').then(r => r.json()).then(d => {
-    if (d.connected !== undefined) { connected = d.connected; updateDogStatus(connected); }
-    if (d.tasks) updateTasks(d.tasks);
-  }).catch(() => {});
-}, 3000);
-
-// 键盘控制
-const keyState = {};
-document.addEventListener('keydown', (e) => {
-  if (e.target.tagName === 'INPUT') return;
-  if (keyState[e.key]) return;
-  keyState[e.key] = true;
-  switch (e.key) {
-    case 'ArrowUp': move(0.4, 0, 0); break;
-    case 'ArrowDown': move(-0.4, 0, 0); break;
-    case 'ArrowLeft': move(0, 0, 0.5); break;
-    case 'ArrowRight': move(0, 0, -0.5); break;
+window.addEventListener('blur', () => { pressedKeys.clear(); resetKeyHighlight(); stopMove(); });
+window.addEventListener('resize', () => {
+  for (const source of Object.keys(DETECTION_VIEWS)) {
+    if ((latestDetectionsBySource[source] || []).length) {
+      scheduleDetectionOverlay(
+        { detections: latestDetectionsBySource[source] },
+        source,
+        streamFrameGeneration[source],
+      );
+    }
   }
+  if (latestLocateResult) scheduleLocateOverlay(latestLocateResult, {
+    expectedGeneration: streamFrameGeneration.c13_vis,
+  });
 });
-document.addEventListener('keyup', (e) => {
-  if (e.target.tagName === 'INPUT') return;
-  keyState[e.key] = false;
-  if (!Object.values(keyState).some(v => v)) stopMove();
-});
-window.addEventListener('blur', () => { Object.keys(keyState).forEach(k => keyState[k] = false); stopMove(); });
 </script>
 </body>
 </html>

@@ -1,55 +1,160 @@
-# Nav2 参数 - Go2W + MID360 + FAST_LIO (3D点云配置)
-# 路线: MID360点云 → pointcloud_to_laserscan → /scan → costmap
-#        local costmap 额外用 VoxelLayer 直接吃点云(双保险)
-# 定位: FAST_LIO (替代amcl, 不装amcl避免抢map→odom)
-# 注: Go2W室内差速起步(max_vel_y=0), 跑通后可开全向
+# Nav2 参数 - Go2W + FAST_LIO 定位/建图 + 2D 激光避障
+#
+# 路线 (TECH_DECISIONS 第三节):
+#   nx_sensor_node 将狗自带 utlidar 过滤为 /scan (LaserScan)
+#   → local/global ObstacleLayer 做标记与清除 → InflationLayer 保留安全距离。
+#   MID360 的 Livox CustomMsg 只供 FAST_LIO 定位/建图，不直接接入 Nav2 costmap。
+#
+# 定位: FAST_LIO 替代 amcl (不发 OccupancyGrid, 直接发 camera_init→body TF +
+#       /Odometry)。Nav2 只消费 /Odometry, 不抢 map→odom TF。
+#       因此 lifecycle 不激活 amcl / map_server / slam_toolbox。
+#
+# 阶段E 客户端契约 (D 服务端必须兼容):
+#   - bt_navigator.global_frame = map (与 rooms.yaml frame_id + goal pose 一致)
+#   - action 名默认 /navigate_to_pose (launch 不 remap)
+#
+# Go2W 室内差速起步 (max_vel_y=0.0), 跑通后可开全向 (max_vel_y=0.3, vy_samples=10)。
+# 坐标系: /cmd_vel 走 REP-103 (linear.x 正=前进, angular.z 正=左转),
+#         nx_motion_node 直接透传给 SDK Move(x,y,z), 零反转 (见 nav2_3d.launch.py 决策 5)。
 
 bt_navigator:
   ros__parameters:
-    global_frame: map
-    robot_base_frame: base_link
-    odom_topic: /Odometry    # FAST_LIO发的(注意frame要对齐odom→base_link)
+    global_frame: map                 # 阶段E 客户端 goal pose 的 frame_id, 必须一致
+    robot_base_frame: base_link       # TF 树叶子, 与 TF 桥 (body→base_link) 一致
+    odom_topic: /odom                 # map_odom_fuser 水平化后的 MID360 里程计
     bt_loop_duration: 10
     default_server_timeout: 20
     action_server_result_timeout: 900.0
+    # nav2_3d.launch.py rewrites this symbolic value to the installed tree.
+    # The tree replans and may clear/wait, but never drives Spin/BackUp recovery.
+    default_nav_to_pose_bt_xml: go2w_safe_dynamic_replan
+    default_nav_through_poses_bt_xml: go2w_safe_dynamic_through_poses_replan
+    # Humble 必填: bt_navigator 要显式声明加载的 BT plugin 库列表,
+    # 否则启动报错 "Failed to load BT plugin" 且 /navigate_to_pose 不暴露。
+    # 列表取自 Nav2 Humble 官方 nav2_params.yaml (navigation_launch 默认 BT XML 用到的全部库)。
+    plugin_lib_names:
+      - nav2_assisted_teleop_action_bt_node
+      - nav2_assisted_teleop_cancel_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_back_up_cancel_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_compute_and_track_route_bt_node
+      - nav2_compute_path_through_poses_action_bt_node
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_compute_route_bt_node
+      - nav2_controller_cancel_bt_node
+      - nav2_controller_selector_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_distance_traveled_condition_bt_node
+      - nav2_drive_on_heading_bt_node
+      - nav2_drive_on_heading_cancel_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_get_pose_from_path_action_bt_node
+      - nav2_globally_updated_goal_condition_bt_node
+      - nav2_goal_checker_selector_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_goal_updated_controller_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_is_battery_charging_condition_bt_node
+      - nav2_is_battery_low_condition_bt_node
+      - nav2_is_path_valid_condition_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_navigate_through_poses_action_bt_node
+      - nav2_navigate_to_pose_action_bt_node
+      - nav2_path_longer_on_approach_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_planner_selector_bt_node
+      - nav2_progress_checker_selector_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_remove_passed_goals_action_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_single_trigger_bt_node
+      - nav2_smoother_selector_bt_node
+      - nav2_smooth_path_action_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_spin_cancel_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_truncate_path_local_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_wait_cancel_bt_node
+
+smoother_server:
+  ros__parameters:
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: true
 
 controller_server:
   ros__parameters:
-    controller_frequency: 10.0
+    controller_frequency: 5.0  # 2026-07-16 匹配 TF 5.9Hz (fastlio/fuser 实际发布率), 消除 extrapolation-into-future
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.5
     min_theta_velocity_threshold: 0.001
-    progress_checker_plugins: ["progress_checker"]
+    progress_checker_plugin: "progress_checker"
     goal_checker_plugins: ["general_goal_checker"]
-    controllers: ["FollowPath"]
+    controller_plugins: ["FollowPath"]
+    # Nav2 原始控制量由 launch remap 进入 velocity_smoother；最终
+    # /cmd_vel_nav 才到 motion 安全出口。
     FollowPath:
-      plugin: "dwb_core::DWBLocalPlanner"
+      # Sample a point ahead on the global path before handing control to DWB.
+      # For a goal exactly behind the robot, raw DWB repeatedly crossed the
+      # +/-pi wrap boundary and alternated left/right pure-turn commands. The
+      # shim commits to the sampled path heading until the error is small.
+      plugin: "nav2_rotation_shim_controller::RotationShimController"
+      primary_controller: "dwb_core::DWBLocalPlanner"
+      forward_sampling_distance: 0.5
+      angular_dist_threshold: 0.2    # 2026-07-18 放宽(原0.05过严): 背对目标大角度转身震荡难达2.8°→卡预转不交DWB不前进; 0.2=11°更容易转完
+      angular_disengage_threshold: 0.25
+      rotate_to_heading_angular_vel: 0.5    # 2026-07-19 降回(1.0 overshoot: 狗转180° yaw振荡9→85→-11→82 难稳定到 angular_dist_threshold 0.2=11°内 → 不交DWB反复转; 0.5慢稳 motion 跟得上不overshoot)
+      max_angular_accel: 1.0    # 2026-07-19 降(2.5起步猛overshoot反弹): 1.0平稳达0.5, 避免转过头振荡
+      simulate_ahead_time: 2.0
+      rotate_to_goal_heading: false
+      closed_loop: true
+      # Root cause is now captured by the ObstacleFootprint critic contract;
+      # keep per-trajectory diagnostics off during normal exploration.
       debug_trajectory_details: false
+      publish_evaluation: false
       # Go2W 差速起步 (全向模式: max_vel_y=0.3, vy_samples=10)
+      # nx_motion_node clamps autonomous reverse to zero. DWB must therefore
+      # sample the same forward-only model that reaches the robot.
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 0.6        # 室内安全速度
-      max_vel_y: 0.0        # 差速; 全向改0.3
-      max_vel_theta: 1.0
-      min_speed_xy: 0.1
-      max_speed_xy: 0.6
-      min_speed_theta: 0.0
-      acc_lim_x: 0.5
+      max_vel_x: 0.8        # 1.0m/s² 制动时中心前移 0.32m；DWB 预测 0.80m
+      max_vel_y: 0.0        # 差速; 全向改 0.3
+      max_vel_theta: 0.5    # 与 rotation shim 的实机稳定转速一致
+      min_speed_xy: 0.05    # 允许慢速前进轨迹
+      max_speed_xy: 0.8
+      min_speed_theta: 0.15 # 纯旋转不得落入 Go2W 轮式死区 (现 < max_vel_theta, 区间有效)
+      acc_lim_x: 1.2
       acc_lim_y: 0.0
-      acc_lim_theta: 2.0
+      acc_lim_theta: 1.0    # 2026-07-19 降(2.5→1.0): 匹配 max_angular_accel 1.0, 转平稳不overshoot
       decel_lim_x: -1.0
       decel_lim_y: 0.0
-      decel_lim_theta: -2.0
-      vx_samples: 20
-      vy_samples: 0         # 差速; 全向改10
-      vtheta_samples: 40
-      sim_time: 1.5
+      decel_lim_theta: -1.5
+      vx_samples: 15        # 2026-07-19 恢复(10→15): 10采样大转角(180°回程)DWB No valid 225全拒; spin_yield解GIL后CPU够
+      vy_samples: 0         # 差速; 全向改 10
+      vtheta_samples: 40         # 2026-07-19 恢复(20→40): 大转角需更多转采样覆盖对齐path轨迹, 20不够致No valid+oscillation锁死
+      sim_time: 1.0         # 0.8m/s 上限下预测 0.8m，覆盖 0.32m 制动距离 + 0.05m 栅格
       linear_granularity: 0.05
       angular_granularity: 0.025
-      transform_tolerance: 0.2
-      xy_goal_tolerance: 0.20
-      yaw_goal_tolerance: 0.15
-      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      transform_tolerance: 0.5  # 有界 TF 等待窗口；时间同步由 fuser 的同时间戳校正保证
+      xy_goal_tolerance: 0.20    # 2026-07-19 放宽(原0.10): 接近goal减速微调久(8s); 0.20少微调快判到达
+      yaw_goal_tolerance: 3.14   # Go2-W 纯转向会平移；目标朝向由搜索/云台单独处理
+      # ObstacleFootprint remains the hard full-body collision gate.
+      critics: ["ObstacleFootprint", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      # BaseObstacle checks only the robot center. This critic evaluates the
+      # full 0.90 x 0.64 m rectangle at every sampled trajectory pose.
+      ObstacleFootprint.scale: 0.02
       BaseObstacle.scale: 0.02
       PathAlign.scale: 32.0
       PathAlign.forward_point_distance: 0.1
@@ -57,119 +162,166 @@ controller_server:
       GoalAlign.forward_point_distance: 0.1
       PathDist.scale: 32.0
       GoalDist.scale: 24.0
-      RotateToGoal.scale: 32.0
-      RotateToGoal.slowing_factor: 5.0
-      RotateToGoal.lookahead_time: -1.0
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      required_movement_radius: 0.1
+      movement_time_allowance: 60.0    # 2026-07-18 放宽(原30s, 反向大角度转身+起步需时间, progress 误判没动 abort 导航失败)
     general_goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.20
-      yaw_goal_tolerance: 0.15
-      stateful: true
+      xy_goal_tolerance: 0.20    # 与 FollowPath.xy_goal_tolerance 一致 (2026-07-19 放宽0.10→0.20)
+      yaw_goal_tolerance: 3.14   # 点选/探索目标不要求终点原地对向
+      stateful: false            # 若滑出位置容差必须重新接近，不能只追逐朝向
+
+velocity_smoother:
+  ros__parameters:
+    smoothing_frequency: 20.0
+    scale_velocities: false
+    feedback: "OPEN_LOOP"
+    max_velocity: [0.8, 0.0, 0.5]
+    min_velocity: [0.0, 0.0, -0.5]
+    max_accel: [1.2, 0.0, 1.0]
+    max_decel: [-1.0, 0.0, -1.5]
+    odom_topic: /odom
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 0.3
 
 local_costmap:
   local_costmap:
     ros__parameters:
-      update_frequency: 5.0
+      update_frequency: 5.0           # 实时 (rolling window 5×5m)
       publish_frequency: 2.0
-      global_frame: odom
+      global_frame: odom              # rolling window 在 odom 系
       robot_base_frame: base_link
-      rolling_window: true
-      width: 5
+      transform_tolerance: 0.5  # 有界 TF 等待窗口，不用于掩盖陈旧变换
+      rolling_window: true            # 滚动窗口 (狗动跟着动)
+      width: 5                        # 5×5m 局部地图
       height: 5
       resolution: 0.05
-      footprint: "[ [0.30, 0.20], [0.30, -0.20], [-0.25, -0.20], [-0.25, 0.20] ]"
-      plugins: ["voxel_layer", "inflation_layer"]
-      voxel_layer:
-        plugin: "nav2_costmap_2d::VoxelLayer"
+      # Go2-W official standing envelope is 0.70 x 0.43 m.  Pad every side by
+      # at least 0.10 m so wheels, turning sweep, scan latency and braking are
+      # represented by the hard collision polygon rather than a soft score.
+      footprint: "[ [0.45, 0.32], [0.45, -0.32], [-0.45, -0.32], [-0.45, 0.32] ]"
+      # MID360 三维障碍点先进入 voxel layer，再做足迹膨胀。
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
-        publish_voxel_map: true
-        origin_z: 0.0
-        z_resolution: 0.10
-        z_voxels: 16          # 16*0.10=1.6m高度
-        max_obstacle_height: 1.5
-        mark_threshold: 0
-        observation_sources: pointcloud
-        pointcloud:
-          topic: /livox/lidar
-          max_obstacle_height: 1.5
-          min_obstacle_height: 0.05
-          clearing: True
+        observation_sources: mid360
+        mid360:
+          topic: /scan_mid360
+          data_type: "LaserScan"
           marking: True
-          data_type: "PointCloud2"
+          clearing: True
+          inf_is_valid: True
+          expected_update_rate: 1.8
+          observation_persistence: 0.3    # 2026-07-17 降到 0.3 (云台假点已在 bridge 源头滤除; persistence 仅清动态滞留, 2s 太长留 ghost)
+          max_obstacle_height: 1.5
+          min_obstacle_height: 0.0     # LaserScan z=0; source cloud was height-filtered
+          obstacle_max_range: 7.0
+          obstacle_min_range: 0.4     # 2026-07-16 剔近场自身/C13/载荷回波(假障碍), 原0.2     # 稍保守于 0.15m
           raytrace_max_range: 8.0
           raytrace_min_range: 0.15
-          obstacle_max_range: 7.0
-          obstacle_min_range: 0.2
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.7
+        # Padded footprint turning radius is 0.552 m; preserve another 0.15 m
+        # cost gradient so the controller prefers clearance before collision.
+        inflation_radius: 0.71
       always_send_full_costmap: true
 
 global_costmap:
   global_costmap:
     ros__parameters:
-      update_frequency: 1.0
+      update_frequency: 2.0           # 2026-07-18 D方案强clearing: scan raytrace clearing随update跑, 提频让ghost残留更快被清(原1.0省CPU但残留滞留); local是5Hz所以干净
       publish_frequency: 1.0
-      global_frame: map
+      global_frame: map               # 全局 frame, 与阶段E goal frame 一致
       robot_base_frame: base_link
-      footprint: "[ [0.30, 0.20], [0.30, -0.20], [-0.25, -0.20], [-0.25, 0.20] ]"
+      transform_tolerance: 0.5  # 有界 TF 等待窗口，不用于掩盖陈旧变换
+      # Admit an approximately 0.80 m straight passage in the global plan.
+      # This circle is only the global centre-line gate; the local DWB
+      # ObstacleFootprint critic still enforces the padded 0.90 x 0.64 m body
+      # at every trajectory pose, and the 0.60 m inflation remains a soft
+      # preference for wider routes when one is available.
+      robot_radius: 0.40
       resolution: 0.05
       track_unknown_space: true
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
-      static_layer:
-        plugin: "nav2_costmap_2d::StaticLayer"
-        map_subscribe_transient_local: true
+      # With one coherent map/odom chain, the SLAM layer can safely retain
+      # obstacles between passes instead of forgetting everything beyond 8 m.
+      rolling_window: true
+      width: 50                        # 半径25m覆盖0↔20m往返，并留5m窗口余量
+      height: 50
+      # SLAM retains obstacles beyond the current MID360 range; the live layer
+      # overlays recent marking/clearing on every pass.
+      plugins: ["obstacle_layer", "inflation_layer"]    # 2026-07-19 去 static_layer: v0.7 方案A 铁证 — /map_frontier latched 重载 FastLIO 抖动 ghost 累积 → planner compute_path_to_pose abort 连续(实测狗卡 11.94m 15m箱前). obstacle_layer 实时 /scan_mid360 够避障不累积 ghost. 保留其他团队 min_vel_x=0 + max_vel_theta 0.5
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
-        observation_sources: scan
-        scan:
-          topic: /scan        # 来自pointcloud_to_laserscan
+        observation_sources: mid360
+        mid360:
+          topic: /scan_mid360
           data_type: "LaserScan"
           marking: True
           clearing: True
+          inf_is_valid: True
+          expected_update_rate: 1.8
+          observation_persistence: 0.3    # 2026-07-17 降到 0.3 (云台假点已在 bridge 源头滤除; persistence 仅清动态滞留, 2s 太长留 ghost)
           max_obstacle_height: 1.5
-          min_obstacle_height: -0.1
+          min_obstacle_height: 0.0     # LaserScan z=0; source cloud was height-filtered
           obstacle_max_range: 7.0
-          obstacle_min_range: 0.2
+          obstacle_min_range: 0.4     # 2026-07-16 剔近场自身/C13/载荷回波(假障碍), 原0.2
+          raytrace_max_range: 8.0
+          raytrace_min_range: 0.15
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.7
+        # Global A* should retain only the hard robot-corner envelope plus
+        # roughly one 5 cm cell. The local controller keeps the wider 0.71 m
+        # live-obstacle gradient, so it remains the final clearance authority.
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.60
       always_send_full_costmap: true
 
 planner_server:
   ros__parameters:
-    expected_planner_frequency: 5.0
+    expected_planner_frequency: 2.0  # 2026-07-19 降(原5.0): 接近goal高频重规划path抖动致DWB反复微调; 2.0少重规划path稳
     planner_plugins: ["GridBased"]
     GridBased:
-      plugin: "nav2_navfn_planner/NavfnPlanner"
-      tolerance: 0.5
-      use_astar: true
+      # NavFn on Humble intermittently reports a legal potential but fails to
+      # extract its gradient path while dynamically replanning. Smac 2D uses
+      # a complete cost-aware A* search and does not have that extraction step.
+      plugin: "nav2_smac_planner/SmacPlanner2D"
+      # Exploration and clicked goals must terminate at the requested free
+      # cell. A 0.5 m tolerated endpoint previously accepted goals whose
+      # requested cell was cost 253, then drove to the nearest free edge.
+      tolerance: 1.0e-10
+      downsample_costmap: false
+      downsampling_factor: 1
       allow_unknown: true
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 2.0
+      cost_travel_multiplier: 2.0
+      use_final_approach_orientation: false
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3
+        w_data: 0.2
+        tolerance: 1.0e-10
+        do_refinement: true
 
 behavior_server:
   ros__parameters:
     costmap_topic: local_costmap/costmap_raw
     footprint_topic: local_costmap/published_footprint
     cycle_frequency: 10.0
-    behavior_plugins: ["spin", "backup", "drive_on_heading", "wait"]
-    spin:
-      plugin: "nav2_behaviors/Spin"
-    backup:
-      plugin: "nav2_behaviors/BackUp"
-    drive_on_heading:
-      plugin: "nav2_behaviors/DriveOnHeading"
+    # The active BT may hold position while retrying, but planning failure must
+    # never introduce unplanned Spin/BackUp/DriveOnHeading motion.
+    behavior_plugins: ["wait"]
     wait:
       plugin: "nav2_behaviors/Wait"
-    global_frame: odom
+    global_frame: odom               # recovery 行为在 odom frame
     robot_base_frame: base_link
-    transform_tolerance: 0.2
+    transform_tolerance: 0.5  # 有界 TF 等待窗口，不用于掩盖陈旧变换
 
 waypoint_follower:
   ros__parameters:

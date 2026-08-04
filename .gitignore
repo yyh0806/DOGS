@@ -15,3 +15,25 @@ deps/
 *.engine
 *.onnx
 .env
+
+# HIGH-3 例外: mock_person.png 是阶段B mock 视频必需资源 (COCO 人物裁图, 让 YOLO 在
+# mock 模式真检出 person, spec-stage-b §8.1/C4.4)。10KB 小图, 必须入库,
+# 否则 git clone/pull 的部署路径 (非 deploy_nx_ai.sh) 会缺该文件。
+!go2w_search_ws/web/static/mock_person.png
+.omc/
+
+# 工具缓存 (不在仓库内但常出现在仓库根: locate-anything.cpp 上游克隆 / playwright MCP)
+.cache/
+.playwright-mcp/
+.playwright-cli/
+
+# 运行时产物: mission report 存储 / costmap 快照 / pytest 缓存 / 调试输出
+costmap.pgm
+.pytest_fastlio_tmp/
+go2w_search_ws/web/missions/
+tmp/
+go2w_search_ws/tmp/
+
+# 仿真 SIGFPE workaround 编译产物 (WSL2 glibc ifunc): 源码 mycos.c + mycos.map 入库,
+# .so 由目标机现场 gcc 编译 (见 QUICKSTART.md "仿真模式" Step 4)
+go2w_search_ws/tools/mycos.so
