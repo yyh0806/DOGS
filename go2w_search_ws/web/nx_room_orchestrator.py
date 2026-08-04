@@ -1506,7 +1506,20 @@ class RoomSearchOrchestrator:
                     room="__frontier__", current_wp=iteration,
                     total_wp=max_frontiers, info="reachability_preflight",
                     **self._exploration_live_fields(exploration))
-                target = exploration.choose_next(map_msg, robot_pose)
+                # D-prefetch: 优先用导航期间预选的下一个 frontier (攻选点慢根因).
+                # GO2W_FRONTIER_PREFETCH=1 + 预选 revision 匹配 → 用预选, 跳过同步 choose_next.
+                # 默认 off 保现有行为. 失效(map 大变/无预选)回退同步 choose_next.
+                prefetched = None
+                if str(os.environ.get("GO2W_FRONTIER_PREFETCH", "0")).strip() in (
+                        "1", "true", "True", "yes"):
+                    prefetched = getattr(self, "_frontier_prefetched", None)
+                    self._frontier_prefetched = None
+                if (prefetched
+                        and prefetched.get("revision") == map_revision(map_msg)
+                        and prefetched.get("target") is not None):
+                    target = prefetched["target"]
+                else:
+                    target = exploration.choose_next(map_msg, robot_pose)
                 if target is None:
                     selection_reason = exploration.snapshot().get(
                         "last_selection_reason")
@@ -1598,6 +1611,39 @@ class RoomSearchOrchestrator:
                 )
                 en_route_thread.start()
                 progress_thread.start()
+                # D-prefetch: 导航期间后台预选下一个 frontier (攻选点慢根因).
+                # 把选点耗时隐藏在导航期间 (狗在走的同时算下一个), 到达即发预选 goal.
+                def _prefetch_worker():
+                    if str(os.environ.get(
+                            "GO2W_FRONTIER_PREFETCH", "0")).strip() not in (
+                            "1", "true", "True", "yes"):
+                        return
+                    try:
+                        with map_lock:
+                            pf_map = latest_map_box[0]
+                        pf_pose = self._get_live_robot_pose()
+                        if pf_map is None or pf_pose is None:
+                            return
+                        # 保存 _current_goal, 预选后恢复. 原因: progress_thread 的
+                        # revalidate_current_goal 读 _current_goal 复核【当前导航 goal】,
+                        # 而预调 choose_next 会把 _current_goal 改指向【下一个】→ 误判
+                        # 当前 goal 不可达. 恢复让 revalidate 仍复核当前. blacklist/
+                        # visited 等其他状态保留 (预选 probe 结果被复用, 减少下轮 probe).
+                        saved_goal = getattr(exploration, "_current_goal", None)
+                        pf_target = exploration.choose_next(pf_map, pf_pose)
+                        exploration._current_goal = saved_goal
+                        if pf_target is not None:
+                            self._frontier_prefetched = {
+                                "target": pf_target,
+                                "revision": map_revision(pf_map),
+                            }
+                    except Exception as exc:
+                        logger.debug("prefetch worker crashed: %s", exc)
+
+                prefetch_thread = threading.Thread(
+                    target=_prefetch_worker, daemon=True,
+                    name=f"frontier-prefetch-{mission_id}-{iteration}")
+                prefetch_thread.start()
                 try:
                     result = nav.send_goal_and_wait(
                         target["x"], target["y"], target.get("yaw", 0.0),
@@ -1606,6 +1652,7 @@ class RoomSearchOrchestrator:
                     stop_event.set()
                     en_route_thread.join(timeout=2.0)
                     progress_thread.join(timeout=2.0)
+                    prefetch_thread.join(timeout=3.0)
                 progress_failure = progress_holder.get("failure")
                 if progress_failure:
                     result = {
