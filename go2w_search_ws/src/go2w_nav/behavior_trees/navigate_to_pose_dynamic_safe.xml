@@ -9,7 +9,7 @@
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="1" name="BoundedPlanningRefresh">
+    <RecoveryNode number_of_retries="2" name="BoundedPlanningRefresh">
       <PipelineSequence name="NavigateWithSafeDynamicReplanning">
         <RateController hz="2.0">
           <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
@@ -17,9 +17,10 @@
         <FollowPath path="{path}" controller_id="FollowPath"
                     goal_checker_id="general_goal_checker"/>
       </PipelineSequence>
-      <Sequence name="RefreshGlobalCostmapWithoutMotion">
+      <Sequence name="ClearSpinRetry">
         <ClearEntireCostmap name="ClearGlobalCostmap"
                             service_name="global_costmap/clear_entirely_global_costmap"/>
+        <Spin name="Spin90" spin_dist="1.5708"/>
         <Wait wait_duration="1"/>
       </Sequence>
     </RecoveryNode>
