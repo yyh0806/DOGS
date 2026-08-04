@@ -97,6 +97,9 @@ ros_env() {
   export GO2W_FRONTIER_YAW_STEP_DEG=45
   export GO2W_FRONTIER_MAX_VEL_X=0.8
   export GO2W_FRONTIER_MAX_VEL_THETA=0.5
+  # 搜索流畅性优化默认启用 (PR #4 + #5): D-yaw-optional + D-prefetch.
+  export GO2W_FRONTIER_YAW_OPTIONAL=1
+  export GO2W_FRONTIER_PREFETCH=1
   _ROS_ENV_DONE=1
 }
 

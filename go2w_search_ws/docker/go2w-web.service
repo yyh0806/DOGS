@@ -57,6 +57,9 @@ Environment=GO2W_FRONTIER_YAW_CANDIDATE_LIMIT=12
 Environment=GO2W_FRONTIER_YAW_STEP_DEG=45
 Environment=GO2W_FRONTIER_MAX_VEL_X=0.8
 Environment=GO2W_FRONTIER_MAX_VEL_THETA=0.5
+# 搜索流畅性优化默认启用 (PR #4 + #5): D-yaw-optional + D-prefetch.
+Environment=GO2W_FRONTIER_YAW_OPTIONAL=1
+Environment=GO2W_FRONTIER_PREFETCH=1
 # Atomic deployment writes the detected dog NIC, NX address, panel origins,
 # and installed YOLO-World model path here.  Keep it after bundled defaults.
 EnvironmentFile=-/etc/go2w/hardware.env

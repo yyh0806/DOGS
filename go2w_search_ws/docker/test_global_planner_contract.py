@@ -26,6 +26,11 @@ FRONTIER_DEFAULTS = {
     "GO2W_FRONTIER_YAW_STEP_DEG": "45",
     "GO2W_FRONTIER_MAX_VEL_X": "0.8",
     "GO2W_FRONTIER_MAX_VEL_THETA": "0.5",
+    # 搜索流畅性优化默认启用 (PR #4 D-yaw-optional + PR #5 D-prefetch).
+    # D-yaw-optional: 大转向仅在 visual_gain 提升>=MIN_GAIN 才执行 (减到达后原地转).
+    # D-prefetch: 导航期间后台预选下一个 frontier (隐藏选点耗时).
+    "GO2W_FRONTIER_YAW_OPTIONAL": "1",
+    "GO2W_FRONTIER_PREFETCH": "1",
 }
 
 
