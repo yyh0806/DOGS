@@ -314,11 +314,19 @@ behavior_server:
     costmap_topic: local_costmap/costmap_raw
     footprint_topic: local_costmap/published_footprint
     cycle_frequency: 10.0
-    # The active BT may hold position while retrying, but planning failure must
-    # never introduce unplanned Spin/BackUp/DriveOnHeading motion.
-    behavior_plugins: ["wait"]
+    # 2026-08-04: 启用受限 Spin recovery (攻 motion_trap 狗卡死无法脱困).
+    # ⚠️ Go2W 轮式转向有平移蠕动 (creep), 标准 Spin 不安全 (见 BT XML 注释);
+    # 用低 max_rotational_vel (0.3 rad/s, 默认 1.0) 限制 creep. 现场测试验证,
+    # creep 明显则改用应用层 back-out (方案 C, orchestrator 发 cmd_vel 后退).
+    behavior_plugins: ["wait", "spin"]
     wait:
       plugin: "nav2_behaviors/Wait"
+    spin:
+      plugin: "nav2_behaviors/Spin"
+      max_rotational_vel: 0.3       # 低角速度 (rad/s) 限制 creep
+      min_rotational_vel: 0.1
+      spin_windup: 0.1              # 短加速 ramp
+      simulate_ahead_time: 0.1
     global_frame: odom               # recovery 行为在 odom frame
     robot_base_frame: base_link
     transform_tolerance: 0.5  # 有界 TF 等待窗口，不用于掩盖陈旧变换
