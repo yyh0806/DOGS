@@ -122,6 +122,11 @@ def _filter_confident_detections(detections):
 # ============================================================================
 # 显式禁检测开关 (round-3 需求 3)
 _DETECT_DISABLED_BY_ENV = str(os.environ.get("GO2W_AI_NO_DETECT", "")).strip() in ("1", "true", "True", "yes")
+# GO2W_VLM_DISABLED=1 → 完全跳过 VLM (不启 _vlm_worker 线程, 不构造 VLMEngine,
+# NxAiVlmProxy.loaded=False 让 TaskManager 走 _parse_product_command 确定性路径).
+# 用途: NX 资源紧张时砍 Qwen2.5-VL-3B (省 3-4GB GPU+内存), 仅保留 YOLO 检测.
+# 新硬件恢复 AI 时 unset 此 env 即可, 无需 redeploy.
+_VLM_DISABLED = str(os.environ.get("GO2W_VLM_DISABLED", "")).strip() in ("1", "true", "True", "yes")
 _AI_VIDEO_ENABLED = str(os.environ.get("GO2W_AI_VIDEO_ENABLE", "0")).strip() in ("1", "true", "True", "yes", "on")
 _AI_EXTERNAL_VIDEO_ENABLED = str(os.environ.get("GO2W_AI_EXTERNAL_VIDEO_ENABLE", "1")).strip() in ("1", "true", "True", "yes", "on")
 
@@ -315,6 +320,7 @@ class NxAiEngine:
         self._detection_input_rr_index = 0
         # VLM (spec 决策 2: 懒加载 + 单工作线程 + 空闲超时 unload)
         self._vlm = None                # ai.vlm.VLMEngine (懒初始化)
+        self._vlm_disabled = _VLM_DISABLED  # GO2W_VLM_DISABLED=1 → 跳过 vlm 线程+构造, proxy.loaded=False
         self._vlm_inited = False
         # VLM 构造失败后的节流重试 (HIGH-1): 记录上次构造尝试时间, _vlm_worker 据此
         # 在 _vlm is None 且距上次尝试 >60s 时复位 _vlm_inited=False 允许自愈重试。
@@ -350,7 +356,6 @@ class NxAiEngine:
         即: 缺重依赖时 start() 不抛、视频流不断, 满足 NX 纯视频流部署。
         """
         self._running = True
-        t2 = threading.Thread(target=self._vlm_worker, name="nx_ai_vlm", daemon=True)
         t3 = threading.Thread(target=self._mem_monitor, name="nx_ai_mem", daemon=True)
         threads = []
         if _AI_VIDEO_ENABLED:
@@ -365,11 +370,16 @@ class NxAiEngine:
         else:
             logger.warning("[AI] dog camera video loop disabled (GO2W_AI_VIDEO_ENABLE=0) — "
                            "无狗原生视频帧; locate/follow 仅在 C13 云台启用时有帧, 否则 /api/locate 返回'无可用帧'")
-        t2.start(); t3.start()
-        threads.extend([t2, t3])
+        if not self._vlm_disabled:
+            t2 = threading.Thread(target=self._vlm_worker, name="nx_ai_vlm", daemon=True)
+            t2.start()
+            threads.append(t2)
+        t3.start()
+        threads.append(t3)
         self._threads = threads
+        vlm_stat = "vlm-off(GO2W_VLM_DISABLED)" if self._vlm_disabled else "vlm"
         logger.info(f"[AI] NxAiEngine 启动 ({len(threads)} daemon 线程: "
-                    f"{'video/' if (_AI_VIDEO_ENABLED or _AI_EXTERNAL_VIDEO_ENABLED) else ''}vlm/mem)")
+                    f"{'video/' if (_AI_VIDEO_ENABLED or _AI_EXTERNAL_VIDEO_ENABLED) else ''}{vlm_stat}/mem)")
 
     def stop(self):
         self._running = False
@@ -1134,6 +1144,11 @@ class NxAiEngine:
         (ai.vlm 内部懒 import transformers), 落入下面 except → _vlm=None。
         VLM 不可用时返回带 parse_error 的空任务，不崩、不退出，也不影响视频流与检测。
         """
+        if self._vlm_disabled:
+            # GO2W_VLM_DISABLED=1: 标记已初始化阻止节流重试, _vlm 永远 None,
+            # NxAiVlmProxy.loaded=False 让 TaskManager 不走 vlm 路径.
+            self._vlm_inited = True
+            return
         if self._vlm_inited:
             return
         # 记录构造尝试时刻 (HIGH-1: 供 _vlm_worker 节流重试判断)
@@ -1780,7 +1795,11 @@ class NxAiVlmProxy:
 
     @property
     def loaded(self):
-        # 恒 True: TaskManager._process_command_bg (nx_web_server.py:421) 据此走 _vlm_parse_command
+        # GO2W_VLM_DISABLED=1 时报 False, 让 TaskManager 走 _parse_product_command
+        # 确定性路径 (nx_web_server.py:1763), 不入队 vlm_worker (省线程 + 省 3-4GB 模型内存).
+        if getattr(self._ai, "_vlm_disabled", False):
+            return False
+        # 否则恒 True: TaskManager._process_command_bg 据此走 _vlm_parse_command
         # 真正的 VLM 状态由 ai_engine 内部按需 load/unload 管理
         return True
 

@@ -63,6 +63,9 @@ EnvironmentFile=-/etc/go2w/hardware.env
 # Frontend uses the C13 gimbal stream; keep the Unitree dog-camera background
 # video loop off unless YOLO/dog-camera AI is explicitly needed.
 Environment=GO2W_AI_VIDEO_ENABLE=0
+# VLM (Qwen2.5-VL-3B) 禁用 — NX 资源紧张时砍 3-4GB GPU+内存, 仅保留 YOLO 检测.
+# TaskManager 走 _parse_product_command 确定性路径 (复杂中文指令解析降级). 新硬件 unset 即恢复.
+Environment=GO2W_VLM_DISABLED=1
 # C13 双流目标推流帧率 (nx_gimbal_node.py:_FPS 默认 12 → 前端天花板 12-15fps, 人眼卡顿感).
 # 调到 30 对齐 C13 源帧率; 若 NX 软解跟不上 (实测 fpsBadge 仍 <25), 需切 NVDEC 硬解.
 Environment=C13_FPS=30
