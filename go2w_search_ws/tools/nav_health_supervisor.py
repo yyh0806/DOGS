@@ -29,6 +29,16 @@ LIFECYCLE_NODES = (
 )
 LIFECYCLE_QUERY_TIMEOUT_SEC = 2.0
 
+# TF parent tracking — see memory "slam-nav-restart-loop-tf-dual-parent".
+# The old `parents_*` sets only grew (.add), so a boot-transient TF publisher
+# that published once and died poisoned the topology gate for the rest of the
+# supervisor's life (the gate reads these sets to enforce "base_link has a
+# single parent"). Dynamic and static parents need different expiry strategies
+# because /tf streams continuously while /tf_static is latched-once.
+DYNAMIC_PARENT_TTL_SEC = 5.0        # /tf edge not refreshed in 5s → publisher dead
+STATIC_REFRESH_INTERVAL_SEC = 3.0   # recreate /tf_static subscription this often
+STATIC_LATCH_GRACE_SEC = 1.0        # let fresh subscription receive latch before swap
+
 
 def topic_snapshot(samples: deque[float], now: float) -> dict:
     if not samples:
@@ -101,7 +111,15 @@ def run(state_file: Path) -> None:
     stamp_ages = {topic: deque(maxlen=100) for topic in TOPICS}
     stamp_totals = {topic: 0 for topic in TOPICS}
     latest_strings: dict[str, str] = {}
-    parents_dynamic: dict[str, set[str]] = {}
+    # Dynamic parents: child -> {parent -> last_seen_monotonic}. /tf publishers
+    # stream continuously, so an edge not refreshed within DYNAMIC_PARENT_TTL_SEC
+    # belongs to a dead publisher and is pruned.
+    parents_dynamic_seen: dict[str, dict[str, float]] = {}
+    # Static parents: child -> {parent}. /tf_static is latched-once, so a static
+    # publisher that dies still has its latch cached in any subscription that was
+    # alive at the time. We periodically recreate the /tf_static subscription:
+    # a fresh subscriber receives latch only from currently-LIVE publishers, so
+    # dead boot-transients drop out after one refresh cycle.
     parents_static: dict[str, set[str]] = {}
     lifecycle: dict[str, dict] = {}
     reliable = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
@@ -128,15 +146,30 @@ def run(state_file: Path) -> None:
         qos = transient if kind == "map" else reliable
         subscriptions.append(node.create_subscription(msg_type, topic, record(topic, kind), qos))
 
-    def record_tf(target: dict[str, set[str]]):
+    def record_tf_dynamic(message: TFMessage) -> None:
+        now_mono = time.monotonic()
+        for transform in message.transforms:
+            parents_dynamic_seen.setdefault(
+                transform.child_frame_id, {})[transform.header.frame_id] = now_mono
+
+    def record_tf_static(target: dict[str, set[str]]):
         def callback(message: TFMessage):
             for transform in message.transforms:
                 target.setdefault(transform.child_frame_id, set()).add(
                     transform.header.frame_id)
         return callback
 
-    subscriptions.append(node.create_subscription(TFMessage, "/tf", record_tf(parents_dynamic), 100))
-    subscriptions.append(node.create_subscription(TFMessage, "/tf_static", record_tf(parents_static), transient))
+    subscriptions.append(node.create_subscription(TFMessage, "/tf", record_tf_dynamic, 100))
+    static_sub = node.create_subscription(
+        TFMessage, "/tf_static", record_tf_static(parents_static), transient)
+    # 2-phase static refresh state. `pending_*` hold a freshly-created
+    # subscription collecting latch from live publishers; after the grace
+    # window we destroy the old subscription and swap `parents_static` to the
+    # fresh dict. No-gap: the old dict serves reads until the swap.
+    pending_static_target = None
+    pending_static_sub = None
+    pending_static_since = 0.0
+    last_static_refresh = time.monotonic()
     tf_buffer = tf2_ros.Buffer()
     tf_listener = tf2_ros.TransformListener(tf_buffer, node, spin_thread=False)
     clients = {name: node.create_client(GetState, f"/{name}/get_state") for name in LIFECYCLE_NODES}
@@ -176,6 +209,41 @@ def run(state_file: Path) -> None:
                             client.call_async(GetState.Request()),
                             now,
                         )
+
+                # ---- Expire dead dynamic (/tf) parents by last-seen ----
+                for child in list(parents_dynamic_seen.keys()):
+                    pmap = parents_dynamic_seen[child]
+                    for parent in list(pmap.keys()):
+                        if now - pmap[parent] > DYNAMIC_PARENT_TTL_SEC:
+                            del pmap[parent]
+                    if not pmap:
+                        del parents_dynamic_seen[child]
+                parents_dynamic_view = {
+                    child: sorted(pmap)
+                    for child, pmap in parents_dynamic_seen.items()
+                    if pmap
+                }
+
+                # ---- Refresh /tf_static subscription to drop dead publishers ----
+                # Phase 1: open a fresh subscription collecting into a temp dict.
+                if (pending_static_target is None
+                        and now - last_static_refresh >= STATIC_REFRESH_INTERVAL_SEC):
+                    pending_static_target = {}
+                    pending_static_sub = node.create_subscription(
+                        TFMessage, "/tf_static",
+                        record_tf_static(pending_static_target), transient)
+                    pending_static_since = now
+                    last_static_refresh = now
+                # Phase 2: after grace, the fresh dict reflects only live
+                # publishers' latches — swap it in and retire the old sub.
+                if (pending_static_target is not None
+                        and now - pending_static_since >= STATIC_LATCH_GRACE_SEC):
+                    node.destroy_subscription(static_sub)
+                    static_sub = pending_static_sub
+                    parents_static = pending_static_target
+                    pending_static_target = None
+                    pending_static_sub = None
+
                 tf_state = {}
                 for parent, child in (("camera_init", "body"), ("odom", "base_link"), ("map", "odom"), ("map", "base_link")):
                     try:
@@ -195,7 +263,7 @@ def run(state_file: Path) -> None:
                     },
                     "dog_state": latest_strings.get("/dog_state"),
                     "tf": tf_state,
-                    "parents_dynamic": {key: sorted(value) for key, value in parents_dynamic.items()},
+                    "parents_dynamic": parents_dynamic_view,
                     "parents_static": {key: sorted(value) for key, value in parents_static.items()},
                     "lifecycle": lifecycle,
                     "actions": {"/navigate_to_pose": action.server_is_ready()},
