@@ -1437,17 +1437,19 @@ class RoomSearchOrchestrator:
                         warning="person seen without reliable lidar range; "
                                 "continuing from another viewpoint",
                     )
-                elif reason == "stale_detection_frame":
+                elif reason in ("stale_detection_frame", "unsynchronized_observation"):
                     # 2026-07-21: tolerate stale frame at initial viewpoint
                     # (YOLO warm-up race after go2w-web restart). Warn and
                     # continue to the frontier loop; per-viewpoint detection
                     # at each frontier arrival retries once YOLO is ready.
+                    # 2026-08-05: 扩到 unsynchronized_observation (observation_sync
+                    # 时间对齐失败), 同等容错 — initial viewpoint 瞬时错误不该 fail.
                     self._phase(
                         "FRONTIER_DETECT", progress=0.0,
                         room="__frontier__", current_wp=0,
                         total_wp=max_frontiers,
-                        warning="initial_viewpoint detection stale; "
-                                "continuing (YOLO warm-up?)",
+                        warning=f"initial_viewpoint {reason}; "
+                                "continuing (YOLO warm-up / sync race?)",
                         **self._exploration_live_fields(exploration))
                 else:
                     self._fail(reason, room="__frontier__",
