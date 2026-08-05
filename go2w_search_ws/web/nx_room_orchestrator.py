@@ -1877,6 +1877,11 @@ class RoomSearchOrchestrator:
                     "map_stamp": None,
                     "inflation_radius_m": coverage_inflation,
                 }
+            # 注入视觉覆盖 + 阈值到 coverage_metrics, 供 _derive motion_trap 例外用.
+            # 地图 bounded_explored (lidar 大范围) ≠ 狗视觉搜索进度; visual_coverage 才是.
+            coverage_metrics["visual_coverage_ratio"] = float(
+                visibility_state.get("visual_coverage_ratio", 0.0))
+            coverage_metrics["coverage_threshold"] = visual_coverage_threshold
             completion_status = self._derive_completion_status(
                 completion_reason, coverage_metrics)
             blocked_frontiers = [
@@ -2049,14 +2054,12 @@ class RoomSearchOrchestrator:
             # 狗虽卡死, 搜索任务(覆盖全屋)已完成. 实测 mission 851fa1fb
             # coverage_ratio=0.917>=0.9 但 motion_trapped→incomplete, 漏报完成.
             if completion_reason == "motion_trapped":
-                # coverage_metrics 来自 _compute_coverage (地图覆盖, 不是视觉 coverage_ratio).
-                # 优先 bounded_explored_ratio (ROI 内地图已知比例), 降级 explored_ratio.
-                # 实测 mission: bounded_explored_ratio=0.985 但 coverage_metrics 无
-                # coverage_ratio 字段 → 旧代码拿 0.0 → 误判 incomplete. 改用 bounded_explored_ratio.
+                # 用视觉覆盖 (狗相机实际扫过), 不是地图已知 bounded_explored_ratio
+                # (lidar 范围大, 狗没动也 0.985). orchestrator REPORT 注入
+                # coverage_metrics["visual_coverage_ratio"]. 实测: 起点motion_trap 狗没动
+                # visual 0.09 vs bounded 0.985 → bounded 误判 completed.
                 try:
-                    cov = float(coverage_metrics.get(
-                        "bounded_explored_ratio",
-                        coverage_metrics.get("explored_ratio", 0.0)))
+                    cov = float(coverage_metrics.get("visual_coverage_ratio", 0.0))
                     thr = float(coverage_metrics.get("coverage_threshold", 0.9))
                 except (TypeError, ValueError):
                     cov, thr = 0.0, 0.9

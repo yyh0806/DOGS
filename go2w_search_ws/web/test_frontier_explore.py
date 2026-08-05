@@ -2009,7 +2009,7 @@ def test_completion_status_completes_when_motion_trapped_but_coverage_above_thre
         "motion_trapped",
         {
             "coverage_valid": True,
-            "coverage_ratio": 0.917,
+            "visual_coverage_ratio": 0.917,
             "coverage_threshold": 0.9,
             "roi": {"type": "circle"},
             "explored_ratio": 0.95,
@@ -2024,7 +2024,7 @@ def test_completion_status_completes_when_motion_trapped_but_coverage_above_thre
         "motion_trapped",
         {
             "coverage_valid": True,
-            "coverage_ratio": 0.511,
+            "visual_coverage_ratio": 0.511,
             "coverage_threshold": 0.9,
             "roi": {"type": "circle"},
             "explored_ratio": 0.5,
