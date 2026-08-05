@@ -1746,16 +1746,22 @@ class ExplorationManager:
                 t_turn = hc / max(self.max_vel_theta, 1e-6)
                 # D-backtrack (2026-08-05, 攻"来回移动"): 惩罚 frontier 在身后的候选,
                 # 偏好当前前进方向延续, 避免 visual_gain 主导选回头点导致狗来回.
-                # GO2W_FRONTIER_BACKTRACK_PENALTY 默认 0.5 (0=关); frontier_yaw 在 L1723 已算.
-                backtrack_penalty = float(os.environ.get(
+                # 量级修正: backtrack_angle 转成等效 turn 时间 (/max_vel_theta), 用
+                # heading_penalty 统一量级. 旧公式 0.5*π=1.57 vs heading 14.5*10s=145
+                # 几乎无效 (狗往返). 新公式 backtrack_penalty 是 heading 等效乘数,
+                # 默认 0.5 (backtrack 半个 heading 权重); 0=关. frontier_yaw 在 L1723 已算.
+                backtrack_penalty_mult = float(os.environ.get(
                     "GO2W_FRONTIER_BACKTRACK_PENALTY", "0.5"))
                 backtrack_angle = _abs_angle_delta(frontier_yaw, robot_yaw)
+                backtrack_turn_equiv = (
+                    backtrack_penalty_mult * backtrack_angle
+                    / max(self.max_vel_theta, 1e-6))
                 utility = (
                     self.mixed_frontier_weight * base_ig
                     + self.mixed_visual_gain_weight * float(vg)
                     + self.mixed_wall_bonus * wall_bonus
-                    - self.mixed_heading_penalty * (t_travel + t_turn)
-                    - backtrack_penalty * backtrack_angle
+                    - self.mixed_heading_penalty * (
+                        t_travel + t_turn + backtrack_turn_equiv)
                 )
                 key = (utility, -hc, -vg)
                 if best is None or key > best[0]:
