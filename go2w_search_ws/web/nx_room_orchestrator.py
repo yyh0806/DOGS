@@ -1711,7 +1711,7 @@ class RoomSearchOrchestrator:
                         # not eligible + _motion_trap 直接返回 None (exploration_manager
                         # L457-461) → break, continue 只多跑一次循环. 清这两个状态,
                         # blacklist 已挡住卡死 frontier, 下次 choose_next 正常选别处.
-                        exploration._motion_trap = None
+                        exploration._motion_trap = {}
                         exploration._last_selection_reason = None
                         logger.warning(
                             "frontier %d motion_trapped (progress<0.10), "
