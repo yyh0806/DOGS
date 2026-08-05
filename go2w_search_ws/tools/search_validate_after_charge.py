@@ -22,16 +22,19 @@
 """
 import json
 import math
+import os
 import sys
 import time
 
 import paramiko
 
-NX_HOST = "192.168.1.200"
-NX_USER = "nx"
-NX_PASS = "nx"
-MONITOR_SEC = 600
-STEP_SEC = 30
+# 内部开发工具 (NX 局域网 192.168.1.200, Unitree nx/nx 默认凭证); 非生产代码.
+# 生产用 SSH key + known_hosts (见 deploy_release.sh). env 可覆盖.
+NX_HOST = os.environ.get("NX_HOST", "192.168.1.200")
+NX_USER = os.environ.get("NX_USER", "nx")
+NX_PASS = os.environ.get("NX_PASS", "nx")
+MONITOR_SEC = int(os.environ.get("MONITOR_SEC", "600"))
+STEP_SEC = int(os.environ.get("STEP_SEC", "30"))
 
 
 def main():
@@ -44,7 +47,8 @@ def main():
             "curl -s http://127.0.0.1:8000/api/status --max-time 6")
         try:
             return json.loads(s.read().decode())
-        except Exception:
+        except Exception as exc:
+            print(f"status parse/SSH 失败: {type(exc).__name__}: {exc}")
             return None
 
     d = status()
