@@ -1189,7 +1189,9 @@ def test_frontier_explore_reports_motion_trap_without_submitting_nav_goal(
     assert task.status == "failed"
     assert task.result["reason"] == "motion_trapped"
     assert task.result["completion_reason"] == "motion_trapped"
-    assert task.result["completion_status"] == "incomplete"
+    # 2026-08-05: motion_trap + bounded_explored_ratio=1.0 (地图全知) → completed
+    # (狗没动但地图已知 = 搜索完成). 旧行为 motion_trap 总 incomplete 漏报实机覆盖.
+    assert task.result["completion_status"] == "completed"
     assert task.result["motion_trap"]["turn_clearance_m"] == pytest.approx(0.50)
     assert nav.plan_calls == []
     assert nav.calls == []
