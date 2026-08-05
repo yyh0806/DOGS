@@ -1703,6 +1703,46 @@ def test_locally_blocked_start_reports_motion_trapped_without_nav2_probe():
     assert snapshot["motion_trap"]["forward_clearance_m"] == pytest.approx(0.45)
 
 
+def test_scan_start_infeasible_tolerates_first_attempts_with_env3(monkeypatch):
+    """GO2W_SCAN_INFEASIBLE_TOLERANCE=3 时, scan_start_infeasible 前 2 次不 motion_trap
+    (给 Spin recovery + 地图更新时间脱困). 默认 1 = 立即 motion_trap
+    (test_locally_blocked_start 锁住旧行为契约). 攻测试4 起点角落 0 waypoint."""
+    monkeypatch.setenv("GO2W_SCAN_INFEASIBLE_TOLERANCE", "3")
+    tracker = _VisibilityTracker(
+        adaptive_step_m=0.0,
+        path_blocked=True,
+        current_adaptive_step_m=0.0,
+        current_path_blocked=True,
+        current_forward_clearance_m=0.45,
+        turn_clearance_m=0.50,
+        turn_motion_blocked=True,
+        gains={0.0: 20.0},
+    )
+    frontier = {
+        "x": 0.0, "y": 4.0, "yaw": math.pi / 2.0, "size": 20,
+        "center_cell": (4, 0), "distance": 4.0,
+        "information_gain": 20.0, "score": 20.0,
+        "prefer_standoff": True,
+    }
+    nav = _PlannerPort()
+    manager = ExplorationManager(
+        navigation_port=nav,
+        mission_origin=(0.0, 0.0, 0.0),
+        mode="current_room",
+        room_radius_m=12.0,
+        initial_radius_m=12.0,
+        tile_size_m=20.0,
+        visibility_tracker=tracker,
+        candidate_selector=lambda *_a, **_k: [dict(frontier)],
+        reject_map_edge=False,
+    )
+    manager.choose_next(_two_room_map(), (0.0, 0.0, 0.0))
+    snap = manager.snapshot()
+    # 容忍: 第一次 (count=1 < 3) 不设 _motion_trap, last_selection_reason 非运动锁定
+    assert snap["last_selection_reason"] != "motion_trapped"
+    assert snap.get("motion_trap", {}) == {}
+
+
 def test_terminal_egress_limited_candidate_only_probes_shortened_safe_goal():
     tracker = _VisibilityTracker(
         adaptive_step_m=4.0,
