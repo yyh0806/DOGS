@@ -1744,11 +1744,18 @@ class ExplorationManager:
                 vg = self.visibility_tracker.visual_gain_at(map_msg, cx, cy, yaw)
                 hc = _abs_angle_delta(yaw, robot_yaw)
                 t_turn = hc / max(self.max_vel_theta, 1e-6)
+                # D-backtrack (2026-08-05, 攻"来回移动"): 惩罚 frontier 在身后的候选,
+                # 偏好当前前进方向延续, 避免 visual_gain 主导选回头点导致狗来回.
+                # GO2W_FRONTIER_BACKTRACK_PENALTY 默认 0.5 (0=关); frontier_yaw 在 L1723 已算.
+                backtrack_penalty = float(os.environ.get(
+                    "GO2W_FRONTIER_BACKTRACK_PENALTY", "0.5"))
+                backtrack_angle = _abs_angle_delta(frontier_yaw, robot_yaw)
                 utility = (
                     self.mixed_frontier_weight * base_ig
                     + self.mixed_visual_gain_weight * float(vg)
                     + self.mixed_wall_bonus * wall_bonus
                     - self.mixed_heading_penalty * (t_travel + t_turn)
+                    - backtrack_penalty * backtrack_angle
                 )
                 key = (utility, -hc, -vg)
                 if best is None or key > best[0]:
