@@ -2036,9 +2036,19 @@ class ExplorationManager:
             if (
                     bool(candidate.get("current_path_blocked"))
                     and bool(candidate.get("turn_motion_blocked"))):
-                self._motion_trap = self._motion_trap_evidence(
-                    candidate, candidate, reason="scan_start_infeasible")
+                # scan_start_infeasible 容忍 (2026-08-05): 给 Spin recovery + 地图
+                # 更新时间脱困. 测试4 起点角落所有候选 blocked → 立即 motion_trap
+                # → 搜索 0 waypoint 终结. 容忍 N 次 choose_next (狗可能 Spin 转出
+                # 角落, 候选变可达); 脱困成功 (有 eligible) reset. 默认 3 次.
+                self._scan_infeasible_count = int(
+                    getattr(self, "_scan_infeasible_count", 0)) + 1
+                if self._scan_infeasible_count >= int(os.environ.get(
+                        "GO2W_SCAN_INFEASIBLE_TOLERANCE", "1")):
+                    self._motion_trap = self._motion_trap_evidence(
+                        candidate, candidate, reason="scan_start_infeasible")
         eligible = locally_executable
+        if eligible:
+            self._scan_infeasible_count = 0
         if not eligible:
             return []
         eligible = self._prioritize_active_tile(eligible, robot_pose)
