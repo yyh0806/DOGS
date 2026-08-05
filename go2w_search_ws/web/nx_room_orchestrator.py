@@ -2049,8 +2049,14 @@ class RoomSearchOrchestrator:
             # 狗虽卡死, 搜索任务(覆盖全屋)已完成. 实测 mission 851fa1fb
             # coverage_ratio=0.917>=0.9 但 motion_trapped→incomplete, 漏报完成.
             if completion_reason == "motion_trapped":
+                # coverage_metrics 来自 _compute_coverage (地图覆盖, 不是视觉 coverage_ratio).
+                # 优先 bounded_explored_ratio (ROI 内地图已知比例), 降级 explored_ratio.
+                # 实测 mission: bounded_explored_ratio=0.985 但 coverage_metrics 无
+                # coverage_ratio 字段 → 旧代码拿 0.0 → 误判 incomplete. 改用 bounded_explored_ratio.
                 try:
-                    cov = float(coverage_metrics.get("coverage_ratio", 0.0))
+                    cov = float(coverage_metrics.get(
+                        "bounded_explored_ratio",
+                        coverage_metrics.get("explored_ratio", 0.0)))
                     thr = float(coverage_metrics.get("coverage_threshold", 0.9))
                 except (TypeError, ValueError):
                     cov, thr = 0.0, 0.9

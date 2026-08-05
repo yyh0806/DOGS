@@ -2026,7 +2026,7 @@ def test_completion_status_completes_when_motion_trapped_but_coverage_above_thre
             "coverage_threshold": 0.9,
             "roi": {"type": "circle"},
             "explored_ratio": 0.5,
-            "bounded_explored_ratio": 0.94,
+            "bounded_explored_ratio": 0.85,
             "enclosed_unknown_regions": [],
         },
     )
