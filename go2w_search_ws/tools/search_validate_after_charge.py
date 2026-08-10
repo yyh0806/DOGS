@@ -28,19 +28,41 @@ import time
 
 import paramiko
 
-# 内部开发工具 (NX 局域网 192.168.1.200, Unitree nx/nx 默认凭证); 非生产代码.
-# 生产用 SSH key + known_hosts (见 deploy_release.sh). env 可覆盖.
-NX_HOST = os.environ.get("NX_HOST", "192.168.1.200")
-NX_USER = os.environ.get("NX_USER", "nx")
-NX_PASS = os.environ.get("NX_PASS", "nx")
+# 内部开发工具: NX 局域网 192.168.1.200.
+# 凭证通过环境变量注入, 无默认值 (禁止硬编码凭据入库).
+# 生产用 SSH key + known_hosts (见 deploy_release.sh).
+NX_HOST = os.environ.get("NX_HOST", "")
+NX_USER = os.environ.get("NX_USER", "")
+NX_PASS = os.environ.get("NX_PASS", "")
+NX_KEY_PATH = os.environ.get("NX_KEY_PATH", "")
+# SKIP_HOST_KEY=1 允许跳过 known_hosts 校验 (仅开发网段, 默认拒绝).
+_SKIP_HOST_KEY = os.environ.get("SKIP_HOST_KEY", "") == "1"
 MONITOR_SEC = int(os.environ.get("MONITOR_SEC", "600"))
 STEP_SEC = int(os.environ.get("STEP_SEC", "30"))
 
 
 def main():
+    if not NX_HOST:
+        print("FATAL: NX_HOST 未设置 (export NX_HOST=192.168.1.200)")
+        return 1
+    if not NX_USER:
+        print("FATAL: NX_USER 未设置 (export NX_USER=nx)")
+        return 1
+    if not NX_PASS and not NX_KEY_PATH:
+        print("FATAL: NX_PASS 或 NX_KEY_PATH 未设置 (export NX_PASS=... 或 NX_KEY_PATH=~/.ssh/id_rsa)")
+        return 1
+
     ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(NX_HOST, username=NX_USER, password=NX_PASS, timeout=15)
+    if _SKIP_HOST_KEY:
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    else:
+        ssh.load_system_host_keys()
+        ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+    if NX_KEY_PATH:
+        key = paramiko.RSAKey.from_private_key_file(os.path.expanduser(NX_KEY_PATH))
+        ssh.connect(NX_HOST, username=NX_USER, pkey=key, timeout=15)
+    else:
+        ssh.connect(NX_HOST, username=NX_USER, password=NX_PASS, timeout=15)
 
     def status():
         _, s, _ = ssh.exec_command(

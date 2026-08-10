@@ -292,6 +292,9 @@ class ExplorationManager:
         self._escape_abort_threshold = max(1, int(3))
         self._escape_min_distance_m = max(0.0, float(3.0))
         self._motion_trap: dict = {}
+        # scan_start_infeasible 容忍计数器 (2026-08-05): 起点角落无
+        # waypoint 时给 Spin recovery 脱困时间, 连续 N 次后触发 motion_trap.
+        self._scan_infeasible_count = 0
         self._raw_candidate_count = 0
         self._analyzed_candidate_count = 0
         self._failure_filtered_candidate_count = 0
@@ -2040,8 +2043,7 @@ class ExplorationManager:
                 # 更新时间脱困. 测试4 起点角落所有候选 blocked → 立即 motion_trap
                 # → 搜索 0 waypoint 终结. 容忍 N 次 choose_next (狗可能 Spin 转出
                 # 角落, 候选变可达); 脱困成功 (有 eligible) reset. 默认 3 次.
-                self._scan_infeasible_count = int(
-                    getattr(self, "_scan_infeasible_count", 0)) + 1
+                self._scan_infeasible_count += 1
                 if self._scan_infeasible_count >= int(os.environ.get(
                         "GO2W_SCAN_INFEASIBLE_TOLERANCE", "1")):
                     self._motion_trap = self._motion_trap_evidence(
