@@ -9,6 +9,8 @@ use_sim_time).
 用法:
   source ~/go2w_ws/install/setup.bash
   ros2 launch go2w_sim sim_fastlio_bringup.launch.py
+
+环境变量 GO2W_NO_GAZEBO=1 跳过 gzserver+spawn+fastlio (纯 mock 模式, WSL2 用).
 """
 import os
 
@@ -18,9 +20,11 @@ from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
     IncludeLaunchDescription,
+    LogInfo,
 )
+from launch.conditions import UnlessCondition, IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import Command, LaunchConfiguration
+from launch.substitutions import Command, LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -31,14 +35,15 @@ def generate_launch_description():
     default_world = os.path.join(sim_share, 'worlds', 'indoor_empty.world')
     default_urdf = os.path.join(sim_share, 'urdf', 'go2_sim_livox.urdf.xacro')
 
+    # GO2W_NO_GAZEBO=1: WSL2 跳过 gzserver+spawn+fastlio, 纯 mock 节点跑导航
+    no_gazebo = PythonExpression(["'", os.environ.get("GO2W_NO_GAZEBO", ""), "' == '1'"])
+
     declare_use_sim_time = DeclareLaunchArgument(
         'use_sim_time', default_value='true')
-    # world 可选: indoor_empty.world (单房 MVP) / indoor_rooms.world (4房间 frontier 探索)
     declare_world = DeclareLaunchArgument(
         'world', default_value=default_world,
         description='Gazebo world (indoor_empty.world | indoor_rooms.world)')
 
-    # xacro 处理 URDF (含 Livox CustomMsg 插件 + IMU 插件)
     xacro_cmd = Command(['xacro ', default_urdf])
 
     gzserver = ExecuteProcess(
@@ -47,9 +52,9 @@ def generate_launch_description():
              '-s', 'libgazebo_ros_factory.so',
              LaunchConfiguration('world')],
         output='screen',
+        condition=UnlessCondition(no_gazebo),
     )
 
-    # robot_state_publisher: xacro URDF -> /robot_description + 静态 TF
     rsp = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
@@ -60,17 +65,15 @@ def generate_launch_description():
         output='screen',
     )
 
-    # spawn URDF from /robot_description topic (Task1 模式, executable=spawn_entity.py)
     spawn = Node(
         package='gazebo_ros',
         executable='spawn_entity.py',
         arguments=['-entity', 'go2_sim', '-topic', '/robot_description',
                    '-x', '0', '-y', '0', '-z', '0'],
         output='screen',
+        condition=UnlessCondition(no_gazebo),
     )
 
-    # fast_lio: fastlio_mapping + mid360.yaml (话题 lid_topic=/livox/lidar,
-    # imu_topic=/livox/imu 已对; use_sim_time; 无 rviz)
     fastlio = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(fastlio_share, 'launch', 'mapping.launch.py')),
@@ -79,10 +82,16 @@ def generate_launch_description():
             'use_sim_time': 'true',
             'rviz': 'false',
         }.items(),
+        condition=UnlessCondition(no_gazebo),
+    )
+
+    no_gazebo_log = LogInfo(
+        msg='GO2W_NO_GAZEBO=1: skipping gzserver/spawn/fastlio, mock nodes only',
+        condition=IfCondition(no_gazebo),
     )
 
     return LaunchDescription([
         declare_use_sim_time,
         declare_world,
-        gzserver, rsp, spawn, fastlio,
+        gzserver, rsp, spawn, fastlio, no_gazebo_log,
     ])
