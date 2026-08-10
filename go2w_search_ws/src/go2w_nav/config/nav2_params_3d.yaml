@@ -113,7 +113,7 @@ controller_server:
       plugin: "nav2_rotation_shim_controller::RotationShimController"
       primary_controller: "dwb_core::DWBLocalPlanner"
       forward_sampling_distance: 0.5
-      angular_dist_threshold: 0.2    # 2026-07-18 放宽(原0.05过严): 背对目标大角度转身震荡难达2.8°→卡预转不交DWB不前进; 0.2=11°更容易转完
+      angular_dist_threshold: 0.4    # 2026-08-05 放宽(0.2→0.4=23°): 实机 mission fe0c3a51 pure_turn_oscillation (DWB 原地转振荡 nav_guard 锁零). 0.2 过严致 RotationShim 大角度反复 overshoot 不交 DWB 发纯旋转→振荡. 0.4 更容易转完交 DWB 前进
       angular_disengage_threshold: 0.25
       rotate_to_heading_angular_vel: 0.5    # 2026-07-19 降回(1.0 overshoot: 狗转180° yaw振荡9→85→-11→82 难稳定到 angular_dist_threshold 0.2=11°内 → 不交DWB反复转; 0.5慢稳 motion 跟得上不overshoot)
       max_angular_accel: 1.0    # 2026-07-19 降(2.5起步猛overshoot反弹): 1.0平稳达0.5, 避免转过头振荡
