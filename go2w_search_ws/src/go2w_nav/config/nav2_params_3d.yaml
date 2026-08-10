@@ -113,7 +113,7 @@ controller_server:
       plugin: "nav2_rotation_shim_controller::RotationShimController"
       primary_controller: "dwb_core::DWBLocalPlanner"
       forward_sampling_distance: 0.5
-      angular_dist_threshold: 0.2    # 2026-07-18 放宽(原0.05过严): 背对目标大角度转身震荡难达2.8°→卡预转不交DWB不前进; 0.2=11°更容易转完
+      angular_dist_threshold: 0.4    # 2026-08-05 放宽(0.2→0.4=23°): 实机 mission fe0c3a51 pure_turn_oscillation (DWB 原地转振荡 nav_guard 锁零). 0.2 过严致 RotationShim 大角度反复 overshoot 不交 DWB 发纯旋转→振荡. 0.4 更容易转完交 DWB 前进
       angular_disengage_threshold: 0.25
       rotate_to_heading_angular_vel: 0.5    # 2026-07-19 降回(1.0 overshoot: 狗转180° yaw振荡9→85→-11→82 难稳定到 angular_dist_threshold 0.2=11°内 → 不交DWB反复转; 0.5慢稳 motion 跟得上不overshoot)
       max_angular_accel: 1.0    # 2026-07-19 降(2.5起步猛overshoot反弹): 1.0平稳达0.5, 避免转过头振荡
@@ -314,11 +314,19 @@ behavior_server:
     costmap_topic: local_costmap/costmap_raw
     footprint_topic: local_costmap/published_footprint
     cycle_frequency: 10.0
-    # The active BT may hold position while retrying, but planning failure must
-    # never introduce unplanned Spin/BackUp/DriveOnHeading motion.
-    behavior_plugins: ["wait"]
+    # 2026-08-04: 启用受限 Spin recovery (攻 motion_trap 狗卡死无法脱困).
+    # ⚠️ Go2W 轮式转向有平移蠕动 (creep), 标准 Spin 不安全 (见 BT XML 注释);
+    # 用低 max_rotational_vel (0.3 rad/s, 默认 1.0) 限制 creep. 现场测试验证,
+    # creep 明显则改用应用层 back-out (方案 C, orchestrator 发 cmd_vel 后退).
+    behavior_plugins: ["wait", "spin"]
     wait:
       plugin: "nav2_behaviors/Wait"
+    spin:
+      plugin: "nav2_behaviors/Spin"
+      max_rotational_vel: 0.3       # 低角速度 (rad/s) 限制 creep
+      min_rotational_vel: 0.1
+      spin_windup: 0.1              # 短加速 ramp
+      simulate_ahead_time: 0.1
     global_frame: odom               # recovery 行为在 odom frame
     robot_base_frame: base_link
     transform_tolerance: 0.5  # 有界 TF 等待窗口，不用于掩盖陈旧变换

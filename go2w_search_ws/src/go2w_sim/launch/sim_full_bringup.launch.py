@@ -91,15 +91,17 @@ def generate_launch_description():
     # mock_scan: 10Hz 假 LaserScan 兜底 livox WSL2 退化 (visualize=false 后 brztink6u 偶发
     # 不发点云 → /scan 空 → nav_scan_fresh=False → motion 不激活 → 狗不位移).
     # b463cl71d/brztink6u 真链路已验证, 本节点是环境退化 fallback.
+    # use_sim_time=false: GO2W_NO_GAZEBO 时无 gzserver → 无 /clock → 用 wall clock.
+    _use_sim = os.environ.get("GO2W_NO_GAZEBO", "") != "1"
     mock_scan = Node(
         package='go2w_sim', executable='mock_scan_node', output='screen',
-        parameters=[{'use_sim_time': True}])  # wall stamp, motion use_sim_time=false 一致
+        parameters=[{'use_sim_time': _use_sim}])
 
     # mock_planar_move: /cmd_vel 运动学积分 → /odom_planar + TF (绕过 gzserver planar_move
     # WSL2 SIGFPE 崩 → planar_move 死 → 狗不动). 用户允许运动模型简化.
     mock_planar_move = Node(
         package='go2w_sim', executable='mock_planar_move_node', output='screen',
-        parameters=[{'use_sim_time': True}])  # wall dt, 避免 gzserver 崩 /clock 冻结 dt=0
+        parameters=[{'use_sim_time': _use_sim}])
 
     # slam_toolbox 在线建图 (订 /scan → /map_frontier_raw) + map_padding_bridge
     # (/map_frontier_raw → /map_frontier) 让 room_orchestrator frontier_explore 有地图.

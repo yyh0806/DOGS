@@ -1189,7 +1189,9 @@ def test_frontier_explore_reports_motion_trap_without_submitting_nav_goal(
     assert task.status == "failed"
     assert task.result["reason"] == "motion_trapped"
     assert task.result["completion_reason"] == "motion_trapped"
-    assert task.result["completion_status"] == "incomplete"
+    # 2026-08-05: motion_trap + bounded_explored_ratio=1.0 (地图全知) → completed
+    # (狗没动但地图已知 = 搜索完成). 旧行为 motion_trap 总 incomplete 漏报实机覆盖.
+    assert task.result["completion_status"] == "completed"
     assert task.result["motion_trap"]["turn_clearance_m"] == pytest.approx(0.50)
     assert nav.plan_calls == []
     assert nav.calls == []
@@ -1995,6 +1997,42 @@ def test_completion_status_is_incomplete_while_a_traversable_opening_is_blocked(
     )
 
     assert status == "incomplete"
+
+
+def test_completion_status_completes_when_motion_trapped_but_coverage_above_threshold():
+    """motion_trapped 时若视觉覆盖达标, 判 completed (狗卡死但搜索已完成).
+
+    实测 mission 851fa1fb: coverage_ratio=0.917>=0.9 但 motion_trapped→incomplete 漏报.
+    """
+    orchestrator = make_orchestrator([], FakeNav())
+    status_done = orchestrator._derive_completion_status(
+        "motion_trapped",
+        {
+            "coverage_valid": True,
+            "visual_coverage_ratio": 0.917,
+            "coverage_threshold": 0.9,
+            "roi": {"type": "circle"},
+            "explored_ratio": 0.95,
+            "bounded_explored_ratio": 0.958,
+            "enclosed_unknown_regions": [],
+        },
+    )
+    assert status_done == "completed"
+
+    # coverage 不达标 → 仍是 incomplete (motion_trapped 在 budget_reasons)
+    status_low = orchestrator._derive_completion_status(
+        "motion_trapped",
+        {
+            "coverage_valid": True,
+            "visual_coverage_ratio": 0.511,
+            "coverage_threshold": 0.9,
+            "roi": {"type": "circle"},
+            "explored_ratio": 0.5,
+            "bounded_explored_ratio": 0.85,
+            "enclosed_unknown_regions": [],
+        },
+    )
+    assert status_low == "incomplete"
 
 
 def test_dynamic_circle_roi_cannot_complete_with_most_area_still_unknown():

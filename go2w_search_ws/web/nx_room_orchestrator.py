@@ -1437,17 +1437,19 @@ class RoomSearchOrchestrator:
                         warning="person seen without reliable lidar range; "
                                 "continuing from another viewpoint",
                     )
-                elif reason == "stale_detection_frame":
+                elif reason in ("stale_detection_frame", "unsynchronized_observation"):
                     # 2026-07-21: tolerate stale frame at initial viewpoint
                     # (YOLO warm-up race after go2w-web restart). Warn and
                     # continue to the frontier loop; per-viewpoint detection
                     # at each frontier arrival retries once YOLO is ready.
+                    # 2026-08-05: 扩到 unsynchronized_observation (observation_sync
+                    # 时间对齐失败), 同等容错 — initial viewpoint 瞬时错误不该 fail.
                     self._phase(
                         "FRONTIER_DETECT", progress=0.0,
                         room="__frontier__", current_wp=0,
                         total_wp=max_frontiers,
-                        warning="initial_viewpoint detection stale; "
-                                "continuing (YOLO warm-up?)",
+                        warning=f"initial_viewpoint {reason}; "
+                                "continuing (YOLO warm-up / sync race?)",
                         **self._exploration_live_fields(exploration))
                 else:
                     self._fail(reason, room="__frontier__",
@@ -1703,8 +1705,24 @@ class RoomSearchOrchestrator:
                         robot_pose=self._get_live_robot_pose() or robot_pose,
                     )
                     if failure_outcome == "motion_trapped":
-                        completion_reason = "motion_trapped"
-                        break
+                        # 2026-08-05: motion_trap 不终结 mission. 清 lockout 让
+                        # choose_next 能选别处. mark_navigation_failed 设 _motion_trap
+                        # + _last_selection_reason='motion_trapped', choose_next 遇
+                        # not eligible + _motion_trap 直接返回 None (exploration_manager
+                        # L457-461) → break, continue 只多跑一次循环. 清这两个状态,
+                        # blacklist 已挡住卡死 frontier, 下次 choose_next 正常选别处.
+                        exploration._motion_trap = {}
+                        exploration._last_selection_reason = None
+                        logger.warning(
+                            "frontier %d motion_trapped (progress<0.10), "
+                            "blacklist + clear lockout + continue", iteration)
+                        self._phase(
+                            "FRONTIER_DETECT", progress=progress,
+                            room="__frontier__", current_wp=iteration,
+                            total_wp=max_frontiers,
+                            warning=f"frontier {iteration} motion_trapped, continue",
+                            **self._exploration_live_fields(exploration))
+                        continue
                     self._phase("FRONTIER_DETECT", progress=progress,
                                 room="__frontier__", current_wp=iteration,
                                 total_wp=max_frontiers,
@@ -1744,46 +1762,68 @@ class RoomSearchOrchestrator:
                         self._visibility_scan_snapshot(),
                     )
 
-                unresolved_before_observation = len(store.unresolved())
-                observed = self._observe_people_at_viewpoint(
-                    store, "__frontier__", iteration, observe_pose,
-                    target_classes, require_photos=require_photos,
-                    use_lidar=True)
-                if observed is None:
-                    self._fail("no_scan", room="__frontier__",
-                               stage=f"frontier_{iteration}")
-                    task.status = "failed"
-                    task.result = {"reason": "no_scan"}
-                    return
-                if isinstance(observed, dict) and observed.get("reason"):
-                    reason = str(observed.get("reason"))
-                    if reason == "no_lidar_range":
+                # ② DETECT 停车税取消 (攻 time_budget 根因 2026-08-05):
+                # en_route worker 已在导航期间做了 YOLO 检测 + observation_sync
+                # 时间对齐 + range_lidar localize + store ingest (见上文
+                # _ingest_en_route_samples 调用). 到达后再调 _observe_people_at_viewpoint
+                # 等 fresh 帧 (GO2W_DETECTION_WAIT_SEC 默认 12s) 是重复劳动, 是搜索
+                # 停顿的最大单一来源. 仅当 en_route 无样本 (导航太短 / YOLO 未跑) 才
+                # 回退 fresh-wait, 保证检测覆盖不降.
+                if en_route_samples:
+                    logger.info(
+                        "frontier %d: DETECT skip fresh-wait (en_route=%d samples "
+                        "already ingested)", iteration, len(en_route_samples))
+                else:
+                    unresolved_before_observation = len(store.unresolved())
+                    observed = self._observe_people_at_viewpoint(
+                        store, "__frontier__", iteration, observe_pose,
+                        target_classes, require_photos=require_photos,
+                        use_lidar=True)
+                    if observed is None:
+                        self._fail("no_scan", room="__frontier__",
+                                   stage=f"frontier_{iteration}")
+                        task.status = "failed"
+                        task.result = {"reason": "no_scan"}
+                        return
+                    if isinstance(observed, dict) and observed.get("reason"):
+                        reason = str(observed.get("reason"))
+                        if reason == "no_lidar_range":
+                            resolved_count = self._positive_int(
+                                observed.get("resolved_count"), 0)
+                            store.resolve_unresolved(min(
+                                resolved_count, unresolved_before_observation))
+                            self._phase(
+                                "FRONTIER_DETECT", progress=progress,
+                                room="__frontier__", current_wp=iteration,
+                                total_wp=max_frontiers,
+                                warning="person seen without reliable lidar range; "
+                                        "continuing from another viewpoint",
+                            )
+                        elif reason in ("stale_detection_frame", "unsynchronized_observation"):
+                            # 2026-08-05: 瞬时检测/同步卡顿不该 fail 整个 mission.
+                            # - stale_detection_frame: YOLO warm-up 窗口内到达, 等 fresh 超时
+                            # - unsynchronized_observation: observation_sync 时间对齐失败 (相机/YOLO 帧)
+                            # 实测多个 mission 因单 frontier 这类瞬时错误 FAILED:
+                            # frontier_0 stale, frontier_13 unsynchronized. en_route worker
+                            # 后续 frontier 会采到. 跳过此 frontier 继续, coverage 仍涨, mission 不死.
+                            logger.warning(
+                                "frontier %d: %s, skip at_viewpoint, continue exploring",
+                                iteration, reason)
+                        else:
+                            self._fail(reason, room="__frontier__",
+                                       stage=f"frontier_{iteration}",
+                                       detections=observed.get("detections"))
+                            task.status = "failed"
+                            task.result = observed
+                            return
+                    elif isinstance(observed, dict):
                         resolved_count = self._positive_int(
                             observed.get("resolved_count"), 0)
                         store.resolve_unresolved(min(
                             resolved_count, unresolved_before_observation))
-                        self._phase(
-                            "FRONTIER_DETECT", progress=progress,
-                            room="__frontier__", current_wp=iteration,
-                            total_wp=max_frontiers,
-                            warning="person seen without reliable lidar range; "
-                                    "continuing from another viewpoint",
-                        )
-                    else:
-                        self._fail(reason, room="__frontier__",
-                                   stage=f"frontier_{iteration}",
-                                   detections=observed.get("detections"))
-                        task.status = "failed"
-                        task.result = observed
-                        return
-                elif isinstance(observed, dict):
-                    resolved_count = self._positive_int(
-                        observed.get("resolved_count"), 0)
-                    store.resolve_unresolved(min(
-                        resolved_count, unresolved_before_observation))
-                elif isinstance(observed, int) and observed > 0:
-                    store.resolve_unresolved(min(
-                        observed, unresolved_before_observation))
+                    elif isinstance(observed, int) and observed > 0:
+                        store.resolve_unresolved(min(
+                            observed, unresolved_before_observation))
 
                 self._broadcast_person_markers(mission_id, store.markers())
 
@@ -1837,6 +1877,11 @@ class RoomSearchOrchestrator:
                     "map_stamp": None,
                     "inflation_radius_m": coverage_inflation,
                 }
+            # 注入视觉覆盖 + 阈值到 coverage_metrics, 供 _derive motion_trap 例外用.
+            # 地图 bounded_explored (lidar 大范围) ≠ 狗视觉搜索进度; visual_coverage 才是.
+            coverage_metrics["visual_coverage_ratio"] = float(
+                visibility_state.get("visual_coverage_ratio", 0.0))
+            coverage_metrics["coverage_threshold"] = visual_coverage_threshold
             completion_status = self._derive_completion_status(
                 completion_reason, coverage_metrics)
             blocked_frontiers = [
@@ -2005,6 +2050,21 @@ class RoomSearchOrchestrator:
             "motion_trapped",
         }
         if completion_reason in budget_reasons:
+            # 2026-08-05: motion_trapped 时若视觉覆盖已达标, 判 completed —
+            # 狗虽卡死, 搜索任务(覆盖全屋)已完成. 实测 mission 851fa1fb
+            # coverage_ratio=0.917>=0.9 但 motion_trapped→incomplete, 漏报完成.
+            if completion_reason == "motion_trapped":
+                # 用视觉覆盖 (狗相机实际扫过), 不是地图已知 bounded_explored_ratio
+                # (lidar 范围大, 狗没动也 0.985). orchestrator REPORT 注入
+                # coverage_metrics["visual_coverage_ratio"]. 实测: 起点motion_trap 狗没动
+                # visual 0.09 vs bounded 0.985 → bounded 误判 completed.
+                try:
+                    cov = float(coverage_metrics.get("visual_coverage_ratio", 0.0))
+                    thr = float(coverage_metrics.get("coverage_threshold", 0.9))
+                except (TypeError, ValueError):
+                    cov, thr = 0.0, 0.9
+                if cov >= thr:
+                    return "completed"
             return "incomplete"
         # 封闭房间判据 (2026-07-21): topology-based completion — when the
         # only remaining frontier is the entry door, the room is enclosed

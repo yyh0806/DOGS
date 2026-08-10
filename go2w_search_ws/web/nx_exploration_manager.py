@@ -292,6 +292,9 @@ class ExplorationManager:
         self._escape_abort_threshold = max(1, int(3))
         self._escape_min_distance_m = max(0.0, float(3.0))
         self._motion_trap: dict = {}
+        # scan_start_infeasible 容忍计数器 (2026-08-05): 起点角落无
+        # waypoint 时给 Spin recovery 脱困时间, 连续 N 次后触发 motion_trap.
+        self._scan_infeasible_count = 0
         self._raw_candidate_count = 0
         self._analyzed_candidate_count = 0
         self._failure_filtered_candidate_count = 0
@@ -1744,11 +1747,24 @@ class ExplorationManager:
                 vg = self.visibility_tracker.visual_gain_at(map_msg, cx, cy, yaw)
                 hc = _abs_angle_delta(yaw, robot_yaw)
                 t_turn = hc / max(self.max_vel_theta, 1e-6)
+                # D-backtrack (2026-08-05, 攻"来回移动"): 惩罚 frontier 在身后的候选,
+                # 偏好当前前进方向延续, 避免 visual_gain 主导选回头点导致狗来回.
+                # 量级修正: backtrack_angle 转成等效 turn 时间 (/max_vel_theta), 用
+                # heading_penalty 统一量级. 旧公式 0.5*π=1.57 vs heading 14.5*10s=145
+                # 几乎无效 (狗往返). 新公式 backtrack_penalty 是 heading 等效乘数,
+                # 默认 0.5 (backtrack 半个 heading 权重); 0=关. frontier_yaw 在 L1723 已算.
+                backtrack_penalty_mult = float(os.environ.get(
+                    "GO2W_FRONTIER_BACKTRACK_PENALTY", "0.5"))
+                backtrack_angle = _abs_angle_delta(frontier_yaw, robot_yaw)
+                backtrack_turn_equiv = (
+                    backtrack_penalty_mult * backtrack_angle
+                    / max(self.max_vel_theta, 1e-6))
                 utility = (
                     self.mixed_frontier_weight * base_ig
                     + self.mixed_visual_gain_weight * float(vg)
                     + self.mixed_wall_bonus * wall_bonus
-                    - self.mixed_heading_penalty * (t_travel + t_turn)
+                    - self.mixed_heading_penalty * (
+                        t_travel + t_turn + backtrack_turn_equiv)
                 )
                 key = (utility, -hc, -vg)
                 if best is None or key > best[0]:
@@ -2023,9 +2039,18 @@ class ExplorationManager:
             if (
                     bool(candidate.get("current_path_blocked"))
                     and bool(candidate.get("turn_motion_blocked"))):
-                self._motion_trap = self._motion_trap_evidence(
-                    candidate, candidate, reason="scan_start_infeasible")
+                # scan_start_infeasible 容忍 (2026-08-05): 给 Spin recovery + 地图
+                # 更新时间脱困. 测试4 起点角落所有候选 blocked → 立即 motion_trap
+                # → 搜索 0 waypoint 终结. 容忍 N 次 choose_next (狗可能 Spin 转出
+                # 角落, 候选变可达); 脱困成功 (有 eligible) reset. 默认 3 次.
+                self._scan_infeasible_count += 1
+                if self._scan_infeasible_count >= int(os.environ.get(
+                        "GO2W_SCAN_INFEASIBLE_TOLERANCE", "1")):
+                    self._motion_trap = self._motion_trap_evidence(
+                        candidate, candidate, reason="scan_start_infeasible")
         eligible = locally_executable
+        if eligible:
+            self._scan_infeasible_count = 0
         if not eligible:
             return []
         eligible = self._prioritize_active_tile(eligible, robot_pose)

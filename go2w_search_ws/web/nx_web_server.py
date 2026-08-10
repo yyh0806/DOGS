@@ -2384,6 +2384,11 @@ def _point_navigation_health(nx_node):
 def _point_navigation_health_sample(nx_node):
     """Classify hard motion failures separately from transient localization loss."""
     try:
+        # 仿真模式: 运动状态机反馈不完整 (无真实底盘), 不因 transient
+        # drive_session 变化 (parked/active 切换) 取消导航目标。
+        if os.environ.get("GO2W_SIM") == "1":
+            return {"healthy": True, "immediate": False, "reason": None,
+                    "motion_reason": None, "localization_reason": None}
         localization = nx_node.get_localization_health()
         motion = nx_node.get_navigation_readiness()
     except Exception:
