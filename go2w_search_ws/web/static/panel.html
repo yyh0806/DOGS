@@ -1789,13 +1789,16 @@ function handleSocketMessage(socket, socketEpoch, e) {
       const data = JSON.parse(e.data);
       if (wsMessageOverlapsStatus(data.type)) markRealtimeStateUpdate();
       if (data.type === 'lidar') {
-        const li = document.getElementById('lidarImg');
-        li.src = 'data:image/png;base64,' + data.data;
-        li.style.display = 'block';
-        document.getElementById('noLidar').style.display = 'none';
-        if (map && data.points) map.addLocalObstaclePoints(data.points);
-        const meta = document.getElementById('lidarMeta');
-        if (meta && data.points) meta.textContent = data.points.length + ' pts';
+        // 2026-08-10: 彻底禁用 LidarBridge 前端渲染。
+        // 地图上已通过 /scan_mid360 → scanPoints (绿色点+线) 唯一渲染雷达数据。
+        // LidarBridge 的 PNG鸟瞰+points 是冗余的第二数据源，关闭避免双源观感。
+        // const li = document.getElementById('lidarImg');
+        // li.src = 'data:image/png;base64,' + data.data;
+        // li.style.display = 'block';
+        // document.getElementById('noLidar').style.display = 'none';
+        // if (map && data.points) map.addLocalObstaclePoints(data.points);
+        // const meta = document.getElementById('lidarMeta');
+        // if (meta && data.points) meta.textContent = data.points.length + ' pts';
       } else if (data.type === 'gimbal') {
         // C13 云台双流 (可见光+红外合并推送)
         if (data.vis) {
