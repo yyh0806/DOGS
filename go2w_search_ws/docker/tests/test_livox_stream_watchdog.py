@@ -2,7 +2,7 @@ import importlib.util
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 WATCHDOG = ROOT / "tools" / "livox_stream_watchdog.py"
 SERVICE = ROOT / "docker" / "livox-mid360-watchdog.service"
 DEPLOY = ROOT / "docker" / "deploy_nav2_bprime.sh"

@@ -2,7 +2,7 @@ from pathlib import Path
 import ast
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_costmap_bridge_is_a_persistent_slam_nav_companion():

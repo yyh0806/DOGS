@@ -13,7 +13,7 @@ FUSER = (
     Path(__file__).resolve().parents[1]
     / "src/go2w_bridge/go2w_bridge/map_odom_fuser.py"
 )
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 SENSOR = ROOT / "src/go2w_bridge/go2w_bridge/nx_sensor_node.py"
 
 

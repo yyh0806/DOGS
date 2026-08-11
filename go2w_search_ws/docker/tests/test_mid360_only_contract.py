@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 BRIDGE = ROOT / "src/go2w_bridge/go2w_bridge"
 POINT_BRIDGE = BRIDGE / "mid360_nav_bridge.py"
 CPP_POINT_BRIDGE = ROOT / "src/go2w_nav/src/mid360_nav_bridge.cpp"

@@ -5,7 +5,7 @@ import re
 import xml.etree.ElementTree as ET
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 SLAM_LAUNCH = ROOT / "src/go2w_nav/launch/slam_online.launch.py"
 SLAM_PARAMS = ROOT / "src/go2w_nav/config/slam_toolbox_online.yaml"
 NAV_PARAMS = ROOT / "src/go2w_nav/config/nav2_params_3d.yaml"

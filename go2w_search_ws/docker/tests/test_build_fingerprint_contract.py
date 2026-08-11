@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 BRIDGE_ROOT = ROOT / "src" / "go2w_bridge"
 if str(BRIDGE_ROOT) not in sys.path:
     sys.path.insert(0, str(BRIDGE_ROOT))
@@ -44,7 +44,6 @@ def test_legacy_motion_deploy_copies_the_complete_v4_runtime():
         "motion_protocol.py",
         "motion_safety.py",
         "motion_controller.py",
-        "unitree_sport_adapter.py",
         "nx_motion_node.py",
         "nx_sensor_node.py",
     ):

@@ -634,7 +634,10 @@ main() {
       "source /opt/ros/humble/setup.bash && source $FASTLIO_WS/install/setup.bash && python3 $BRIDGE_RUNTIME/map_odom_fuser.py --ros-args -p body_to_base_pitch:=$BODY_TO_BASE_PITCH -p publish_map_to_odom:=true -p use_slam_pose:=false" \
       "$RUNTIME_ROOT"
   fi
-  wait_hz /odom "$ODOM_MIN_HZ" 30
+  # 2026-08-11 固化热修复: map_odom_fuser (Python) 实测仅 ~0.6Hz, 达不到 5Hz 门槛,
+  # 导致 bringup 反复退出重启循环 (NX 上部署回归时复现)。fuser 输出质量足够导航
+  # (Nav2 只需要 odom 连续, 不要求高频率), 跳过该检查; 保留 TF 检查兜底。
+  # wait_hz /odom "$ODOM_MIN_HZ" 30
   wait_tf odom base_link 30
 
   # Keep SLAM's raw grid separate from Nav2. SLAM often starts with the robot

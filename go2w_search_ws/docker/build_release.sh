@@ -40,7 +40,7 @@ copy_path() {
 copy_motion_runtime() {
   local name
   for name in build_info.py motion_types.py motion_machine.py motion_protocol.py \
-      motion_safety.py motion_controller.py unitree_sport_adapter.py \
+      motion_safety.py motion_controller.py \
       sport_gateway_protocol.py sport_gateway_server.py sport_gateway_client.py \
       safety_event_recorder.py nx_safety_observer.py nx_sport_gateway.py \
       nx_motion_node.py; do

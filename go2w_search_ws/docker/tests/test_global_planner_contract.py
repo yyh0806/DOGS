@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 PARAMS = ROOT / "src/go2w_nav/config/nav2_params_3d.yaml"
 PACKAGE_XML = ROOT / "src/go2w_nav/package.xml"
 BRINGUP = ROOT / "docker/bringup_slam_nav2.sh"

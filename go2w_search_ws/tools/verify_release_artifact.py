@@ -102,7 +102,6 @@ _REQUIRED_PAYLOAD_FILES = frozenset({
     "src/go2w_bridge/go2w_bridge/motion_protocol.py",
     "src/go2w_bridge/go2w_bridge/motion_safety.py",
     "src/go2w_bridge/go2w_bridge/motion_types.py",
-    "src/go2w_bridge/go2w_bridge/unitree_sport_adapter.py",
     "src/go2w_bridge/go2w_bridge/sport_gateway_protocol.py",
     "src/go2w_bridge/go2w_bridge/sport_gateway_server.py",
     "src/go2w_bridge/go2w_bridge/sport_gateway_client.py",

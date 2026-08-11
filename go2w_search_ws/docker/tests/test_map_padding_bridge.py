@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "src/go2w_bridge/go2w_bridge/map_padding_bridge.py"
 
 

@@ -12,7 +12,7 @@ import pytest
 import yaml
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 PATCH = ROOT / "docker" / "patches" / "fast_lio_latest_frame.patch"
 LIVOX_RELIABLE_PATCH = (
     ROOT / "docker" / "patches" / "fast_lio_livox_reliable_qos.patch"
