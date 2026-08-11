@@ -8,7 +8,7 @@ import sys
 import pytest
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 BRIDGE = ROOT / "src" / "go2w_bridge"
 if str(BRIDGE) not in sys.path:
     sys.path.insert(0, str(BRIDGE))

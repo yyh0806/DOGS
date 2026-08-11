@@ -16,7 +16,7 @@ def test_web_builds_versioned_canonical_motion_intent():
 
 
 def test_web_server_never_publishes_legacy_motion_session_strings():
-    source = Path(__file__).with_name("nx_web_server.py").read_text(
+    source = (Path(__file__).resolve().parents[1] / "nx_web_server.py").read_text(
         encoding="utf-8")
     assert "build_motion_intent(" in source
     assert 'publish_motion_session(f"{owner}_start")' not in source
@@ -24,7 +24,7 @@ def test_web_server_never_publishes_legacy_motion_session_strings():
 
 
 def test_navigation_readiness_consumes_status_v4_canonical_fields():
-    source = Path(__file__).with_name("nx_web_server.py").read_text(
+    source = (Path(__file__).resolve().parents[1] / "nx_web_server.py").read_text(
         encoding="utf-8")
     callback = source[source.index("    def _on_dog_state("):]
     callback = callback[:callback.index("    def _on_imu(")]

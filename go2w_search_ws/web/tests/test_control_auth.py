@@ -82,7 +82,7 @@ def test_preflight_is_allowed_only_for_configured_panel_origin():
 
 
 def test_http_adapter_authorizes_before_reading_request_body():
-    source = (Path(__file__).with_name("nx_web_server.py")).read_text(
+    source = (Path(__file__).resolve().parents[1] / "nx_web_server.py").read_text(
         encoding="utf-8")
     post = source[source.index("        def do_POST(self):"):]
     auth = post.index("authorize_request(")
@@ -93,7 +93,7 @@ def test_http_adapter_authorizes_before_reading_request_body():
 
 
 def test_global_stop_does_not_infer_semantics_from_referer():
-    source = (Path(__file__).with_name("nx_web_server.py")).read_text(
+    source = (Path(__file__).resolve().parents[1] / "nx_web_server.py").read_text(
         encoding="utf-8")
     stop = source[source.index("elif p.path == '/api/stop':"):]
     stop = stop[:stop.index("elif p.path == '/api/e_stop':")]
