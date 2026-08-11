@@ -34,6 +34,15 @@ go2w_search_ws/web/missions/
 tmp/
 go2w_search_ws/tmp/
 
+# 根目录调试产物: TF 帧图 / API 状态快照 / 界面截图 (均为人工排查时导出, 不入库)
+frames_*.gv
+frames_*.pdf
+status.json
+plan-check.png
+search-panel.png
+web-check-8000.png
+*.log
+
 # 仿真 SIGFPE workaround 编译产物 (WSL2 glibc ifunc): 源码 mycos.c + mycos.map 入库,
 # .so 由目标机现场 gcc 编译 (见 QUICKSTART.md "仿真模式" Step 4)
 go2w_search_ws/tools/mycos.so

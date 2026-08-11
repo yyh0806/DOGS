@@ -86,7 +86,8 @@ PC (浏览器, 瘦客户端)
 | `static/map.js` | 地图 Canvas 渲染（合同）|
 | `static/mock_person.png` | mock 视频用的 COCO 人物裁图 |
 | `verify_nx_web.sh` / `verify_nx_ai.sh` / `verify_stage_e.sh` | NX 验证脚本 |
-| `start_nx_web.sh` / `start_pc_browser.sh` | NX 启动 / PC 开浏览器访问 NX |
+| `start_go2w_web.sh` / `start_pc_browser.sh` | NX 启动（go2w-web.service 实际引用）/ PC 开浏览器访问 NX |
+> 注：旧版 `start_nx_web.sh` 已被 `start_go2w_web.sh` 取代（2026-08 优化分支移除），历史版本见 `docs/archive/nx_deploy_snapshot/`。
 
 ### `src/go2w_bridge/` — 狗 SDK 桥 ✅ active（仅 2 节点）
 | 文件 | 用途 |
