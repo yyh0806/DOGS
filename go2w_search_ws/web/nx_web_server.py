@@ -1636,6 +1636,11 @@ class TaskManager:
         self._search_targets = []
         # fetch 插件装载确认事件 (S4: 前端 POST /api/fetch_confirm 置位)
         self._fetch_confirm_event = threading.Event()
+        # propose-verify LLM 规划器 (None = 纯确定性解析)
+        self._llm_planner = None
+
+    def set_llm_planner(self, planner):
+        self._llm_planner = planner
         # 阶段A 不跑 AI: vlm/detector 传 None, tracker 不创建
         self._tracker = None
         if self.vlm is not None:
@@ -1866,6 +1871,20 @@ class TaskManager:
                 result = parse_follow_command(text)
             except Exception as e:
                 logger.warning(f"follow parser failed: {e}")
+                result = None
+        if result is None and self._llm_planner is not None:
+            # propose-verify 最后兜底: DeepSeek 提议计划 → 强校验
+            # (fail-closed: LLM 失败/非法输出 → None, 走拒绝路径)
+            try:
+                result = self._llm_planner.plan(text)
+                if result is not None:
+                    ws_broadcast({
+                        "type": "llm_reasoning",
+                        "data": {"text": text,
+                                 "reasoning": result.get("reasoning") or ""},
+                    })
+            except Exception as e:
+                logger.warning(f"LLM planner failed: {e}")
                 result = None
         if result is not None:
             self._resolve_product_current_room(result)
@@ -3509,6 +3528,14 @@ def main():
 
     task_mgr = TaskManager(robot, vlm_engine=vlm_proxy, detector=detector_proxy)
     task_mgr.set_point_nav(point_nav)
+
+    # DeepSeek 云端 LLM 规划器 (propose-verify, fail-closed 回退确定性解析)
+    try:
+        from ai.cloud_llm import CloudLLM
+        from nx_llm_planner import LLMPlanner
+        task_mgr.set_llm_planner(LLMPlanner(CloudLLM()))
+    except Exception as _e:
+        logger.warning(f"LLM 规划器初始化失败 (回退纯确定性解析): {_e}")
 
     # C13 云台双流桥接 (独立 daemon 线程拉 vis+ir RTSP → type=gimbal 推前端)
     gimbal_bridge = None

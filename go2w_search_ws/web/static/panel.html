@@ -277,6 +277,7 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
       <button class="btn primary" onclick="activateDog()" title="激活狗进入轮式可导航态 (parked→active); 进入轮式平衡时轮子可能小幅移动, 请确保场地空旷">激活</button>
       <button class="btn" id="landmarkModeBtn" onclick="toggleLandmarkMode()" title="标记地标: 点击地图选点, 输入名字(如:大门)注册; 之后可说'去大门'导航">📍 标记地标</button>
       <button class="btn" onclick="listLandmarks()" title="列出已注册的地标">🗺️ 地标列表</button>
+      <div id="llmReasoning" style="display:none;margin:6px 0;padding:8px;background:#1a1a2e;color:#9ad0ff;border-radius:6px;font-size:12px;max-height:80px;overflow:auto;"></div>
       <!-- 2026-07-18 删急停按钮: 用户要求去掉 (导航取消误判为急停); 急停改用遥控器或键盘(空格已取消). eStop() 函数保留备用. -->
     </div>
     <div class="divider"></div>
@@ -1911,6 +1912,14 @@ function handleSocketMessage(socket, socketEpoch, e) {
           showFetchConfirmButton(!!fd.object ? fd.object : '物品');
         } else if (fd.phase === 'DONE' || fd.phase === 'FAILED') {
           hideFetchConfirmButton();
+        }
+      } else if (data.type === 'llm_reasoning') {
+        // DeepSeek 思考过程透出 (只展示, 不参与执行)
+        const r = data.data || {};
+        const box = document.getElementById('llmReasoning');
+        if (box && r.reasoning) {
+          box.textContent = '🧠 ' + r.reasoning;
+          box.style.display = 'block';
         }
       } else if (data.type === 'slam') {
         if (map) map.update(data.data);
