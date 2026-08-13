@@ -283,6 +283,13 @@ class Go2WMap {
 
   clearNavGoal() { return this.setNavGoal(null); }
 
+  /** 设置地标标记列表 (panel.html drawLandmarkMarkers 调用)。 */
+  setLandmarks(landmarks) {
+    this._landmarks = Array.isArray(landmarks) ? landmarks : [];
+    this._tf = null;
+    this._markDirty();
+  }
+
   /** 接收 MID360 局部点 (x前/y左, 米), 转成世界坐标并累积到左侧障碍栅格。 */
   addLocalObstaclePoints(points) {
     if (!Array.isArray(points) || !points.length) return;
@@ -893,6 +900,20 @@ class Go2WMap {
     ctx.moveTo(rx, ry);
     ctx.lineTo(rx + Math.cos(_dogYaw) * 16, ry - Math.sin(_dogYaw) * 16);
     ctx.stroke();
+    // 地标标记 (fetch-task-planner): 紫色菱形 + 名字标签
+    const landmarks = this._landmarks || [];
+    for (const lm of landmarks) {
+      const lx = toX(Number(lm.x)), ly = toY(Number(lm.y));
+      if (!Number.isFinite(lx) || !Number.isFinite(ly)) continue;
+      ctx.fillStyle = '#9c27b0';
+      ctx.beginPath();
+      ctx.moveTo(lx, ly - 7); ctx.lineTo(lx + 6, ly);
+      ctx.lineTo(lx, ly + 7); ctx.lineTo(lx - 6, ly);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#ce93d8';
+      ctx.font = '11px sans-serif';
+      ctx.fillText(String(lm.name || ''), lx + 9, ly + 4);
+    }
     if (s.scanPoints.length) {
       ctx.strokeStyle = 'rgba(0,230,118,0.12)'; ctx.lineWidth = 0.5;
       ctx.beginPath();

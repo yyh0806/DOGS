@@ -1833,6 +1833,14 @@ class TaskManager:
         except Exception as e:
             logger.warning(f"Product command parser failed, using existing parse path: {e}")
             return None
+        if result is None:
+            # go_landmark 模板 ("去大门"): 搜索/移动之外的导航意图
+            try:
+                from nx_product_command import parse_go_landmark
+                result = parse_go_landmark(text)
+            except Exception as e:
+                logger.warning(f"go_landmark parser failed: {e}")
+                result = None
         if result is not None:
             self._resolve_product_current_room(result)
         return result
@@ -2047,6 +2055,8 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
                             traceback.print_exc()
                             task.status = "failed"
                             task.result = f"orchestrator 异常: {_e}"
+                elif task.type == "go_landmark":
+                    self._execute_go_landmark(task)
                 elif task.type == "return_home":
                     logger.info("return_home: 无定位，原地停住")
                     self.robot.stop_move()
@@ -2081,6 +2091,54 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
         self._tracker.start_follow(target)
         task.status = "completed"
         task.result = "跟踪已启动 (后台运行)"
+
+    def _execute_go_landmark(self, task):
+        """go_landmark 执行: 查地标注册表 → 导航 → 语音/WS 回复。"""
+        name = (task.params or {}).get("landmark", "").strip()
+        lm = None
+        try:
+            from nx_landmarks import LandmarkMap as _LM
+            path = os.path.realpath(os.environ.get(
+                "GO2W_LANDMARKS_YAML",
+                os.path.normpath(os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "..", "config", "landmarks.yaml"))))
+            lm = _LM.load(path).find(name)
+        except Exception as e:
+            logger.warning(f"landmarks 加载失败: {e}")
+            lm = None
+        if lm is None:
+            # fail-closed: 未知地标不执行, 语音报告
+            task.status = "failed"
+            task.result = f"未知地标: {name}"
+            ws_broadcast({"type": "go_landmark",
+                          "data": {"ok": False, "landmark": name,
+                                   "reason": "unknown_landmark"}})
+            return
+        if self._point_nav is None:
+            task.status = "failed"
+            task.result = "point_nav 不可用"
+            return
+        logger.info(f"go_landmark: '{name}' → ({lm.x}, {lm.y}, yaw={lm.yaw})")
+        ws_broadcast({"type": "go_landmark",
+                      "data": {"ok": True, "landmark": name,
+                               "x": lm.x, "y": lm.y, "yaw": lm.yaw,
+                               "status": "navigating"}})
+        result = self._point_nav.send_goal_and_wait(
+            lm.x, lm.y, lm.yaw, frame_id="map")
+        if result.get("ok") or result.get("reached"):
+            task.status = "completed"
+            task.result = f"已到达 {name}"
+            ws_broadcast({"type": "go_landmark",
+                          "data": {"ok": True, "landmark": name,
+                                   "status": "arrived"}})
+        else:
+            task.status = "failed"
+            task.result = f"导航到 {name} 失败: {result.get('reason', result)}"
+            ws_broadcast({"type": "go_landmark",
+                          "data": {"ok": False, "landmark": name,
+                                   "status": "failed",
+                                   "reason": result.get("reason")}})
 
     def _execute_move_relative(self, task):
         """move_relative 执行 (spec §1.3): linear→nav2, angular→cmd_vel+odom 闭环."""
@@ -2441,6 +2499,17 @@ def create_server(host, port, static_dir, mission_root=None):
         or os.environ.get("GO2W_MISSION_ROOT")
         or os.path.join(static_dir, "missions")
     )
+    # 地标注册表 (landmarks.yaml): 与 rooms.yaml 同目录, 环境变量可覆盖
+    from nx_landmarks import Landmark as _Landmark
+    from nx_landmarks import LandmarkMap as _LandmarkMap  # 延迟 import 避循环
+    _landmarks_path = os.path.realpath(os.environ.get(
+        "GO2W_LANDMARKS_YAML",
+        os.path.normpath(os.path.join(static_dir, "..", "config", "landmarks.yaml"))))
+    _landmark_map = _LandmarkMap([])
+    try:
+        _landmark_map = _LandmarkMap.load(_landmarks_path)
+    except Exception:
+        _landmark_map = _LandmarkMap([])
     control_token = os.environ.get("GO2W_CONTROL_TOKEN", "")
     allowed_origins = parse_allowed_origins(os.environ.get(
         "GO2W_PANEL_ORIGINS",
@@ -2451,6 +2520,7 @@ def create_server(host, port, static_dir, mission_root=None):
         def do_GET(self):
             p = urlparse(self.path)
             q = parse_qs(p.query)
+            nonlocal _landmark_map
             if p.path in ('/', '/index.html'):
                 self._serve(os.path.join(static_dir, 'panel.html'), 'text/html')
             elif p.path == '/map.js':
@@ -2528,6 +2598,20 @@ def create_server(host, port, static_dir, mission_root=None):
                     except Exception as e:
                         err = str(e)
                 self._json({"ok": ok_reload, "err": err})
+            elif p.path == '/api/landmarks':
+                # 地标注册表: 列出 landmarks.yaml 全部地标 (前端地图标记 + NLU 导航)
+                try:
+                    lm_list = [lm.to_dict() for lm in _landmark_map.landmarks]
+                except Exception:
+                    lm_list = []
+                self._json({"ok": True, "landmarks": lm_list})
+            elif p.path == '/api/reload_landmarks':
+                try:
+                    _landmark_map = _LandmarkMap.load(_landmarks_path)
+                    self._json({"ok": True, "landmarks":
+                                [lm.to_dict() for lm in _landmark_map.landmarks]})
+                except Exception as e:
+                    self._json({"ok": False, "err": str(e)})
             else:
                 self.send_error(404)
 
@@ -2705,6 +2789,22 @@ def create_server(host, port, static_dir, mission_root=None):
                     ) if navigation_arbiter else {
                         "ok": False, "reason": "arbiter_unavailable"}
                 self._json(result, status=200 if result.get("ok") else 409)
+            elif p.path == '/api/landmarks':
+                # 注册/更新地标: {"name":"大门","x":2.5,"y":1.8,"yaw":0,"aliases":["门口"]}
+                nonlocal _landmark_map
+                try:
+                    payload = json.loads(body) if body else {}
+                    if not isinstance(payload, dict):
+                        raise ValueError("body 必须是 JSON 对象")
+                    lm = _Landmark.from_dict(payload)
+                    _landmark_map.upsert(lm)
+                    _landmark_map.save(_landmarks_path)
+                    self._json({"ok": True,
+                                "landmark": lm.to_dict(),
+                                "landmarks": [x.to_dict()
+                                              for x in _landmark_map.landmarks]})
+                except Exception as e:
+                    self._json({"ok": False, "err": str(e)}, status=400)
             elif p.path == '/api/command':
                 text = q.get('text', [''])[0] or body
                 if body:

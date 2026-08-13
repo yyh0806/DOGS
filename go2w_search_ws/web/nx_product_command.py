@@ -670,3 +670,41 @@ def _multi_target_command_result(
         "response": response,
         "tasks": [{"type": "search_room", "priority": 8, "params": params}],
     }
+
+
+# ---------------------------------------------------------------------------
+# go_landmark: "去<地标>" 导航模板 (fetch-task-planner 分支新增)
+# 地标名不在此处校验存在性 — 执行时查 LandmarkMap, 找不到则 fail-closed 拒绝。
+# ---------------------------------------------------------------------------
+
+_GO_LANDMARK_RE = re.compile(
+    r"^(?:去|到|前往)(?P<name>.+?)(?:那里|那边|那)?(?:去)?$"
+)
+_REFERENTIAL_ONLY = {"那里", "那边", "那", "这里", "这边"}
+
+
+def parse_go_landmark(text: str) -> dict | None:
+    """Parse "去大门" / "到门口去" into a go_landmark task template.
+
+    Returns canonical task dict, or None when the text is not a go-to
+    landmark command.  Landmark existence is NOT validated here; the
+    executor resolves the name against LandmarkMap and rejects unknown
+    names (fail-closed).
+    """
+    normalized = _normalize_text(text)
+    if not normalized:
+        return None
+    m = _GO_LANDMARK_RE.match(normalized)
+    if not m:
+        return None
+    name = m.group("name").strip()
+    if not name or name in _REFERENTIAL_ONLY:
+        return None
+    return {
+        "response": f"去{name}",
+        "tasks": [{
+            "type": "go_landmark",
+            "priority": 8,
+            "params": {"landmark": name},
+        }],
+    }

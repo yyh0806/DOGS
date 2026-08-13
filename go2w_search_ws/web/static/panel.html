@@ -275,6 +275,8 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
       <button class="btn" id="balanceBtn" onclick="enterBalance()" disabled>进入平衡</button>
       <button class="btn" id="confirmBalanceBtn" onclick="confirmBalance()" disabled>确认平衡</button>
       <button class="btn primary" onclick="activateDog()" title="激活狗进入轮式可导航态 (parked→active); 进入轮式平衡时轮子可能小幅移动, 请确保场地空旷">激活</button>
+      <button class="btn" id="landmarkModeBtn" onclick="toggleLandmarkMode()" title="标记地标: 点击地图选点, 输入名字(如:大门)注册; 之后可说'去大门'导航">📍 标记地标</button>
+      <button class="btn" onclick="listLandmarks()" title="列出已注册的地标">🗺️ 地标列表</button>
       <!-- 2026-07-18 删急停按钮: 用户要求去掉 (导航取消误判为急停); 急停改用遥控器或键盘(空格已取消). eStop() 函数保留备用. -->
     </div>
     <div class="divider"></div>
@@ -669,7 +671,10 @@ function initMap() {
       document.getElementById('searchH').value = region.h.toFixed(1);
       console.log('[选区]', region);
     },
-    onSelectGoal: sendNavGoal,
+    onSelectGoal: (point) => {
+      // 地标模式: 点地图 → 命名注册地标 (不导航); 普通模式: 点导航
+      if (landmarkMode) { registerLandmark(point); } else { sendNavGoal(point); }
+    },
   });
   // 点地图上 person 标记 → 弹该目标的检测截图 (复用 detection snapshot modal — Q1=b)
   map.onSelectMarker = (m) => {
@@ -745,6 +750,58 @@ function confirmBalance() { controlFetch('/api/confirm_balance', { method: 'POST
 function sit() { controlFetch('/api/sit', { method: 'POST' }); }
 function eStop() { clearInterval(_moveInterval); _moveInterval = null; if (_locateLoopTimer) { clearTimeout(_locateLoopTimer); _locateLoopTimer = null; } pressedKeys.clear(); resetKeyHighlight(); controlFetch('/api/e_stop', { method: 'POST' }); }
 function activateDog() { controlFetch('/api/activate', { method: 'POST' }).then(r => r.json()).then(d => { console.log('activate:', d); }).catch(e => console.warn('activate failed:', e)); }
+
+// ---- 地标功能 (fetch-task-planner): 点地图标记 + 注册 + 列表 ----
+let landmarkMode = false;
+
+function toggleLandmarkMode() {
+  landmarkMode = !landmarkMode;
+  const btn = document.getElementById('landmarkModeBtn');
+  btn.style.background = landmarkMode ? '#ff9800' : '';
+  setNavStatusChip('info', landmarkMode ? '地标模式: 点击地图选点注册' : '地标模式已关闭');
+}
+
+async function registerLandmark(point) {
+  if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) return;
+  const name = (prompt('地标名字 (如: 大门):') || '').trim();
+  if (!name) { setNavStatusChip('failed', '地标名不能为空'); return; }
+  const yaw = Number(map.slam.robotYaw || 0);
+  try {
+    const r = await controlFetch('/api/landmarks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, x: Number(point.x), y: Number(point.y), yaw }),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      setNavStatusChip('success', `地标「${name}」已注册 (${Number(point.x).toFixed(2)}, ${Number(point.y).toFixed(2)})`);
+      drawLandmarkMarkers(d.landmarks || []);
+      toggleLandmarkMode(); // 注册完自动退出地标模式
+    } else {
+      setNavStatusChip('failed', '地标注册失败: ' + (d.err || 'unknown'));
+    }
+  } catch (e) {
+    setNavStatusChip('failed', '地标注册请求失败');
+  }
+}
+
+async function listLandmarks() {
+  try {
+    const r = await controlFetch('/api/landmarks');
+    const d = await r.json();
+    const lms = d.landmarks || [];
+    drawLandmarkMarkers(lms);
+    if (!lms.length) { setNavStatusChip('info', '暂无地标 (点「标记地标」注册)'); return; }
+    setNavStatusChip('info', '地标: ' + lms.map(l => `${l.name}(${l.x.toFixed(1)},${l.y.toFixed(1)})`).join(' · '));
+  } catch (e) {
+    setNavStatusChip('failed', '地标列表请求失败');
+  }
+}
+
+function drawLandmarkMarkers(landmarks) {
+  if (!map) return;
+  map.setLandmarks(landmarks);
+}
 
 // ---- 键盘控制 ----
 const KEY_MAP = {
