@@ -1781,6 +1781,10 @@ class TaskManager:
                               if isinstance(tasks[0], dict) else None)
                 if first_type == "move_relative":
                     tasks = canonicalize_move_tasks(tasks)
+                elif first_type in ("go_landmark", "follow"):
+                    # fetch-task-planner: 地标导航/跟踪任务模板已由解析器校验,
+                    # 无 canonicalize 需要, 直接放行 (存在性由执行端 fail-closed)
+                    pass
                 else:
                     tasks = canonicalize_search_tasks(tasks)
             except MissionValidationError as exc:
@@ -2129,7 +2133,7 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
                                "x": lm.x, "y": lm.y, "yaw": lm.yaw,
                                "status": "navigating"}})
         result = self._point_nav.send_goal_and_wait(
-            lm.x, lm.y, lm.yaw, frame_id="map")
+            lm.x, lm.y, lm.yaw, frame_id=lm.frame_id or "map")
         if result.get("ok") or result.get("reached"):
             task.status = "completed"
             task.result = f"已到达 {name}"

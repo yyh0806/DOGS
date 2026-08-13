@@ -58,6 +58,8 @@ class Landmark:
             aliases = [aliases]
         elif isinstance(aliases, (list, tuple)):
             aliases = list(aliases)
+            if not all(isinstance(a, str) for a in aliases):
+                raise LandmarkValidationError("aliases 元素必须是 str")
         else:
             raise LandmarkValidationError("aliases 必须是 list 或 str")
         self.aliases = [str(a).strip() for a in aliases]
