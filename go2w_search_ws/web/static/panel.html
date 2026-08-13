@@ -877,7 +877,25 @@ function sendCmd() {
   const text = input.value.trim();
   if (!text) return;
   input.value = '';
-  controlFetch('/api/command', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+  setNavStatusChip('pending', '指令发送中...');
+  controlFetch('/api/command', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text })
+  }).then(r => r.json()).then(d => {
+    console.log('command response:', d);
+    if (d.ok && d.accepted) {
+      const steps = (d.tasks || []).map(t => t.type).join(' → ');
+      setNavStatusChip('success', '已接受: ' + (steps || d.response || text));
+    } else if (d.ok && d.queued) {
+      setNavStatusChip('pending', '已入队(异步解析): ' + text);
+    } else {
+      setNavStatusChip('failed', '指令被拒: ' + (d.reason || d.response || '未知'));
+    }
+  }).catch(e => {
+    setNavStatusChip('failed', '指令发送失败: ' + e);
+    console.warn('sendCmd failed:', e);
+  });
 }
 function quickCmd(text) { document.getElementById('cmdInput').value = text; sendCmd(); }
 // 搜索当前房间 (v2 frontier 探索 + YOLO 标人): 直接调 /api/search_room, 绕过 NLU 解析 (比 🎤 quick-btn 更可靠)
