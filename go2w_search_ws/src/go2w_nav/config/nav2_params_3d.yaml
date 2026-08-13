@@ -129,11 +129,11 @@ controller_server:
       # sample the same forward-only model that reaches the robot.
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 0.8        # 1.0m/s² 制动时中心前移 0.32m；DWB 预测 0.80m
+      max_vel_x: 0.55        # 2026-08-11 降(0.8→0.55): costmap 更新仅1.67Hz(感知延迟0.6s), 0.8m/s 盲区0.48m 致DWB接近障碍时全部轨迹被拒卡住; 0.55m/s 盲区0.33m 留出膨胀区反应距离
       max_vel_y: 0.0        # 差速; 全向改 0.3
       max_vel_theta: 0.5    # 与 rotation shim 的实机稳定转速一致
       min_speed_xy: 0.05    # 允许慢速前进轨迹
-      max_speed_xy: 0.8
+      max_speed_xy: 0.55
       min_speed_theta: 0.15 # 纯旋转不得落入 Go2W 轮式死区 (现 < max_vel_theta, 区间有效)
       acc_lim_x: 1.2
       acc_lim_y: 0.0
@@ -190,7 +190,7 @@ local_costmap:
   local_costmap:
     ros__parameters:
       update_frequency: 5.0           # 实时 (rolling window 5×5m)
-      publish_frequency: 2.0
+      publish_frequency: 5.0           # 2026-08-11 提(2.0→5.0): 原2Hz限速致costmap仅1.67Hz, 感知延迟0.6s让DWB避障滞后; 匹配update 5Hz
       global_frame: odom              # rolling window 在 odom 系
       robot_base_frame: base_link
       transform_tolerance: 0.5  # 有界 TF 等待窗口，不用于掩盖陈旧变换
@@ -214,7 +214,7 @@ local_costmap:
           marking: True
           clearing: True
           inf_is_valid: True
-          expected_update_rate: 1.8
+          expected_update_rate: 5.0   # 2026-08-11 提(1.8→5.0): 匹配 /scan_mid360 10Hz, MAXN 功率下 CPU 有余量, 缩短感知延迟
           observation_persistence: 0.3    # 2026-07-17 降到 0.3 (云台假点已在 bridge 源头滤除; persistence 仅清动态滞留, 2s 太长留 ghost)
           max_obstacle_height: 1.5
           min_obstacle_height: 0.0     # LaserScan z=0; source cloud was height-filtered
@@ -225,9 +225,9 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        # Padded footprint turning radius is 0.552 m; preserve another 0.15 m
-        # cost gradient so the controller prefers clearance before collision.
-        inflation_radius: 0.71
+        # Padded footprint turning radius is 0.552 m; 2026-08-11 降(0.71→0.58)
+        # 原0.71m膨胀过大, 窄通道被软墙堵死→DWB无有效轨迹卡住; 0.58=旋转半径+0.03余量
+        inflation_radius: 0.58
       always_send_full_costmap: true
 
 global_costmap:
