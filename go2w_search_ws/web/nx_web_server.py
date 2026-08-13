@@ -2219,6 +2219,15 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
         def _point_nav(x, y, yaw, frame_id="map"):
             if self._point_nav is None:
                 return {"ok": False, "reason": "point_nav_unavailable"}
+            # 2026-08-13 治本: 发送导航前确保狗激活 (真机 task_activation_failed
+            # 根因: park→立即导航, SDK 未就绪 → gateway 静默拒绝)。
+            try:
+                if hasattr(self.robot, "start_drive_session"):
+                    r = self.robot.start_drive_session("nav")
+                    if r.get("ok"):
+                        self.robot.wait_drive_ready("nav", timeout=5.0)
+            except Exception:
+                pass
             return self._point_nav.send_goal_and_wait(x, y, yaw, frame_id=frame_id)
 
         def _locate(obj):
@@ -2282,6 +2291,14 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
                       "data": {"ok": True, "landmark": name,
                                "x": lm.x, "y": lm.y, "yaw": lm.yaw,
                                "status": "navigating"}})
+        # 2026-08-13 治本: 导航前确保狗激活 (park→立即导航被 gateway 静默拒绝)
+        try:
+            if hasattr(self.robot, "start_drive_session"):
+                _r = self.robot.start_drive_session("nav")
+                if _r.get("ok"):
+                    self.robot.wait_drive_ready("nav", timeout=5.0)
+        except Exception:
+            pass
         result = self._point_nav.send_goal_and_wait(
             lm.x, lm.y, lm.yaw, frame_id=lm.frame_id or "map")
         if result.get("ok") or result.get("reached"):
