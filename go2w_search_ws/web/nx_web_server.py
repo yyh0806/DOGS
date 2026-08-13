@@ -1787,6 +1787,9 @@ class TaskManager:
                     # fetch-task-planner: 地标导航/跟踪任务模板已由解析器校验,
                     # 无 canonicalize 需要, 直接放行 (存在性由执行端 fail-closed)
                     pass
+                elif first_type in _plugin_action_names():
+                    # 插件动作 (fetch 等): 注册表动态白名单, 新插件零改动
+                    pass
                 else:
                     tasks = canonicalize_search_tasks(tasks)
             except MissionValidationError as exc:
@@ -2577,6 +2580,15 @@ def _point_navigation_health_sample(nx_node):
         "reason": None,
         **common,
     }
+
+
+def _plugin_action_names():
+    """已注册插件动作名集合 (admission 白名单动态化, 新插件零改动)。"""
+    try:
+        from nx_action_plugin import registered_actions
+        return set(registered_actions())
+    except Exception:
+        return set()
 
 
 def create_server(host, port, static_dir, mission_root=None):
