@@ -2106,12 +2106,8 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
         lm = None
         try:
             from nx_landmarks import LandmarkMap as _LM
-            path = os.path.realpath(os.environ.get(
-                "GO2W_LANDMARKS_YAML",
-                os.path.normpath(os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    "..", "config", "landmarks.yaml"))))
-            lm = _LM.load(path).find(name)
+            from nx_landmarks import default_landmarks_path as _dlp
+            lm = _LM.load(_dlp()).find(name)
         except Exception as e:
             logger.warning(f"landmarks 加载失败: {e}")
             lm = None
@@ -2510,9 +2506,8 @@ def create_server(host, port, static_dir, mission_root=None):
     # 地标注册表 (landmarks.yaml): 与 rooms.yaml 同目录, 环境变量可覆盖
     from nx_landmarks import Landmark as _Landmark
     from nx_landmarks import LandmarkMap as _LandmarkMap  # 延迟 import 避循环
-    _landmarks_path = os.path.realpath(os.environ.get(
-        "GO2W_LANDMARKS_YAML",
-        os.path.normpath(os.path.join(static_dir, "..", "config", "landmarks.yaml"))))
+    from nx_landmarks import default_landmarks_path as _default_landmarks_path
+    _landmarks_path = _default_landmarks_path()
     _landmark_map = _LandmarkMap([])
     try:
         _landmark_map = _LandmarkMap.load(_landmarks_path)

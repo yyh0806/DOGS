@@ -29,6 +29,19 @@ class LandmarkValidationError(ValueError):
     pass
 
 
+def default_landmarks_path() -> str:
+    """landmarks.yaml 默认路径 (两处调用方共用, 保证读写同一文件)。
+
+    优先级: GO2W_LANDMARKS_YAML 环境变量 > web/../config/landmarks.yaml
+    (与 rooms.yaml 同目录, 部署时 payload/config/ 由 build_release.sh 拷贝)。
+    """
+    return os.path.realpath(os.environ.get(
+        "GO2W_LANDMARKS_YAML",
+        os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "config", "landmarks.yaml"))))
+
+
 class Landmark:
     def __init__(self, name: str, x: float, y: float, yaw: float = 0.0,
                  aliases: Optional[List[str]] = None,
@@ -38,7 +51,16 @@ class Landmark:
         self.x = float(x)
         self.y = float(y)
         self.yaw = float(yaw)
-        self.aliases = [str(a).strip() for a in (aliases or [])]
+        if aliases is None:
+            aliases = []
+        elif isinstance(aliases, str):
+            # 字符串别名归一为单元素列表 (避免 "门口" 被误拆成 ['门','口'])
+            aliases = [aliases]
+        elif isinstance(aliases, (list, tuple)):
+            aliases = list(aliases)
+        else:
+            raise LandmarkValidationError("aliases 必须是 list 或 str")
+        self.aliases = [str(a).strip() for a in aliases]
         self.gps = gps
         self.frame_id = str(frame_id)
 
@@ -121,8 +143,20 @@ class LandmarkMap:
             "version": self.version,
             "landmarks": [lm.to_dict() for lm in self.landmarks],
         }
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+        # 原子写: 先写临时文件再 os.replace, 并发 POST / 写中断不损坏 YAML
+        import tempfile
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(path) or ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def find(self, query: str) -> Optional[Landmark]:
         """地标匹配: name 完全相等 > alias 完全相等 > name/alias 子串包含。"""
