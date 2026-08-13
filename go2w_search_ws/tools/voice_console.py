@@ -469,6 +469,24 @@ def _on_ws_message(ws, message: str) -> None:
             speak(f"任务完成，在{room}找到{n}人" if room else f"任务完成，找到{n}人")
         else:
             speak(f"任务完成，但{room or '房间'}未发现人")
+    elif mtype == "person_found":
+        # fetch-task-planner: 搜索过程中新发现人 → 实时播报
+        count = int(payload.get("count") or 0)
+        prev = int(payload.get("prev") or 0)
+        if count > prev:
+            speak(f"发现{count}个人" if count > 1 else "发现一个人")
+    elif mtype == "go_landmark":
+        # fetch-task-planner: 地标导航结果播报
+        lm = payload.get("landmark") or "地标"
+        status = payload.get("status")
+        if status == "navigating":
+            speak(f"正在前往{lm}")
+        elif status == "arrived":
+            speak(f"已到达{lm}")
+        elif status == "failed":
+            speak(f"前往{lm}失败")
+        elif payload.get("ok") is False:
+            speak(f"找不到地标{lm}")
     elif mtype == "search_room":
         phase = payload.get("phase")
         room = payload.get("room") or ""

@@ -1841,6 +1841,14 @@ class TaskManager:
             except Exception as e:
                 logger.warning(f"go_landmark parser failed: {e}")
                 result = None
+        if result is None:
+            # follow 模板 ("跟踪穿黑衣服的人")
+            try:
+                from nx_product_command import parse_follow_command
+                result = parse_follow_command(text)
+            except Exception as e:
+                logger.warning(f"follow parser failed: {e}")
+                result = None
         if result is not None:
             self._resolve_product_current_room(result)
         return result
@@ -3134,6 +3142,7 @@ _obstacle_grid = ObstacleGridAccumulator(
 
 def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager: TaskManager, ai_engine=None, lidar_bridge=None):
     global _trail
+    _person_state = {}  # fetch-task-planner: person_found 边沿检测状态
     logger.info("广播启动")
     slam_counter = 0
     ipc_mtimes = {}
@@ -3201,6 +3210,23 @@ def broadcast_loop(robot_bridge: NxRobotBridge, nx_node: NxWebNode, task_manager
                 det_count = ai_engine.get_frame_detection_count()
                 if det_count is not None:
                     ws_broadcast({"type": "frame", "detections": int(det_count)})
+                # ---- person_found 边沿事件 (fetch-task-planner): 新发现人 → 语音播报 ----
+                try:
+                    snap = getattr(ai_engine, "get_person_detection_snapshot", lambda: None)()
+                    person_cnt = int(len(snap.get("detections") or [])
+                                     if isinstance(snap, dict) else 0)
+                    _person_state.setdefault("last", 0)
+                    _person_state.setdefault("last_at", 0.0)
+                    now = time.time()
+                    if person_cnt > _person_state["last"] and \
+                            now - _person_state["last_at"] > 30.0:
+                        ws_broadcast({"type": "person_found",
+                                      "data": {"count": person_cnt,
+                                               "prev": _person_state["last"]}})
+                        _person_state["last_at"] = now
+                    _person_state["last"] = person_cnt
+                except Exception:
+                    pass
 
             # ---- trail 累积 (每 0.1m 一个点, 上限 2000) ----
             if localization_healthy:

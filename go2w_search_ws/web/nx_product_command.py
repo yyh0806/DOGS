@@ -708,3 +708,42 @@ def parse_go_landmark(text: str) -> dict | None:
             "params": {"landmark": name},
         }],
     }
+
+
+# ---------------------------------------------------------------------------
+# follow: "跟踪<目标>" / "跟着<目标>" 模板 (fetch-task-planner 分支新增)
+# 指代词 ("那个"/"前面") 剥离后交给 TargetTracker, 由其用 locate-anything
+# 属性短语 (如 "穿黑衣服的人") 定位并持续跟踪。
+# ---------------------------------------------------------------------------
+
+_FOLLOW_LEAD_RE = re.compile(
+    r"^(?:跟踪|跟着|跟)(?P<target>.+?)(?:吧|一下)?$"
+)
+_FOLLOW_REFERENTIAL = ("那个", "这个人", "那个人", "前面那个")
+
+
+def parse_follow_command(text: str) -> dict | None:
+    """Parse "跟踪穿黑衣服的人" into a follow task template."""
+    normalized = _normalize_text(text)
+    if not normalized:
+        return None
+    m = _FOLLOW_LEAD_RE.match(normalized)
+    if not m:
+        return None
+    target = m.group("target").strip()
+    for ref in _FOLLOW_REFERENTIAL:
+        if target.startswith(ref):
+            target = target[len(ref):]
+            break
+    target = target.strip()
+    # 排除"跟/跟踪"字误吞残留 (如"跟踪"→target="踪"), "人"等单字合法目标保留
+    if not target or target in {"踪", "着"}:
+        return None
+    return {
+        "response": f"跟踪{target}",
+        "tasks": [{
+            "type": "follow",
+            "priority": 8,
+            "params": {"target": target},
+        }],
+    }
