@@ -88,7 +88,7 @@ class Landmark:
             x=float(data["x"]),
             y=float(data["y"]),
             yaw=float(yaw),
-            aliases=data.get("aliases") or [],
+            aliases=data.get("aliases"),
             gps=gps,
             frame_id=str(data.get("frame_id", "map")),
         )
@@ -152,6 +152,10 @@ class LandmarkMap:
                 yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
             os.replace(tmp, path)
         except Exception:
+            try:
+                os.close(fd)  # fdopen 失败时 fd 仍持有
+            except OSError:
+                pass
             try:
                 os.unlink(tmp)
             except OSError:

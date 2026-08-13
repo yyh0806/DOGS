@@ -40,3 +40,9 @@ def test_parse_go_landmark_matches(text, expected):
 def test_parse_go_landmark_rejects(text):
     r = parse_go_landmark(text)
     assert r is None or r["tasks"][0]["type"] != "go_landmark"
+
+
+@pytest.mark.parametrize("text", ["到达", "到", "跟踪一下吧"])
+def test_review_regressions_rejected(text):
+    r = parse_go_landmark(text)
+    assert r is None or r["tasks"][0]["type"] != "go_landmark"

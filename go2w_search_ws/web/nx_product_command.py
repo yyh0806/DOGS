@@ -737,7 +737,7 @@ def parse_follow_command(text: str) -> dict | None:
             break
     target = target.strip()
     # 排除"跟/跟踪"字误吞残留 (如"跟踪"→target="踪"), "人"等单字合法目标保留
-    if not target or target in {"踪", "着", "一下", "吧"}:
+    if not target or target in {"踪", "着", "一下", "一下吧", "吧"}:
         return None
     return {
         "response": f"跟踪{target}",

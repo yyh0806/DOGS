@@ -80,3 +80,19 @@ def test_invalid_entries_rejected():
     with pytest.raises(LandmarkValidationError):
         Landmark.from_dict({"name": "X", "x": 1, "y": 0,
                             "gps": {"lat": "a"}})          # gps 缺 lon
+
+
+def test_review_str_alias_normalized():
+    lm = Landmark("大门", 1, 0, aliases="门口")
+    assert lm.aliases == ["门口"]
+
+
+def test_review_atomic_save_roundtrip():
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "lm.yaml")
+        m = LandmarkMap([Landmark("大门", 2.5, 1.8)])
+        m.save(path)
+        m2 = LandmarkMap.load(path)
+        assert m2.landmarks[0].name == "大门"
+        leftovers = [f for f in os.listdir(td) if f.endswith(".tmp")]
+        assert leftovers == []
