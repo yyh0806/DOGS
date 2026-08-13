@@ -3606,7 +3606,17 @@ def main():
     try:
         from ai.cloud_llm import CloudLLM
         from nx_llm_planner import LLMPlanner
-        task_mgr.set_llm_planner(LLMPlanner(CloudLLM()))
+
+        def _landmarks_provider():
+            try:
+                from nx_landmarks import LandmarkMap as _LM
+                from nx_landmarks import default_landmarks_path as _dlp
+                return [lm.to_dict() for lm in _LM.load(_dlp()).landmarks]
+            except Exception:
+                return []
+
+        task_mgr.set_llm_planner(LLMPlanner(
+            CloudLLM(), landmarks_provider=_landmarks_provider))
     except Exception as _e:
         logger.warning(f"LLM 规划器初始化失败 (回退纯确定性解析): {_e}")
 

@@ -105,14 +105,39 @@ def _validate_step(step: dict) -> Tuple[bool, str]:
 class LLMPlanner:
     """propose-verify: LLM 提议 → 强校验 → 计划或 None。"""
 
-    def __init__(self, llm):
+    def __init__(self, llm, landmarks_provider=None):
         self._llm = llm
+        # 动态地标上下文: callable() -> [{name, x, y, ...}] (让 LLM 知道可用的地标)
+        self._landmarks_provider = landmarks_provider
+
+    def _build_system_prompt(self):
+        prompt = _SYSTEM_PROMPT
+        lm_names = []
+        if callable(self._landmarks_provider):
+            try:
+                lms = self._landmarks_provider() or []
+                lm_names = [str(l.get("name")) for l in lms
+                            if isinstance(l, dict) and l.get("name")]
+            except Exception:
+                lm_names = []
+        if lm_names:
+            prompt += (
+                "\n当前已注册的地标点（go_landmark 只能用这些名字）："
+                + "、".join(lm_names) + "\n"
+                "'去X找Y' 类指令必须拆两步：go_landmark(X) + "
+                "search_room(附近, 找Y)，不要直接 search_room(X)。\n")
+        else:
+            prompt += (
+                "\n当前没有已注册的地标点。\n"
+                "'去X找Y' 类指令无法导航到 X 时，输出 "
+                '{"steps": [], "reasoning": "地点未标记"}。\n')
+        return prompt
 
     def plan(self, text: str) -> Optional[dict]:
         """返回 {response, tasks, reasoning} 或 None (fail-closed 回退)。"""
         if not getattr(self._llm, "configured", False):
             return None
-        answer, reasoning = self._llm.chat(_SYSTEM_PROMPT, text)
+        answer, reasoning = self._llm.chat(self._build_system_prompt(), text)
         if not answer:
             return None
         # 剥离可能的 markdown 代码块
