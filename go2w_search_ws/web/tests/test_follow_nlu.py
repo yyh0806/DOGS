@@ -42,3 +42,15 @@ def test_parse_follow_rejects(text):
 def test_review_referential_stripped_rejected(text):
     r = parse_follow_command(text)
     assert r is None or r["tasks"][0]["type"] != "follow"
+
+
+@pytest.mark.parametrize("text", ["跟踪我们"])
+def test_review_we_my_rejected(text):
+    r = parse_follow_command(text)
+    assert r is None or r["tasks"][0]["type"] != "follow"
+
+
+def test_review_my_bag_strips_to_bag():
+    # "我的"剥离后 "包" 是合法目标描述 (由 locate fail-closed 兜底)
+    r = parse_follow_command("跟踪我的包")
+    assert r is not None and r["tasks"][0]["params"]["target"] == "包"
