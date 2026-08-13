@@ -26,6 +26,8 @@ EnvironmentFile=-/etc/go2w/release.env
 # DeepSeek 云端 LLM (propose-verify 规划器): key 存 /etc/go2w/llm.env (root 600),
 # 仓库只声明文件位, 不携带密钥。缺失时 LLM 规划器自动禁用 (纯确定性解析)。
 EnvironmentFile=-/etc/go2w/llm.env
+# 地标注册表持久化在 release 之外 (payload/config 随原子发布整体替换会丢地标)
+Environment=GO2W_LANDMARKS_YAML=/home/nx/go2w/landmarks.yaml
 # Root-owned (0600) file populated during commissioning.  systemd reads it
 # before dropping privileges to User=nx; absent/empty tokens fail closed.
 EnvironmentFile=-/etc/go2w/control.env
