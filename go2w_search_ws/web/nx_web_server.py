@@ -1667,6 +1667,10 @@ class TaskManager:
     def set_navigation_arbiter(self, arbiter):
         self._navigation_arbiter = arbiter
 
+    def set_task_nav_port(self, port):
+        """任务模式导航端口 (owner=tasks, 与 arbiter.start_tasks 对齐)。"""
+        self._task_nav_port = port
+
     def set_point_nav(self, port):
         """Inject the PointNavigationController owner port for linear moves."""
         self._point_nav = port
@@ -2207,35 +2211,18 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
         task.result = "跟踪已启动 (后台运行)"
 
     def _navigate_blocking(self, x, y, yaw, timeout=90.0):
-        """通过 navigation_arbiter 提交点导航并阻塞等待完成。
+        """任务模式阻塞导航 (owner=tasks, 不经过 start_point_goal 避免死锁)。
 
-        直接调 _point_nav.send_goal_and_wait 会绕过 arbiter 的 owner 管理,
-        被 gateway 以 navigation_owner_busy 拒绝 (真机 1ms 静默失败根因)。
+        任务由 arbiter.start_tasks 激活 (motion_owner=tasks) 后,
+        直接用 tasks 导航端口提交并阻塞等待 terminal。
         """
-        arb = self._navigation_arbiter
-        if arb is None:
-            return {"ok": False, "reason": "arbiter_unavailable"}
+        port = getattr(self, "_task_nav_port", None)
+        if port is None or not hasattr(port, "send_goal_and_wait"):
+            return {"ok": False, "reason": "task_nav_unavailable"}
         try:
-            r = arb.start_point_goal(x, y, yaw)
+            return port.send_goal_and_wait(x, y, yaw, frame_id="map")
         except Exception as e:
-            return {"ok": False, "reason": f"start_point_goal_error: {e}"}
-        if not isinstance(r, dict) or not r.get("ok"):
-            return {"ok": False, "reason": (r or {}).get("reason", "rejected")}
-        deadline = time.monotonic() + max(1.0, float(timeout))
-        while time.monotonic() < deadline:
-            try:
-                state = self._point_nav.get_state() if hasattr(
-                    self._point_nav, "get_state") else {}
-            except Exception:
-                state = {}
-            status = str(state.get("status") or "")
-            if state.get("drained") and status in (
-                    "succeeded", "canceled", "aborted", "failed"):
-                ok = status == "succeeded"
-                return {"ok": ok, "status": status,
-                        "reason": None if ok else status}
-            time.sleep(0.5)
-        return {"ok": False, "reason": "timeout"}
+            return {"ok": False, "reason": f"task_nav_error: {e}"}
 
     def _plugin_context(self, task):
         """构造插件动作上下文 ctx (fetch 等), 依赖注入便于测试。"""
@@ -3586,6 +3573,8 @@ def main():
     point_nav = OwnerNavigationPort(navigation_gateway, "point")
     mission_navigation = MissionNavigationPort(
         navigation_gateway, owner="mission")
+    task_navigation = MissionNavigationPort(
+        navigation_gateway, owner="tasks")
     node.create_timer(0.1, navigation_gateway.tick)
 
     # 机器人抽象 + 任务管理器 (阶段A detector/vlm 传 None; 阶段B 注入 AI 代理)
@@ -3611,6 +3600,7 @@ def main():
 
     task_mgr = TaskManager(robot, vlm_engine=vlm_proxy, detector=detector_proxy)
     task_mgr.set_point_nav(point_nav)
+    task_mgr.set_task_nav_port(task_navigation)
 
     # DeepSeek 云端 LLM 规划器 (propose-verify, fail-closed 回退确定性解析)
     try:
