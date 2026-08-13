@@ -52,3 +52,13 @@ def test_review_regressions_rejected(text):
 def test_review_go_residue_rejected(text):
     r = parse_go_landmark(text)
     assert r is None
+
+
+@pytest.mark.parametrize("text", [
+    "去大门口帮我找个人",
+    "去厨房拿水",
+    "去大门口看看有没有人",
+])
+def test_review_compound_verb_falls_back(text):
+    # 地标名含动作词 → go_landmark 不匹配, 交 LLM 多步计划
+    assert parse_go_landmark(text) is None

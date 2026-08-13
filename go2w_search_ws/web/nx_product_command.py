@@ -700,6 +700,11 @@ def parse_go_landmark(text: str) -> dict | None:
     name = m.group("name").strip()
     if not name or name in _REFERENTIAL_ONLY or name in {"达", "到", "一下"}:
         return None
+    # 地标名含动作词 ("帮我/找/拿/取/送/搜索") → 这是复合任务而非纯导航,
+    # 返回 None 让 LLM propose-verify 拆成多步计划 (go_landmark + 其他动作)
+    if any(_w in name for _w in ("帮我", "找", "拿", "取", "送", "搜索",
+                                 "看看", "看看有没有", "有没有")):
+        return None
     return {
         "response": f"去{name}",
         "tasks": [{
