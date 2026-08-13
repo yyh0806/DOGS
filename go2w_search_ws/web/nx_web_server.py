@@ -1840,6 +1840,15 @@ class TaskManager:
             logger.warning(f"Product command parser failed, using existing parse path: {e}")
             return None
         if result is None:
+            # 插件动作链 (fetch 等): 优先于 go_landmark — fetch 模板"去X拿Y"
+            # 是 go_landmark 模板"去X"的精确超集, 先试更具体的匹配
+            try:
+                from nx_action_plugin import parse_plugin_intent
+                result = parse_plugin_intent(text)
+            except Exception as e:
+                logger.warning(f"plugin intent chain failed: {e}")
+                result = None
+        if result is None:
             # go_landmark 模板 ("去大门"): 搜索/移动之外的导航意图
             try:
                 from nx_product_command import parse_go_landmark
@@ -1854,14 +1863,6 @@ class TaskManager:
                 result = parse_follow_command(text)
             except Exception as e:
                 logger.warning(f"follow parser failed: {e}")
-                result = None
-        if result is None:
-            # 插件动作链 (fetch 等): 注册表按序尝试, 新动作零核心改动
-            try:
-                from nx_action_plugin import parse_plugin_intent
-                result = parse_plugin_intent(text)
-            except Exception as e:
-                logger.warning(f"plugin intent chain failed: {e}")
                 result = None
         if result is not None:
             self._resolve_product_current_room(result)

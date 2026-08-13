@@ -92,6 +92,10 @@ def validate_voice_command(text: str) -> dict:
     raw_text = text.strip() if isinstance(text, str) else ""
     result = parse_product_command(raw_text)
     if result is None:
+        # 插件动作链 (fetch 等) 优先: "去X拿Y" 比 "去X" 更具体
+        from nx_action_plugin import parse_plugin_intent
+        result = parse_plugin_intent(raw_text)
+    if result is None:
         # go_landmark 模板 ("去大门"): 与搜索指令并列的产品意图
         from nx_product_command import parse_go_landmark
         result = parse_go_landmark(raw_text)
