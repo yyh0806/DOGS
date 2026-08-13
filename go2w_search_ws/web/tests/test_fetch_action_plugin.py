@@ -113,3 +113,13 @@ def test_execute_confirm_timeout_fails():
 def test_plugin_intent_chain_parses_fetch():
     r = parse_plugin_intent("去大门口拿咖啡")
     assert r is not None and r["tasks"][0]["type"] == "fetch"
+
+
+@pytest.mark.parametrize("text", [
+    "先去门口，然后拿咖啡",
+    "去大门口拿咖啡，然后送到客厅",
+    "先巡逻一圈，然后去大门口拿咖啡",
+])
+def test_review_compound_falls_back_to_llm(text):
+    # 复合连接词 → fetch 模板不匹配, 交 LLM 多步计划
+    assert parse_fetch_command(text) is None

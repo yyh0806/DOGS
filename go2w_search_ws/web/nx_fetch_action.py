@@ -45,6 +45,11 @@ def parse_fetch_command(text: str) -> Optional[dict]:
         return None
     pickup = m.group("pickup").strip()
     obj = _strip_quantifiers(m.group("object"))
+    # 复合连接词 ("然后/接着/先") 出现在槽位里 → 确定性模板无法正确拆,
+    # 返回 None 让 LLM propose-verify 生成多步计划
+    for _part in (pickup, obj):
+        if any(_w in _part for _w in ("然后", "接着", "先", "再", "之后")):
+            return None
     # 反例: 纯移动/搜索/跟踪/地标导航不应落入 fetch
     if not pickup or not obj:
         return None
