@@ -2206,6 +2206,37 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
         task.status = "completed"
         task.result = "跟踪已启动 (后台运行)"
 
+    def _navigate_blocking(self, x, y, yaw, timeout=90.0):
+        """通过 navigation_arbiter 提交点导航并阻塞等待完成。
+
+        直接调 _point_nav.send_goal_and_wait 会绕过 arbiter 的 owner 管理,
+        被 gateway 以 navigation_owner_busy 拒绝 (真机 1ms 静默失败根因)。
+        """
+        arb = self._navigation_arbiter
+        if arb is None:
+            return {"ok": False, "reason": "arbiter_unavailable"}
+        try:
+            r = arb.start_point_goal(x, y, yaw)
+        except Exception as e:
+            return {"ok": False, "reason": f"start_point_goal_error: {e}"}
+        if not isinstance(r, dict) or not r.get("ok"):
+            return {"ok": False, "reason": (r or {}).get("reason", "rejected")}
+        deadline = time.monotonic() + max(1.0, float(timeout))
+        while time.monotonic() < deadline:
+            try:
+                state = self._point_nav.get_state() if hasattr(
+                    self._point_nav, "get_state") else {}
+            except Exception:
+                state = {}
+            status = str(state.get("status") or "")
+            if state.get("drained") and status in (
+                    "succeeded", "canceled", "aborted", "failed"):
+                ok = status == "succeeded"
+                return {"ok": ok, "status": status,
+                        "reason": None if ok else status}
+            time.sleep(0.5)
+        return {"ok": False, "reason": "timeout"}
+
     def _plugin_context(self, task):
         """构造插件动作上下文 ctx (fetch 等), 依赖注入便于测试。"""
         def _landmarks_find(name):
@@ -2219,16 +2250,8 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
         def _point_nav(x, y, yaw, frame_id="map"):
             if self._point_nav is None:
                 return {"ok": False, "reason": "point_nav_unavailable"}
-            # 2026-08-13 治本: 发送导航前确保狗激活 (真机 task_activation_failed
-            # 根因: park→立即导航, SDK 未就绪 → gateway 静默拒绝)。
-            try:
-                if hasattr(self.robot, "start_drive_session"):
-                    r = self.robot.start_drive_session("nav")
-                    if r.get("ok"):
-                        self.robot.wait_drive_ready("nav", timeout=5.0)
-            except Exception:
-                pass
-            return self._point_nav.send_goal_and_wait(x, y, yaw, frame_id=frame_id)
+            # 通过 arbiter 高层通道 (管理 owner/激活), 阻塞等待导航完成
+            return self._navigate_blocking(x, y, yaw)
 
         def _locate(obj):
             engine = getattr(self.robot, "_ai_engine", None)
@@ -2291,16 +2314,9 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
                       "data": {"ok": True, "landmark": name,
                                "x": lm.x, "y": lm.y, "yaw": lm.yaw,
                                "status": "navigating"}})
-        # 2026-08-13 治本: 导航前确保狗激活 (park→立即导航被 gateway 静默拒绝)
-        try:
-            if hasattr(self.robot, "start_drive_session"):
-                _r = self.robot.start_drive_session("nav")
-                if _r.get("ok"):
-                    self.robot.wait_drive_ready("nav", timeout=5.0)
-        except Exception:
-            pass
-        result = self._point_nav.send_goal_and_wait(
-            lm.x, lm.y, lm.yaw, frame_id=lm.frame_id or "map")
+        # 通过 arbiter 高层通道阻塞导航 (owner 由 arbiter 管理, 避免 gateway 拒绝)
+        result = self._navigate_blocking(
+            lm.x, lm.y, lm.yaw, timeout=90.0)
         if result.get("ok") or result.get("reached"):
             task.status = "completed"
             task.result = f"已到达 {name}"
