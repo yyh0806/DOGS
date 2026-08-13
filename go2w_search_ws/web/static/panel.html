@@ -761,6 +761,28 @@ function toggleLandmarkMode() {
   setNavStatusChip('info', landmarkMode ? '地标模式: 点击地图选点注册' : '地标模式已关闭');
 }
 
+// ---- fetch 插件装载确认按钮 (S4) ----
+let fetchConfirmBtn = null;
+
+function showFetchConfirmButton(objectLabel) {
+  if (fetchConfirmBtn) { fetchConfirmBtn.remove(); }
+  fetchConfirmBtn = document.createElement('button');
+  fetchConfirmBtn.className = 'btn primary';
+  fetchConfirmBtn.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:99;background:#e65100;';
+  fetchConfirmBtn.textContent = '✅ 已把「' + objectLabel + '」放上狗，继续';
+  fetchConfirmBtn.onclick = () => {
+    controlFetch('/api/fetch_confirm', { method: 'POST' })
+      .then(r => r.json()).then(d => { console.log('fetch_confirm:', d); })
+      .catch(e => console.warn('fetch_confirm failed:', e));
+    hideFetchConfirmButton();
+  };
+  document.body.appendChild(fetchConfirmBtn);
+}
+
+function hideFetchConfirmButton() {
+  if (fetchConfirmBtn) { fetchConfirmBtn.remove(); fetchConfirmBtn = null; }
+}
+
 async function registerLandmark(point) {
   if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) return;
   const name = (prompt('地标名字 (如: 大门):') || '').trim();
@@ -1880,6 +1902,16 @@ function handleSocketMessage(socket, socketEpoch, e) {
         if (map) map.update({ occupancy_map: data.data });
       } else if (data.type === 'plan') {
         if (map) map.update({ plan: data.data });
+      } else if (data.type === 'go_landmark') {
+        updateSlamStatus(data.data.landmark || '地标');
+      } else if (data.type === 'fetch') {
+        // fetch 插件状态: AWAITING_LOAD 时显示装载确认按钮
+        const fd = data.data || {};
+        if (fd.phase === 'AWAITING_LOAD') {
+          showFetchConfirmButton(!!fd.object ? fd.object : '物品');
+        } else if (fd.phase === 'DONE' || fd.phase === 'FAILED') {
+          hideFetchConfirmButton();
+        }
       } else if (data.type === 'slam') {
         if (map) map.update(data.data);
         updateSlamStatus(data.data.slam_source);

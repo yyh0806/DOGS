@@ -1634,6 +1634,8 @@ class TaskManager:
         self._running = False
         self._follow_active = False
         self._search_targets = []
+        # fetch 插件装载确认事件 (S4: 前端 POST /api/fetch_confirm 置位)
+        self._fetch_confirm_event = threading.Event()
         # 阶段A 不跑 AI: vlm/detector 传 None, tracker 不创建
         self._tracker = None
         if self.vlm is not None:
@@ -1853,6 +1855,14 @@ class TaskManager:
             except Exception as e:
                 logger.warning(f"follow parser failed: {e}")
                 result = None
+        if result is None:
+            # 插件动作链 (fetch 等): 注册表按序尝试, 新动作零核心改动
+            try:
+                from nx_action_plugin import parse_plugin_intent
+                result = parse_plugin_intent(text)
+            except Exception as e:
+                logger.warning(f"plugin intent chain failed: {e}")
+                result = None
         if result is not None:
             self._resolve_product_current_room(result)
         return result
@@ -2069,6 +2079,25 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
                             task.result = f"orchestrator 异常: {_e}"
                 elif task.type == "go_landmark":
                     self._execute_go_landmark(task)
+                elif task.type == "fetch":
+                    # 插件动作 (fetch 等): 注册表分发, 新动作零核心改动
+                    from nx_action_plugin import get_action
+                    plugin = get_action(task.type)
+                    if plugin is None:
+                        task.status = "failed"
+                        task.result = f"未注册的动作类型: {task.type}"
+                    else:
+                        ok, reason = plugin.validate(task.params or {})
+                        if not ok:
+                            task.status = "failed"
+                            task.result = reason
+                        else:
+                            try:
+                                plugin.execute(task, self._plugin_context(task))
+                            except Exception as _e:
+                                logger.error(f"插件 {task.type} 执行异常: {_e}")
+                                task.status = "failed"
+                                task.result = f"插件异常: {_e}"
                 elif task.type == "return_home":
                     logger.info("return_home: 无定位，原地停住")
                     self.robot.stop_move()
@@ -2103,6 +2132,54 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
         self._tracker.start_follow(target)
         task.status = "completed"
         task.result = "跟踪已启动 (后台运行)"
+
+    def _plugin_context(self, task):
+        """构造插件动作上下文 ctx (fetch 等), 依赖注入便于测试。"""
+        def _landmarks_find(name):
+            try:
+                from nx_landmarks import LandmarkMap as _LM
+                from nx_landmarks import default_landmarks_path as _dlp
+                return _LM.load(_dlp()).find(name)
+            except Exception:
+                return None
+
+        def _point_nav(x, y, yaw, frame_id="map"):
+            if self._point_nav is None:
+                return {"ok": False, "reason": "point_nav_unavailable"}
+            return self._point_nav.send_goal_and_wait(x, y, yaw, frame_id=frame_id)
+
+        def _locate(obj):
+            engine = getattr(self.robot, "_ai_engine", None)
+            if engine is None:
+                return {"found": False}
+            try:
+                frame = engine.get_latest_frame()
+                return engine.locate_target(frame, obj)
+            except Exception:
+                return {"found": False}
+
+        def _confirm_wait(timeout=120.0):
+            self._fetch_confirm_event.clear()
+            return self._fetch_confirm_event.wait(timeout)
+
+        def _robot_pos():
+            node_obj = getattr(self.robot, "_node", None)
+            health = getattr(node_obj, "get_localization_health", None)
+            if callable(health):
+                h = health() or {}
+                if h.get("healthy") and isinstance(h.get("x"), (int, float)):
+                    return (float(h["x"]), float(h.get("y", 0.0)),
+                            float(h.get("yaw", 0.0)))
+            return None
+
+        return {
+            "ws": ws_broadcast,
+            "landmarks_find": _landmarks_find,
+            "point_nav": _point_nav,
+            "locate": _locate,
+            "confirm_wait": _confirm_wait,
+            "robot_pos": _robot_pos,
+        }
 
     def _execute_go_landmark(self, task):
         """go_landmark 执行: 查地标注册表 → 导航 → 语音/WS 回复。"""
@@ -2512,6 +2589,13 @@ def create_server(host, port, static_dir, mission_root=None):
     from nx_landmarks import LandmarkMap as _LandmarkMap  # 延迟 import 避循环
     from nx_landmarks import default_landmarks_path as _default_landmarks_path
     _landmarks_path = _default_landmarks_path()
+    # 动作插件注册 (fetch 等): 新动作在此 register, 核心零改动
+    try:
+        from nx_action_plugin import register_action
+        from nx_fetch_action import FetchActionPlugin
+        register_action(FetchActionPlugin())
+    except Exception as _e:
+        logger.warning(f"动作插件注册失败: {_e}")
     _landmark_map = _LandmarkMap([])
     try:
         _landmark_map = _LandmarkMap.load(_landmarks_path)
@@ -2723,6 +2807,14 @@ def create_server(host, port, static_dir, mission_root=None):
                     "manual_release") if navigation_arbiter else {
                         "ok": False, "reason": "arbiter_unavailable"}
                 self._json(result, status=200 if result.get("ok") else 409)
+            elif p.path == '/api/fetch_confirm':
+                # fetch 插件 S4 装载确认: 人把东西放上狗后点确认
+                if task_mgr is not None and hasattr(task_mgr, "_fetch_confirm_event"):
+                    task_mgr._fetch_confirm_event.set()
+                    self._json({"ok": True, "msg": "装载已确认"})
+                else:
+                    self._json({"ok": False, "reason": "task_manager_unavailable"},
+                               status=503)
             elif p.path == '/api/stop':
                 result = navigation_arbiter.stop_all(
                     "operator_stop") if navigation_arbiter else {

@@ -488,6 +488,24 @@ def _on_ws_message(ws, message: str) -> None:
         prev = int(payload.get("prev") or 0)
         if count > prev:
             speak(f"发现{count}个人" if count > 1 else "发现一个人")
+    elif mtype == "fetch":
+        # fetch 插件状态播报 (拿咖啡 S1-S5)
+        phase = payload.get("phase")
+        obj = payload.get("object") or "物品"
+        landmark = payload.get("landmark") or ""
+        phrases = {
+            "NAVIGATING": f"正在前往{landmark}",
+            "ARRIVED": f"已到达{landmark}",
+            "FOUND": f"看到了{obj}",
+            "NOT_FOUND": f"没有找到{obj}",
+            "AWAITING_LOAD": f"请把{obj}放到我身上",
+            "LOADED": f"收到{obj}，准备返回",
+            "RETURNING": "正在返回",
+            "DONE": f"{obj}送到了，请取",
+            "FAILED": f"任务失败：{payload.get('reason') or '未知原因'}",
+        }
+        if phase in phrases:
+            speak(phrases[phase])
     elif mtype == "go_landmark":
         # fetch-task-planner: 地标导航结果播报
         lm = payload.get("landmark") or "地标"
