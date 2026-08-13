@@ -2,8 +2,8 @@ from pathlib import Path
 import re
 
 
-SOURCE = Path(__file__).resolve().parent / "nx_web_server.py"
-OUTBOX_SOURCE = Path(__file__).resolve().parent / "nx_ws_latest.py"
+SOURCE = Path(__file__).resolve().parents[1] / "nx_web_server.py"
+OUTBOX_SOURCE = Path(__file__).resolve().parents[1] / "nx_ws_latest.py"
 
 
 def test_ws_broadcast_uses_bounded_latest_value_ingress():

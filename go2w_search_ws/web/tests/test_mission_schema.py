@@ -141,7 +141,7 @@ def test_search_task_list_rejects_missing_legacy_or_ambiguous_tasks(tasks):
 
 
 def test_task_manager_never_defaults_missing_task_type_to_move():
-    source = (Path(__file__).resolve().parent / "nx_web_server.py").read_text(
+    source = (Path(__file__).resolve().parents[1] / "nx_web_server.py").read_text(
         encoding="utf-8")
 
     assert 't.get("type", "move")' not in source

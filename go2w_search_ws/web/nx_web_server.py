@@ -1638,9 +1638,6 @@ class TaskManager:
         self._fetch_confirm_event = threading.Event()
         # propose-verify LLM 规划器 (None = 纯确定性解析)
         self._llm_planner = None
-
-    def set_llm_planner(self, planner):
-        self._llm_planner = planner
         # 阶段A 不跑 AI: vlm/detector 传 None, tracker 不创建
         self._tracker = None
         if self.vlm is not None:
@@ -1655,6 +1652,9 @@ class TaskManager:
         self._navigation_arbiter = None
         # move_relative (spec §1.3): linear→point_nav, angular→cmd_vel+odom
         self._point_nav = None
+
+    def set_llm_planner(self, planner):
+        self._llm_planner = planner
 
     def set_navigation_arbiter(self, arbiter):
         self._navigation_arbiter = arbiter

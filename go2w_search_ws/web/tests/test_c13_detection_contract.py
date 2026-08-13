@@ -1,7 +1,7 @@
 from pathlib import Path
 
 
-WEB_DIR = Path(__file__).resolve().parent
+WEB_DIR = Path(__file__).resolve().parents[1]
 SERVER_SOURCE = WEB_DIR / "nx_web_server.py"
 GIMBAL_SOURCE = WEB_DIR / "nx_gimbal_node.py"
 PANEL_SOURCE = WEB_DIR / "static" / "panel.html"

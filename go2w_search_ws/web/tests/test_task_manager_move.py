@@ -11,7 +11,7 @@ import textwrap
 
 import pytest
 
-SRC = Path(__file__).resolve().parent / "nx_web_server.py"
+SRC = Path(__file__).resolve().parents[1] / "nx_web_server.py"
 
 
 @pytest.fixture(scope="module")
