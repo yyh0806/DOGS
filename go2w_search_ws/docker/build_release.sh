@@ -62,6 +62,7 @@ copy_ai_runtime() {
   copy_path "ai/locate_anything.py"
   copy_path "ai/tracker.py"
   copy_path "ai/vlm.py"
+  copy_path "ai/cloud_llm.py"
 }
 
 copy_web_runtime() {
