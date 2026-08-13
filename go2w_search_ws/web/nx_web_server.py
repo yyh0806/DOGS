@@ -1608,7 +1608,7 @@ class NxRobotBridge:
 # Task / TaskManager (复制自 panel.py:411-646, detector/vlm 传 None)
 # ============================================================================
 class Task:
-    def __init__(self, task_type, params=None, priority=5):
+    def __init__(self, task_type, params=None, priority=5, plan_id=None):
         self.id = uuid.uuid4().hex[:8]
         self.type = task_type
         self.params = params or {}
@@ -1616,11 +1616,19 @@ class Task:
         self.status = "pending"
         self.result = None
         self.created_at = time.time()
+        # 多步计划上下文: 同 plan_id 的任务按序执行, 前步失败 → 后续取消
+        self.plan_id = plan_id
+        self.plan_index = None
 
     def to_dict(self):
-        return {"id": self.id, "type": self.type, "params": self.params,
-                "priority": self.priority, "status": self.status,
-                "result": self.result, "created_at": self.created_at}
+        d = {"id": self.id, "type": self.type, "params": self.params,
+             "priority": self.priority, "status": self.status,
+             "result": self.result, "created_at": self.created_at}
+        if self.plan_id:
+            d["plan_id"] = self.plan_id
+            if self.plan_index is not None:
+                d["plan_index"] = self.plan_index
+        return d
 
 
 class TaskManager:
@@ -1684,6 +1692,34 @@ class TaskManager:
             inferred = reason or (task_list[0].type if task_list else "task_command")
             return self._navigation_arbiter.start_tasks(task_list, reason=inferred)
         return self._add_list_unchecked(task_list)
+
+    def add_plan(self, tasks, reason=None):
+        """多步计划入队: 同 plan_id 按序执行, 前步失败 → 后续自动取消。"""
+        task_list = list(tasks)
+        if not task_list:
+            return {"ok": False, "reason": "empty_plan"}
+        plan_id = uuid.uuid4().hex[:8]
+        for i, t in enumerate(task_list):
+            t.plan_id = plan_id
+            t.plan_index = i
+        if self._navigation_arbiter is not None:
+            inferred = reason or f"plan_{task_list[0].type}"
+            return self._navigation_arbiter.start_tasks(
+                task_list, reason=inferred)
+        return self._add_list_unchecked(task_list)
+
+    def _cancel_plan_pending(self, plan_id):
+        """取消同 plan_id 的 pending 任务 (前步失败中止)。"""
+        with self._lock:
+            cancelled = 0
+            for t in self._tasks:
+                if (t.plan_id == plan_id and t.status == "pending"):
+                    t.status = "cancelled"
+                    t.result = "plan_aborted"
+                    cancelled += 1
+        if cancelled:
+            ws_broadcast({"type": "tasks", "data": self.get_state()})
+        return cancelled
 
     def _add_list_unchecked(self, tasks):
         with self._lock:
@@ -1786,7 +1822,11 @@ class TaskManager:
             try:
                 first_type = (tasks[0].get("type")
                               if isinstance(tasks[0], dict) else None)
-                if first_type == "move_relative":
+                if len(tasks) > 1:
+                    # 多步计划 (LLM propose-verify): 跳过单任务 canonicalize,
+                    # 每步已在 LLMPlanner._validate_step / 插件 validate 校验过
+                    pass
+                elif first_type == "move_relative":
                     tasks = canonicalize_move_tasks(tasks)
                 elif first_type in ("go_landmark", "follow"):
                     # fetch-task-planner: 地标导航/跟踪任务模板已由解析器校验,
@@ -1819,7 +1859,10 @@ class TaskManager:
             payload["reason"] = invalid_reason or "no_tasks"
             return payload
 
-        admission = self.add_list(
+        admission = self.add_plan(
+            [Task(t["type"], t["params"], t["priority"]) for t in tasks],
+            reason="task_command",
+        ) if len(tasks) > 1 else self.add_list(
             [Task(t["type"], t["params"], t["priority"]) for t in tasks],
             reason="task_command",
         )
@@ -2131,6 +2174,13 @@ target_classes 是需要搜索和地图标注的英文视觉类别数组，例�
             except Exception as e:
                 task.status = "failed"
                 task.result = str(e)
+            # 多步计划: 前步失败 → 取消后续步骤 (plan_aborted)
+            if task.status == "failed" and task.plan_id:
+                cancelled = self._cancel_plan_pending(task.plan_id)
+                if cancelled:
+                    logger.warning(
+                        f"计划 {task.plan_id} 第 {task.plan_index} 步失败, "
+                        f"取消后续 {cancelled} 步")
             with self._lock:
                 self._tasks = [t for t in self._tasks if t.id != task.id]
                 if self._active is task:
