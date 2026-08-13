@@ -36,3 +36,9 @@ def test_parse_follow_matches(text, expected_target):
 def test_parse_follow_rejects(text):
     r = parse_follow_command(text)
     assert r is None or r["tasks"][0]["type"] != "follow"
+
+
+@pytest.mark.parametrize("text", ["跟踪我", "跟踪我吧", "跟一下"])
+def test_review_referential_stripped_rejected(text):
+    r = parse_follow_command(text)
+    assert r is None or r["tasks"][0]["type"] != "follow"

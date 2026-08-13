@@ -46,3 +46,9 @@ def test_parse_go_landmark_rejects(text):
 def test_review_regressions_rejected(text):
     r = parse_go_landmark(text)
     assert r is None or r["tasks"][0]["type"] != "go_landmark"
+
+
+@pytest.mark.parametrize("text", ["去一下"])
+def test_review_go_residue_rejected(text):
+    r = parse_go_landmark(text)
+    assert r is None

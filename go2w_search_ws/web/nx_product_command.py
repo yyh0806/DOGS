@@ -719,7 +719,7 @@ def parse_go_landmark(text: str) -> dict | None:
 _FOLLOW_LEAD_RE = re.compile(
     r"^(?:跟踪|跟着|跟)(?P<target>.+?)(?:吧|一下)?$"
 )
-_FOLLOW_REFERENTIAL = ("那个", "这个人", "那个人", "前面那个", "前面这位", "这位")
+_FOLLOW_REFERENTIAL = ("那个", "这个人", "那个人", "前面那个", "前面这位", "这位", "我")
 
 
 def parse_follow_command(text: str) -> dict | None:
