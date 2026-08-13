@@ -678,8 +678,14 @@ def send_command(nx_url: str, text: str, *, token: str | None = None,
 def accepted_acknowledgement(result: dict) -> str:
     """Choose the confirmed acknowledgement from the admitted task type."""
     task = result.get("task") if isinstance(result, dict) else None
-    if isinstance(task, dict) and task.get("type") == "move_relative":
-        return "移动任务已接收"
+    if isinstance(task, dict):
+        ttype = task.get("type")
+        if ttype == "move_relative":
+            return "移动任务已接收"
+        if ttype == "go_landmark":
+            return "地标导航任务已接收"
+        if ttype == "follow":
+            return "跟踪任务已接收"
     return "搜索任务已接收"
 
 
