@@ -95,6 +95,10 @@ def validate_voice_command(text: str) -> dict:
         # go_landmark 模板 ("去大门"): 与搜索指令并列的产品意图
         from nx_product_command import parse_go_landmark
         result = parse_go_landmark(raw_text)
+    if result is None:
+        # follow 模板 ("跟踪穿黑衣服的人"): 语音路径与面板路径对齐
+        from nx_product_command import parse_follow_command
+        result = parse_follow_command(raw_text)
     tasks = result.get("tasks", []) if isinstance(result, dict) else []
     task = tasks[0] if len(tasks) == 1 and isinstance(tasks[0], dict) else None
     if task is None:
@@ -116,6 +120,15 @@ def validate_voice_command(text: str) -> dict:
         # 地标名只要求非空; 存在性由执行端查 LandmarkMap (fail-closed 拒绝未知地标)
         lm = (task.get("params") or {}).get("landmark")
         if not isinstance(lm, str) or not lm.strip():
+            return {
+                "ok": False,
+                "reason": "unsupported_voice_command",
+                "text": raw_text,
+            }
+    elif task.get("type") == "follow":
+        # 跟踪目标只要求非空描述; 定位由 TargetTracker/locate 兜底
+        target = (task.get("params") or {}).get("target")
+        if not isinstance(target, str) or not target.strip():
             return {
                 "ok": False,
                 "reason": "unsupported_voice_command",
