@@ -27,3 +27,7 @@ webrtcvad
 
 # --- Go2W SDK ---
 # unitree_sdk2py  # 需从源码安装: pip install git+https://github.com/unitreerobotics/unitree_sdk2_python.git
+
+# --- UWB 串口桥 (B-1: Nooploop LinkTrack) ---
+# 缺失时 go2w_bridge.uwb_serial_bridge 自动降级 mock 注入路径,不阻塞开发/测试
+pyserial>=3.5
