@@ -78,6 +78,7 @@ from nx_navigation_gateway import (
     RosComputePathPort,
 )
 from nx_navigation_arbiter import NavigationArbiter
+from nx_uwb_follow import UwbFollowController
 from nx_camera_calibration import resolve_camera_calibration
 from nx_person_localizer import (
     coerce_laser_scan_snapshot,
@@ -2528,6 +2529,7 @@ point_nav = None        # OwnerNavigationPort
 navigation_gateway = None  # sole NavigateToPose owner
 room_orchestrator = None  # 阶段E: RoomSearchOrchestrator (main 注入)
 navigation_arbiter = None  # NavigationArbiter: process-wide autonomous owner
+uwb_follow = None          # 功能B-2: UwbFollowController (ROS-free, main 注入)
 
 
 def _perception_health(robot_bridge):
@@ -2610,6 +2612,82 @@ def _handle_point_nav_state(state):
     ws_broadcast({"type": "nav_goal", "data": state}, force=True)
     if navigation_arbiter is not None:
         navigation_arbiter.on_point_state(state)
+
+
+# ---- 功能B-2: UWB 钥匙扣跟随 (ROS-free 控制器, 见 nx_uwb_follow.py) ----
+
+def _load_uwb_follow_source():
+    """尝试加载 UWB 测距源 (功能 B-1, nx_uwb_bridge, worktree feature/uwb-bridge)。
+
+    合同: nx_uwb_bridge 暴露 get_follow_fix_source() → 带 get_fix() 的对象
+    (fix 字段合同见 nx_uwb_follow.py 模块头注释)。桥未部署 (开发机/仿真) 时
+    返回 None —— /api/uwb_follow/start 会拒绝 (uwb_source_unavailable),
+    状态查询与参数调优仍可用。
+    """
+    if os.environ.get("GO2W_UWB_FOLLOW_DISABLE") == "1":
+        return None
+    try:
+        import nx_uwb_bridge  # noqa: F401  (功能B-1 提供, 本包不强制依赖)
+        factory = getattr(nx_uwb_bridge, "get_follow_fix_source", None)
+        if callable(factory):
+            return factory()
+        logger.warning("nx_uwb_bridge 缺少 get_follow_fix_source(), 跟随源未接入")
+    except ImportError:
+        pass
+    except Exception as exc:
+        logger.warning(f"UWB 测距源初始化失败 (跟随降级为只读): {exc}")
+    return None
+
+
+def build_uwb_follow_controller(robot_bridge, arbiter, *, source=None,
+                                broadcast=None):
+    """组装 UWB 跟随控制器 (所有 ROS/仲裁交互经闭包注入)。
+
+    独立工厂函数便于契约测试: 注入替身后可在无 ROS 开发机上全链路
+    (tick → arbiter → robot) 验证接线正确性。
+    """
+    def _probe(direction_deg, half_fov_deg):
+        try:
+            return robot_bridge.directional_clearance(
+                direction_deg, half_fov_deg)
+        except Exception:
+            return None  # 探测异常由控制器按 fail-closed 处理
+
+    def _sink(vx, vy, wz):
+        # manual 通道直发 /cmd_vel: 避障闸门已在控制器内先行 (方向性+迟滞+
+        # 降速), robot.move 的通用 guard 另一套阈值会双重 gating 互相抖动。
+        robot_bridge.move(vx, vy, wz, manual=True)
+
+    def _acquire(reason):
+        # 跟随生产者借用 arbiter 的 manual 所有权通道 (零速 handoff、idle
+        # 租约由 arbiter 保证); B-3 集成若引入独立 owner 只改这个闭包。
+        return arbiter.run_manual_action(reason, lambda: None)
+
+    def _release(reason):
+        return arbiter.release_manual(reason)
+
+    def _on_state(state):
+        if broadcast is not None:
+            broadcast({"type": "uwb_follow", "data": state}, force=True)
+
+    return UwbFollowController(
+        clearance_probe=_probe,
+        motion_sink=_sink,
+        uwb_source=source,
+        ownership_acquire=_acquire,
+        ownership_release=_release,
+        state_callback=_on_state,
+    )
+
+
+def _uwb_follow_loop(controller, stop_event, period=0.1):
+    """跟随控制器 daemon tick 线程 (~10Hz, 与 cmd_vel 看门狗同量级)。"""
+    while not stop_event.is_set():
+        try:
+            controller.tick()
+        except Exception:
+            logger.exception("uwb follow tick 异常 (跳过本拍)")
+        stop_event.wait(period)
 
 
 def _point_navigation_health(nx_node):
@@ -2762,6 +2840,7 @@ def create_server(host, port, static_dir, mission_root=None):
                     "services": snap.get("services", {}),
                     "point_nav": point_nav.get_state() if point_nav else {},
                     "room_nav": room_nav_state,
+                    "uwb_follow": uwb_follow.get_state() if uwb_follow else {},
                     "perception": _perception_health(robot),
                     "det_list": _detection_list_snapshot(robot),
                 })
@@ -2805,6 +2884,13 @@ def create_server(host, port, static_dir, mission_root=None):
                                 [lm.to_dict() for lm in _landmark_map.landmarks]})
                 except Exception as e:
                     self._json({"ok": False, "err": str(e)})
+            elif p.path == '/api/uwb_follow/status':
+                # 功能B-2: UWB 跟随状态快照 (无源时也返回 idle 只读态)
+                if uwb_follow is not None:
+                    self._json(uwb_follow.get_state())
+                else:
+                    self._json({"state": "idle", "active": False,
+                                "reason": "uwb_follow_unavailable"})
             else:
                 self.send_error(404)
 
@@ -2841,6 +2927,8 @@ def create_server(host, port, static_dir, mission_root=None):
                 "/api/activate",
                 "/api/e_stop", "/api/reset_drive_fault", "/api/stop",
                 "/api/manual_stop", "/api/navigate", "/api/search", "/api/clear_all",
+                "/api/uwb_follow/start", "/api/uwb_follow/stop",
+                "/api/uwb_follow/params",
             }
             audit_request = p.path in audited_paths
             if p.path == "/api/move" and navigation_arbiter is not None:
@@ -2918,6 +3006,13 @@ def create_server(host, port, static_dir, mission_root=None):
                     self._json({"ok": False, "reason": "task_manager_unavailable"},
                                status=503)
             elif p.path == '/api/stop':
+                # B-2: 跟随是持续生产者, 必须先停状态机再 arbiter 停车,
+                # 否则 10Hz tick 下一拍会重新抢回 manual 所有权。
+                if uwb_follow is not None:
+                    try:
+                        uwb_follow.stop("operator_stop")
+                    except Exception:
+                        logger.exception("/api/stop 停跟随失败 (继续全局停车)")
                 result = navigation_arbiter.stop_all(
                     "operator_stop") if navigation_arbiter else {
                         "ok": False, "reason": "arbiter_unavailable"}
@@ -2951,6 +3046,13 @@ def create_server(host, port, static_dir, mission_root=None):
                         cleared[_key] = f'err:{type(_e).__name__}'
                 self._json({"ok": True, "trail_cleared": True, "costmap": cleared})
             elif p.path == '/api/e_stop':
+                # B-2: 急停同样先停跟随状态机 (estop 与所有权释放赛跑时
+                # 控制器不能在下一拍复活)。
+                if uwb_follow is not None:
+                    try:
+                        uwb_follow.stop("emergency_stop")
+                    except Exception:
+                        logger.exception("/api/e_stop 停跟随失败 (继续急停)")
                 result = navigation_arbiter.emergency_stop() if navigation_arbiter else {
                     "ok": False, "reason": "arbiter_unavailable"}
                 self._json(result, status=(
@@ -3177,6 +3279,50 @@ def create_server(host, port, static_dir, mission_root=None):
                 if payload.get("ok"):
                     payload["msg"] = f"搜索任务 {mission.request_id} 已入队"
                 self._json(payload, status=200 if payload.get("ok") else 409)
+            elif p.path == '/api/uwb_follow/start':
+                # 功能B-2: 启动 UWB 钥匙扣跟随。body 可选 JSON:
+                #   {"follow_distance_m": 1.5} 或 {"params": {...}} 包一层
+                if uwb_follow is None:
+                    self._json({"ok": False, "reason": "uwb_follow_unavailable"},
+                               status=503)
+                    return
+                payload = {}
+                if body:
+                    try:
+                        parsed = json.loads(body)
+                        if not isinstance(parsed, dict):
+                            raise ValueError("not an object")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        self._json({"ok": False, "reason": "invalid_json"},
+                                   status=400)
+                        return
+                    payload = parsed
+                params = payload.get("params")
+                if not isinstance(params, dict):
+                    params = payload  # 顶层平铺也接受
+                result = uwb_follow.start(params or None)
+                self._json(result, status=202 if result.get("ok") else (
+                    400 if result.get("reason") == "invalid_params" else 409))
+            elif p.path == '/api/uwb_follow/stop':
+                if uwb_follow is None:
+                    self._json({"ok": False, "reason": "uwb_follow_unavailable"},
+                               status=503)
+                    return
+                self._json(uwb_follow.stop("operator_stop"))
+            elif p.path == '/api/uwb_follow/params':
+                # 运行期调参 (跟随中可用, 下一 tick 生效)
+                if uwb_follow is None:
+                    self._json({"ok": False, "reason": "uwb_follow_unavailable"},
+                               status=503)
+                    return
+                try:
+                    parsed = json.loads(body) if body else {}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    self._json({"ok": False, "reason": "invalid_json"}, status=400)
+                    return
+                result = uwb_follow.update_params(
+                    parsed if isinstance(parsed, dict) else None)
+                self._json(result, status=200 if result.get("ok") else 400)
             else:
                 self.send_error(404)
 
@@ -3547,7 +3693,7 @@ def _spin_loop_yielding(node):
 # ============================================================================
 def main():
     global robot, task_mgr, node, point_nav, navigation_gateway
-    global room_orchestrator, navigation_arbiter
+    global room_orchestrator, navigation_arbiter, uwb_follow
 
     rclpy.init()
     node = NxWebNode()
@@ -3681,6 +3827,20 @@ def main():
     mission_navigation.set_recovery_callback(
         navigation_arbiter.recover_task_motion)
 
+    # 功能B-2: UWB 钥匙扣跟随 (ROS-free 控制器 + manual 所有权通道)。
+    # 桥 (B-1) 未部署时源为 None: start 拒绝, status/params 仍可用。
+    _uwb_source = _load_uwb_follow_source()
+    if _uwb_source is not None:
+        logger.info("B-2: UWB 测距源已接入 (nx_uwb_bridge)")
+    else:
+        logger.info("B-2: UWB 测距源未接入 (跟随 start 将拒绝, 查询/调参可用)")
+    uwb_follow = build_uwb_follow_controller(
+        robot, navigation_arbiter, source=_uwb_source, broadcast=ws_broadcast)
+    _uwb_follow_stop_event = threading.Event()
+    threading.Thread(target=_uwb_follow_loop,
+                     args=(uwb_follow, _uwb_follow_stop_event),
+                     daemon=True).start()
+
     # Humble's rclpy wait-set cannot be mutated while an executor is waiting.
     # PointNav and RoomSearch both create ActionClients, so start spin only
     # after every ROS entity has been constructed.
@@ -3716,6 +3876,17 @@ def main():
             server.shutdown()
         except Exception:
             pass
+        # B-2: 先停跟随 tick 线程与状态机 (零速+释放所有权), 再 drain
+        # PointNav/TaskManager, 避免 arbiter 收尾后跟随线程复活所有权。
+        try:
+            _uwb_follow_stop_event.set()
+        except Exception:
+            pass
+        try:
+            if uwb_follow is not None:
+                uwb_follow.stop("web_shutdown")
+        except Exception:
+            logger.exception("退出清理: 停 UWB 跟随失败")
         # ROS executor 仍在运行时封住新请求，并同时 drain PointNav、
         # TaskManager worker 与 Room Nav2 action ownership。
         try:
