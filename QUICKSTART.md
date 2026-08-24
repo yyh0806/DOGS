@@ -13,7 +13,7 @@
 | **A 仿真**（推荐） | Ubuntu 22.04（原生双启动最稳，WSL2 可用但有 SIGFPE 坑） | ROS2 Humble + Gazebo Classic 11 + fast_lio | 无 |
 | **B 真狗** | Ubuntu 22.04 (Jetson Orin NX, aarch64) | ROS2 Humble + 全套 systemd 服务 | Go2W + MID360 + USB 网口 |
 
-> ⚠️ 当前活跃分支是 `codex/product-room-person-search`（领先 master 7 万+行）。clone 后**务必切到此分支**，否则拿不到仿真栈。
+> ⚠️ 当前活跃分支是 **`master`**（已合并搜索/仿真全栈，含 7 万+行自研代码）。clone 后直接 checkout `master` 即可。
 
 ---
 
@@ -24,7 +24,7 @@
 ```bash
 git clone https://github.com/yyh0806/DOGS.git
 cd DOGS
-git checkout codex/product-room-person-search
+git checkout master
 ```
 
 ### Step 2 — 装系统依赖（一次性）
@@ -145,12 +145,15 @@ bash go2w_search_ws/tools/diag_sim.sh      # 诊断仿真栈健康（话题频�
 ### Step 2 — NX 部署（一次性）
 
 ```bash
-# 在 PC 上对 NX 部署 (假设 NX_IP 已知)
-NX_HOST=<NX_IP> bash go2w_search_ws/docker/deploy_nx.sh        # go2w-motion (控狗, lease 持有)
-NX_HOST=<NX_IP> bash go2w_search_ws/docker/deploy_nx_web.sh    # go2w-web (HTTP:8000 + WS:8001)
+# 在 PC 上对 NX 部署 (假设 NX_IP 已知)；发布入口是原子 build/deploy，旧的 deploy_nx*.sh 已 retired
+cd go2w_search_ws                                        # 以下命令均在 go2w_search_ws/ 下执行
+python tools/verify_release.py
+bash docker/build_release.sh all
+NX_HOST=<NX_IP> NX_USER=nx bash docker/deploy_release.sh \
+  dist/<artifact>-all.tar.gz --allow-motion-restart --control-token-file control-token.txt
 ```
 
-两者开机自启（systemd `enabled`）。`go2w-web` 依赖 `go2w-motion`（`After=`）。
+部署后全部服务 systemd `enabled` 自启（`go2w-web` 依赖 `go2w-motion`，`After=`）。
 
 ### Step 3 — PC 端
 

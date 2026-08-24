@@ -107,6 +107,21 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
 .cmd-input { flex: 1; padding: 7px 10px; background: #1a1a1a; border: 1px solid #333; border-radius: 5px; color: #fff; font-size: 12px; outline: none; }
 .cmd-input:focus { border-color: #1565c0; }
 .cmd-input::placeholder { color: #555; }
+/* ---- 对话面板 ---- */
+#chatPanel { position: fixed; right: 14px; bottom: 96px; width: 330px; max-height: 400px;
+  background: rgba(22,22,26,.97); border: 1px solid #333; border-radius: 8px; z-index: 120;
+  display: flex; flex-direction: column; box-shadow: 0 4px 18px rgba(0,0,0,.55); }
+#chatPanel.chat-collapsed { max-height: 34px; }
+.chat-head { display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 10px; border-bottom: 1px solid #333; font-size: 12px; color: #ccc; cursor: pointer; }
+#chatLog { overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px;
+  min-height: 110px; max-height: 350px; }
+#chatPanel.chat-collapsed #chatLog { display: none; }
+.chat-msg { max-width: 88%; padding: 5px 9px; border-radius: 8px; font-size: 12px;
+  line-height: 1.5; word-break: break-word; white-space: pre-wrap; }
+.chat-user { align-self: flex-end; background: #1565c0; color: #fff; }
+.chat-bot { align-self: flex-start; background: #2c2c33; color: #e8e8e8; }
+.chat-system { align-self: center; background: transparent; color: #999; font-size: 11px; }
 .quick-cmds { display: flex; gap: 5px; margin-top: 6px; flex-wrap: wrap; }
 .quick-btn { padding: 3px 9px; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; color: #aaa; font-size: 11px; cursor: pointer; }
 .quick-btn:hover { border-color: #555; color: #fff; }
@@ -229,12 +244,18 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
   </div>
 </div>
 
+<div id="chatPanel">
+  <div class="chat-head" onclick="toggleChat()"><span>🤖 与狗对话</span><span id="chatToggle" style="font-size:11px;color:#888;">收起 ▾</span></div>
+  <div id="chatLog"></div>
+</div>
+
 <div class="bottom">
   <div class="cmd-row">
     <div class="cmd-input-wrap">
       <input class="cmd-input" id="cmdInput" placeholder="输入指令: 搜索前方10x10米找红色背包..." onkeydown="if(event.key==='Enter')sendCmd()" />
       <button class="btn" id="voiceBtn" title="语音输入 (需 Chrome/Edge + 联网; 识别后回车确认发送)" onclick="toggleVoice()" style="padding:3px 10px;">🎤</button>
       <button class="btn primary" onclick="sendCmd()">发送</button>
+      <span id="panelVer" style="font-size:10px;color:#888;margin-left:4px;">v1.3</span>
     </div>
     <div class="search-form">
       <span class="lbl">或表单搜索:</span>
@@ -871,12 +892,36 @@ document.addEventListener('keyup', (e) => {
   }
 });
 
+// ---- 对话面板 ----
+function chatSay(role, text) {
+  const log = document.getElementById('chatLog');
+  if (!log || !text) return;
+  const row = document.createElement('div');
+  row.className = 'chat-msg chat-' + role;
+  row.textContent = String(text);
+  log.appendChild(row);
+  log.scrollTop = log.scrollHeight;
+}
+function toggleChat() {
+  const panel = document.getElementById('chatPanel');
+  const toggle = document.getElementById('chatToggle');
+  if (!panel) return;
+  const collapsed = panel.classList.toggle('chat-collapsed');
+  if (toggle) toggle.textContent = collapsed ? '展开 ▸' : '收起 ▾';
+}
+function initChat() {
+  const log = document.getElementById('chatLog');
+  if (!log || log.childElementCount > 0) return;
+  chatSay('system', '你好，我是小狗 🤖 我可以：搜索房间 / 去地标 / 前进后退 / 找目标。\n直接在下框输入指令（如"去大门"、"搜索厨房"）。');
+}
+
 // ---- 指令 ----
 function sendCmd() {
   const input = document.getElementById('cmdInput');
   const text = input.value.trim();
   if (!text) return;
   input.value = '';
+  chatSay('user', text);
   setNavStatusChip('pending', '指令发送中...');
   controlFetch('/api/command', {
     method: 'POST',
@@ -887,14 +932,18 @@ function sendCmd() {
     if (d.ok && d.accepted) {
       const steps = (d.tasks || []).map(t => t.type).join(' → ');
       setNavStatusChip('success', '已接受: ' + (steps || d.response || text));
+      chatSay('bot', (d.response || text) + (steps ? '（任务: ' + steps + '）' : ''));
     } else if (d.ok && d.queued) {
       setNavStatusChip('pending', '已入队(异步解析): ' + text);
+      chatSay('system', '已收到，正在解析…');
     } else {
       setNavStatusChip('failed', '指令被拒: ' + (d.reason || d.response || '未知'));
+      chatSay('bot', '无法执行：' + (d.reason || d.response || '未知') + '\n可以试试：去大门 / 搜索厨房 / 前进两米');
     }
   }).catch(e => {
     setNavStatusChip('failed', '指令发送失败: ' + e);
     console.warn('sendCmd failed:', e);
+    chatSay('bot', '发送失败：' + e);
   });
 }
 function quickCmd(text) { document.getElementById('cmdInput').value = text; sendCmd(); }
@@ -1923,6 +1972,9 @@ function handleSocketMessage(socket, socketEpoch, e) {
         if (map) map.update({ plan: data.data });
       } else if (data.type === 'go_landmark') {
         updateSlamStatus(data.data.landmark || '地标');
+        const gl = data.data || {};
+        if (gl.status === 'arrived') chatSay('bot', '已到达 ' + (gl.landmark || '目标点'));
+        else if (gl.status === 'failed') chatSay('bot', '去' + (gl.landmark || '目标点') + '失败：' + (gl.reason || '未知原因'));
       } else if (data.type === 'fetch') {
         // fetch 插件状态: AWAITING_LOAD 时显示装载确认按钮
         const fd = data.data || {};
@@ -1939,6 +1991,7 @@ function handleSocketMessage(socket, socketEpoch, e) {
           box.textContent = '🧠 ' + r.reasoning;
           box.style.display = 'block';
         }
+        if (r.reasoning) chatSay('bot', '🧠 ' + r.reasoning);
       } else if (data.type === 'slam') {
         if (map) map.update(data.data);
         updateSlamStatus(data.data.slam_source);
@@ -1949,7 +2002,10 @@ function handleSocketMessage(socket, socketEpoch, e) {
       } else if (data.type === 'tasks') {
         updateTasks(data.data);
       } else if (data.type === 'vlm') {
-        if (data.data.response) console.log('[VLM]', data.data.response);
+        if (data.data.response) {
+          console.log('[VLM]', data.data.response);
+          chatSay('bot', data.data.response);
+        }
       } else if (data.type === 'locate') {
         latestLocateTs = Date.now();  // 每次 locate 都刷新 ts (worker 活着, 防 TTL 误清)
         if (data.data && data.data.detections) updateDetList(data.data.detections);
@@ -1985,6 +2041,11 @@ function handleSocketMessage(socket, socketEpoch, e) {
           legend.style.display = active ? 'block' : 'none';
         }
         console.log('[房间搜索]', data.data || {});
+        const sp = data.data || {};
+        const spPhase = String(sp.phase || '').toUpperCase();
+        if (spPhase === 'DONE') chatSay('bot', (sp.room ? '『' + sp.room + '』' : '') + '搜索完成 ✅');
+        else if (spPhase === 'FAILED') chatSay('bot', (sp.room ? '『' + sp.room + '』' : '') + '搜索失败：' + (sp.reason || '未知原因'));
+        else if (spPhase === 'REPORT') chatSay('system', '生成任务报告…');
       } else if (data.type === 'mission_report') {
         const report = data.data || {};
         const detections = filterDetectionResults(report.detections);
@@ -2015,6 +2076,9 @@ function handleSocketMessage(socket, socketEpoch, e) {
         });
         updateMissionTargetMarkers(detections);
         console.log('[任务报告]', report);
+        const found = filterDetectionResults(report.detections).length;
+        chatSay('bot', (report.room ? '『' + report.room + '』' : '任务') + '完成：发现 ' + found + ' 个目标'
+          + (report.completion_reason ? '（' + report.completion_reason + '）' : ''));
       }
     } catch (err) { console.error('[WS] parse', err); }
 }
@@ -2061,6 +2125,7 @@ function connectWS() {
 // ---- 启动 ----
 initMap();
 connectWS();
+initChat();
 panelStatusPoller.start(0);
 
 // FPS

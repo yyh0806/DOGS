@@ -1,40 +1,48 @@
 # Go2W Search & Discover
 
-通过前端（及未来的语音）让 Unitree Go2W 轮足机器狗自动搜索区域、发现并报告目标。
+通过前端（及语音）让 Unitree Go2W 轮足机器狗自动搜索区域、发现并报告目标。
 
 > ⚠️ **权威文档声明**：本文件仅作快速入口。
 > - 项目**真实结构与文件状态** → [`docs/PROJECT_STRUCTURE.md`](docs/PROJECT_STRUCTURE.md)
 > - **技术决策与实测结论** → [`docs/TECH_DECISIONS.md`](docs/TECH_DECISIONS.md)
+> - **整体架构** → [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 > - 其余 `docs/*.md` 多为阶段性记录，阅读时注意时效（部分已被推翻，见各文首注明）。
 
 ---
 
-## 系统架构（NX 中心化 — 迁移进行中）
+## 系统架构（NX 中心化）
 
 ```
-┌── PC (仅前端 UI + 高层指令) ────────────────────┐
-│  浏览器 → web/panel.py (HTTP:8000 / WS:8001)     │
-│  [迁移目标: panel 重活迁 NX, PC 退化为瘦客户端]   │
-└────────────────────┬────────────────────────────┘
-                     │ ROS2 Humble DDS (手机热点, 只传低频状态/指令)
+┌── PC (仅浏览器瘦客户端) ─────────────────────┐
+│  访问 http://<NX_IP>:8000 (HTTP) / :8001 (WS) │
+└────────────────────┬─────────────────────────┘
+                     │ 手机热点 (只传低频状态/指令)
                      ▼
-┌── 载荷 NX (Orin NX 16GB, Ubuntu 22.04, Humble) ──┐  ← 所有重活在此
-│  nx_motion_node   持 lease 控狗 (systemd 自启)     │
-│  nx_sensor_node   读狗 IMU/雷达 → /imu /scan /odom │
-│  [迁移中] FAST_LIO + Nav2 + YOLO/VLM              │
-└────────────────────┬────────────────────────────┘
+┌── 载荷 NX (Orin NX 16GB, Ubuntu 22.04, ROS2 Humble) ──┐  ← 所有重活在此，本机闭环
+│  go2w-web         nx_web_server.py  HTTP:8000 + WS:8001 │
+│                   (内嵌感知/云台/雷达/任务编排组件)        │
+│  go2w-motion      nx_motion_node.py  持 lease 控狗       │
+│  go2w-sport-gateway  nx_sport_gateway.py  Unix socket 网关│
+│  go2w-sensor      nx_sensor_node.py  读狗传感器          │
+│  go2w-safety-observer   nx_safety_observer.py  只读看门狗 │
+│  go2w-slam-nav    bringup_slam_nav2.sh  (transient units) │
+│                   FAST_LIO + map_odom_fuser + Nav2 + slam │
+│  costmap-bridge   写 /tmp/*.json 供 web 转发              │
+│  livox-*          MID360 雷达驱动 + 看门狗               │
+└────────────────────┬────────────────────────────────────┘
                      │ USB 转网口 (192.168.123.100/24)
-                     │ unitree_sdk2py / CycloneDDS
+                     │ unitree_sdk2py / FastDDS
                      ▼
           狗主控 192.168.123.161 (出厂系统, 只收 SDK 指令)
 ```
 
 **核心原则**（详见 [`docs/REFACTOR_NX_CENTRIC.md`](docs/REFACTOR_NX_CENTRIC.md)）：
 - **NX 本机闭环**：感知 → 建图 → 规划 → 控狗 全在 NX，零跨网延迟
-- **lease 钉在 NX**：压制狗主控残留乱跑程序；PC↔NX 热点断了，NX 看门狗仍会自动停狗
+- **lease 钉在 NX 网关**：`nx_sport_gateway.py` 是全系统唯一 `SportClient(enableLease=True)` 持有者，运动策略进程重启期间租约不断、永不重放速度
 - **热点只传低频数据**：状态/指令（KB 级），不传点云/视频流
 
 > 技术栈：**ROS2 Humble + Python**（非 Rust/Galactic；早期 README 的 Rust 描述已废弃）。
+> 部署方式：**原子发布**（`docker/build_release.sh` + `docker/deploy_release.sh`，content-addressed 归档 + 软链切换）。
 
 ---
 
@@ -45,9 +53,9 @@
 | Unitree Go2W | 轮足版机器狗（主控 192.168.123.161） |
 | Jetson Orin NX 16GB | 载荷，跑 ROS2 Humble + 全部重活 |
 | USB-Ethernet (AX88179) | NX → 狗主控，192.168.123.100/24（nmcli 持久化, con-name: go2-dog） |
-| MID360 LiDAR (USB 版) | 接 NX，建图用（⚠️ USB 供电问题排查中，见 TROUBLESHOOTING 问题7） |
+| MID360 LiDAR (网口版) | 接 NX（192.168.1.160，host 192.168.1.200/32），`livox-mid360-net.service` 持久化，建图用 |
 
-接线/IP/网卡清单见 [`hardware/SETUP_GUIDE.md`](hardware/SETUP_GUIDE.md) 与 [`docs/REFACTOR.md`](docs/REFACTOR.md) 第五节。
+接线/IP/网卡清单见 [`hardware/SETUP_GUIDE.md`](hardware/SETUP_GUIDE.md)。
 
 ---
 
@@ -55,17 +63,21 @@
 
 | 能力 | 状态 | 说明 |
 |------|------|------|
-| Web 前端（键盘/按钮） | ✅ | `web/panel.py` + `static/panel.html` |
-| 站立 / 坐下 / 急停 | ✅ | `nx_motion_node` |
-| 狗轮式移动 | ⏳ 待实车 | _do_stand 已加回 BalanceStand（对齐 panel.py），硬件装完验证 |
-| 乱跑 / 后滑防护 | ✅ | systemd 崩溃自启 + 看门狗超时停狗 |
-| YOLO 检测 | ✅ | `ai/detector.py`（当前在 PC，待迁 NX） |
-| 地图/雷达显示 | ⚠️ | `nx_sensor_node` 数据流 |
-| VLM 指令解析 | ⚠️ | `ai/vlm.py`，模型加载失败时降级关键词匹配 |
-| 语音控制 | ⏳ | `ai/voice.py` 待修（暂后置） |
-| FAST_LIO 建图 | ⏳ | 待 MID360 供电解决后落地 |
-| Nav2 自主导航 | ⏳ | 依赖建图 + 移动 |
-| 自动搜索/跟踪 | ⏳ | 依赖 Nav2 |
+| Web 前端（键盘/按钮/地图/视频） | ✅ | `web/nx_web_server.py` + `static/panel.html`（HTTP:8000 + WS:8001） |
+| 站立 / 坐下 / 急停 / 手动移动 | ✅ | `nx_motion_node.py` 状态机（9 态）经 `nx_sport_gateway.py` 控狗 |
+| 自主导航（点选 / 任务） | ✅ | Nav2 + `nx_navigation_arbiter.py` 运动所有权仲裁（point/tasks/manual） |
+| 房间搜索（frontier 探索） | ✅ | `nx_room_orchestrator.py` + `nx_exploration_manager.py` + `nx_frontier_planner.py` |
+| 产品搜索（next-best-view） | ✅ | `nx_active_search.py` 视锥覆盖 NBV 规划 |
+| 目标物证（照片/去重/报告） | ✅ | `nx_person_mission.py`（空间+外观融合去重，report.json 落盘） |
+| 目标跟踪 / 跟随 | ✅ | `ai/tracker.py`（VLM + SDK 闭环） |
+| 取物（fetch） | ✅ | `nx_fetch_action.py` 插件（S1-S5 状态机） |
+| YOLO 检测 / VLM 定位 | ✅ | `ai/detector.py` / `ai/vlm.py` / `ai/locate_anything.py`（注入 `nx_web_server` 同进程） |
+| LLM 指令解析 | ✅ | `nx_llm_planner.py`（DeepSeek propose-verify，动作白名单，fail-closed） |
+| 语音控制（PC 端） | ✅ | `tools/voice_console.py`（Vosk 离线 STT → 确定性解析 → 可选本地 LLM → NX `/api/command`） |
+| 仿真全栈 | ✅ | `src/go2w_sim/`（Gazebo + FastLIO + Nav2 + web，`GO2W_SIM=1`） |
+| 地图/雷达显示 | ✅ | `/scan_mid360` + `/mid360/points_nav` → 前端渲染 |
+
+> ⏳ 遗留：`ai/voice.py`（Audio-Interaction 语音方案）无生产调用方且 import 即 NameError（引用 config 未定义的常量），实际语音走 `tools/voice_console.py`；`config/rooms.yaml` 三房间仍为占位坐标（`calibrated: false`），需实车标定。
 
 ---
 
@@ -75,47 +87,56 @@
 
 | 路径 | 状态 | 说明 |
 |------|------|------|
-| `web/panel.py` + `static/panel.html` + `static/map.js` | ✅ 活跃 | 当前前端后端 + 页面 |
-| `ai/`（detector / vlm / tracker / config） | ✅ 活跃 | AI 推理（待迁 NX） |
-| `src/go2w_bridge/nx_motion_node.py` | ✅ 活跃 | NX 控狗（systemd 服务） |
-| `src/go2w_bridge/nx_sensor_node.py` | ✅ 活跃 | NX 读狗传感器 |
-| `docker/`（deploy_nx.sh, go2w-motion.service） | ✅ 活跃 | NX 部署 + systemd |
-| `src/go2w_interfaces/` | 💤 休眠 | msg/srv，NX 多节点通信将启用 |
-| `src/go2w_nav/` | 💤 休眠 | Nav2 配置，迁移目标载体 |
-| `src/go2w_orchestrator/` | 💤 休眠 | 任务编排，迁移目标载体 |
-| `src/go2w_detector/` | 💤 休眠 | YOLO ROS 节点，迁移目标载体 |
-| `src/go2w_bringup/` | 💤 休眠 | launch，迁移目标载体 |
-| `web/server.py`、`static/index.html` | ❌ 废弃 | panel.py 的前身（老单体） |
-| `src/go2w_bridge/bridge_node.py`、`sport_client.py` | ❌ 废弃 | 老 PC 直连狗桥（被 NX 架构取代） |
+| `web/nx_web_server.py` | ✅ 活跃 | **唯一 Web 主程序**（HTTP+WS+rclpy），装配所有组件（感知/云台/雷达/任务编排） |
+| `web/nx_*.py`（30+ 模块） | ✅ 活跃 | 任务编排 / 导航仲裁 / 产品命令 / 物证 / 探索 / 前端桥等，见 PROJECT_STRUCTURE |
+| `web/static/panel.html` + `map.js` | ✅ 活跃 | 前端页面 + 地图 Canvas 渲染 |
+| `src/go2w_bridge/` | ✅ 活跃 | 运动控制层：`nx_motion_node` / `nx_sensor_node` / `nx_sport_gateway` / `nx_safety_observer` + 纯策略状态机（`motion_*.py`） |
+| `src/go2w_nav/` | ✅ 活跃 | Nav2 launch + 参数（`nav2_3d` 真机主力） |
+| `src/go2w_sim/` | ✅ 活跃 | Gazebo 仿真包（7 自定义节点 + 4 launch） |
+| `ai/` | ✅ 活跃 | detector / vlm / locate_anything / tracker / cloud_llm / config（voice.py 遗留待清理） |
+| `tools/` | ✅ 活跃 | 诊断 `diag_*` / 安全门控 `*_gate` / 发布验证 `verify_*` / 语音 `voice_console.py` / 运维脚本 |
+| `docker/` | ✅ 活跃 | 12 个 systemd service + `build_release.sh` / `deploy_release.sh`（原子发布唯一入口） |
+| `config/rooms.yaml` | ⏳ 占位 | 房间标定坐标（需实车标定后 `calibrated: true`） |
 
-> - 💤 **休眠** = 当前不在运行链路，但是 NX 中心化迁移的**目标载体**，**勿删**。
-> - ❌ **废弃** = 已被取代，待清理（清理前会再次确认无引用）。
+> 旧 PC 中心化架构产物（`panel.py` / `cmd_publisher.py` / `ros_to_json.py` / PC 容器）**已全部删除**，勿再参考旧文档中的路径。
 
 ---
 
-## 快速开始（阶段A：web 通信层上移 NX）
+## 快速开始
 
-> 阶段A 起，web 服务（`web/nx_web_server.py`，内嵌 rclpy）跑在载荷 NX 上，PC 摆脱 `go2w_humble` Docker 容器，浏览器直连 `http://<NX_IP>:8000`。PC 端不再需要 rclpy / 容器 / `dog_state.json` 文件桥。详见 [`gan-harness/spec.md`](gan-harness/spec.md)。
+### 路径 A：仿真（无需硬件，30 分钟内跑通）
 
-**NX 端**（一次性部署）：
-```bash
-NX_HOST=<NX_IP> bash docker/deploy_nx.sh        # 控狗服务 go2w-motion (lease 持有)
-NX_HOST=<NX_IP> bash docker/deploy_nx_web.sh    # web 服务 go2w-web (HTTP:8000 + WS:8001)
-```
-两者开机自启（systemd `enabled`）。web 服务依赖控狗服务（`go2w-web.service` 设 `After=go2w-motion.service`）。
+见顶层 [`QUICKSTART.md`](../QUICKSTART.md)。核心一条命令：
 
-**PC 端**（每次开机，只开浏览器）：
 ```bash
 cd go2w_search_ws
-bash web/start_pc_browser.sh    # 只提示浏览器打开 http://<NX_IP>:8000
+export GO2W_WEB_DIR="$PWD/web"
+ros2 launch go2w_sim sim_full_bringup.launch.py   # Gazebo + FastLIO + Nav2 + web
+# 浏览器打开 http://localhost:8000
 ```
 
-**验证**（NX 上跑，8 项全 PASS，不依赖狗硬件）：
+### 路径 B：真狗（NX 原子发布）
+
+**NX 端**（一次性部署，全部 systemd 自启）：
+
 ```bash
-bash web/verify_nx_web.sh       # 启 nx_web + mock，跑 curl + WS 断言
+python tools/verify_release.py                       # 离线发布门禁
+bash docker/build_release.sh all                     # 构建 content-addressed 归档
+NX_HOST=<NX_IP> NX_USER=nx bash docker/deploy_release.sh \
+  dist/<artifact>-all.tar.gz --allow-motion-restart \
+  --control-token-file control-token.txt             # 原子部署（软链切换 current）
 ```
 
-> 退役链路（PC fallback，可回滚）：`web/start_ros2.sh.legacy`（原 PC 容器 + panel.py 路径）、`web/cmd_publisher.py`、`web/ros_to_json.py`、`web/panel.py` 均保留不删。
+**PC 端**：每次开机只开浏览器 `http://<NX_IP>:8000`（`bash web/start_pc_browser.sh`）。
+
+> 旧的 `deploy_nx.sh` / `deploy_nx_web.sh` / `deploy_nav2_bprime.sh` 仅作历史排障参考，不再是生产发布入口（见 `docs/PROJECT_STRUCTURE.md` 与 `docs/NX_REDEPLOY.md`）。
+
+**验证**（NX 上跑）：
+```bash
+bash web/scripts/verify_nx_web.sh    # 启 nx_web + mock，跑 curl + WS 断言
+bash web/scripts/verify_nx_ai.sh     # AI 感知链验证
+bash web/scripts/verify_stage_e.sh   # 端到端阶段验证
+```
 
 ---
 
@@ -129,15 +150,17 @@ python tools/voice_console.py --text "帮我找一下椅子并标出来" --no-au
   --llm-model qwen2.5:3b --llm-mode fallback --llm-timeout 5
 ```
 
-Ollama 使用 `/api/chat`；其他本地 OpenAI 兼容服务使用完整的 `/v1/chat/completions` 地址，例如 `http://127.0.0.1:8080/v1/chat/completions`。对应环境变量为 `GO2W_LOCAL_LLM_URL`、`GO2W_LOCAL_LLM_MODEL`、`GO2W_LOCAL_LLM_MODE` 和 `GO2W_LOCAL_LLM_TIMEOUT`。模式可选 `off`、`fallback`（默认，仅在确定性解析失败时调用）和 `always`；URL 留空会彻底禁用 LLM 请求。
+Ollama 使用 `/api/chat`；其他本地 OpenAI 兼容服务使用完整的 `/v1/chat/completions` 地址。对应环境变量为 `GO2W_LOCAL_LLM_URL`、`GO2W_LOCAL_LLM_MODEL`、`GO2W_LOCAL_LLM_MODE` 和 `GO2W_LOCAL_LLM_TIMEOUT`。模式可选 `off`、`fallback`（默认）和 `always`；URL 留空会彻底禁用 LLM 请求。
 
-安全边界：本地模型没有直接控制权，只能提出一个规范中文移动或“当前房间搜索”指令；任何输出都必须重新通过 `validate_voice_command`，并继续接受 NX 端解析与任务准入检查。自动发送仍要求控制 Token；首次调试建议始终保留 `--no-auto-send`。
+安全边界：本地模型没有直接控制权，只能提出一个规范中文移动或"当前房间搜索"指令；任何输出都必须重新通过 `validate_voice_command`，并继续接受 NX 端解析与任务准入检查。
+
+> ⚠️ 鉴权说明：NX 端 `nx_control_auth.authorize_request` 自 2026-07-16 起被用户要求短路为 `auth_disabled`（局域网内所有 `/api` 请求免 Bearer Token）。恢复 Token 限制需重新启用 `nx_control_auth.py` 中已被短路的下半段校验逻辑。
 
 ---
 
 ## 架构演进方向
 
-正在从「PC 跑重活」迁移到「NX 跑所有重活，PC 仅 UI」。分阶段路线与并行分工见
+正在从「PC 跑重活」迁移到「NX 跑所有重活，PC 仅 UI」——**已完成**：当前全部重活（感知/建图/规划/控狗/搜索）均在 NX，PC 只开浏览器。历史分阶段路线见
 [`docs/REFACTOR_NX_CENTRIC.md`](docs/REFACTOR_NX_CENTRIC.md) 与
 [`docs/TECH_DECISIONS.md`](docs/TECH_DECISIONS.md) 第四节。
 
@@ -146,3 +169,4 @@ Ollama 使用 `/api/chat`；其他本地 OpenAI 兼容服务使用完整的 `/v1
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — 架构/部署决策
 - [`docs/TECH_DECISIONS.md`](docs/TECH_DECISIONS.md) — 技术调研结论（移动控制 / FAST_LIO / Nav2）
 - [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — 实测踩坑（网卡 / DDS 版本 / USB 供电等）
+- [`docs/OPTIMIZATION_PLAN.md`](docs/OPTIMIZATION_PLAN.md) — 代码级优化建议与方案（2026-08 代码审计产出）

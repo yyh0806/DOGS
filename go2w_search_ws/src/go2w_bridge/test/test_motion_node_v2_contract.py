@@ -136,7 +136,7 @@ def test_pure_motion_modules_support_nx_direct_file_deployment():
                 "import sys; "
                 f"sys.path.insert(0, {module_dir!r}); "
                 "import motion_types, motion_machine, motion_protocol, "
-                "motion_safety, motion_controller, unitree_sport_adapter, "
+                "motion_safety, motion_controller, "
                 "sport_gateway_protocol, sport_gateway_client"
             ),
         ],

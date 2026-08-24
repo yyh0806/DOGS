@@ -140,8 +140,6 @@ def architecture_violations(root: Path = ROOT) -> list[str]:
         root, "src/go2w_bridge/go2w_bridge/nx_safety_observer.py")
     gateway_server = _read(
         root, "src/go2w_bridge/go2w_bridge/sport_gateway_server.py")
-    sport_adapter = _read(
-        root, "src/go2w_bridge/go2w_bridge/unitree_sport_adapter.py")
     web = _read(root, "web/nx_web_server.py")
     ai = _read(root, "web/nx_ai_node.py")
     room = _read(root, "web/nx_room_orchestrator.py")
@@ -192,7 +190,7 @@ def architecture_violations(root: Path = ROOT) -> list[str]:
         if legacy in motion:
             problems.append(f"legacy motion authority remains: {legacy}")
     for forbidden in ('"Damp"', '"RecoveryStand"', '"StandDown"'):
-        if forbidden in sport_adapter + gateway + gateway_server:
+        if forbidden in gateway + gateway_server:
             problems.append(
                 f"autonomous sport adapter exposes support-changing operation: {forbidden}")
 
