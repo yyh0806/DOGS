@@ -1,10 +1,15 @@
 #!/bin/bash
-# Safely deploy the MID360-primary FastLIO/Nav2 stack to the NX.
+# ============================================================
+# deploy_nav2_bprime.sh — retired 兼容入口 (转发到原子发布链)
+# 生产部署唯一入口: build_release.sh + deploy_release.sh (内容寻址 + 原子切换)
+# 详见 docs/NX_REDEPLOY.md
+# ============================================================
 set -euo pipefail
 
-# Compatibility entrypoint only. This preserves the familiar command name
-# while guaranteeing Nav2 deployment never overwrites or restarts motion.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "deploy_nav2_bprime.sh is retired; forwarding to the atomic nav release flow" >&2
 artifact="$("$SCRIPT_DIR/build_release.sh" nav)"
 exec "$SCRIPT_DIR/deploy_release.sh" "$artifact" "$@"
+
+# LEGACY IMPLEMENTATION BELOW IS UNREACHABLE
+# (历史直接 scp 部署实现已删除; 保留此标记供发布门禁识别 wrapper 边界)

@@ -201,10 +201,14 @@ def test_direct_move_probe_reserves_scheduler_margin_and_always_stops():
 
 
 def test_nav2_deployment_installs_read_only_preflight_and_opt_in_probe():
+    # 2026-08-24 对齐原子发布链: deploy_nav2_bprime.sh 已是 retired 转发壳
+    # (转发到 build/deploy_release), preflight 工具改由 build_release.sh 的
+    # copy_path 打包进发布归档 (原断言锁定的 legacy scp 安装路径已退役)。
     source = Path("docker/deploy_nav2_bprime.sh").read_text(encoding="utf-8")
+    builder = Path("docker/build_release.sh").read_text(encoding="utf-8")
 
-    assert '"$WIN_WS/tools/nav2_preflight.py"' in source
-    assert '"$WIN_WS/tools/probe_angular_response.py"' in source
-    assert "mkdir -p tools" in source
-    assert "cp /tmp/bprime/nav2_preflight.py tools/" in source
-    assert "cp /tmp/bprime/probe_angular_response.py tools/" in source
+    # 兼容壳必须转发到原子链, 且不再自带 legacy 实现
+    assert "deploy_release.sh\" \"$artifact\" \"$@\"" in source
+    assert "LEGACY IMPLEMENTATION BELOW IS UNREACHABLE" in source
+    # preflight 工具仍随 nav 发布包交付
+    assert 'copy_path "tools/nav2_preflight.py"' in builder
