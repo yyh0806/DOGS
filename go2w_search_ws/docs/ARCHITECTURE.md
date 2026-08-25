@@ -58,6 +58,25 @@ MID360 雷达 ──► /livox/lidar (CustomMsg)
                 ├──► FAST_LIO ──► /Odometry ──► map_odom_fuser ──► /odom → TF(map→odom→base_link)
                 └──► LidarBridge (Web 内嵌) ──► WS type=lidar（2026-08 起前端停用）
 狗自带 utlidar ──► rt/utlidar/cloud (PointCloud2) ──► nx_sensor_node ──► /scan（诊断用，自屏蔽盒内编码 NaN）
+
+### 3.1.1 室外扩展链（2026-08 新增，代码就绪待实机标定）
+
+```
+GPS 天线/PX4 ──► /gps/fix (NavSatFix) 或串口 NMEA
+                   └─► nx_gps_nav (web 进程内): GpsFixGate 质量门 → ENU+北向标定
+                       → GpsRouteController 逐航点 → PointNavigationController
+                       → Nav2 (复用室内点导航链, 不动 TF/odom)
+                   ──► /api/gps/route (受理) / /api/gps/calibrate (标定)
+                   ──► WS type=gps_route (状态推送); fail-closed 条款见 docs/GPS_NAV.md §3
+
+Nooploop AOA 基站 (串口 NLink) ──► uwb_serial_bridge (B-1, mock 可降级测试)
+                   └─► latest() 快照 → nx_uwb_bridge 适配 (fix 合同, 隐式 mock 拒绝)
+                       → UwbFollowController (B-2, 五态状态机)
+                       → 避障闸门(directional_clearance) → robot.move(manual)
+                       → arbiter manual 所有权通道 (零速 handoff)
+                   ──► /api/uwb_follow/{start,stop,status,params} + 前端跟随按钮
+                   ──► WS type=uwb_follow; 安全条款见 nx_uwb_follow.py 模块头
+```
 ```
 
 ### 3.2 控制链路
@@ -79,6 +98,8 @@ Web 面板点击地图 ──► /api/navigate ──► navigation_arbiter ─�
 | `gimbal` | C13 云台双流（可见光+红外） | nx_gimbal_node |
 | `detections` | YOLO 检测结果 | nx_ai_node |
 | `lidar` | MID360 鸟瞰 PNG | **2026-08 起前端停用**（双源交叉显示修复） |
+| `uwb_follow` | UWB 跟随状态（state/reason） | UwbFollowController state_callback |
+| `gps_route` | GPS 航线状态（航点进度/健康） | GpsRouteController state_callback |
 
 ## 4. systemd 服务依赖
 

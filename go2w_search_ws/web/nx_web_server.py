@@ -63,6 +63,11 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, LaserScan
 try:
+    from sensor_msgs.msg import NavSatFix
+except ImportError:  # ROS-free contract-test stubs may omit this optional type.
+    class NavSatFix:  # pragma: no cover - production ROS always supplies it
+        pass
+try:
     from sensor_msgs.msg import PointCloud2
 except ImportError:  # ROS-free contract-test stubs may omit this optional type.
     class PointCloud2:  # pragma: no cover - production ROS always supplies it
@@ -79,6 +84,7 @@ from nx_navigation_gateway import (
 )
 from nx_navigation_arbiter import NavigationArbiter
 from nx_uwb_follow import UwbFollowController
+from nx_gps_nav import GpsRouteController, nav_sat_fix_to_gps_fix
 from nx_camera_calibration import resolve_camera_calibration
 from nx_person_localizer import (
     coerce_laser_scan_snapshot,
@@ -2530,6 +2536,7 @@ navigation_gateway = None  # sole NavigateToPose owner
 room_orchestrator = None  # 阶段E: RoomSearchOrchestrator (main 注入)
 navigation_arbiter = None  # NavigationArbiter: process-wide autonomous owner
 uwb_follow = None          # 功能B-2: UwbFollowController (ROS-free, main 注入)
+gps_route = None           # 功能A: GpsRouteController (室外 GPS 航线, main 注入)
 
 
 def _perception_health(robot_bridge):
@@ -2841,6 +2848,7 @@ def create_server(host, port, static_dir, mission_root=None):
                     "point_nav": point_nav.get_state() if point_nav else {},
                     "room_nav": room_nav_state,
                     "uwb_follow": uwb_follow.get_state() if uwb_follow else {},
+        "gps_route": gps_route.get_state() if gps_route else {},
                     "perception": _perception_health(robot),
                     "det_list": _detection_list_snapshot(robot),
                 })
@@ -2891,6 +2899,13 @@ def create_server(host, port, static_dir, mission_root=None):
                 else:
                     self._json({"state": "idle", "active": False,
                                 "reason": "uwb_follow_unavailable"})
+            elif p.path == '/api/gps/route':
+                # 功能A: GPS 航线状态快照 (含北向标定/最新 GPS 健康)
+                if gps_route is not None:
+                    self._json(gps_route.get_state())
+                else:
+                    self._json({"active": False, "status": "idle",
+                                "reason": "gps_route_unavailable"})
             else:
                 self.send_error(404)
 
@@ -2929,6 +2944,8 @@ def create_server(host, port, static_dir, mission_root=None):
                 "/api/manual_stop", "/api/navigate", "/api/search", "/api/clear_all",
                 "/api/uwb_follow/start", "/api/uwb_follow/stop",
                 "/api/uwb_follow/params",
+                "/api/gps/route", "/api/gps/route_cancel",
+                "/api/gps/calibrate",
             }
             audit_request = p.path in audited_paths
             if p.path == "/api/move" and navigation_arbiter is not None:
@@ -3013,6 +3030,11 @@ def create_server(host, port, static_dir, mission_root=None):
                         uwb_follow.stop("operator_stop")
                     except Exception:
                         logger.exception("/api/stop 停跟随失败 (继续全局停车)")
+                if gps_route is not None:
+                    try:
+                        gps_route.cancel("operator_stop")
+                    except Exception:
+                        logger.exception("/api/stop 撤 GPS 航线失败 (继续全局停车)")
                 result = navigation_arbiter.stop_all(
                     "operator_stop") if navigation_arbiter else {
                         "ok": False, "reason": "arbiter_unavailable"}
@@ -3053,6 +3075,11 @@ def create_server(host, port, static_dir, mission_root=None):
                         uwb_follow.stop("emergency_stop")
                     except Exception:
                         logger.exception("/api/e_stop 停跟随失败 (继续急停)")
+                if gps_route is not None:
+                    try:
+                        gps_route.cancel("emergency_stop")
+                    except Exception:
+                        logger.exception("/api/e_stop 撤 GPS 航线失败 (继续急停)")
                 result = navigation_arbiter.emergency_stop() if navigation_arbiter else {
                     "ok": False, "reason": "arbiter_unavailable"}
                 self._json(result, status=(
@@ -3323,6 +3350,65 @@ def create_server(host, port, static_dir, mission_root=None):
                 result = uwb_follow.update_params(
                     parsed if isinstance(parsed, dict) else None)
                 self._json(result, status=200 if result.get("ok") else 400)
+            elif p.path == '/api/gps/route':
+                # 功能A: 受理 GPS 航线。body: {"waypoints": [{"lat": ..,
+                # "lon": .., "yaw": ..(可选), "name": ..(可选)}, ...]}
+                # 北向未标定 / GPS 不健康 / 航点非法 → 拒绝 (fail-closed,
+                # 理由见 docs/GPS_NAV.md §3)。
+                if gps_route is None:
+                    self._json({"ok": False, "reason": "gps_route_unavailable"},
+                               status=503)
+                    return
+                try:
+                    parsed = json.loads(body) if body else {}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    self._json({"ok": False, "reason": "invalid_json"}, status=400)
+                    return
+                waypoints = parsed.get("waypoints") if isinstance(parsed, dict) else None
+                if not isinstance(waypoints, list) or not waypoints:
+                    self._json({"ok": False, "reason": "invalid_waypoints"},
+                               status=400)
+                    return
+                localization = node.get_localization_health()
+                if not bool(localization.get("healthy")):
+                    self._json({"ok": False,
+                                "reason": "localization_unhealthy",
+                                "detail": localization.get("reason")}, status=409)
+                    return
+                map_pose = {"x": localization.get("x"),
+                            "y": localization.get("y"),
+                            "yaw": localization.get("yaw")}
+                result = gps_route.submit_route(waypoints, map_pose=map_pose)
+                # 400: 请求本身非法 (坐标/航线空); 409: 系统状态拒绝
+                # (未标定/GPS 不健康/已有航线)。
+                reason = str(result.get("reason"))
+                status = 202 if result.get("ok") else (
+                    400 if reason in ("invalid_waypoint", "empty_route") else 409)
+                self._json(result, status=status)
+            elif p.path == '/api/gps/route_cancel':
+                if gps_route is None:
+                    self._json({"ok": False, "reason": "gps_route_unavailable"},
+                               status=503)
+                    return
+                self._json(gps_route.cancel("operator_cancel"))
+            elif p.path == '/api/gps/calibrate':
+                # 功能A: 写入北向标定 (每场地一次, 流程见 docs/GPS_NAV.md §4)。
+                # body: {"heading_deg": <float>}
+                if gps_route is None:
+                    self._json({"ok": False, "reason": "gps_route_unavailable"},
+                               status=503)
+                    return
+                try:
+                    parsed = json.loads(body) if body else {}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    self._json({"ok": False, "reason": "invalid_json"}, status=400)
+                    return
+                heading = parsed.get("heading_deg") if isinstance(parsed, dict) else None
+                if not isinstance(heading, (int, float)):
+                    self._json({"ok": False, "reason": "invalid_heading"},
+                               status=400)
+                    return
+                self._json(gps_route.set_heading_calibration(float(heading)))
             else:
                 self.send_error(404)
 
@@ -3841,6 +3927,36 @@ def main():
                      args=(uwb_follow, _uwb_follow_stop_event),
                      daemon=True).start()
 
+    # 功能A: 室外 GPS 航线导航 (纯核心见 nx_gps_nav.py; 见 docs/GPS_NAV.md §5)。
+    # point_port 复用 PointNavigationController (天然暴露 generation, 所有权
+    # 被抢检测依赖它); park 接 arbiter.stop_all (GPS fail-closed 条款 1/3/6/7)。
+    gps_route = GpsRouteController(
+        point_nav,
+        park_hook=lambda reason: navigation_arbiter.stop_all(
+            f"gps_route:{reason}"),
+        state_callback=lambda s: ws_broadcast(
+            {"type": "gps_route", "data": s}, force=True),
+    )
+    _gps_fix_sub = node.create_subscription(
+        NavSatFix, '/gps/fix',
+        lambda msg: gps_route.update_fix(
+            nav_sat_fix_to_gps_fix(msg, time.monotonic())),
+        qos_profile_sensor_data)
+
+    def _gps_route_loop(stop_event, period=0.2):
+        # 5Hz tick: 航点推进/超时/门禁裁决都在核心状态机内, 此线程只驱动。
+        while not stop_event.is_set():
+            try:
+                gps_route.tick()
+            except Exception:
+                logger.exception("gps_route tick 失败 (下一拍重试)")
+            stop_event.wait(period)
+
+    _gps_route_stop_event = threading.Event()
+    threading.Thread(target=_gps_route_loop,
+                     args=(_gps_route_stop_event,),
+                     daemon=True).start()
+
     # Humble's rclpy wait-set cannot be mutated while an executor is waiting.
     # PointNav and RoomSearch both create ActionClients, so start spin only
     # after every ROS entity has been constructed.
@@ -3887,6 +4003,19 @@ def main():
                 uwb_follow.stop("web_shutdown")
         except Exception:
             logger.exception("退出清理: 停 UWB 跟随失败")
+        # 功能A: 停 GPS 航线 tick 并撤航线 (Nav2 目标由 arbiter drain 兜底);
+        # 功能B: 停 UWB 串口桥 (释放串口句柄)。
+        try:
+            _gps_route_stop_event.set()
+            if gps_route is not None:
+                gps_route.cancel("web_shutdown")
+        except Exception:
+            logger.exception("退出清理: 停 GPS 航线失败")
+        try:
+            from nx_uwb_bridge import shutdown_bridge as _shutdown_uwb_bridge
+            _shutdown_uwb_bridge()
+        except Exception:
+            pass
         # ROS executor 仍在运行时封住新请求，并同时 drain PointNav、
         # TaskManager worker 与 Room Nav2 action ownership。
         try:

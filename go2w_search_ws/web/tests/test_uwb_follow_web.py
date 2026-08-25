@@ -157,11 +157,39 @@ def test_factory_stop_releases_ownership():
 
 
 def test_load_uwb_follow_source_returns_none_without_bridge(monkeypatch):
-    # 开发机无 nx_uwb_bridge → None (start 拒绝, 不抛)
+    # 集成后 (B-1 桥已合入) 语义升级: 开发机无串口时桥自动降级 mock,
+    # 但 mock 假测距不得驱动生产跟随 → 源必须为 None (fail-closed)。
+    import nx_uwb_bridge
+    nx_uwb_bridge.reset_singleton_for_tests()
     monkeypatch.delenv("GO2W_UWB_FOLLOW_DISABLE", raising=False)
-    assert nws._load_uwb_follow_source() is None
+    monkeypatch.delenv("GO2W_UWB_MODE", raising=False)
+    try:
+        # 本测试机无 /dev/ttyUSB0: auto 模式下串口必失败 → 降级 mock 被拦
+        assert nws._load_uwb_follow_source() is None
+    finally:
+        nx_uwb_bridge.reset_singleton_for_tests()
     monkeypatch.setenv("GO2W_UWB_FOLLOW_DISABLE", "1")
-    assert nws._load_uwb_follow_source() is None
+    try:
+        assert nws._load_uwb_follow_source() is None
+    finally:
+        nx_uwb_bridge.reset_singleton_for_tests()
+
+
+def test_load_uwb_follow_source_explicit_mock_allowed(monkeypatch):
+    # 显式 GO2W_UWB_MODE=mock (演示/联调意图) 时源可用, get_fix 出合同字段
+    import nx_uwb_bridge
+    nx_uwb_bridge.reset_singleton_for_tests()
+    monkeypatch.delenv("GO2W_UWB_FOLLOW_DISABLE", raising=False)
+    monkeypatch.setenv("GO2W_UWB_MODE", "mock")
+    monkeypatch.setenv("GO2W_UWB_PORT", "")  # 强制走 mock 源
+    try:
+        source = nws._load_uwb_follow_source()
+        assert source is not None
+        fix = source.get_fix()
+        assert fix and fix.get("ok") is True
+        assert isinstance(fix.get("range_m"), float) and fix["range_m"] > 0.0
+    finally:
+        nx_uwb_bridge.reset_singleton_for_tests()
 
 
 def test_load_uwb_follow_source_uses_bridge_factory(monkeypatch):

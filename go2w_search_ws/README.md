@@ -76,6 +76,8 @@
 | 语音控制（PC 端） | ✅ | `tools/voice_console.py`（Vosk 离线 STT → 确定性解析 → 可选本地 LLM → NX `/api/command`） |
 | 仿真全栈 | ✅ | `src/go2w_sim/`（Gazebo + FastLIO + Nav2 + web，`GO2W_SIM=1`） |
 | 地图/雷达显示 | ✅ | `/scan_mid360` + `/mid360/points_nav` → 前端渲染 |
+| 室外 GPS 航线导航 | ✅代码就绪⏳待实机标定 | `web/nx_gps_nav.py`（NMEA/NavSatFix→质量门→ENU+北向→逐航点）+ `/api/gps/route`；北向标定流程见 `docs/GPS_NAV.md` §4 |
+| UWB 钥匙扣跟随 | ✅代码就绪⏳待实机标定 | `nlink_uwb` 协议桥（Nooploop AOA）+ `web/nx_uwb_follow.py` 状态机 + `/api/uwb_follow/*`；AOA 角度零偏标定见 `docs/UWB_FOLLOW.md` |
 
 > ⏳ 遗留：`ai/voice.py`（Audio-Interaction 语音方案）无生产调用方且 import 即 NameError（引用 config 未定义的常量），实际语音走 `tools/voice_console.py`；`config/rooms.yaml` 三房间仍为占位坐标（`calibrated: false`），需实车标定。
 

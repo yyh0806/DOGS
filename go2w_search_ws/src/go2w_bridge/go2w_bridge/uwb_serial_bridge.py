@@ -199,11 +199,16 @@ class UwbSerialBridge:
                 self._safe_call(self._on_tag, tag_id, payload)
 
     def _record_latest(self, frame: AnyFrame) -> None:
+        # 到达时刻 (monotonic): 消费者计算 age 的唯一可靠基准。协议里的
+        # system_time_ms 是 uint32 墙钟毫秒, &0xFFFFFFFF 后每 ~49.7 天回绕,
+        # 直接相减会得到天文数字年龄 (集成期实测踩坑), 不得用于新鲜度。
+        received_monotonic = time.monotonic()
         if isinstance(frame, AoaNodeFrame):
             for node in frame.nodes:
                 snapshot = node.to_dict()
                 snapshot["local_time_ms"] = frame.local_time_ms
                 snapshot["system_time_ms"] = frame.system_time_ms
+                snapshot["received_monotonic"] = received_monotonic
                 self._latest[node.id] = snapshot
         elif frame.to_dict().get("kind") == "tag_frame":
             payload = frame.to_dict()
@@ -211,6 +216,7 @@ class UwbSerialBridge:
             snapshot["distance_m"] = next(
                 (d for d in frame.distances_m if d > 0.0), None
             )
+            snapshot["received_monotonic"] = received_monotonic
             self._latest[frame.id] = snapshot
 
     def _safe_call(self, callback, *args) -> None:
