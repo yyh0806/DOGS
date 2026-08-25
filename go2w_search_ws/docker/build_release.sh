@@ -78,7 +78,7 @@ copy_web_runtime() {
   # (from go2w_bridge.uwb_serial_bridge import ...), 漏包则 NX 上跟随源
   # 静默不可用 (适配层 ImportError 降级为 None, start 被拒)。
   local name
-  for name in nooploop_uwb_protocol.py uwb_serial_bridge.py; do
+  for name in nooploop_uwb_protocol.py followme_protocol.py uwb_serial_bridge.py; do
     copy_path "src/go2w_bridge/go2w_bridge/$name"
   done
 }

@@ -3,6 +3,29 @@
 > 分支 `feature/uwb-follow` · 模块 `web/nx_uwb_follow.py` (ROS-free 纯逻辑)
 > 姊妹件: B-1 UWB 桥 (`feature/uwb-bridge` → `nx_uwb_bridge.py`)、B-3 集成 (`feature/outdoor-follow-integration`)。
 
+## 0. 真机硬件 (2026-08-24 确认: Nooploop Follow-Me 系列)
+
+- **狗侧**: FMM-A01/FM-A1 跟随基站 (Anchor, 圆盘 Φ60mm)。M8 航插: 红=VCC
+  (3.3-5.5V), 黑=GND, 黄=UART_TX (TTL 3.3V), 蓝=UART_RX → 经 USB-TTL
+  (官方 NUTT, CH343 芯片) 接 NX, 设备名一般 /dev/ttyUSB0。
+- **人侧**: FMM-T01 标签 (Tag, 钥匙扣), 出厂默认已与基站**一对一配对**,
+  供电即工作 (绿灯快闪=配对且交互中)。
+- **串口**: 921600 波特率, 8N1, 无流控 (出厂值)。
+- **协议**: Follow-Me 私有协议 (与 LinkTrack NLink **不兼容**): 帧头 0xAA +
+  FuncField(Role 高 4 位 | 0x06 低 4 位) + CNT + UID(6B) + PayloadSize(u16 LE)
+  + Messages + CRC-16/Modbus (LE)。跟随消费 `MSG_SPHERICAL_RESULT (0x2A)`:
+  distance(m) + azimuth(°) + elevation(°), 25Hz (遮挡/多径时角度可能更慢)。
+  解析器: `go2w_bridge/followme_protocol.py` (官方协议 PDF 测试向量逐字节验证,
+  PDF 存 `uwb_docs/`)。
+- **角度约定**: 基站指示灯/按键方向 = 方位角 0°, 航空插头方向 = ±180°, Z 轴
+  朝上, 逆时针为正 (右手系)。**安装要求指示灯朝狗头正前方**; 装反用
+  `GO2W_UWB_ANGLE_OFFSET_DEG=180` 补偿。安装尽量高、远离大金属面 (多径)。
+- **服务端配置** (go2w-web.service 已钉死): `GO2W_UWB_MODE=serial`
+  `GO2W_UWB_PROTOCOL=followme` `GO2W_UWB_BAUD=921600` —— 真机零 mock,
+  串口不可用时跟随 start 直接拒绝。
+- **Bench 验证** (不动狗): 部署后 `curl http://<NX>:8000/api/uwb_follow/status`,
+  移动标签观察 `fix.range_m`/`fix.azimuth_rad` 实时变化即链路通。
+
 ## 1. 设计原则
 
 1. **ROS-free**: 控制器不 import rclpy; 测距源、避障探测、速度发布、运动

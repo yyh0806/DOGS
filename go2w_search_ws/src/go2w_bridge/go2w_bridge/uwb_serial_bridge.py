@@ -32,6 +32,12 @@ from go2w_bridge.nooploop_uwb_protocol import (
     ROLE_CONSOLE,
     build_aoa_node_frame,
 )
+from go2w_bridge.followme_protocol import (
+    FollowMeStreamParser,
+    MSG_SPHERICAL_RESULT,
+    MSG_DIS as FOLLOWME_MSG_DIS,
+    build_spherical_frame,
+)
 
 LOGGER = logging.getLogger("go2w.uwb_serial_bridge")
 
@@ -49,6 +55,7 @@ class UwbBridgeConfig:
     port: Optional[str] = None          # None/空 => 自动降级 mock
     baudrate: int = DEFAULT_BAUDRATE
     mode: str = "auto"                  # auto | serial | mock
+    protocol: str = "auto"              # auto | followme | nlink (2026-08-24 Follow-Me 硬件)
     mock_hz: float = DEFAULT_MOCK_HZ
     followed_tag_id: Optional[int] = None
     max_frame_bytes: int = 1024
@@ -57,6 +64,8 @@ class UwbBridgeConfig:
     def __post_init__(self) -> None:
         if self.mode not in ("auto", "serial", "mock"):
             raise ValueError(f"unsupported bridge mode: {self.mode!r}")
+        if self.protocol not in ("auto", "followme", "nlink"):
+            raise ValueError(f"unsupported protocol: {self.protocol!r}")
         if self.baudrate <= 0:
             raise ValueError("baudrate must be positive")
         if self.mock_hz <= 0:
@@ -77,10 +86,12 @@ class MockUwbSource:
         base_id: int = 0,
         hz: float = DEFAULT_MOCK_HZ,
         scenario: Optional[Callable[[float], tuple]] = None,
+        protocol: str = "nlink",
     ) -> None:
         self.tag_id = tag_id
         self.base_id = base_id
         self.hz = hz
+        self.protocol = protocol  # followme 时生成 0xAA Follow-Me 帧
         self._scenario = scenario or (lambda t: (3.0, 0.0))
         self._start = time.monotonic()
         self._tick = 0
@@ -88,6 +99,11 @@ class MockUwbSource:
     def next_frame_bytes(self) -> bytes:
         distance_m, angle_deg = self._scenario(time.monotonic() - self._start)
         self._tick += 1
+        if self.protocol == "followme":
+            return build_spherical_frame(
+                dis_m=distance_m, azimuth_deg=angle_deg, elevation_deg=0.0,
+                local_time_us=int(self._tick * 1e6 / self.hz),
+                cnt=self._tick & 0xFF)
         return build_aoa_node_frame(
             nodes=[AoaNodeSpec(id=self.tag_id, distance_m=distance_m, angle_deg=angle_deg)],
             device_role=ROLE_CONSOLE,
@@ -107,7 +123,12 @@ class UwbSerialBridge:
         on_tag: Optional[MeasurementCallback] = None,
     ) -> None:
         self.config = config or UwbBridgeConfig()
-        self._parser = NLinkStreamParser(max_frame_bytes=self.config.max_frame_bytes)
+        self._nlink_parser = NLinkStreamParser(max_frame_bytes=self.config.max_frame_bytes)
+        self._followme_parser = FollowMeStreamParser()
+        # 协议锁定: auto 模式下第一个解出完整帧的协议胜出并锁定 (两种协议
+        # 帧头/校验完全不同, 不会误锁); 显式配置则只喂选定解析器。
+        self._protocol_locked: Optional[str] = (
+            None if self.config.protocol == "auto" else self.config.protocol)
         self._on_frame = on_frame
         self._on_tag = on_tag
         self._serial = None
@@ -118,6 +139,11 @@ class UwbSerialBridge:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    @property
+    def _parser(self):
+        # 兼容旧引用 (run_for / status 走 nlink 统计)
+        return self._nlink_parser
 
     # ------------------------------------------------------------------ 源
     def open(self) -> str:
@@ -134,6 +160,7 @@ class UwbSerialBridge:
         self._mock_source = MockUwbSource(
             tag_id=self.config.followed_tag_id if self.config.followed_tag_id is not None else 1,
             hz=self.config.mock_hz,
+            protocol=("followme" if self.config.protocol == "followme" else "nlink"),
         )
         self._fallback_reason = self._fallback_reason or "mode=mock"
         LOGGER.warning("UWB bridge fell back to mock source: %s", self._fallback_reason)
@@ -160,12 +187,30 @@ class UwbSerialBridge:
 
     # ------------------------------------------------------------- 注入路径
     def inject_bytes(self, data: bytes) -> List[AnyFrame]:
-        """mock 注入路径入口:原始字节流经真解析器(线程安全)。"""
+        """注入原始字节流(串口读线程与 mock/测试共用),线程安全。"""
+        nlink_frames: List[AnyFrame] = []
+        followme_dicts: List[Dict] = []
         with self._lock:
-            frames = self._parser.feed(data)
-        for frame in frames:
+            # Follow-Me 与 NLink 帧头(0xAA vs 0x55)/校验(CRC16 vs 累加和)
+            # 完全不同, 各喂各的解析器互不干扰; 锁定后只喂胜出者省 CPU。
+            if self._protocol_locked in (None, "followme"):
+                fm_frames = self._followme_parser.feed(data)
+                if fm_frames and self._protocol_locked is None:
+                    self._protocol_locked = "followme"
+                for frame in fm_frames:
+                    snapshot = self._record_followme(frame)
+                    if snapshot is not None:
+                        followme_dicts.append(snapshot)
+            if self._protocol_locked in (None, "nlink"):
+                nlink_frames = self._nlink_parser.feed(data)
+                if nlink_frames and self._protocol_locked is None:
+                    self._protocol_locked = "nlink"
+        # 回调在锁外执行 (回调不得再调桥方法造成死锁)
+        for frame in nlink_frames:
             self._dispatch(frame)
-        return frames
+        for snapshot in followme_dicts:
+            self._emit_followme_callbacks(snapshot)
+        return nlink_frames + [type("F", (), {"to_dict": lambda s=s: s})() for s in followme_dicts]
 
     def inject_tag(
         self,
@@ -180,6 +225,48 @@ class UwbSerialBridge:
             local_time_ms=0 if local_time_ms is None else local_time_ms,
         )
         return self.inject_bytes(frame)
+
+    # ---------------------------------------------------- Follow-Me 数据路径
+    def _record_followme(self, frame) -> Optional[Dict]:
+        """Follow-Me 帧 → 统一快照 (与 NLink 路径同 shape, 上层零改动)。
+
+        Follow-Me 基站与标签一对一配对 (手册 §5.1), 不存在多标签选择;
+        快照 id 用 followed_tag_id (默认 1, 对齐 GO2W_UWB_TAG_ID 语义)。
+        只认 MSG_SPHERICAL_RESULT (距离+方位角); MSG_DIS 作降级(仅距离)。
+        """
+        snapshot: Optional[Dict] = None
+        received = time.monotonic()
+        for msg in frame.messages:
+            if msg.get("msg_id") not in (MSG_SPHERICAL_RESULT, FOLLOWME_MSG_DIS):
+                continue
+            tag_key = self.config.followed_tag_id
+            if tag_key is None:
+                tag_key = 1  # Follow-Me 一对一: 未配置时固定跟随那一只标签
+            entry = {
+                "id": tag_key,
+                "role": 1,
+                "role_name": "tag",
+                "distance_m": msg.get("distance_m"),
+                "angle_deg": msg.get("azimuth_deg"),
+                "elevation_deg": msg.get("elevation_deg"),
+                "prr_percent": msg.get("prr_percent"),
+                "local_time_us": msg.get("local_time_us"),
+                "cnt": msg.get("cnt"),
+                "anchor_uid": frame.uid,
+                "received_monotonic": received,
+                "kind": "followme_spherical" if msg.get("msg_id") == MSG_SPHERICAL_RESULT else "followme_dis",
+                "msg_id": msg.get("msg_id"),
+            }
+            self._latest[tag_key] = entry
+            snapshot = entry
+            break  # 一帧内多条测量取第一条 (一对一场景不会出现多条)
+        return snapshot
+
+    def _emit_followme_callbacks(self, snapshot: Dict) -> None:
+        if self._on_tag is None:
+            return
+        tag_id = snapshot.get("id", 1)
+        self._safe_call(self._on_tag, tag_id, dict(snapshot))
 
     # --------------------------------------------------------------- 分发
     def _dispatch(self, frame: AnyFrame) -> None:
@@ -241,8 +328,11 @@ class UwbSerialBridge:
             "port": self.config.port,
             "baudrate": self.config.baudrate,
             "mode": self.config.mode,
+            "protocol": self._protocol_locked or self.config.protocol,
             "followed_tag_id": self.config.followed_tag_id,
             "stats": self._parser.stats.to_dict(),
+            "followme_frames": self._followme_parser.frames_parsed,
+            "followme_crc_errors": self._followme_parser.crc_errors,
             "pending_bytes": self._parser.pending_bytes,
         }
 

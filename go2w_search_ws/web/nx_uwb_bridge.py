@@ -43,10 +43,12 @@ def _bridge_config_from_env():
     from go2w_bridge.uwb_serial_bridge import UwbBridgeConfig
 
     port = os.environ.get("GO2W_UWB_PORT", "/dev/ttyUSB0").strip() or None
+    # 2026-08-24 默认对齐真机硬件 Follow-Me 系列 (FMM-A01 基站出厂 921600;
+    # 旧 LinkTrack 是 115200, 用 GO2W_UWB_BAUD 覆盖)
     try:
-        baud = int(os.environ.get("GO2W_UWB_BAUD", "115200"))
+        baud = int(os.environ.get("GO2W_UWB_BAUD", "921600"))
     except ValueError:
-        baud = 115200
+        baud = 921600
     try:
         tag_id = int(os.environ.get("GO2W_UWB_TAG_ID", "1"))
     except ValueError:
@@ -54,8 +56,12 @@ def _bridge_config_from_env():
     mode = os.environ.get("GO2W_UWB_MODE", "auto").strip().lower()
     if mode not in ("auto", "serial", "mock"):
         mode = "auto"
+    protocol = os.environ.get("GO2W_UWB_PROTOCOL", "auto").strip().lower()
+    if protocol not in ("auto", "followme", "nlink"):
+        protocol = "auto"
     return UwbBridgeConfig(
-        port=port, baudrate=baud, mode=mode, followed_tag_id=tag_id,
+        port=port, baudrate=baud, mode=mode, protocol=protocol,
+        followed_tag_id=tag_id,
     )
 
 
