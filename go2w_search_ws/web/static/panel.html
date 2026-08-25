@@ -298,6 +298,7 @@ header h1 { font-size: 15px; font-weight: 600; color: #fff; margin-right: 16px; 
       <button class="btn primary" onclick="activateDog()" title="激活狗进入轮式可导航态 (parked→active); 进入轮式平衡时轮子可能小幅移动, 请确保场地空旷">激活</button>
       <button class="btn" id="landmarkModeBtn" onclick="toggleLandmarkMode()" title="标记地标: 点击地图选点, 输入名字(如:大门)注册; 之后可说'去大门'导航">📍 标记地标</button>
       <button class="btn" onclick="listLandmarks()" title="列出已注册的地标">🗺️ 地标列表</button>
+      <button class="btn" id="uwbFollowBtn" onclick="toggleUwbFollow()" title="UWB 钥匙扣跟随: 机器狗按 UWB 测距跟随钥匙扣佩戴者, 避障闸门优先 (需部署 UWB 桥)">🎯 跟随</button>
       <div id="llmReasoning" style="display:none;margin:6px 0;padding:8px;background:#1a1a2e;color:#9ad0ff;border-radius:6px;font-size:12px;max-height:80px;overflow:auto;"></div>
       <!-- 2026-07-18 删急停按钮: 用户要求去掉 (导航取消误判为急停); 急停改用遥控器或键盘(空格已取消). eStop() 函数保留备用. -->
     </div>
@@ -772,6 +773,45 @@ function confirmBalance() { controlFetch('/api/confirm_balance', { method: 'POST
 function sit() { controlFetch('/api/sit', { method: 'POST' }); }
 function eStop() { clearInterval(_moveInterval); _moveInterval = null; if (_locateLoopTimer) { clearTimeout(_locateLoopTimer); _locateLoopTimer = null; } pressedKeys.clear(); resetKeyHighlight(); controlFetch('/api/e_stop', { method: 'POST' }); }
 function activateDog() { controlFetch('/api/activate', { method: 'POST' }).then(r => r.json()).then(d => { console.log('activate:', d); }).catch(e => console.warn('activate failed:', e)); }
+
+// ---- UWB 钥匙扣跟随 (功能B-2): 状态展示由 WS type=uwb_follow 驱动 ----
+let uwbFollowActive = false;
+function updateUwbFollowUi(state) {
+  const btn = document.getElementById('uwbFollowBtn');
+  if (!btn) return;
+  const s = state || {};
+  uwbFollowActive = !!s.active;
+  if (!s.state) { btn.style.background = ''; btn.textContent = '🎯 跟随'; return; }
+  if (s.state === 'following') {
+    btn.style.background = '#1565c0';
+    btn.textContent = '🎯 跟随中 (' + (s.filtered_range_m != null ? Number(s.filtered_range_m).toFixed(1) + 'm' : '—') + ')';
+  } else if (s.state === 'obstacle_hold') {
+    btn.style.background = '#e65100';
+    btn.textContent = '🎯 跟随·避障停';
+  } else if (s.state === 'searching') {
+    btn.style.background = '#f9a825';
+    btn.textContent = '🎯 搜索钥匙扣…';
+  } else if (s.state === 'fault') {
+    btn.style.background = '#c62828';
+    btn.textContent = '🎯 跟随故障';
+  } else {
+    btn.style.background = '';
+    btn.textContent = '🎯 跟随';
+  }
+}
+function toggleUwbFollow() {
+  if (uwbFollowActive) {
+    controlFetch('/api/uwb_follow/stop', { method: 'POST' })
+      .then(r => r.json()).then(d => updateUwbFollowUi(d))
+      .catch(e => console.warn('uwb follow stop failed:', e));
+  } else {
+    controlFetch('/api/uwb_follow/start', { method: 'POST' })
+      .then(r => r.json()).then(d => {
+        updateUwbFollowUi(d);
+        if (!d.ok) chatSay('bot', '跟随启动失败: ' + (d.reason || d.message || '未知'));
+      }).catch(e => console.warn('uwb follow start failed:', e));
+  }
+}
 
 // ---- 地标功能 (fetch-task-planner): 点地图标记 + 注册 + 列表 ----
 let landmarkMode = false;
@@ -1772,6 +1812,7 @@ function markRealtimeStateUpdate() {
 const STATUS_OVERLAP_WS_TYPES = new Set([
   'status', 'tasks', 'nav_goal', 'detections', 'locate',
   'target_markers', 'person_markers', 'search_room', 'mission_report',
+  'uwb_follow',
 ]);
 
 function wsMessageOverlapsStatus(type) {
@@ -1992,6 +2033,9 @@ function handleSocketMessage(socket, socketEpoch, e) {
           box.style.display = 'block';
         }
         if (r.reasoning) chatSay('bot', '🧠 ' + r.reasoning);
+      } else if (data.type === 'uwb_follow') {
+        // B-2: UWB 跟随状态心跳 (following/obstacle_hold/searching/fault/idle)
+        updateUwbFollowUi(data.data || {});
       } else if (data.type === 'slam') {
         if (map) map.update(data.data);
         updateSlamStatus(data.data.slam_source);
