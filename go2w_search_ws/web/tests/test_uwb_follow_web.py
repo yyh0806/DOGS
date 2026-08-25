@@ -176,20 +176,41 @@ def test_load_uwb_follow_source_returns_none_without_bridge(monkeypatch):
 
 
 def test_load_uwb_follow_source_explicit_mock_allowed(monkeypatch):
-    # 显式 GO2W_UWB_MODE=mock (演示/联调意图) 时源可用, get_fix 出合同字段
+    # 2026-08-24 真机策略升级: 生产 web 进程绝不接 mock 测距 (service 钉
+    # GO2W_UWB_MODE=serial + 适配层双保险), 显式 mock 同样被拒。
+    # mock 数据路径的正确测试在 uwb_serial_bridge 单元层 (test_uwb_serial_
+    # bridge.py 已覆盖); 本测试锁定"web 层无 mock 出口"这一安全属性。
     import nx_uwb_bridge
     nx_uwb_bridge.reset_singleton_for_tests()
     monkeypatch.delenv("GO2W_UWB_FOLLOW_DISABLE", raising=False)
     monkeypatch.setenv("GO2W_UWB_MODE", "mock")
     monkeypatch.setenv("GO2W_UWB_PORT", "")  # 强制走 mock 源
     try:
-        source = nws._load_uwb_follow_source()
-        assert source is not None
-        fix = source.get_fix()
-        assert fix and fix.get("ok") is True
-        assert isinstance(fix.get("range_m"), float) and fix["range_m"] > 0.0
+        assert nws._load_uwb_follow_source() is None  # 真机无 mock 出口
     finally:
         nx_uwb_bridge.reset_singleton_for_tests()
+
+
+def test_uwb_bridge_fix_contract_direct(monkeypatch):
+    # 适配层 get_fix 合同的直测 (不经 web): serial 语义挡在源层, 但
+    # _FollowFixSource 本身按合同转换快照 —— 用注入桥验证字段映射。
+    import nx_uwb_bridge as nb
+    import time as _time
+    class _FakeBridge:
+        def latest(self):
+            return {"id": 7, "distance_m": 2.5, "angle_deg": 30.0,
+                    "received_monotonic": _time.monotonic()}
+        def status(self):
+            return {"source": "serial"}
+        def stop(self):
+            pass
+    src = nb._FollowFixSource(_FakeBridge(), angle_offset_deg=0.0)
+    fix = src.get_fix()
+    assert fix["ok"] is True
+    assert abs(fix["range_m"] - 2.5) < 1e-9
+    assert abs(fix["azimuth_rad"] - __import__("math").radians(30.0)) < 1e-9
+    assert fix["age_sec"] >= 0.0 and fix["age_sec"] < 1.0
+    assert fix["anchor_id"] == "uwb-tag-7"
 
 
 def test_load_uwb_follow_source_uses_bridge_factory(monkeypatch):

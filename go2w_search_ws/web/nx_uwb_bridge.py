@@ -138,6 +138,13 @@ def get_follow_fix_source():
                         "fallback_reason"))
                 bridge.stop()
                 return None
+            if source_name != "serial":
+                # 双保险: service 层已钉 GO2W_UWB_MODE=serial; 即使环境被
+                # 误改, 非 serial 源也一律拒绝 (真机不碰任何 mock 数据)。
+                logger.warning(
+                    "UWB 源非串口 (%s), 真机模式拒绝接入", source_name)
+                bridge.stop()
+                return None
             try:
                 offset = float(os.environ.get("GO2W_UWB_ANGLE_OFFSET_DEG", "0.0"))
             except ValueError:

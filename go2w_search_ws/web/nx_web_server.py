@@ -2893,12 +2893,21 @@ def create_server(host, port, static_dir, mission_root=None):
                 except Exception as e:
                     self._json({"ok": False, "err": str(e)})
             elif p.path == '/api/uwb_follow/status':
-                # 功能B-2: UWB 跟随状态快照 (无源时也返回 idle 只读态)
-                if uwb_follow is not None:
-                    self._json(uwb_follow.get_state())
-                else:
-                    self._json({"state": "idle", "active": False,
-                                "reason": "uwb_follow_unavailable"})
+                # 功能B-2: UWB 跟随状态快照 (无源时也返回 idle 只读态)。
+                # 附 uwb_source/fix: 真机 bench 测试看这里即可确认狗是否实时
+                # 抓到钥匙扣 (range/azimuth/age), 无需启动跟随、不动狗。
+                payload = dict(uwb_follow.get_state()) if uwb_follow else {
+                    "state": "idle", "active": False,
+                    "reason": "uwb_follow_unavailable"}
+                try:
+                    from nx_uwb_bridge import get_follow_fix_source as _gfs
+                    _source = _gfs()
+                    payload["uwb_source"] = "available" if _source else "unavailable"
+                    if _source is not None:
+                        payload["fix"] = _source.get_fix()
+                except Exception as exc:
+                    payload["uwb_source"] = f"error:{type(exc).__name__}"
+                self._json(payload)
             elif p.path == '/api/gps/route':
                 # 功能A: GPS 航线状态快照 (含北向标定/最新 GPS 健康)
                 if gps_route is not None:
@@ -3779,7 +3788,7 @@ def _spin_loop_yielding(node):
 # ============================================================================
 def main():
     global robot, task_mgr, node, point_nav, navigation_gateway
-    global room_orchestrator, navigation_arbiter, uwb_follow
+    global room_orchestrator, navigation_arbiter, uwb_follow, uwb_source, gps_route
 
     rclpy.init()
     node = NxWebNode()
@@ -3916,6 +3925,7 @@ def main():
     # 功能B-2: UWB 钥匙扣跟随 (ROS-free 控制器 + manual 所有权通道)。
     # 桥 (B-1) 未部署时源为 None: start 拒绝, status/params 仍可用。
     _uwb_source = _load_uwb_follow_source()
+    uwb_source = _uwb_source  # 全局暴露: 状态 API 实时 fix 读取用
     if _uwb_source is not None:
         logger.info("B-2: UWB 测距源已接入 (nx_uwb_bridge)")
     else:
