@@ -1,0 +1,23 @@
+# nav2_params_water_guard.yaml — M3 水域 keepout 过滤器叠加片段
+#
+# 用法: 在 outdoor profile 的 controller/local_costmap 配置中叠加本片段。
+# 禁区多边形来源: lake_plan 规划结果 (WGS-84 → map 系) 由任务层发布到
+# /keepout_polygons (PolygonsWithHoles 消息? 项目用简化: PolygonStamped 多段),
+# KeepoutFilter 订阅 costmap_filters 信息话题读取 mask。
+#
+# 说明: 运行期的一票否决在 nx_motion_node.WaterGuardClient (不经 Nav2);
+# 本层只负责让 Nav2 规划器绕开禁区 —— 双层防御的"绕行"层。
+
+costmap_filters:
+  water_keepout_filter:
+    plugin: "nav2_costmap_2d::KeepoutFilter"
+    enabled: true
+    filter_info_topic: "/water_keepout_filter_info"
+    transform_tolerance: 0.1
+
+  water_speed_filter:
+    plugin: "nav2_costmap_2d::SpeedFilter"
+    enabled: true
+    filter_info_topic: "/water_speed_filter_info"
+    mode: 0                     # 0=按速度百分比限制
+    transform_tolerance: 0.1
