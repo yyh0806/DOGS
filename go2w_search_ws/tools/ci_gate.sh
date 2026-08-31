@@ -18,6 +18,9 @@ python3 -m pytest tests/test_gps_nav.py -q
 echo "[ci_gate] M3 离水守卫纯逻辑回归"
 python3 -m pytest tests/test_water_guard.py -q
 
+echo "[ci_gate] M4 落水检测管线回归 (合成数据集)"
+python3 -m pytest tests/test_drowning_detect.py -q
+
 echo "[ci_gate] M3 运动链守卫客户端回归 (bridge 纯逻辑, 无 ROS)"
 (cd ../src/go2w_bridge/go2w_bridge && \
  python3 -m pytest ../../test/test_water_guard_client.py \
