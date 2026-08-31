@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+requests
+pillow
+numpy
+langgraph>=0.2
+langchain-core>=0.3
