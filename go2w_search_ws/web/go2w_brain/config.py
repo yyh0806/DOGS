@@ -28,6 +28,8 @@ class BrainConfig:
     control_token: str = ""
     # M2: 干跑模式 (True = 运动类工具只记录不下发, 验收/演练用)
     dry_run: bool = False
+    # M3: 审批令牌 (操作员授权高危操作, 如解除离水守卫)
+    approval_token: str = ""
 
     @classmethod
     def from_env(cls) -> "BrainConfig":
@@ -43,6 +45,8 @@ class BrainConfig:
             log_dir=Path(os.environ.get("GO2W_BRAIN_LOG_DIR", "runs/brain")),
             control_token=os.environ.get("GO2W_CONTROL_TOKEN", "").strip(),
             dry_run=os.environ.get("GO2W_BRAIN_DRY", "") == "1",
+            approval_token=os.environ.get(
+                "GO2W_BRAIN_APPROVAL_TOKEN", "").strip(),
         )
 
 
