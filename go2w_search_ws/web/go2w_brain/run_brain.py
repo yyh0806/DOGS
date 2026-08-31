@@ -19,7 +19,8 @@ from .tools import BUILTIN_TOOLS
 
 
 def build_session(config: BrainConfig, log: SessionLog):
-    platform = (NxHttpAdapter(config.nx_url, timeout=config.tool_timeout_s)
+    platform = (NxHttpAdapter(config.nx_url, timeout=config.tool_timeout_s,
+                              control_token=config.control_token)
                 if config.platform == "nx" else MockAdapter())
     registry = ToolRegistry()
     for tool in BUILTIN_TOOLS:
@@ -40,6 +41,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--nx-url", default=None, help="NX 基址")
     parser.add_argument("--no-llm", action="store_true",
                         help="强制离线规则模式 (忽略 DEEPSEEK_API_KEY)")
+    parser.add_argument("--dry", action="store_true",
+                        help="干跑: 运动类工具只记录不下发 (默认 GO2W_BRAIN_DRY)")
     parser.add_argument("--log-dir", default=None, help="轨迹目录")
     args = parser.parse_args(argv)
 
@@ -50,6 +53,8 @@ def main(argv: list[str] | None = None) -> int:
         config.nx_url = args.nx_url
     if args.no_llm:
         config.llm_api_key = ""
+    if args.dry:
+        config.dry_run = True
     if args.log_dir:
         config.log_dir = Path(args.log_dir)
 

@@ -17,7 +17,7 @@ from typing import Any
 
 
 class PlatformAdapter:
-    """适配器接口: snapshot() 返回大脑每轮看到的遥测快照。"""
+    """适配器接口: snapshot() 读遥测; 下列为 M2 运动指令写端口。"""
 
     def snapshot(self) -> dict[str, Any]:
         raise NotImplementedError
@@ -25,9 +25,18 @@ class PlatformAdapter:
     def gps_state(self) -> dict[str, Any]:
         raise NotImplementedError
 
+    def submit_gps_route(self, waypoints: list[dict[str, Any]]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def cancel_gps_route(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def calibrate_heading(self, heading_deg: float) -> dict[str, Any]:
+        raise NotImplementedError
+
 
 class MockAdapter(PlatformAdapter):
-    """测试/干跑用: 固定遥测, 可用 overrides 覆盖。"""
+    """测试/干跑用: 固定遥测 + 内存航线状态机 + 调用记录。"""
 
     def __init__(self, **overrides: Any):
         base: dict[str, Any] = {
@@ -39,27 +48,74 @@ class MockAdapter(PlatformAdapter):
             },
             "battery_soc": 72.5,
             "pose": {"available": True, "x": 0.0, "y": 0.0, "yaw_deg": 0.0},
-            "gps_route": {
-                "active": False, "status": "idle",
-                "waypoint_index": 0, "waypoint_total": 0, "reason": None,
-            },
         }
         base.update(overrides)
         self._base = base
+        self.calls: list[tuple[str, Any]] = []
+        self._route: dict[str, Any] = {"active": False, "status": "idle",
+                                       "waypoint_index": 0,
+                                       "waypoint_total": 0, "reason": None}
 
     def snapshot(self) -> dict[str, Any]:
-        return json.loads(json.dumps(self._base, default=str))
+        out = json.loads(json.dumps(self._base, default=str))
+        out["gps_route"] = dict(self._route)
+        return out
 
     def gps_state(self) -> dict[str, Any]:
-        return dict(self._base.get("gps_route") or {})
+        return dict(self._route)
+
+    @staticmethod
+    def _valid_waypoints(waypoints: Any) -> bool:
+        return (isinstance(waypoints, list) and bool(waypoints)
+                and all(isinstance(w, dict)
+                        and isinstance(w.get("lat"), (int, float))
+                        and isinstance(w.get("lon"), (int, float))
+                        for w in waypoints))
+
+    def submit_gps_route(self, waypoints):
+        self.calls.append(("submit_gps_route", waypoints))
+        if not self._valid_waypoints(waypoints):
+            return {"ok": False, "reason": "invalid_waypoints"}
+        self._route = {"active": True, "status": "navigating",
+                       "waypoint_index": 0, "waypoint_total": len(waypoints),
+                       "reason": None}
+        return {"ok": True, "active": True,
+                "waypoint_total": len(waypoints)}
+
+    def cancel_gps_route(self):
+        self.calls.append(("cancel_gps_route", None))
+        self._route = {"active": False, "status": "idle",
+                       "waypoint_index": 0, "waypoint_total": 0,
+                       "reason": "operator_cancel"}
+        return {"ok": True, "status": "idle"}
+
+    def calibrate_heading(self, heading_deg: float):
+        self.calls.append(("calibrate_heading", heading_deg))
+        try:
+            value = float(heading_deg)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "invalid_heading"}
+        if value != value or value in (float("inf"), float("-inf")):
+            return {"ok": False, "reason": "invalid_heading"}
+        self._base.setdefault("gps", {})["north_heading_deg"] = value % 360.0
+        return {"ok": True, "heading_deg": value % 360.0}
 
 
 class NxHttpAdapter(PlatformAdapter):
-    """NX 生产/仿真接入: 只读 GET, 超时即按不可用处理 (fail-soft)。"""
+    """NX 生产/仿真接入: GET 读状态 fail-soft; POST 运动指令带控制令牌。
 
-    def __init__(self, base_url: str, timeout: float = 3.0):
+    POST 契约 (对齐 nx_web_server):
+      POST /api/gps/route         {"waypoints": [{"lat","lon",...}]}
+      POST /api/gps/route_cancel  {}
+      POST /api/gps/calibrate     {"heading_deg": float}
+    拒绝 (409/400/503) 一律返回 {"ok": False, "reason": ..}, 绝不抛出。
+    """
+
+    def __init__(self, base_url: str, timeout: float = 3.0,
+                 control_token: str = ""):
         self._base = base_url.rstrip("/")
         self._timeout = timeout
+        self._token = control_token
 
     def _get(self, path: str) -> dict[str, Any]:
         try:
@@ -68,6 +124,45 @@ class NxHttpAdapter(PlatformAdapter):
                 return json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
             return {"_http_error": f"{type(exc).__name__}: {exc}"}
+
+    def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        request = urllib.request.Request(
+            self._base + path,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(
+                    request, timeout=self._timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+                return payload if isinstance(payload, dict) else {
+                    "ok": True, "raw": payload}
+        except urllib.error.HTTPError as exc:
+            # 服务端拒绝 (409 未标定/已有航线, 400 参数, 503 不可用)
+            try:
+                payload = json.loads(exc.read().decode("utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            reason = payload.get("reason") if isinstance(payload, dict) else None
+            return {"ok": False, "http_status": exc.code,
+                    "reason": reason or f"http_{exc.code}"}
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+            return {"ok": False, "reason":
+                    f"unreachable:{type(exc).__name__}"}
+
+    # ---- M2 运动指令写端口 --------------------------------------------------
+
+    def submit_gps_route(self, waypoints):
+        return self._post("/api/gps/route", {"waypoints": waypoints})
+
+    def cancel_gps_route(self):
+        return self._post("/api/gps/route_cancel", {})
+
+    def calibrate_heading(self, heading_deg: float):
+        return self._post("/api/gps/calibrate",
+                          {"heading_deg": float(heading_deg)})
 
     def gps_state(self) -> dict[str, Any]:
         return self._get("/api/gps/route") or {}

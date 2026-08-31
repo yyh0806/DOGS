@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 from typing import Any
 
 from . import prompt_assembler
@@ -42,6 +43,7 @@ class BrainSession:
         self._events: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._wake = threading.Event()
         self._mission_lock: Any = None
+        self._plan_store: dict[str, Any] = {}  # M2: 规划结果引用传递
 
     # -- 事件 (M1 管道就绪, M2 起注入异步进度) ----------------------------
 
@@ -68,8 +70,23 @@ class BrainSession:
     # -- 主循环 ------------------------------------------------------------
 
     def run(self, task: str) -> dict[str, Any]:
-        self._log.append("session_start", version="0.1.0")
+        self._log.append("session_start", version="0.2.0")
         self._log.append("task", content=task)
+        # M2: 任务上下文即任务锁 —— act 级工具 (follow_route 等) 的前置
+        self._mission_lock = f"mission:{time.time():.0f}"
+        self._log.append("event", event="mission_lock_acquired",
+                         token=self._mission_lock)
+        try:
+            result = self._run_locked(task)
+            end_meta = result.pop("_session_end", {})
+            return result
+        finally:
+            self.release_mission_lock()
+            self._log.append("event", event="mission_lock_released")
+            # session_end 恒为轨迹最后一行 (任何退出路径都闭合)
+            self._log.append("session_end", **end_meta)
+
+    def _run_locked(self, task: str) -> dict[str, Any]:
 
         system = prompt_assembler.assemble(
             self._registry.schemas(),
@@ -138,16 +155,18 @@ class BrainSession:
         if not answer:
             answer = "(步数耗尽, 未得到最终答复)"
         self._log.append("reply", content=answer)
-        self._log.append("session_end", steps=steps,
-                         llm_used=self._llm.available())
         return {"answer": answer, "trace": str(self._log.path),
-                "steps": steps, "llm_used": self._llm.available()}
+                "steps": steps, "llm_used": self._llm.available(),
+                "_session_end": {"steps": steps,
+                                 "llm_used": self._llm.available()}}
 
     # -- 内部 --------------------------------------------------------------
 
     def _dispatch_and_run(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         ctx = {"platform": self._platform, "log": self._log,
-               "mission_lock": self._mission_lock}
+               "mission_lock": self._mission_lock,
+               "config": self._config,
+               "plan_store": self._plan_store}
         ok, reason, tool = self._gate.check(name, args, ctx)
         self._log.append("tool_call", name=name, args=args, ok=ok,
                          reason=reason)
