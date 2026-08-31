@@ -7,7 +7,7 @@ from lake_plan.geo import (StitchGeoref, gcj02_to_wgs84, global_px_to_lat,
 
 
 def test_mercator_roundtrip():
-    for lat, lng in ((31.5163, 120.2673), (0.0, 0.0), (-45.0, 30.0)):
+    for lat, lng in ((31.488192, 120.369486), (0.0, 0.0), (-45.0, 30.0)):
         px, py = lng_to_global_px(lng, 15), lat_to_global_px(lat, 15)
         assert abs(global_px_to_lng(px, 15) - lng) < 1e-9
         assert abs(global_px_to_lat(py, 15) - lat) < 1e-6
@@ -27,7 +27,7 @@ def test_haversine_known_distance():
 
 
 def test_gcj02_wgs84_roundtrip():
-    lat, lng = 31.5163, 120.2673
+    lat, lng = 31.488192, 120.369486
     glat, glng = wgs84_to_gcj02(lat, lng)
     wlat, wlng = gcj02_to_wgs84(glat, glng)
     assert abs(wlat - lat) < 1e-6 and abs(wlng - lng) < 1e-6
