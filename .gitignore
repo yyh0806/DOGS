@@ -20,9 +20,9 @@ deps/
 # mock 模式真检出 person, spec-stage-b §8.1/C4.4)。10KB 小图, 必须入库,
 # 否则 git clone/pull 的部署路径 (非 deploy_nx_ai.sh) 会缺该文件。
 !go2w_search_ws/web/static/mock_person.png
-# lake_plan golden 回归夹具瓦片 (蠡湖 z13 粗扫 + 高分辨率细化, 2.1MB/145 张):
-# 保证航线回归测试在无网络环境可跑 (见 lake_plan/tests/test_route_api_golden.py)
-!go2w_search_ws/web/lake_plan/tests/fixtures/tiles/**/*.png
+# lake_plan golden 回归夹具 (M2.1 起为太科园园区基准: z16 瓦片 64 张 0.7MB
+# + Overpass 响应缓存): 保证双目标航线回归测试在无网络环境可跑
+!go2w_search_ws/web/lake_plan/tests/fixtures/cache/**/*.png
 .omc/
 
 # 工具缓存 (不在仓库内但常出现在仓库根: locate-anything.cpp 上游克隆 / playwright MCP)
