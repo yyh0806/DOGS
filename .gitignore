@@ -52,6 +52,9 @@ lake_loop/.venv/
 lake_loop/cache/
 lake_loop/runs/
 
+# go2w_brain 轨迹目录 (jsonl 运行时产物)
+runs/
+
 # 部署依赖 tar 包 (347MB, 可由 vendor 源重打包) 与根目录临时文件
 go2w_search_ws/fast_lio_deps.tar.gz
 .reasonix/
