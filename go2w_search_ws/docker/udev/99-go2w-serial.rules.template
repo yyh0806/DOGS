@@ -1,0 +1,16 @@
+# go2w 串口固定名 udev 规则 — 模板 (FIELD_TEST_READINESS HI-2)
+# 用法: 在 NX 上对每个设备跑一次
+#   udevadm info -a -n /dev/ttyACM0 | grep -E 'idVendor|idSerial|serial' | head
+#   udevadm info -q property -n /dev/ttyUSB0 | grep ID_
+# 把 VID/PID/序列号填进来, 然后:
+#   sudo cp 99-go2w-serial.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+#
+# PX4 飞控 (USB CDC-ACM; 常见 VID: 26AC=3DR/PX4, 2e3c=Holybro, 0483=STM32 DFU 类)
+# SUBSYSTEM=="tty", ATTRS{idVendor}=="26AC", ATTRS{serial}=="<PX4序列号>", SYMLINK+="ttyPX4"
+#
+# UWB 基站 (Nooploop Follow-Me, CH34x USB 串口; CH340=1a86:7523, CH343=1a86:75d3)
+# SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="ttyUWB"
+#
+# 固定后: go2w-web.service 加 Environment=GO2W_UWB_PORT=/dev/ttyUWB (随发布走,
+# 不会被 deploy 重生成的 /etc/go2w/hardware.env 抹掉); mavros-px4.service 的
+# fcu_url 用 /dev/ttyPX4:115200。

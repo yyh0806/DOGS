@@ -3947,8 +3947,14 @@ def main():
         state_callback=lambda s: ws_broadcast(
             {"type": "gps_route", "data": s}, force=True),
     )
+    # GPS fix 话题可配 (2026-08-28 PX4/RTK 接入): 默认 /gps/fix (nmea_navsat_driver
+    # 惯例); 走 mavros 时设 GO2W_GPS_FIX_TOPIC=/mavros/global_position/global,
+    # 或 mavros 启动时 remap 到 /gps/fix, 两条路径等效。
+    _gps_fix_topic = (os.environ.get("GO2W_GPS_FIX_TOPIC", "/gps/fix").strip()
+                      or "/gps/fix")
+    logger.info("gps_route fix topic: %s", _gps_fix_topic)
     _gps_fix_sub = node.create_subscription(
-        NavSatFix, '/gps/fix',
+        NavSatFix, _gps_fix_topic,
         lambda msg: gps_route.update_fix(
             nav_sat_fix_to_gps_fix(msg, time.monotonic())),
         qos_profile_sensor_data)

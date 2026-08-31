@@ -46,3 +46,19 @@ web-check-8000.png
 # 仿真 SIGFPE workaround 编译产物 (WSL2 glibc ifunc): 源码 mycos.c + mycos.map 入库,
 # .so 由目标机现场 gcc 编译 (见 QUICKSTART.md "仿真模式" Step 4)
 go2w_search_ws/tools/mycos.so
+
+# lake_loop 原型 (2026-08 入库): Python 环境 / 瓦片与渲染缓存 / 任务产物不入库
+lake_loop/.venv/
+lake_loop/cache/
+lake_loop/runs/
+
+# 部署依赖 tar 包 (347MB, 可由 vendor 源重打包) 与根目录临时文件
+go2w_search_ws/fast_lio_deps.tar.gz
+.reasonix/
+tmp_pdf.py
+
+# vendor 排除 (来源与获取方式见 src/VENDORED.md):
+# FAST_LIO 上游文档媒体 (127MB 论文/实验gif, 非构建必需)
+go2w_search_ws/src/FAST_LIO_ROS2/doc/
+# livox 仿真扫描模式表 (164MB 上游数据, 首次仿真前 tools/fetch_livox_scan_modes.sh 获取)
+go2w_search_ws/src/ros2_livox_simulation/scan_mode/
