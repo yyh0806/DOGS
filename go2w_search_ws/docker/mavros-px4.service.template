@@ -1,0 +1,29 @@
+[Unit]
+# MAVROS 桥 (PX4/RTK GPS -> NX) — 模板, 外场确认设备名后启用。
+# ⚠️ 本文件不在 deploy_release.sh managed_units 内 (deploy_release.sh:361),
+#    设备名确认后手工安装: sudo cp mavros-px4.service /etc/systemd/system/ &&
+#    sudo systemctl daemon-reload && sudo systemctl enable --now mavros-px4
+# 上电自检顺序: ls /dev/ttyACM* -> udevadm info /dev/ttyACM0 | grep ID_SERIAL
+# 把 fcu_url 换成实际设备 (USB CDC 通常 /dev/ttyACM0:115200)。
+Description=MAVROS bridge (PX4 RTK GPS)
+After=network-online.target
+Wants=network-online.target
+# 防快速崩溃 5 次进 failed 死态 (对齐 FIELD_TEST_READINESS HI-8)
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=nx
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=ROS_DOMAIN_ID=0
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/home/nx/go2w/current/payload/docker/fastdds_udp.xml
+# 关键 remap: mavros 的 NavSatFix 主话题 -> web 订阅的 /gps/fix
+# (nx_web_server.py 已支持 GO2W_GPS_FIX_TOPIC, 两侧任改一个即可)
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec ros2 run mavros mavros_node --ros-args -p fcu_url:=/dev/ttyACM0:115200 -r /mavros/global_position/global:=/gps/fix'
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
