@@ -21,7 +21,7 @@
 | `llm.py` | DeepSeek function-calling (stdlib urllib, 零依赖) |
 | `platform.py` | 世界状态接入: 读 (GET) + M2 运动写端口 (POST+令牌) |
 | `brain_loop.py` | 事件驱动自由循环 + 规则退化 + 任务锁 + plan_store 引用传递 |
-| `tools/` | M1: get_gps/get_battery/get_pose/speak(桩); M2: plan_lake_loop/follow_route/cancel_route/calibrate_heading/get_route_state |
+| `tools/` | M1: get_gps/get_battery/get_pose/speak(桩); M2: plan_lake_loop/follow_route/cancel_route/calibrate_heading/get_route_state; M2.1: plan_campus_loop(绕园区) |
 | `skills/` | status-report / lake-patrol(占位) |
 
 ## 运行

@@ -57,6 +57,6 @@ USER_AGENT = "go2w-lake-plan/1.0 (robot patrol planner)"
 # 电量模型在任务层做 (分段/返航), 不在选湖阶段一刀切。
 DEFAULT_LOOP_OFFSET_M = 15.0    # 离岸 15m (人行原型为 140m)
 DEFAULT_STEP_M = 40.0           # 航点间距
-DEFAULT_MAX_PERIM_KM = 12.0     # 蠡湖级 (~9.5km) 在内; 太湖级被拒
+DEFAULT_MAX_PERIM_KM = 12.0     # 中型城市湖泊 (~10km 周长) 在内; 特大湖被拒
 DEFAULT_MIN_PERIM_KM = 0.3
 COMPACT_MIN = 0.12              # 紧凑度下限 (低于视为河流/水渠)

@@ -1,42 +1,64 @@
-"""route_api — 绕湖航线规划主入口 (确定性, 无 LLM)。
+"""route_api — 环线规划主入口 (确定性, 无 LLM)。
 
-自 lake_loop/agent.py 的规则路径移植: 粗扫感知 → 选湖(规则) →
-高分辨率细化 → 离岸环线规划 → waypoints 输出。
+两种目标 (kind):
+- "water"  绕湖: 瓦片水域分割 (自 lake_loop/agent.py 规则路径移植);
+- "campus" 绕园区: Overpass landuse 地块聚类 + 凸包 (osm_client),
+  纯向量, 不需要瓦片。
+
+两者共用离岸外扩管线 (planner.plan_loop_around_polygon)。
 
 输出契约 (与 nx_web_server POST /api/gps/route 对齐, 注意是 "lon"):
-    {"ok": true,
+    {"ok": true, "kind": "water"|"campus",
      "waypoints": [{"lat": .., "lon": .., "name": "wp000"}, ...],  # 闭合环
-     "water_polygon": [[lat, lng], ...],                           # WGS-84
-     "lake": {"centroid": [lat, lng], "area_km2": .., "perim_km": ..},
-     "stats": {..planner stats + 细化上下文..}}
+     "water_polygon" | "campus_polygon": [[lat, lng], ...],
+     "target": {"kind", "centroid", "area_km2", "perim_km", "dist_km", ..},
+     "stats": {..}}
 
-失败一律 {"ok": false, "reason": .., "candidates": [..摘要..]}, 绝不抛出。
+失败一律 {"ok": false, "reason": ..}, 绝不抛出。
 """
 from __future__ import annotations
 
 import math
 from typing import Any
 
-from . import config, planner, tiles, water
+from . import config, osm_client, planner, tiles, water
 from .config import (DEFAULT_LOOP_OFFSET_M, DEFAULT_MAX_PERIM_KM,
                      DEFAULT_MIN_PERIM_KM, DEFAULT_STEP_M)
-from .geo import haversine_m, lat_to_global_px, lng_to_global_px
+from .geo import (StitchGeoref, haversine_m, lat_to_global_px,
+                  lng_to_global_px)
 
-# 粗扫视野计划: (zoom, nx, ny), 逐级放宽 (自 agent.node_perceive)
-_PERCEIVE_PLANS = ((13, 8, 8), (12, 10, 10), (11, 10, 10))
+# 感知阶梯: 先近后远 (z16 园区尺度 ~4km → z14 街区 ~17km → z12 城区 ~40km)。
+# 旧的 z13 起步会把园区小湖挤出"面积前几名", 选到 10km 外的大湖 —— 这是
+# 2026-08-31 园区坐标 (31.488192, 120.369486) 实测暴露的缺陷;
+# 先近后远让"距离最近合格水体"真正最近。
+_PERCEIVE_PLANS = ((16, 8, 8), (14, 8, 8), (12, 10, 10))
+_CANDIDATE_SCAN = 24  # 连通域扫描深度 (按面积排序取前 N)
 
 
 def plan_route(lat: float, lng: float, provider: str = "osm",
+               kind: str = "water",
                offset_m: float = DEFAULT_LOOP_OFFSET_M,
                step_m: float = DEFAULT_STEP_M,
                max_perim_km: float = DEFAULT_MAX_PERIM_KM,
                min_perim_km: float = DEFAULT_MIN_PERIM_KM,
-               compact_min: float = config.COMPACT_MIN) -> dict[str, Any]:
-    """以 (lat,lng) 为中心规划绕湖环线。任何失败返回 ok=False + reason。"""
+               compact_min: float = config.COMPACT_MIN,
+               campus_radius_m: float = 1200.0) -> dict[str, Any]:
+    """以 (lat,lng) 为中心规划环线。任何失败返回 ok=False + reason。"""
     if not (-90.0 <= float(lat) <= 90.0 and -180.0 <= float(lng) <= 180.0):
         return {"ok": False, "reason": "invalid_center"}
+    if kind not in ("water", "campus"):
+        return {"ok": False, "reason": "invalid_kind"}
+    if kind == "campus":
+        return _plan_campus(lat, lng, offset_m, step_m, campus_radius_m)
+    return _plan_water(lat, lng, provider, offset_m, step_m,
+                       max_perim_km, min_perim_km, compact_min)
 
-    # ---------- 1. 粗扫感知 (逐级放宽视野) ----------
+
+# ---------- 绕湖 ------------------------------------------------------------
+
+def _plan_water(lat, lng, provider, offset_m, step_m,
+                max_perim_km, min_perim_km, compact_min):
+    # ---------- 1. 粗扫感知 (先近后远) ----------
     usable: list[dict[str, Any]] = []
     georef_coarse = None
     last_candidates: list[dict[str, Any]] = []
@@ -97,32 +119,128 @@ def plan_route(lat: float, lng: float, provider: str = "osm",
     stats = dict(result["stats"])
     stats["refined"] = refined
     stats["provider"] = provider
+    poly_ll = [georef_plan.pixel_to_latlon(x, y) for (x, y) in poly_px]
+    out = _finish(result, poly_ll, "water", {
+        "area_km2": target["area_km2"], "perim_km": target["perim_km"],
+        "dist_km": target["dist_km"]})
+    out["stats"] = stats
+    return out
+
+
+# ---------- 绕园区 ----------------------------------------------------------
+
+def _plan_campus(lat, lng, offset_m, step_m, campus_radius_m):
+    campus = osm_client.campus_polygon(lat, lng,
+                                       radius_m=campus_radius_m)
+    if "ring" not in campus:
+        extra = {k: v for k, v in campus.items() if k != "reason"}
+        return {"ok": False,
+                "reason": campus.get("reason", "campus_failed"), **extra}
+    ring = campus["ring"]
+    # 虚拟地理参照: 纯向量规划, 不抓任何瓦片 → 缩放自由选择。
+    # 条件: 凸包像素跨度 300~3600px (分辨率够 + 内存有界), 从 z19 向下
+    # 找第一个满足者; 到 z10 仍超上限 (>~140km) 才算异常大。
+    lats = [p[0] for p in ring]
+    lngs = [p[1] for p in ring]
+    west, south = min(lngs), min(lats)
+    east, north = max(lngs), max(lats)
+    chosen_z = None
+    for z in range(19, 9, -1):
+        px_w = lng_to_global_px(east, z) - lng_to_global_px(west, z)
+        px_h = lat_to_global_px(south, z) - lat_to_global_px(north, z)
+        span = max(px_w, px_h)
+        if span <= 3600.0:
+            chosen_z = z
+            if span >= 300.0:
+                break
+            # span < 300: 多边形极小, 但 z 不能再高 (z19 封顶), 就用它
+            break
+    if chosen_z is None:
+        return {"ok": False, "reason": "campus_too_large"}
+    z = chosen_z
+    gx0 = int(lng_to_global_px(west, z) // 256)
+    gx1 = int(lng_to_global_px(east, z) // 256)
+    gy0 = int(lat_to_global_px(north, z) // 256)
+    gy1 = int(lat_to_global_px(south, z) // 256)
+    nx, ny = gx1 - gx0 + 1, gy1 - gy0 + 1
+    georef = StitchGeoref(z, gx0, gy0, nx * 256, ny * 256, "wgs84")
+    poly_px = [georef.latlon_to_pixel(p[0], p[1]) for p in ring]
+    try:
+        result = planner.plan_loop_around_polygon(
+            poly_px, georef, offset_m=offset_m, step_m=step_m)
+    except ValueError as exc:
+        return {"ok": False, "reason": f"plan_failed:{exc}"}
+    # 矢量级保证: 环线任何点不得落在园区凸包内 (圆角/栅格化可能在
+    # 角部切入几米 —— 对真凸包逐点检查并径向推出)。
+    result["route_latlon"] = _snap_outside_ring(result["route_latlon"], ring)
+    stats = dict(result["stats"])
+    stats["refined"] = False
+    stats["cluster_plots"] = campus["cluster_plots"]
+    target = {"area_km2": campus["area_km2"],
+              "perim_km": round(result["stats"]["length_m"] / 1000.0, 2),
+              "dist_km": 0.0,
+              "landuse": campus["kind"],
+              "containing": campus.get("containing", {})}
+    out = _finish(result, [list(p) for p in ring], "campus", target)
+    out["stats"] = stats
+    return out
+
+
+# ---------- 公共收尾 --------------------------------------------------------
+
+def _finish(result, poly_ll, kind, target):
     waypoints = [{"lat": round(ll[0], 6), "lon": round(ll[1], 6),
                   "name": f"wp{i:03d}"}
                  for i, ll in enumerate(result["route_latlon"])]
-    water_poly_ll = [georef_plan.pixel_to_latlon(x, y)
-                     for (x, y) in poly_px]
-    cent_lat = sum(p[0] for p in water_poly_ll) / len(water_poly_ll)
-    cent_lng = sum(p[1] for p in water_poly_ll) / len(water_poly_ll)
-    return {
+    cent_lat = sum(p[0] for p in poly_ll) / len(poly_ll)
+    cent_lng = sum(p[1] for p in poly_ll) / len(poly_ll)
+    target = dict(target)
+    target["kind"] = kind
+    target["centroid"] = target.get(
+        "centroid", [round(cent_lat, 6), round(cent_lng, 6)])
+    out = {
         "ok": True,
+        "kind": kind,
         "waypoints": waypoints,
-        "water_polygon": [[round(p[0], 6), round(p[1], 6)]
-                          for p in water_poly_ll],
-        "lake": {"centroid": [round(cent_lat, 6), round(cent_lng, 6)],
-                 "area_km2": target["area_km2"],
-                 "perim_km": target["perim_km"],
-                 "dist_km": target["dist_km"]},
-        "stats": stats,
+        "target": target,
+        "stats": result["stats"],
     }
+    out["water_polygon" if kind == "water" else "campus_polygon"] = [
+        [round(p[0], 6), round(p[1], 6)] for p in poly_ll]
+    return out
 
 
 # ---------- 内部 ------------------------------------------------------------
 
+def _snap_outside_ring(route_ll, ring):
+    """把落入 ring (矢量多边形) 内的点从环质心方向推出, 直到在环外。"""
+    from .osm_client import _point_in_ring
+    clat = sum(p[0] for p in ring) / len(ring)
+    clng = sum(p[1] for p in ring) / len(ring)
+    kx = 111320.0 * math.cos(math.radians(clat))
+    ky = 110540.0
+    out = []
+    for lat, lng in route_ll:
+        if not _point_in_ring((lat, lng), ring):
+            out.append((lat, lng))
+            continue
+        dx, dy = lng - clng, lat - clat
+        norm = math.hypot(dx * kx, dy * ky) or 1.0
+        ux, uy = dx * kx / norm, dy * ky / norm
+        pushed = (lat, lng)
+        for step_m in (3.0, 6.0, 12.0, 25.0, 50.0, 100.0, 200.0):
+            cand = (lat + uy * step_m / ky, lng + ux * step_m / kx)
+            if not _point_in_ring(cand, ring):
+                pushed = cand
+                break
+        out.append(pushed)
+    return out
+
+
 def _candidates(comps, georef, mask_shape, ref_lat, ref_lng):
     """连通域 → 候选摘要 (自 agent.node_perceive 的循环体)。"""
     cands = []
-    for c in comps[:8]:
+    for c in comps[:_CANDIDATE_SCAN]:
         poly = water.polygon_from_component(c, mask_shape)
         if len(poly) < 4:
             continue

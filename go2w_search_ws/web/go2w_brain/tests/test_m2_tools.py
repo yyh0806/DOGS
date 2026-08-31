@@ -13,9 +13,11 @@ from pathlib import Path
 import pytest
 
 # lake_plan 夹具 (在导入 lake_plan 前设置即可: config 每次调用读环境)
+# 路径与 lake_plan/tests/conftest.py 保持一致 (fixtures/cache, M2.1 起
+# 瓦片与 Overpass 缓存同居一个缓存根), 避免两套测试互相污染环境变量。
 _LAKE_FIXTURES = (Path(__file__).resolve().parents[2]
                   / "lake_plan" / "tests" / "fixtures")
-os.environ["GO2W_LAKE_CACHE_DIR"] = str(_LAKE_FIXTURES / "tiles")
+os.environ["GO2W_LAKE_CACHE_DIR"] = str(_LAKE_FIXTURES / "cache")
 os.environ["GO2W_LAKE_OFFLINE"] = "1"
 
 from go2w_brain.platform import MockAdapter, NxHttpAdapter  # noqa: E402
@@ -41,13 +43,16 @@ def gate():
     return gate
 
 
-def _ctx(platform, config=None, mission_lock="m-test"):
-    return {"platform": platform, "log": _NullLog(), "config": config,
-            "mission_lock": mission_lock}
+def _ctx(platform, config=None, mission_lock="m-test", log=None):
+    return {"platform": platform, "log": log or _NullLog(),
+            "config": config, "mission_lock": mission_lock}
 
 
 class _NullLog:
-    def append(self, *a, **k):
+    """与 SessionLog.append 同签名 —— 让关键字冲突类 bug 在单测即暴露
+    (2026-08-31 plan 工具 kind= 冲突曾因此漏网)。"""
+
+    def append(self, kind, **fields):
         return None
 
 
@@ -57,11 +62,30 @@ def test_plan_lake_loop_with_fixture_cache(mock_platform):
     result = TOOLS["plan_lake_loop"].execute({}, _ctx(mock_platform))
     assert result["ok"], result.get("reason")
     # 摘要契约: LLM 只见计数/统计/样本, 不见全量数组 (上下文经济)
-    assert result["waypoint_count"] > 8
+    assert result["waypoint_count"] >= 8
     assert result["closed"] is True
-    assert 8.0 < result["length_km"] < 20.0
+    assert 0.1 < result["length_km"] < 20.0
     assert len(result["first_waypoints"]) == 3
-    assert result["lake"]["dist_km"] < 2.5  # mock GPS=蠡湖中心 → 选蠡湖本身
+    # mock GPS=太科园园区中心 → 选园区内/旁的近水体 (先近后远)
+    assert result["target"]["dist_km"] < 3.0
+
+
+def test_plan_campus_loop_with_fixture_cache(mock_platform):
+    result = TOOLS["plan_campus_loop"].execute({}, _ctx(mock_platform))
+    assert result["ok"], result.get("reason")
+    assert result["target"]["kind"] == "campus"
+    assert result["closed"] is True
+    assert result["waypoint_count"] >= 8
+    assert result["target"]["area_km2"] >= 0.02
+
+
+def test_plan_campus_loop_not_inside(mock_platform, monkeypatch):
+    import lake_plan.osm_client as osm_mod
+    monkeypatch.setattr(osm_mod, "overpass_query",
+                        lambda q: {"elements": []})
+    result = TOOLS["plan_campus_loop"].execute({}, _ctx(mock_platform))
+    assert result["ok"] is False
+    assert result["reason"] in ("no_landuse_plots", "not_inside_any_plot")
 
 
 def test_plan_lake_loop_no_gps_no_center(mock_platform):
@@ -84,15 +108,22 @@ def test_follow_route_dispatch_requires_mission_lock(gate):
     assert not ok and reason == "mission_lock_required"
 
 
-def test_plan_then_follow_from_plan_reference(mock_platform):
-    """引用传递: plan_lake_loop 摘要 → follow_route(from_plan) 全量受理。"""
+def test_plan_then_follow_from_plan_reference(mock_platform, tmp_path):
+    """引用传递: plan_lake_loop 摘要 → follow_route(from_plan) 全量受理。
+
+    用真 SessionLog (非哑对象): 规划工具的日志调用若与 append 签名冲突
+    (如 kind= 关键字) 在此立即抛错。
+    """
+    from go2w_brain.session_log import SessionLog
+    log = SessionLog(tmp_path / "s.jsonl")
     plan_store: dict = {}
-    ctx = _ctx(mock_platform)
+    ctx = _ctx(mock_platform, log=log)
     ctx["plan_store"] = plan_store
     plan = TOOLS["plan_lake_loop"].execute({}, ctx)
-    assert plan["ok"] and plan["waypoint_count"] > 8
+    assert plan["ok"] and plan["waypoint_count"] >= 8
     assert "waypoints" not in plan  # LLM 只见摘要, 不见全量数组
     assert "last_route" in plan_store
+    assert log.stats().get("event") == 1  # plan_result 事件已落轨迹
     follow = TOOLS["follow_route"].execute({"from_plan": True}, ctx)
     assert follow["ok"] and follow["waypoint_total"] == plan["waypoint_count"]
     assert mock_platform.calls[-1][0] == "submit_gps_route"

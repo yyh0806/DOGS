@@ -1,4 +1,4 @@
-"""plan_lake_loop — 绕湖航线规划 (M2, 调 lake_plan 确定性核心)。"""
+"""plan_campus_loop — 绕园区环线规划 (M2.1, Overpass landuse 聚类 + 凸包)。"""
 from __future__ import annotations
 
 from typing import Any
@@ -18,22 +18,20 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     offset = args.get("offset_m", 15.0)
     offset = min(max(float(offset), 5.0), 500.0)
     try:
-        from lake_plan import plan_route  # 姗姗导入: numpy/PIL 只在此需要
+        from lake_plan import plan_route
     except ImportError as exc:
         return {"ok": False, "reason": "lake_plan_import_failed",
                 "detail": str(exc)}
-    result = plan_route(float(lat), float(lng), offset_m=offset)
-    result.setdefault("center", [lat, lng])
+    result = plan_route(float(lat), float(lng), kind="campus",
+                        offset_m=offset)
     if not result.get("ok"):
         return result
-    # 引用传递 (上下文经济): 全量结果入 plan_store, LLM 只看摘要;
-    # follow_route(from_plan=true) 直接取用, 不经模型上下文搬运。
     plan_store = ctx.get("plan_store")
     if plan_store is not None:
         plan_store["last_route"] = result
         # 注意: 不能用 kind= 作关键字 (SessionLog.append 首参即 kind)
         ctx["log"].append("event", event="plan_result",
-                          plan_kind="water",
+                          plan_kind="campus",
                           waypoint_count=len(result["waypoints"]),
                           length_m=result["stats"]["length_m"],
                           offset_m=result["stats"]["offset_m"],
@@ -43,7 +41,6 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
         "waypoint_count": len(result["waypoints"]),
         "length_km": round(result["stats"]["length_m"] / 1000.0, 2),
         "closed": result["stats"]["closed"],
-        "water_cross_ratio": result["stats"]["water_cross_ratio"],
         "target": result["target"],
         "first_waypoints": result["waypoints"][:3],
         "usage": "调用 follow_route 并传 from_plan=true 即可受理这条航线",
@@ -51,13 +48,13 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 TOOL = ToolRegistration(
-    name="plan_lake_loop",
+    name="plan_campus_loop",
     description=(
-        "规划绕湖巡查环线 (确定性几何引擎, 瓦片缓存优先): 以当前 GNSS 定位"
-        "(或显式 lat/lng) 为中心, 选择**距离最近的合格水体**(小到园区景观湖,"
-        "大到天然湖泊), 沿其岸线外侧 offset_m 米(默认15)生成闭合环线。"
-        "返回摘要; 调 follow_route(from_plan=true) 受理。"
-        "若任务要绕的是园区/厂区轮廓而非湖, 用 plan_campus_loop。"),
+        "规划绕园区(产业园/厂区等)一圈的巡查环线: 以当前 GNSS 定位(或显式 "
+        "lat/lng) 为中心, 从 OSM landuse 地块聚类出园区轮廓, 沿其外侧"
+        "offset_m 米(默认15)生成闭合环线。当前点位不在任何园区地块内时"
+        "返回 not_inside_any_plot。与 plan_lake_loop (绕最近的湖) 对应, "
+        "按任务语义选择。"),
     parameters={"type": "object",
                 "properties": {
                     "lat": {"type": "number"},
