@@ -36,9 +36,19 @@ def build_session(config: BrainConfig, log: SessionLog):
     # nx 生产路径另由 nx_water_guard_node 拦运行期 (arm 工具同步布防)。
     from nx_water_guard import WaterGuard
     guard = WaterGuard(approval_token=config.approval_token)
+    # M4: 落水检测引擎 + 帧源 (mock/演练用合成帧源; NX 生产由
+    # nx_ai_node 桥接真实相机, M6 接入)
+    detector = None
+    frame_source = None
+    if config.platform != "nx":
+        from nx_drowning_detect import DrowningDetector
+        from synthetic_frame_source import SyntheticPatrolSource
+        detector = DrowningDetector()
+        frame_source = SyntheticPatrolSource()
     from .brain_loop import BrainSession
     return BrainSession(config, platform, registry, gate, skills, llm, log,
-                        guard=guard)
+                        guard=guard, detector=detector,
+                        frame_source=frame_source)
 
 
 def main(argv: list[str] | None = None) -> int:
