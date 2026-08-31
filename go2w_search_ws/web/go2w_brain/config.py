@@ -24,6 +24,10 @@ class BrainConfig:
     max_steps: int = 20
     skill_dir: Path = _HERE / "skills"
     log_dir: Path = Path("runs/brain")
+    # M2: 运动指令通道 (NX 控制令牌, 对齐 voice_command.py 的 Bearer 模式)
+    control_token: str = ""
+    # M2: 干跑模式 (True = 运动类工具只记录不下发, 验收/演练用)
+    dry_run: bool = False
 
     @classmethod
     def from_env(cls) -> "BrainConfig":
@@ -37,6 +41,8 @@ class BrainConfig:
             llm_api_key=(os.environ.get("DEEPSEEK_API_KEY", "").strip()
                          or _read_legacy_credential()),
             log_dir=Path(os.environ.get("GO2W_BRAIN_LOG_DIR", "runs/brain")),
+            control_token=os.environ.get("GO2W_CONTROL_TOKEN", "").strip(),
+            dry_run=os.environ.get("GO2W_BRAIN_DRY", "") == "1",
         )
 
 

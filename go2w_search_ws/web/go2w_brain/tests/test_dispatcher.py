@@ -41,16 +41,16 @@ def test_approve_tool_requires_token(gate):
 def test_missing_precondition_fails_closed(gate):
     """声明了前置但没人实现 → 视为不安全, 拒绝。"""
     reg_ = gate._registry
-    reg_.register(ToolRegistration("follow_route", "", {"type": "object"},
+    reg_.register(ToolRegistration("route_stub_fp", "", {"type": "object"},
                                    _exec, risk="act",
                                    requires=("arm_water_guard",)))
-    ok, reason, _ = gate.check("follow_route", {}, {})
+    ok, reason, _ = gate.check("route_stub_fp", {}, {})
     assert not ok and "missing_precondition:arm_water_guard" in reason
 
 
 def test_precondition_gate(gate):
     reg_ = gate._registry
-    reg_.register(ToolRegistration("follow_route", "", {"type": "object"},
+    reg_.register(ToolRegistration("route_stub_pg", "", {"type": "object"},
                                    _exec, risk="act",
                                    requires=("arm_water_guard",)))
     armed = {"armed": False}
@@ -60,10 +60,10 @@ def test_precondition_gate(gate):
             False, "water_guard_not_armed")
 
     gate.register_precondition("arm_water_guard", arm_precondition)
-    ok, reason, _ = gate.check("follow_route", {}, {})
+    ok, reason, _ = gate.check("route_stub_pg", {}, {})
     assert not ok and reason == "water_guard_not_armed"
     armed["armed"] = True
-    ok, _, _ = gate.check("follow_route", {}, {})
+    ok, _, _ = gate.check("route_stub_pg", {}, {})
     assert ok
 
 
