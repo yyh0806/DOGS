@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 
 
 def motion_command_timed_out(
@@ -455,4 +456,78 @@ class DriveExecutionWatchdog:
                 "feedback_timeout": self._timeout,
                 "response_grace": self._response_grace,
                 "pending_fault_reason": self._pending_fault_reason,
+            }
+
+
+class WaterGuardClient:
+    """M3 离水守卫客户端: 消费守卫节点心跳, 在 nav 速度路径上否决。
+
+    与 ScanFreshnessWatchdog 同一注入模式 (velocity filter + reason)。
+    fail-closed 语义:
+    - verdict=veto (新鲜)          → 速度清零;
+    - verdict=limit (新鲜, 有 cap) → 线性速度模长压到 cap;
+    - 心跳过龄 且 最近已知 armed   → 视为 veto (守卫失联不许继续动);
+    - 心跳过龄 但 从未布防/已解除 → 放行 (室内任务不受影响)。
+    纯逻辑零 ROS 依赖, 心跳由节点侧 observe_status 喂入。
+    """
+
+    def __init__(self, stale_after: float = 1.5,
+                 clock=time.monotonic) -> None:
+        self._stale_after = float(stale_after)
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._last_status: dict | None = None
+        self._last_ts: float | None = None
+        self._guard_reason: str | None = None
+
+    def observe_status(self, payload) -> None:
+        status = dict(payload) if isinstance(payload, dict) else {}
+        with self._lock:
+            self._last_status = status
+            self._last_ts = self._clock()
+
+    def _effective_locked(self, now: float):
+        """返回 (armed, verdict, speed_cap); 过龄且 armed → veto(stale)。"""
+        if self._last_status is None or self._last_ts is None:
+            return False, None, None
+        armed = bool(self._last_status.get("armed"))
+        verdict = self._last_status.get("verdict")
+        cap = self._last_status.get("speed_cap")
+        if now - self._last_ts > self._stale_after:
+            if armed:
+                return True, "veto", 0.0
+            return False, None, None
+        return armed, verdict, cap
+
+    def filter_nav_velocity(self, velocity):
+        with self._lock:
+            armed, verdict, cap = self._effective_locked(self._clock())
+            if not armed or verdict is None:
+                self._guard_reason = None
+                return velocity
+            if verdict == "veto":
+                self._guard_reason = "water_guard_veto"
+                return (0.0, 0.0, 0.0)
+            if verdict == "limit" and isinstance(cap, (int, float)) and cap > 0.0:
+                vx, vy, vyaw = velocity
+                linear = math.hypot(vx, vy)
+                if linear > cap > 0.0:
+                    scale = cap / linear
+                    self._guard_reason = "water_guard_limit"
+                    return (vx * scale, vy * scale, vyaw)
+            self._guard_reason = None
+            return velocity
+
+    def guard_reason(self):
+        with self._lock:
+            return self._guard_reason
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "last_status": dict(self._last_status or {}),
+                "status_age_s": (
+                    None if self._last_ts is None
+                    else round(self._clock() - self._last_ts, 2)),
+                "guard_reason": self._guard_reason,
             }

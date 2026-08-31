@@ -31,7 +31,11 @@ try:
         MotionProtocolError,
         motion_status_dict,
     )
-    from .motion_safety import DriveExecutionWatchdog, ScanFreshnessWatchdog
+    from .motion_safety import (
+        DriveExecutionWatchdog,
+        ScanFreshnessWatchdog,
+        WaterGuardClient,
+    )
     from .motion_types import ActualMotionState, SessionState, StopProfile
     from .sport_gateway_client import SportGatewayClient
 except ImportError:  # Direct-file compatibility deployment on the NX.
@@ -43,7 +47,11 @@ except ImportError:  # Direct-file compatibility deployment on the NX.
         MotionProtocolError,
         motion_status_dict,
     )
-    from motion_safety import DriveExecutionWatchdog, ScanFreshnessWatchdog
+    from motion_safety import (
+        DriveExecutionWatchdog,
+        ScanFreshnessWatchdog,
+        WaterGuardClient,
+    )
     from motion_types import ActualMotionState, SessionState, StopProfile
     from sport_gateway_client import SportGatewayClient
 
@@ -160,10 +168,14 @@ class NxMotionNode(Node):
             min_wheel_speed=self._min_wheel_response,
             clock=clock,
         )
+        # M3: 离水守卫客户端 — 心跳来自 /water_guard/status (守卫节点),
+        # 无守卫节点在跑时行为与历史版本完全一致 (从未布防 → 放行)。
+        self._water_guard = WaterGuardClient(clock=clock)
         self._controller = MotionController(
             machine=machine,
             scan_watchdog=scan_watchdog,
             drive_watchdog=drive_watchdog,
+            water_guard=self._water_guard,
             clock=clock,
             manual_timeout=self._manual_cmd_timeout,
             nav_timeout=self._nav_cmd_timeout,
@@ -208,6 +220,9 @@ class NxMotionNode(Node):
             String, "/motion_session", self._on_motion_session, 10)
         self._cmd_pose_sub = self.create_subscription(
             String, "/cmd_pose", self._on_cmd_pose, 10)
+        # M3: 离水守卫心跳 (nx_water_guard_node 发布, String JSON)
+        self._water_guard_sub = self.create_subscription(
+            String, "/water_guard/status", self._on_water_guard_status, 10)
         # wall publisher thread: GO2W_SIM 时 sim time 随 gzserver CPU 慢 (~2Hz),
         # create_timer 0.5s sim → /dog_state 发布间隔 ~12s wall → web dog_state_stale
         # → activatable=false → 拒绝导航. 独立 wall thread 固定 0.5s wall 发布
@@ -242,6 +257,7 @@ class NxMotionNode(Node):
             "velocity_authorized": False,
             "nav_scan_fresh": False,
             "nav_guard_reason": None,
+            "water_guard_reason": None,
             "drive_fault": None,
             "vx": 0.0,
             "vy": 0.0,
@@ -274,6 +290,13 @@ class NxMotionNode(Node):
 
     def _on_cmd_pose(self, message):
         self._enqueue("pose", getattr(message, "data", ""))
+
+    def _on_water_guard_status(self, message):
+        """守卫心跳 → 客户端 (坏 JSON 容忍: 忽略, 交由过龄语义兜底)。"""
+        try:
+            self._water_guard.observe_status(json.loads(message.data))
+        except (ValueError, TypeError):
+            pass
 
     def _actor_loop(self):
         period = 1.0 / max(1.0, self._move_rate)
@@ -412,6 +435,7 @@ class NxMotionNode(Node):
             "motion_source": self._last_command_source,
             "nav_scan_fresh": self._controller.scan_watchdog.is_fresh(),
             "nav_guard_reason": self._controller.scan_watchdog.nav_guard_reason(),
+            "water_guard_reason": self._water_guard.guard_reason(),
             "scan_valid_n": self._scan_valid_count,
             "scan_invalid_n": self._scan_invalid_count,
             "invalid_feedback_n": self._invalid_feedback_count,
