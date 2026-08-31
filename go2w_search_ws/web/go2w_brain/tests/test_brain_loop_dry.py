@@ -25,7 +25,7 @@ def test_status_report_full_loop(offline_config, mock_platform, registry,
                           skills, tmp_path)
     result = session.run("报告当前状态")
     answer = result["answer"]
-    assert "31.5163" in answer          # GPS 经纬度
+    assert "31.488192" in answer      # GPS 经纬度 (mock 默认=太科园园区)
     assert "72.5" in answer             # 电量
     assert "位姿" in answer
     stats = log.stats()

@@ -42,7 +42,8 @@ class MockAdapter(PlatformAdapter):
         base: dict[str, Any] = {
             "gps": {
                 "available": True,
-                "lat": 31.5163, "lng": 120.2673,
+                # 默认中心: 无锡太科园园区 (M2.1 基准点, 园区内有湖)
+                "lat": 31.488192, "lng": 120.369486,
                 "hdop": 0.8, "sats": 18,
                 "quality": "fix", "fix_age_s": 0.4,
             },
