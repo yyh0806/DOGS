@@ -34,7 +34,8 @@ class BrainSession:
     def __init__(self, config: BrainConfig, platform: PlatformAdapter,
                  registry: ToolRegistry, gate: DispatchGate,
                  skills: SkillCatalog, llm: LLMClient, log: SessionLog,
-                 guard: Any = None):
+                 guard: Any = None, detector: Any = None,
+                 frame_source: Any = None):
         self._config = config
         self._platform = platform
         self._registry = registry
@@ -43,6 +44,8 @@ class BrainSession:
         self._llm = llm
         self._log = log
         self._guard = guard  # M3: 离水守卫 (nx_water_guard.WaterGuard)
+        self._detector = detector  # M4: 落水检测引擎 (nx_drowning_detect)
+        self._frame_source = frame_source  # M4: 帧源 callable → (frame, robot)
         self._events: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._wake = threading.Event()
         self._mission_lock: Any = None
@@ -171,6 +174,8 @@ class BrainSession:
                "config": self._config,
                "plan_store": self._plan_store,
                "guard": self._guard,
+               "detector": self._detector,
+               "frame_source": self._frame_source,
                "skills": self._skills,
                "approval_token": self._config.approval_token}
         ok, reason, tool = self._gate.check(name, args, ctx)
