@@ -64,3 +64,17 @@ def require_mission_lock(tool: ToolRegistration,
     if ctx.get("mission_lock"):
         return True, ""
     return False, "mission_lock_required"
+
+
+def require_water_guard_armed(tool: ToolRegistration,
+                              ctx: dict[str, Any]) -> tuple[bool, str]:
+    """M3 前置: 运动类任务必须先布防离水守卫 (安全先行)。
+
+    follow_route 挂载此前置 —— 守卫不在岗, 航线一律不受理。
+    """
+    guard = ctx.get("guard")
+    if guard is None:
+        return False, "water_guard_unavailable"
+    if guard.state().get("armed"):
+        return True, ""
+    return False, "water_guard_not_armed"

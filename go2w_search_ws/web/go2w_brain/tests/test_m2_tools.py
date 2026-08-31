@@ -23,8 +23,17 @@ os.environ["GO2W_LAKE_OFFLINE"] = "1"
 from go2w_brain.platform import MockAdapter, NxHttpAdapter  # noqa: E402
 from go2w_brain.registry import ToolRegistry  # noqa: E402
 from go2w_brain.tools import BUILTIN_TOOLS  # noqa: E402
+from nx_water_guard import WaterGuard  # noqa: E402
 
 TOOLS = {t.name: t for t in BUILTIN_TOOLS}
+
+
+def _armed_guard(ring=None):
+    """守卫环远离一切测试航点与园区规划水域 (M2 测试用, 环放 ~10km 外)。"""
+    guard = WaterGuard(approval_token="test-token")
+    guard.arm(ring or [(31.4000, 120.5000), (31.4000, 120.5020),
+                       (31.4020, 120.5020), (31.4020, 120.5000)])
+    return guard
 
 
 @pytest.fixture
@@ -34,18 +43,24 @@ def mock_platform():
 
 @pytest.fixture
 def gate():
-    from go2w_brain.dispatcher import DispatchGate, require_mission_lock
+    from go2w_brain.dispatcher import (DispatchGate,
+                                       require_mission_lock,
+                                       require_water_guard_armed)
     registry = ToolRegistry()
     for tool in BUILTIN_TOOLS:
         registry.register(tool)
     gate = DispatchGate(registry)
     gate.register_precondition("mission_lock", require_mission_lock)
+    gate.register_precondition("water_guard_armed",
+                               require_water_guard_armed)
     return gate
 
 
-def _ctx(platform, config=None, mission_lock="m-test", log=None):
+def _ctx(platform, config=None, mission_lock="m-test", log=None,
+         guard=None):
     return {"platform": platform, "log": log or _NullLog(),
-            "config": config, "mission_lock": mission_lock}
+            "config": config, "mission_lock": mission_lock,
+            "guard": guard if guard is not None else _armed_guard()}
 
 
 class _NullLog:

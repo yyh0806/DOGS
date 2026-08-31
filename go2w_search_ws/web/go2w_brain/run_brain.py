@@ -10,7 +10,8 @@ import time
 from pathlib import Path
 
 from .config import BrainConfig
-from .dispatcher import DispatchGate, require_mission_lock
+from .dispatcher import (DispatchGate, require_mission_lock,
+                         require_water_guard_armed)
 from .llm import LLMClient
 from .platform import MockAdapter, NxHttpAdapter
 from .registry import SkillCatalog, ToolRegistry
@@ -27,10 +28,17 @@ def build_session(config: BrainConfig, log: SessionLog):
         registry.register(tool)
     gate = DispatchGate(registry)
     gate.register_precondition("mission_lock", require_mission_lock)
+    gate.register_precondition("water_guard_armed",
+                               require_water_guard_armed)
     skills = SkillCatalog(config.skill_dir)
     llm = LLMClient(config)
+    # M3: 会话内离水守卫 —— 本地拦规划期违规 (任何平台);
+    # nx 生产路径另由 nx_water_guard_node 拦运行期 (arm 工具同步布防)。
+    from nx_water_guard import WaterGuard
+    guard = WaterGuard(approval_token=config.approval_token)
     from .brain_loop import BrainSession
-    return BrainSession(config, platform, registry, gate, skills, llm, log)
+    return BrainSession(config, platform, registry, gate, skills, llm, log,
+                        guard=guard)
 
 
 def main(argv: list[str] | None = None) -> int:

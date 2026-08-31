@@ -34,6 +34,13 @@ class PlatformAdapter:
     def calibrate_heading(self, heading_deg: float) -> dict[str, Any]:
         raise NotImplementedError
 
+    # M3: 离水守卫同步端口 (运行期守卫节点在 NX 侧)
+    def arm_water_guard(self, ring, margin_m: float = 2.0) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def disarm_water_guard(self, approval_token: str) -> dict[str, Any]:
+        raise NotImplementedError
+
 
 class MockAdapter(PlatformAdapter):
     """测试/干跑用: 固定遥测 + 内存航线状态机 + 调用记录。"""
@@ -101,6 +108,16 @@ class MockAdapter(PlatformAdapter):
         self._base.setdefault("gps", {})["north_heading_deg"] = value % 360.0
         return {"ok": True, "heading_deg": value % 360.0}
 
+    def arm_water_guard(self, ring, margin_m: float = 2.0):
+        self.calls.append(("arm_water_guard", len(ring) if ring else 0))
+        self._guard_ring = ring
+        return {"ok": True, "synced": True}
+
+    def disarm_water_guard(self, approval_token: str):
+        self.calls.append(("disarm_water_guard", bool(approval_token)))
+        self._guard_ring = None
+        return {"ok": True, "synced": True}
+
 
 class NxHttpAdapter(PlatformAdapter):
     """NX 生产/仿真接入: GET 读状态 fail-soft; POST 运动指令带控制令牌。
@@ -167,6 +184,16 @@ class NxHttpAdapter(PlatformAdapter):
 
     def gps_state(self) -> dict[str, Any]:
         return self._get("/api/gps/route") or {}
+
+    # M3: 守卫同步 (NX 侧 nx_web_server → nx_water_guard_node)
+    def arm_water_guard(self, ring, margin_m: float = 2.0):
+        return self._post("/api/water_guard/arm",
+                          {"ring": [[p[0], p[1]] for p in ring],
+                           "margin_m": float(margin_m)})
+
+    def disarm_water_guard(self, approval_token: str):
+        return self._post("/api/water_guard/disarm",
+                          {"approval_token": str(approval_token)})
 
     def snapshot(self) -> dict[str, Any]:
         status = self._get("/api/status") or {}

@@ -15,6 +15,15 @@ python3 -m pytest lake_plan/tests -q
 echo "[ci_gate] GPS 航线控制器回归 (纯逻辑)"
 python3 -m pytest tests/test_gps_nav.py -q
 
+echo "[ci_gate] M3 离水守卫纯逻辑回归"
+python3 -m pytest tests/test_water_guard.py -q
+
+echo "[ci_gate] M3 运动链守卫客户端回归 (bridge 纯逻辑, 无 ROS)"
+(cd ../src/go2w_bridge/go2w_bridge && \
+ python3 -m pytest ../../test/test_water_guard_client.py \
+                    ../../test/test_motion_safety.py \
+                    ../../test/test_motion_controller.py -q)
+
 echo "[ci_gate] 干跑演示: 状态报告 (mock, 规则模式)"
 python3 -m go2w_brain.run_brain --task "报告当前状态" \
     --platform mock --no-llm > /dev/null

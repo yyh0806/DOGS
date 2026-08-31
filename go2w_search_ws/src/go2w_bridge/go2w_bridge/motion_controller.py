@@ -13,6 +13,7 @@ try:
     from .motion_safety import (
         DriveExecutionWatchdog,
         ScanFreshnessWatchdog,
+        WaterGuardClient,
         compensate_pure_turn_creep,
         motion_command_timed_out,
     )
@@ -23,6 +24,7 @@ except ImportError:  # Direct-file compatibility deployment on the NX.
     from motion_safety import (
         DriveExecutionWatchdog,
         ScanFreshnessWatchdog,
+        WaterGuardClient,
         compensate_pure_turn_creep,
         motion_command_timed_out,
     )
@@ -55,10 +57,13 @@ class MotionController:
         turn_creep_maximum: float = 0.15,
         turn_linear_epsilon: float = 0.02,
         turn_angular_threshold: float = 0.05,
+        water_guard: Optional[WaterGuardClient] = None,
     ) -> None:
         self.machine = machine
         self.scan_watchdog = scan_watchdog
         self.drive_watchdog = drive_watchdog
+        # M3: 离水守卫 (可选注入; None = 行为与历史版本完全一致)
+        self.water_guard = water_guard
         self._clock = clock
         self._manual_timeout = float(manual_timeout)
         self._nav_timeout = float(nav_timeout)
@@ -186,6 +191,9 @@ class MotionController:
             # planner/recovery command drive the robot backwards.
             velocity = (max(0.0, velocity[0]), velocity[1], velocity[2])
             velocity = self.scan_watchdog.filter_nav_velocity(velocity)
+            if self.water_guard is not None:
+                # M3: 离水守卫否决/限速 (独立于 Nav2, 只作用于 nav 速度)
+                velocity = self.water_guard.filter_nav_velocity(velocity)
         velocity = compensate_pure_turn_creep(velocity, **self._turn_creep)
         effect = self.machine.command_velocity(
             owner,

@@ -1,0 +1,148 @@
+<?xml version="1.0" ?>
+<!-- lake_patrol.world — M3 湖景仿真场景
+
+     要点:
+     - 水面用深色平面, RayScanMaterial 关闭激光回波 → 复现真实
+       "水面是激光盲区" (狗看不见湖, 只能靠 keepout);
+     - 湖心放一个漂浮假人 (drowning dummy), 供 M4 检测管线验收;
+     - GPS 由 gz 插件在 URDF/launch 侧提供 (见 sim_full_bringup 追加)。
+     尺寸: 湖 ~200m x 140m 椭圆近似 (矩形+圆角由多块拼成, 简化为矩形),
+     岸边留 ~40m 可走环形通道。
+-->
+<sdf version="1.6">
+  <world name="lake_patrol">
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <!-- 岸边地面: 大平面, 激光可见 -->
+    <model name="shore_ground">
+      <static>true</static>
+      <pose>0 0 0 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane><normal>0 0 1</normal><size>600 600</size></plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane><normal>0 0 1</normal><size>600 600</size></plane>
+          </geometry>
+          <material>
+            <ambient>0.45 0.55 0.35 1</ambient>
+            <diffuse>0.45 0.55 0.35 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 水面: 略低于地面, 深蓝; 关键是 <laser_retro> 不设且无 collision
+         —— 激光无回波, costmap 视为未知 (盲区) -->
+    <model name="water">
+      <static>true</static>
+      <pose>0 0 -0.05 0 0 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <plane><normal>0 0 1</normal><size>200 140</size></plane>
+          </geometry>
+          <material>
+            <ambient>0.08 0.20 0.45 1</ambient>
+            <diffuse>0.10 0.25 0.55 1</diffuse>
+            <specular>0.8 0.8 0.9 1</specular>
+          </material>
+        </visual>
+        <!-- 无 collision: 狗理论上能走进去 —— keepout/守卫必须拦住它
+             (这正是 M3 验收要证明的行为) -->
+      </link>
+    </model>
+
+    <!-- 岸线围栏段 (激光可见, 构成自然导航边界), 四角留口 -->
+    <model name="fence_n">
+      <static>true</static>
+      <pose>0 72 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>210 0.4 0.8</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>210 0.4 0.8</size></box></geometry>
+          <material><ambient>0.6 0.4 0.2 1</ambient></material></visual>
+      </link>
+    </model>
+    <model name="fence_s">
+      <static>true</static>
+      <pose>0 -72 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>210 0.4 0.8</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>210 0.4 0.8</size></box></geometry>
+          <material><ambient>0.6 0.4 0.2 1</ambient></material></visual>
+      </link>
+    </model>
+    <model name="fence_e">
+      <static>true</static>
+      <pose>105 0 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.4 145 0.8</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.4 145 0.8</size></box></geometry>
+          <material><ambient>0.6 0.4 0.2 1</ambient></material></visual>
+      </link>
+    </model>
+    <model name="fence_w">
+      <static>true</static>
+      <pose>-105 0 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.4 145 0.8</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.4 145 0.8</size></box></geometry>
+          <material><ambient>0.6 0.4 0.2 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- 漂浮假人 (落水者): 半沉的亮色人形, 供相机检测 -->
+    <model name="drowning_dummy_1">
+      <static>false</static>
+      <pose>20 -10 -0.15 0 0 0.6</pose>
+      <link name="body">
+        <inertial>
+          <mass>60</mass>
+          <inertia><ixx>8.0</ixx><iyy>8.0</iyy><izz>2.0</izz>
+            <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
+        </inertial>
+        <collision name="c">
+          <geometry><box><size>0.5 0.25 0.15</size></box></geometry>
+        </collision>
+        <visual name="v">
+          <geometry><box><size>0.5 0.25 0.15</size></box></geometry>
+          <material>
+            <ambient>0.95 0.55 0.10 1</ambient>
+            <diffuse>1.0 0.60 0.10 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 第二个假人 (更远, 测距离档) -->
+    <model name="drowning_dummy_2">
+      <static>false</static>
+      <pose>-60 30 -0.15 0 0 -0.4</pose>
+      <link name="body">
+        <inertial>
+          <mass>60</mass>
+          <inertia><ixx>8.0</ixx><iyy>8.0</iyy><izz>2.0</izz>
+            <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
+        </inertial>
+        <collision name="c">
+          <geometry><box><size>0.5 0.25 0.15</size></box></geometry>
+        </collision>
+        <visual name="v">
+          <geometry><box><size>0.5 0.25 0.15</size></box></geometry>
+          <material>
+            <ambient>0.95 0.55 0.10 1</ambient>
+            <diffuse>1.0 0.60 0.10 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+  </world>
+</sdf>

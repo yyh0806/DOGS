@@ -120,6 +120,11 @@ def _plan_water(lat, lng, provider, offset_m, step_m,
     stats["refined"] = refined
     stats["provider"] = provider
     poly_ll = [georef_plan.pixel_to_latlon(x, y) for (x, y) in poly_px]
+    # 规划-安全一致性 (M3): 航点距输出水域多边形 ≥ 5m。覆盖链路:
+    # 守卫 veto 2.0m + 布防默认 margin 2.0m + 1m 余量 —— 圆角平滑在
+    # 岸线细节处可贴水到 <2m, 与其让守卫受理时拒收, 规划期就推出。
+    result["route_latlon"] = _snap_outside_ring_min(
+        result["route_latlon"], poly_ll, min_dist_m=5.0)
     out = _finish(result, poly_ll, "water", {
         "area_km2": target["area_km2"], "perim_km": target["perim_km"],
         "dist_km": target["dist_km"]})
@@ -214,23 +219,49 @@ def _finish(result, poly_ll, kind, target):
 
 def _snap_outside_ring(route_ll, ring):
     """把落入 ring (矢量多边形) 内的点从环质心方向推出, 直到在环外。"""
+    return _snap_outside_ring_min(route_ll, ring, min_dist_m=0.0)
+
+
+def _snap_outside_ring_min(route_ll, ring, min_dist_m=0.0):
+    """推出到环外且至少距环边 min_dist_m 米 (规划-安全一致性)。
+
+    逐点沿 (点→环质心) 反方向尝试递增步长; 包内独立实现基础几何
+    (lake_plan 不依赖 web/ 平铺模块)。
+    """
     from .osm_client import _point_in_ring
     clat = sum(p[0] for p in ring) / len(ring)
     clng = sum(p[1] for p in ring) / len(ring)
     kx = 111320.0 * math.cos(math.radians(clat))
     ky = 110540.0
+    xs = [p[1] * kx for p in ring]
+    ys = [p[0] * ky for p in ring]
+
+    def _edge_dist_m(lat, lng):
+        x, y = lng * kx, lat * ky
+        best = float("inf")
+        n = len(ring)
+        for i in range(n):
+            dx, dy = xs[(i + 1) % n] - xs[i], ys[(i + 1) % n] - ys[i]
+            seg2 = dx * dx + dy * dy or 1e-9
+            t = max(0.0, min(1.0, ((x - xs[i]) * dx + (y - ys[i]) * dy) / seg2))
+            best = min(best, math.hypot(x - (xs[i] + t * dx),
+                                        y - (ys[i] + t * dy)))
+        return best
+
     out = []
     for lat, lng in route_ll:
-        if not _point_in_ring((lat, lng), ring):
+        if (not _point_in_ring((lat, lng), ring)
+                and _edge_dist_m(lat, lng) >= min_dist_m):
             out.append((lat, lng))
             continue
         dx, dy = lng - clng, lat - clat
         norm = math.hypot(dx * kx, dy * ky) or 1.0
         ux, uy = dx * kx / norm, dy * ky / norm
         pushed = (lat, lng)
-        for step_m in (3.0, 6.0, 12.0, 25.0, 50.0, 100.0, 200.0):
+        for step_m in (1.0, 3.0, 6.0, 12.0, 25.0, 50.0, 100.0, 200.0):
             cand = (lat + uy * step_m / ky, lng + ux * step_m / kx)
-            if not _point_in_ring(cand, ring):
+            if (not _point_in_ring(cand, ring)
+                    and _edge_dist_m(cand[0], cand[1]) >= min_dist_m):
                 pushed = cand
                 break
         out.append(pushed)

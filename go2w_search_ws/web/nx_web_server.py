@@ -2537,6 +2537,7 @@ room_orchestrator = None  # 阶段E: RoomSearchOrchestrator (main 注入)
 navigation_arbiter = None  # NavigationArbiter: process-wide autonomous owner
 uwb_follow = None          # 功能B-2: UwbFollowController (ROS-free, main 注入)
 gps_route = None           # 功能A: GpsRouteController (室外 GPS 航线, main 注入)
+water_guard_pub = None     # M3: 离水守卫布防发布器 → nx_water_guard_node (main 注入)
 
 
 def _perception_health(robot_bridge):
@@ -2955,6 +2956,7 @@ def create_server(host, port, static_dir, mission_root=None):
                 "/api/uwb_follow/params",
                 "/api/gps/route", "/api/gps/route_cancel",
                 "/api/gps/calibrate",
+                "/api/water_guard/arm", "/api/water_guard/disarm",
             }
             audit_request = p.path in audited_paths
             if p.path == "/api/move" and navigation_arbiter is not None:
@@ -3418,6 +3420,46 @@ def create_server(host, port, static_dir, mission_root=None):
                                status=400)
                     return
                 self._json(gps_route.set_heading_calibration(float(heading)))
+            elif p.path == '/api/water_guard/arm':
+                # M3: 布防离水守卫 → 守卫节点 (body: {"ring": [[lat,lng]...],
+                # "margin_m": float}; ring 为 WGS-84 禁区环)
+                if water_guard_pub is None:
+                    self._json({"ok": False,
+                                "reason": "water_guard_unavailable"}, status=503)
+                    return
+                try:
+                    parsed = json.loads(body) if body else {}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    self._json({"ok": False, "reason": "invalid_json"}, status=400)
+                    return
+                ring = parsed.get("ring") if isinstance(parsed, dict) else None
+                if not isinstance(ring, list) or len(ring) < 4:
+                    self._json({"ok": False, "reason": "invalid_ring"}, status=400)
+                    return
+                message = String()
+                message.data = json.dumps({
+                    "arm": True, "ring": ring,
+                    "margin_m": float(parsed.get("margin_m", 0.0) or 0.0)})
+                water_guard_pub.publish(message)
+                self._json({"ok": True, "published": True})
+            elif p.path == '/api/water_guard/disarm':
+                # M3: 解除守卫 (审批令牌透传给守卫节点校验)
+                if water_guard_pub is None:
+                    self._json({"ok": False,
+                                "reason": "water_guard_unavailable"}, status=503)
+                    return
+                try:
+                    parsed = json.loads(body) if body else {}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    self._json({"ok": False, "reason": "invalid_json"}, status=400)
+                    return
+                token = (parsed.get("approval_token")
+                         if isinstance(parsed, dict) else None)
+                message = String()
+                message.data = json.dumps({
+                    "disarm": True, "approval_token": str(token or "")})
+                water_guard_pub.publish(message)
+                self._json({"ok": True, "published": True})
             else:
                 self.send_error(404)
 
@@ -3972,6 +4014,12 @@ def main():
     threading.Thread(target=_gps_route_loop,
                      args=(_gps_route_stop_event,),
                      daemon=True).start()
+
+    # M3: 离水守卫布防通道 → nx_water_guard_node (latched 语义用 transient_local
+    # 不可用于 String 默认 QoS; 布防命令幂等, 丢失由大脑侧重发兜底)
+    global water_guard_pub
+    water_guard_pub = node.create_publisher(
+        String, "/water_guard/polygon", 10)
 
     # Humble's rclpy wait-set cannot be mutated while an executor is waiting.
     # PointNav and RoomSearch both create ActionClients, so start spin only
