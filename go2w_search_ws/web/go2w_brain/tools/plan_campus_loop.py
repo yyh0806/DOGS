@@ -36,14 +36,22 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
                           length_m=result["stats"]["length_m"],
                           offset_m=result["stats"]["offset_m"],
                           target=result["target"])
+    # M5: 续航判决 (电量取自平台遥测)
+    from ..patrol_math import endurance_check
+    battery = ctx["platform"].snapshot().get("battery_soc")
+    endurance = endurance_check(result["stats"]["length_m"], battery)
     return {
         "ok": True,
         "waypoint_count": len(result["waypoints"]),
+        "scan_points": len(result.get("scan_points") or []),
         "length_km": round(result["stats"]["length_m"] / 1000.0, 2),
         "closed": result["stats"]["closed"],
         "target": result["target"],
+        "endurance": endurance,
         "first_waypoints": result["waypoints"][:3],
-        "usage": "调用 follow_route 并传 from_plan=true 即可受理这条航线",
+        "usage": "调用 follow_route 并传 from_plan=true 即可受理这条航线"
+                 + ("; 电量不足, 建议分段" if endurance.get("verdict")
+            in ("SEGMENT", "REFUSE") else ""),
     }
 
 

@@ -23,7 +23,8 @@ from typing import Any
 
 from . import config, osm_client, planner, tiles, water
 from .config import (DEFAULT_LOOP_OFFSET_M, DEFAULT_MAX_PERIM_KM,
-                     DEFAULT_MIN_PERIM_KM, DEFAULT_STEP_M)
+                     DEFAULT_MIN_PERIM_KM, DEFAULT_SCAN_SPACING_M,
+                     DEFAULT_STEP_M)
 from .geo import (StitchGeoref, haversine_m, lat_to_global_px,
                   lng_to_global_px)
 
@@ -193,7 +194,8 @@ def _plan_campus(lat, lng, offset_m, step_m, campus_radius_m):
 
 # ---------- 公共收尾 --------------------------------------------------------
 
-def _finish(result, poly_ll, kind, target):
+def _finish(result, poly_ll, kind, target,
+            scan_spacing_m: float = DEFAULT_SCAN_SPACING_M):
     waypoints = [{"lat": round(ll[0], 6), "lon": round(ll[1], 6),
                   "name": f"wp{i:03d}"}
                  for i, ll in enumerate(result["route_latlon"])]
@@ -203,15 +205,49 @@ def _finish(result, poly_ll, kind, target):
     target["kind"] = kind
     target["centroid"] = target.get(
         "centroid", [round(cent_lat, 6), round(cent_lng, 6)])
+    # M5 扫描点: 沿环线每 scan_spacing_m 米一个, 朝向目标质心
+    # (湖法线方向) —— 云台扫视的朝向基准。
+    scan_points = _scan_points(result["route_latlon"],
+                               (cent_lat, cent_lng), scan_spacing_m)
     out = {
         "ok": True,
         "kind": kind,
         "waypoints": waypoints,
+        "scan_points": scan_points,
         "target": target,
         "stats": result["stats"],
     }
     out["water_polygon" if kind == "water" else "campus_polygon"] = [
         [round(p[0], 6), round(p[1], 6)] for p in poly_ll]
+    return out
+
+
+def _scan_points(route_ll, centroid, spacing_m):
+    """沿闭合环线每 spacing_m 取扫描点, 附朝向质心的方位角 (真北)。"""
+    if spacing_m <= 0 or len(route_ll) < 2:
+        return []
+    clat, clng = centroid
+    kx = 111320.0 * math.cos(math.radians(clat))
+    ky = 110540.0
+    out = []
+    acc = 0.0
+    nxt = spacing_m
+    n = len(route_ll)
+    for i in range(1, n + 1):
+        lat0, lng0 = route_ll[i - 1]
+        lat1, lng1 = route_ll[i % n]
+        seg = math.hypot((lng1 - lng0) * kx, (lat1 - lat0) * ky)
+        while acc + seg >= nxt and seg > 1e-9:
+            t = (nxt - acc) / seg
+            plat = lat0 + t * (lat1 - lat0)
+            plng = lng0 + t * (lng1 - lng0)
+            bearing = (math.degrees(math.atan2((clng - plng) * kx,
+                                               (clat - plat) * ky))
+                       % 360.0)
+            out.append({"lat": round(plat, 6), "lon": round(plng, 6),
+                        "look_bearing_deg": round(bearing, 1)})
+            nxt += spacing_m
+        acc += seg
     return out
 
 
