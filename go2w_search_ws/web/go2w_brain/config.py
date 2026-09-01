@@ -30,6 +30,8 @@ class BrainConfig:
     dry_run: bool = False
     # M3: 审批令牌 (操作员授权高危操作, 如解除离水守卫)
     approval_token: str = ""
+    # M7: 语义记忆库目录 (地图式经验层, append-only + 网格索引)
+    memory_dir: Path = Path("runs/memory")
 
     @classmethod
     def from_env(cls) -> "BrainConfig":
@@ -47,6 +49,8 @@ class BrainConfig:
             dry_run=os.environ.get("GO2W_BRAIN_DRY", "") == "1",
             approval_token=os.environ.get(
                 "GO2W_BRAIN_APPROVAL_TOKEN", "").strip(),
+            memory_dir=Path(os.environ.get(
+                "GO2W_MEMORY_DIR", "runs/memory")),
         )
 
 

@@ -69,6 +69,18 @@
     "name": "wp011"
    }
   ],
+  "scan_points": [
+   {
+    "lat": 31.488779,
+    "lon": 120.369228,
+    "look_bearing_deg": 359.6
+   },
+   {
+    "lat": 31.489222,
+    "lon": 120.368842,
+    "look_bearing_deg": 124.8
+   }
+  ],
   "target": {
    "area_km2": 0.001,
    "perim_km": 0.34,

@@ -176,9 +176,11 @@ def _plan_campus(lat, lng, offset_m, step_m, campus_radius_m):
             poly_px, georef, offset_m=offset_m, step_m=step_m)
     except ValueError as exc:
         return {"ok": False, "reason": f"plan_failed:{exc}"}
-    # 矢量级保证: 环线任何点不得落在园区凸包内 (圆角/栅格化可能在
-    # 角部切入几米 —— 对真凸包逐点检查并径向推出)。
-    result["route_latlon"] = _snap_outside_ring(result["route_latlon"], ring)
+    # 矢量级保证 + 规划-安全一致性 (M3/M7): 环线任何点不得落在园区凸包
+    # 内, 且距凸包 ≥5m (守卫 veto 2.0 + margin 2.0 + 1m 余量) —— 与水
+    # 分支同一纪律, 圆角切入与贴边航点都会被推出。
+    result["route_latlon"] = _snap_outside_ring_min(
+        result["route_latlon"], ring, min_dist_m=5.0)
     stats = dict(result["stats"])
     stats["refined"] = False
     stats["cluster_plots"] = campus["cluster_plots"]

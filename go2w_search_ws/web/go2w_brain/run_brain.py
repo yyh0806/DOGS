@@ -45,10 +45,13 @@ def build_session(config: BrainConfig, log: SessionLog):
         from synthetic_frame_source import SyntheticPatrolSource
         detector = DrowningDetector()
         frame_source = SyntheticPatrolSource()
+    # M7: 语义记忆库 (地图式经验层, 跨会话持久)
+    from .memory import MemoryStore
+    memory = MemoryStore(config.memory_dir / "memory.jsonl")
     from .brain_loop import BrainSession
     return BrainSession(config, platform, registry, gate, skills, llm, log,
                         guard=guard, detector=detector,
-                        frame_source=frame_source)
+                        frame_source=frame_source, memory=memory)
 
 
 def main(argv: list[str] | None = None) -> int:
