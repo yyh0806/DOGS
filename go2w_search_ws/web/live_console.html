@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>GO2W 实时任务控制台</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+:root{--bg:#0A111E;--panel:#101A2B;--edge:#1E2C44;--ink:#D8E2F0;--muted:#8294AC;
+--accent:#F0913B;--water:#2A6F97;--ok:#3EDC97;--veto:#FF5C5C;--info:#5C8DFF}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--ink);font-family:"Segoe UI",system-ui,sans-serif;font-size:14px}
+.wrap{display:flex;flex-direction:column;height:100%}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:12px 18px;
+background:var(--panel);border-bottom:1px solid var(--edge)}
+header h1{font-size:16px;letter-spacing:.14em;font-weight:600}
+header .note{font-size:11px;color:var(--muted);letter-spacing:.05em}
+#status{margin-left:auto;font-family:ui-monospace,Consolas,monospace;font-size:12px;
+border:1px solid var(--edge);padding:4px 12px;border-radius:2px;color:var(--muted)}
+#status.running{color:var(--accent);border-color:var(--accent)}
+#status.done{color:var(--ok);border-color:var(--ok)}
+.bar{display:flex;gap:8px;padding:10px 18px;border-bottom:1px solid var(--edge);align-items:center}
+#task{flex:1;background:var(--bg);color:var(--ink);border:1px solid var(--edge);
+font:inherit;font-family:ui-monospace,Consolas,monospace;padding:8px 12px;border-radius:2px;outline:none}
+#task:focus{border-color:var(--info)}
+button{background:var(--panel);color:var(--ink);border:1px solid var(--edge);
+font:inherit;padding:8px 16px;border-radius:2px;cursor:pointer;white-space:nowrap}
+button.primary{background:var(--accent);border-color:var(--accent);color:#14100A;font-weight:600}
+button:hover{border-color:var(--ink)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.preset{color:var(--muted);font-size:12px;padding:8px 10px}
+main{flex:1;display:grid;grid-template-columns:minmax(0,1.1fr) minmax(330px,1fr);min-height:0}
+.map{position:relative;border-right:1px solid var(--edge)}
+#map{position:absolute;inset:0}
+.legend{position:absolute;left:10px;bottom:10px;z-index:1000;background:rgba(10,17,30,.85);
+border:1px solid var(--edge);padding:7px 10px;font-size:11px;color:var(--muted);
+font-family:ui-monospace,Consolas,monospace;border-radius:2px}
+.legend i{display:inline-block;width:9px;height:9px;margin-right:5px;border-radius:50%}
+.legend span{display:block;margin:2px 0}
+.flow{overflow-y:auto;padding:10px 16px;background:var(--bg)}
+.flow .empty{color:var(--muted);font-size:13px;line-height:1.7}
+.step{padding:9px 12px;border-bottom:1px solid var(--edge);border-left:3px solid var(--edge);
+animation:fadein .35s ease}
+@keyframes fadein{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.step.task{border-left-color:var(--ink);background:var(--panel)}
+.step.llm_call{border-left-color:var(--info)}
+.step.event{border-left-color:var(--accent)}
+.step.reply{border-left-color:var(--ok);background:var(--panel)}
+.step.denied{border-left-color:var(--veto);background:#1A1220}
+.step .kind{font-size:10px;letter-spacing:.15em;color:var(--muted);
+font-family:ui-monospace,Consolas,monospace}
+.step .body{margin-top:4px;font-family:ui-monospace,Consolas,monospace;font-size:12.5px;
+line-height:1.55;word-break:break-word}
+.step .body .zh{color:var(--ink);font-weight:600}
+.step .badge{display:inline-block;font-size:10px;padding:1px 7px;border-radius:2px;
+margin:4px 6px 0 0;font-family:ui-monospace,Consolas,monospace}
+.badge.ok{color:var(--ok);border:1px solid var(--ok)}
+.badge.denied{color:var(--veto);border:1px solid var(--veto)}
+.badge.warn{color:var(--accent);border:1px solid var(--accent)}
+.badge.info{color:var(--info);border:1px solid var(--info)}
+.step .dim{color:var(--muted);font-size:11px}
+@media(max-width:860px){main{grid-template-columns:1fr;grid-template-rows:40vh 1fr}
+.map{border-right:none;border-bottom:1px solid var(--edge)}}
+@media (prefers-reduced-motion: reduce){.step{animation:none}}
+</style></head><body>
+<div class="wrap">
+  <header>
+    <h1>GO2W 实时任务控制台</h1>
+    <span class="note">真实大脑 · 真 LLM 推理 · 真规划引擎 · 运动指令强制干跑（控制层不在本页范围）</span>
+    <span id="status">空闲</span>
+  </header>
+  <div class="bar">
+    <input id="task" value="绕湖一周，巡查有没有落水人员（干跑预演）"/>
+    <button id="run" class="primary">执行任务</button>
+    <button id="clear">清空</button>
+    <button class="preset" data-t="绕湖一周，巡查有没有落水人员（干跑预演）">绕湖巡查</button>
+    <button class="preset" data-t="绕园区一周巡查（干跑预演）">绕园区巡查</button>
+    <button class="preset" data-t="报告当前状态">状态报告</button>
+  </div>
+  <main>
+    <div class="map">
+      <div id="map"></div>
+      <div class="legend">
+        <span style="color:var(--accent)"><i style="background:var(--accent)"></i>环线 / 扫描点</span>
+        <span style="color:var(--water)"><i style="background:var(--water)"></i>水域 / 园区禁区</span>
+        <span style="color:var(--veto)"><i style="background:var(--veto)"></i>confirmed 告警</span>
+        <span style="color:var(--ok)"><i style="background:var(--ok)"></i>起点</span>
+      </div>
+    </div>
+    <div class="flow" id="flow">
+      <div class="empty">在这里输入任务并点击「执行任务」。大脑的每一步思考、每一次工具调用与安全拦截都会实时出现在右侧；规划完成时左侧地图会画出真实环线、扫描点与告警位置。<br/><br/>注：本机无相机，湖面扫描使用合成帧源站台（NX 上由真实相机替换）；其余环节全部为真实执行。</div>
+    </div>
+  </main>
+</div>
+<script>
+var ZH={get_gps:"读 GNSS 定位",get_battery:"读电量",get_pose:"读位姿",speak:"语音播报",
+plan_lake_loop:"规划绕湖环线",plan_campus_loop:"规划绕园区环线",follow_route:"受理航线",
+cancel_route:"取消航线",calibrate_heading:"北向标定",get_route_state:"读航线进度",
+arm_water_guard:"布防离水守卫",disarm_water_guard:"解除守卫(审批)",get_guard_state:"读守卫状态",
+load_skill:"加载技能方法论",scan_water:"扫描湖面检测落水者",get_detection_events:"读检测告警",
+approach_vantage:"选安全接近点",patrol_report:"生成任务报告"};
+var KIND={session_start:"会话开始",task:"任务",llm_call:"大脑推理",tool_call:"工具调用",
+tool_result:"工具结果",event:"事件",snapshot:"遥测快照",reply:"最终答复",session_end:"会话结束"};
+var map=L.map("map");
+L.tileLayer("https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+  {maxZoom:19,attribution:"&copy; OpenStreetMap &copy; CARTO"}).addTo(map);
+map.setView([31.488192,120.369486],16);
+var routeLayer=null,alertLayer=null,scanLayer=null;
+var flow=document.getElementById("flow");
+var status=document.getElementById("status");
+var runBtn=document.getElementById("run");
+var counts={tools:0,denied:0,alerts:0};
+var es=new EventSource("/events");
+
+function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function brief(o,n){var s=JSON.stringify(o===undefined?null:o);return s.length>n?s.slice(0,n)+"…":s;}
+function setStatus(txt,cls){status.textContent=txt;status.className=cls||"";}
+function card(kind,html,badges,extraCls){
+  var div=document.createElement("div");
+  div.className="step "+kind+(extraCls?" "+extraCls:"");
+  div.innerHTML="<div class='kind'>"+(KIND[kind]||kind)+"</div>"+
+    "<div class='body'>"+html+"</div>"+
+    (badges&&badges.length?"<div>"+badges.map(function(b){
+      return "<span class='badge "+b.cls+"'>"+b.text+"</span>";}).join("")+"</div>":"");
+  flow.appendChild(div);
+  flow.scrollTop=flow.scrollHeight;
+}
+function resultHtml(name,r){
+  if(!r||typeof r!=="object")return brief(r,120);
+  var denied=r.dispatch_denied||(r.ok===false&&r.reason);
+  if(denied)return "<b style='color:var(--veto)'>"+esc(denied)+"</b>";
+  if(name==="plan_lake_loop"||name==="plan_campus_loop")
+    return r.waypoint_count+" 航点 · "+r.length_km+"km · 闭合"+(r.closed?"是":"否")+
+      " · 扫描点 "+r.scan_points+" · 续航 "+((r.endurance||{}).verdict||"?");
+  if(name==="follow_route")return "受理 "+r.waypoint_count+" 航点"+(r.dry?"（干跑，未下发）":"");
+  if(name==="arm_water_guard")return "禁区 "+r.vertices+" 顶点 · veto "+r.veto_m+"m / limit "+r.limit_m+"m";
+  if(name==="scan_water")return r.frames_scanned+" 帧 · confirmed "+r.confirmed_count+" · suspect "+
+    (r.new_events||[]).filter(function(e){return e.tier==="suspect"}).length;
+  if(name==="approach_vantage")return "观察点距告警 "+r.dist_to_alert_m+"m"+
+    (r.guard_dist_m!=null?" · 守卫距离 "+r.guard_dist_m+"m":"");
+  if(name==="patrol_report"){var s=r.summary||{};return "进度 "+Math.round((s.completion||0)*100)+
+    "% · confirmed "+s.confirmed+" · 扫描点 "+s.scan_points;}
+  if(name==="get_battery")return r.battery_soc+"%";
+  if(name==="calibrate_heading")return r.heading_deg+"°";
+  if(name==="load_skill")return "方法论: "+r.name;
+  if(name==="get_gps"&&r.ok)return r.lat+", "+r.lng+" · HDOP "+r.hdop+" · "+r.sats+" 星";
+  return esc(brief(r,120));
+}
+function drawPlan(p){
+  if(routeLayer)map.removeLayer(routeLayer);
+  if(scanLayer)map.removeLayer(scanLayer);
+  var group=L.layerGroup();
+  var bounds=[];
+  var poly=p.water_polygon||p.campus_polygon;
+  if(poly&&poly.length){
+    var ring=poly.map(function(x){return [x[0],x[1]];});
+    L.polygon(ring,{color:"#2A6F97",weight:2,fillOpacity:.16}).addTo(group);
+    ring.forEach(function(x){bounds.push(x);});
+  }
+  if(p.waypoints&&p.waypoints.length){
+    var wps=p.waypoints.map(function(w){return [w.lat,w.lon];});
+    L.polyline(wps,{color:"#F0913B",weight:3,dashArray:"2 6"}).addTo(group);
+    wps.forEach(function(x){bounds.push(x);});
+    L.circleMarker(wps[0],{radius:7,color:"#3EDC97",weight:2,fillColor:"#3EDC97",fillOpacity:.5})
+      .addTo(group).bindPopup("起点 wp000");
+  }
+  if(p.scan_points&&p.scan_points.length){
+    p.scan_points.forEach(function(sp){
+      var pt=[sp.lat,sp.lon];bounds.push(pt);
+      var rad=sp.look_bearing_deg*Math.PI/180;
+      var tip=[sp.lat+0.00028*Math.cos(rad),sp.lon+0.00028*Math.sin(rad)];
+      L.circleMarker(pt,{radius:4,color:"#F0913B",fillOpacity:.7}).addTo(group)
+        .bindPopup("扫描点 · 朝向 "+sp.look_bearing_deg+"°");
+      L.polyline([pt,tip],{color:"#F0913B",weight:2}).addTo(group);
+    });
+  }
+  routeLayer=group.addTo(map);
+  if(bounds.length)map.fitBounds(L.latLngBounds(bounds).pad(.25));
+}
+function drawAlerts(events){
+  if(alertLayer)map.removeLayer(alertLayer);
+  var group=L.layerGroup();
+  events.forEach(function(a){
+    if(a.lat==null)return;
+    var color=a.tier==="confirmed"?"#FF5C5C":"#F0913B";
+    L.circleMarker([a.lat,a.lng],{radius:9,color:color,weight:2,fillColor:color,fillOpacity:.35})
+      .addTo(group).bindPopup("<b>"+(a.tier==="confirmed"?"confirmed 落水告警":"suspect 疑似")+
+      "</b><br/>"+a.lat.toFixed(6)+", "+a.lng.toFixed(6)+"<br/>方位 "+a.bearing_deg+"° · 距 "+
+      a.est_range_m+"m · 置信 "+a.confidence);
+  });
+  alertLayer=group.addTo(map);
+}
+var seenAlerts=[];
+es.addEventListener("hello",function(ev){
+  var d=JSON.parse(ev.data);
+  setStatus(d.running?"运行中":"空闲",d.running?"running":"");
+});
+es.addEventListener("status",function(ev){
+  var d=JSON.parse(ev.data);
+  if(d.running){setStatus("运行中 · "+d.task,"running");runBtn.disabled=true;}
+  else{setStatus("就绪（上次任务已结束）","done");runBtn.disabled=false;}
+});
+es.addEventListener("log",function(ev){
+  var e=JSON.parse(ev.data);
+  var k=e.kind;
+  if(k==="session_start"){card("task","<span class='zh'>任务启动</span> · go2w_brain v"+(e.version||"?")+"（真实执行，运动指令强制干跑）","", "task");return;}
+  if(k==="task"){card("task","<span class='zh'>"+esc(e.content)+"</span>");return;}
+  if(k==="session_end")return;
+  if(k==="snapshot"){
+    var d=e.data||{},g=d.gps||{};
+    card(k,"GPS "+(g.available?"fix "+g.sats+" 星":"无")+" · 电量 "+(d.battery_soc??"?")+"% · 守卫 "+
+      ((d.guard||{}).armed?"在岗":"未布防"));
+    return;
+  }
+  if(k==="llm_call"){
+    if(e.kind_note==="system_prompt"){card(k,"组装系统提示词（身份→安全铁律→工具指引→技能目录）",[{cls:"info",text:"提示词"}]);return;}
+    var calls=(e.tool_calls||[]).map(function(c){return ZH[c]||c;});
+    var html="模型决策"+(calls.length?" → 计划调用：<span class='zh'>"+calls.map(esc).join("、")+"</span>":"");
+    if(e.reasoning)html+="<div class='dim'>推理："+esc(e.reasoning.slice(0,200))+"</div>";
+    card(k,html,[{cls:"info",text:"推理"}]);return;
+  }
+  if(k==="tool_call"){
+    counts.tools++;
+    var denied=!e.ok;
+    if(denied)counts.denied++;
+    card(k,"<span class='zh'>"+(ZH[e.name]||e.name)+"</span> ("+esc(e.name)+")",
+      [{cls:denied?"denied":"ok",text:denied?("拦截: "+esc(e.reason||"")):"放行"}],
+      denied?"denied":"");
+    return;
+  }
+  if(k==="tool_result"){
+    var r=e.result||{};
+    var isDenied=!!(r.dispatch_denied||(r.ok===false&&r.reason));
+    if(isDenied)counts.denied++;
+    card(k,(ZH[e.name]||e.name)+" → "+resultHtml(e.name,r),
+      isDenied?[{cls:"denied",text:"拒绝/拦截"}]:[],
+      isDenied?"denied":"");
+    if(e.name==="scan_water"&&r.new_events){
+      seenAlerts=seenAlerts.concat(r.new_events);counts.alerts=seenAlerts.length;
+      drawAlerts(seenAlerts);
+    }
+    return;
+  }
+  if(k==="event"){
+    var zh={plan_result:"规划完成",water_guard_armed:"守卫布防",water_guard_disarmed:"守卫解除",
+    mission_lock_acquired:"任务锁获取",mission_lock_released:"任务锁释放",
+    follow_route_dry:"航线受理（干跑，未下发）",scan_water:"湖面扫描",patrol_report:"报告生成",
+    vantage_selected:"安全接近点选定",waypoint_in_keepout_rejected:"禁区航点拦截",
+    water_guard_disarmed:"守卫解除",speak:"语音播报(桩)"}[e.event]||e.event;
+    var extra="";
+    if(e.event==="plan_result")extra=" · "+e.waypoint_count+" 航点 / "+Math.round((e.length_m||0)/100)/10+"km";
+    var isDenied=e.event==="waypoint_in_keepout_rejected";
+    if(isDenied)counts.denied++;
+    card(k,zh+extra,[{cls:isDenied?"denied":"warn",text:isDenied?"安全拦截":"事件"}],isDenied?"denied":"");
+    return;
+  }
+  if(k==="reply"){card(k,e.content,[{cls:"ok",text:"任务完成"}]);return;}
+  card(k,esc(brief(e,160)));
+});
+es.addEventListener("plan",function(ev){drawPlan(JSON.parse(ev.data));});
+es.addEventListener("done",function(ev){
+  var d=JSON.parse(ev.data);
+  runBtn.disabled=false;
+  setStatus("完成 · 工具调用 "+counts.tools+" · 拦截 "+counts.denied+" · 告警 "+counts.alerts,"done");
+});
+es.addEventListener("error",function(ev){
+  var d=JSON.parse(ev.data);
+  card("tool_call","<b style='color:var(--veto)'>任务异常:</b> "+esc(d.reason),"","denied");
+  runBtn.disabled=false;setStatus("异常",null);
+});
+runBtn.addEventListener("click",function(){
+  if(!document.getElementById("task").value.trim())return;
+  flow.innerHTML="";
+  seenAlerts=[];counts={tools:0,denied:0,alerts:0};
+  if(routeLayer)map.removeLayer(routeLayer);if(alertLayer)map.removeLayer(alertLayer);
+  setStatus("启动中…","running");runBtn.disabled=true;
+  fetch("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({task:document.getElementById("task").value.trim()})})
+    .then(function(r){return r.json();})
+    .then(function(j){if(!j.ok){alert("无法启动: "+j.reason);runBtn.disabled=false;setStatus("空闲",null);}});
+});
+document.getElementById("clear").addEventListener("click",function(){flow.innerHTML="";});
+document.querySelectorAll(".preset").forEach(function(b){
+  b.addEventListener("click",function(){document.getElementById("task").value=b.dataset.t;});
+});
+</script></body></html>
