@@ -52,13 +52,25 @@ def build_session(config: BrainConfig, log: SessionLog):
     import os
     from .tts import build_backend
     tts = build_backend(os.environ.get("GO2W_TTS", "console"))
+    # M7.3: VLM 客户端 (卫星图语义锚定, 无 key 时自动落到规则锚定)
+    from .vlm import DEFAULT_VLM_MODEL, VLMClient
+    vlm = VLMClient(config.llm_api_key,
+                    model=os.environ.get("GO2W_VLM_MODEL",
+                                         DEFAULT_VLM_MODEL))
     from .brain_loop import BrainSession
     return BrainSession(config, platform, registry, gate, skills, llm, log,
                         guard=guard, detector=detector,
-                        frame_source=frame_source, memory=memory, tts=tts)
+                        frame_source=frame_source, memory=memory, tts=tts,
+                        vlm=vlm)
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows GBK 控制台下 ✅ 等 emoji 会 UnicodeEncodeError → 统一 utf-8
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
     parser = argparse.ArgumentParser(description="go2w_brain 任务大脑 (M1)")
     parser.add_argument("--task", required=True, help="任务文本")
     parser.add_argument("--platform", choices=("mock", "nx"),

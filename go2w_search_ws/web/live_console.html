@@ -104,8 +104,8 @@ approach_vantage:"选安全接近点",patrol_report:"生成任务报告"};
 var KIND={session_start:"会话开始",task:"任务",llm_call:"大脑推理",tool_call:"工具调用",
 tool_result:"工具结果",event:"事件",snapshot:"遥测快照",reply:"最终答复",session_end:"会话结束"};
 var map=L.map("map");
-L.tileLayer("/tiles/{z}/{x}/{y}.png",
-  {maxZoom:19,attribution:"本地缓存 OSM 底图"}).addTo(map)
+L.tileLayer("/tiles/esri/{z}/{x}/{y}.png",
+  {maxZoom:19,attribution:"Esri 卫星影像"}).addTo(map)
   .on("tileerror",function(){document.getElementById("maperr").style.display="block";});
 map.setView([31.488192,120.369486],16);
 var routeLayer=null,alertLayer=null,scanLayer=null;
@@ -279,9 +279,18 @@ es.addEventListener("log",function(ev){
     mission_lock_acquired:"任务锁获取",mission_lock_released:"任务锁释放",
     follow_route_dry:"航线受理（干跑，未下发）",scan_water:"湖面扫描",patrol_report:"报告生成",
     vantage_selected:"安全接近点选定",waypoint_in_keepout_rejected:"禁区航点拦截",
+    semantic_anchor:"语义锚定",anchor_replan:"锚定纠正重规划",
+    geometry_reused:"几何记忆复用",geometry_persisted:"几何记忆写入",
     water_guard_disarmed:"守卫解除",speak:"语音播报(桩)"}[e.event]||e.event;
     var extra="";
     if(e.event==="plan_result")extra=" · "+e.waypoint_count+" 航点 / "+Math.round((e.length_m||0)/100)/10+"km";
+    if(e.event==="semantic_anchor"){
+      var t=e.target||{};
+      extra=" · 来源:"+(e.source==="vlm"?"VLM":"规则")
+        +(t.idx!=null?" · 湖=候选#"+t.idx:"")
+        +(t.name?" "+t.name:"")
+        +(e.ambiguity&&e.ambiguity.length?" · 歧义["+e.ambiguity.join(",")+"]":"");
+    }
     var isDenied=e.event==="waypoint_in_keepout_rejected";
     if(isDenied)counts.denied++;
     card(k,zh+extra,[{cls:isDenied?"denied":"warn",text:isDenied?"安全拦截":"事件"}],isDenied?"denied":"");

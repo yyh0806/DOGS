@@ -37,6 +37,15 @@ PORT = 8088
 _PLAN_TOOLS = ("plan_lake_loop", "plan_campus_loop")
 
 
+def _tile_content_type(data: bytes) -> str:
+    """按魔数识别瓦片格式 (esri 卫星影像实为 JPEG, osm 为 PNG)。"""
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    return "application/octet-stream"
+
+
 class Hub:
     """SSE 广播中枢: 每客户端一个队列, 断连自动清理。"""
 
@@ -190,25 +199,27 @@ class Handler(BaseHTTPRequestHandler):
         self._respond(200, content_type, file_path.read_bytes())
 
     def _serve_tile(self, path):
-        parts = path.strip("/").split("/")  # tiles/z/x/y.png
-        if len(parts) != 4:
+        # /tiles/{provider}/{z}/{x}/{y}.png  (provider: esri|osm|carto|amap)
+        parts = path.strip("/").split("/")
+        if len(parts) != 5:
             self._respond(404, "text/plain; charset=utf-8", "not found")
             return
+        provider, z_s, x_s, y_s = parts[1], parts[2], parts[3], parts[4]
         try:
-            z, x, y = (int(parts[1]), int(parts[2]),
-                       int(parts[3].split(".")[0]))
+            z, x, y = (int(z_s), int(x_s), int(y_s.split(".")[0]))
         except ValueError:
             self._respond(404, "text/plain; charset=utf-8", "not found")
             return
         sys.path.insert(0, str(WEB_DIR))
         from lake_plan import tiles as tile_lib
-        cache = tile_lib.tile_cache_path("osm", z, x, y)
+        cache = tile_lib.tile_cache_path(provider, z, x, y)
         if cache.exists() and cache.stat().st_size > 100:
-            self._respond(200, "image/png", cache.read_bytes())
+            data = cache.read_bytes()
+            self._respond(200, _tile_content_type(data), data)
             return
         try:
-            data = tile_lib.fetch_tile("osm", z, x, y)
-            self._respond(200, "image/png", data)
+            data = tile_lib.fetch_tile(provider, z, x, y)
+            self._respond(200, _tile_content_type(data), data)
         except tile_lib.TileError:
             self._respond(404, "text/plain; charset=utf-8", "tile missing")
 

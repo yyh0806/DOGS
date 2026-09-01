@@ -36,7 +36,7 @@ class BrainSession:
                  skills: SkillCatalog, llm: LLMClient, log: SessionLog,
                  guard: Any = None, detector: Any = None,
                  frame_source: Any = None, memory: Any = None,
-                 tts: Any = None):
+                 tts: Any = None, vlm: Any = None):
         self._config = config
         self._platform = platform
         self._registry = registry
@@ -49,6 +49,7 @@ class BrainSession:
         self._frame_source = frame_source  # M4: 帧源 callable → (frame, robot)
         self._memory = memory  # M7: 语义记忆库 (MemoryStore)
         self._tts = tts  # M7.2: 语音播报后端 (go2w_brain.tts)
+        self._vlm = vlm  # M7.3: 语义锚定 VLM 客户端 (go2w_brain.vlm.VLMClient)
         self._events: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._wake = threading.Event()
         self._mission_lock: Any = None
@@ -102,6 +103,7 @@ class BrainSession:
 
     def _run_locked(self, task: str) -> dict[str, Any]:
 
+        self._task_text = task  # M7.3: 工具 ctx 可读取原始任务文本 (语义锚定用)
         system = prompt_assembler.assemble(
             self._registry.schemas(),
             self._skills.catalog_text(),
@@ -418,6 +420,8 @@ class BrainSession:
                "frame_source": self._frame_source,
                "memory": self._memory,
                "tts": self._tts,
+               "vlm": self._vlm,
+               "task": getattr(self, "_task_text", ""),
                "skills": self._skills,
                "approval_token": self._config.approval_token}
         ok, reason, tool = self._gate.check(name, args, ctx)

@@ -44,6 +44,15 @@ PROVIDERS = {
         "water_rgb": (166, 208, 238),
         "attribution": "(c) 高德地图",
     },
+    # M7.3: 卫星影像 (Esri World Imagery, WGS-84/3857 无坐标偏移)。
+    # 用途: 底图展示 + 多模态语义锚定/分割 (真实纹理, 供 VLM/locate-anything)。
+    # 注意: 卫星图上水色随天候变化, 不适用 HSV 色彩分割 (那仍是 osm 的职责)。
+    "esri": {
+        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        "crs": "wgs84",
+        "water_rgb": None,
+        "attribution": "Esri, Maxar, Earthstar Geographics",
+    },
 }
 DEFAULT_PROVIDER = "osm"
 

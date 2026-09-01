@@ -131,8 +131,8 @@ font-family:ui-monospace,Consolas,monospace;border-radius:2px}
 <script>
 var DATA = @@DATA@@;
 var map = L.map("map");
-L.tileLayer("/tiles/{z}/{x}/{y}.png",
-  {maxZoom: 19, attribution: "本地缓存 OSM 底图"}
+L.tileLayer("/tiles/esri/{z}/{x}/{y}.png",
+  {maxZoom: 19, attribution: "Esri 卫星影像"}
 ).addTo(map);
 var bounds = [];
 function latlng(p){ return [p[0], p[1]]; }
@@ -287,11 +287,21 @@ def build_steps(entries):
                   "follow_route_dry": "航线受理 (干跑, 未下发)",
                   "scan_water": "湖面扫描", "patrol_report": "报告生成",
                   "vantage_selected": "安全接近点选定",
+                  "semantic_anchor": "语义锚定",
+                  "anchor_replan": "锚定纠正重规划",
+                  "geometry_reused": "几何记忆复用",
+                  "geometry_persisted": "几何记忆写入",
                   "waypoint_in_keepout_rejected": "禁区航点拦截"}.get(event, event)
             step["html"] = zh
             if event == "plan_result":
                 step["html"] += (f" · {entry.get('waypoint_count', '?')} 航点 / "
                                  f"{round((entry.get('length_m') or 0) / 1000, 2)}km")
+            if event == "semantic_anchor":
+                target = entry.get("target") or {}
+                step["html"] += (f" · 来源:{'VLM' if entry.get('source') == 'vlm' else '规则'}"
+                                 + (f" · 湖=候选#{target.get('idx')}"
+                                    if target.get("idx") is not None else "")
+                                 + (f" {target.get('name')}" if target.get("name") else ""))
             if event == "waypoint_in_keepout_rejected":
                 step["denied"] = True
                 step["alert"] = True

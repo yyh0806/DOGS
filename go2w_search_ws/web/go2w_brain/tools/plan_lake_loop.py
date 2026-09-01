@@ -33,6 +33,35 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
         result = plan_route(float(lat), float(lng), offset_m=offset)
         result.setdefault("center", [lat, lng])
         if result.get("ok"):
+            # M7.3 语义锚定: 本体在哪 / 湖是哪个 (VLM 确认, 失败退化规则);
+            # VLM 认定任务所指是另一候选水体 → 以其质心重规划 (至多一次)。
+            task_text = str(args.get("_task") or ctx.get("task") or "")
+            anchor = _anchor_plan(result, float(lat), float(lng),
+                                  task_text, ctx)
+            if (anchor.get("source") == "vlm"
+                    and (anchor.get("target") or {}).get("idx", 0) != 0):
+                prefer = (anchor.get("target") or {}).get("centroid")
+                if prefer and len(prefer) == 2:
+                    ctx["log"].append("event", event="anchor_replan",
+                                      prefer=[float(prefer[0]),
+                                              float(prefer[1])])
+                    corrected = plan_route(float(lat), float(lng),
+                                           offset_m=offset,
+                                           prefer=(float(prefer[0]),
+                                                   float(prefer[1])))
+                    if corrected.get("ok"):
+                        corrected.setdefault("center", [lat, lng])
+                        result = corrected
+                        anchor = _anchor_plan(result, float(lat),
+                                              float(lng), task_text, ctx)
+            result["anchor"] = anchor
+            ctx["log"].append("event", event="semantic_anchor",
+                              source=anchor["source"],
+                              target=anchor["target"],
+                              ambiguity=anchor.get("ambiguity"),
+                              resolved_to_plan=(
+                                  (anchor.get("target") or {})
+                                  .get("idx", 0) == 0))
             mem_id = persist_plan(ctx.get("memory"), result)
             if mem_id:
                 ctx["log"].append("event", event="geometry_persisted",
@@ -55,6 +84,7 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     from ..patrol_math import endurance_check
     battery = ctx["platform"].snapshot().get("battery_soc")
     endurance = endurance_check(result["stats"]["length_m"], battery)
+    anchor = result.get("anchor") or {}
     return {
         "ok": True,
         "waypoint_count": len(result["waypoints"]),
@@ -63,12 +93,29 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
         "closed": result["stats"]["closed"],
         "water_cross_ratio": result["stats"]["water_cross_ratio"],
         "target": result["target"],
+        "anchor": {"source": anchor.get("source"),
+                   "self": anchor.get("self"),
+                   "target": anchor.get("target"),
+                   "ambiguity": anchor.get("ambiguity") or []},
         "endurance": endurance,
         "first_waypoints": result["waypoints"][:3],
         "usage": "调用 follow_route 并传 from_plan=true 即可受理这条航线"
                  + ("; 电量不足, 建议分段" if endurance.get("verdict")
             in ("SEGMENT", "REFUSE") else ""),
     }
+
+
+def _anchor_plan(result, lat, lng, task, ctx):
+    """M7.3: 语义锚定 (VLM 确认本体与目标水体; 不可用→规则退化)。"""
+    from lake_plan import semantic_anchor
+    vlm = ctx.get("vlm")
+    center = (float(lat), float(lng))
+    candidates = [{"centroid": result["target"]["centroid"],
+                   "dist_km": 0.0}]
+    candidates += result.get("nearby_candidates") or []
+    return semantic_anchor.anchor_semantics(
+        vlm, task or "绕湖巡查", {"lat": center[0], "lng": center[1]},
+        candidates, center)
 
 
 TOOL = ToolRegistration(

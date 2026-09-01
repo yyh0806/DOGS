@@ -138,7 +138,8 @@ def test_plan_then_follow_from_plan_reference(mock_platform, tmp_path):
     assert plan["ok"] and plan["waypoint_count"] >= 8
     assert "waypoints" not in plan  # LLM 只见摘要, 不见全量数组
     assert "last_route" in plan_store
-    assert log.stats().get("event") == 1  # plan_result 事件已落轨迹
+    assert log.stats().get("event") == 2  # semantic_anchor + plan_result 事件已落轨迹
+    assert plan["anchor"]["source"] == "rule"  # M7.3: 离线 → 规则锚定
     follow = TOOLS["follow_route"].execute({"from_plan": True}, ctx)
     assert follow["ok"] and follow["waypoint_total"] == plan["waypoint_count"]
     assert mock_platform.calls[-1][0] == "submit_gps_route"
