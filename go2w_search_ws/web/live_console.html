@@ -83,8 +83,9 @@ margin:4px 6px 0 0;font-family:ui-monospace,Consolas,monospace}
       <div class="legend">
         <span style="color:var(--accent)"><i style="background:var(--accent)"></i>环线 / 扫描点</span>
         <span style="color:var(--water)"><i style="background:var(--water)"></i>水域 / 园区禁区</span>
-        <span style="color:var(--veto)"><i style="background:var(--veto)"></i>confirmed 告警</span>
-        <span style="color:var(--ok)"><i style="background:var(--ok)"></i>起点</span>
+        <span style="color:var(--veto)"><i style="background:var(--veto)"></i>confirmed 告警 / hazard</span>
+        <span style="color:var(--ok)"><i style="background:var(--ok)"></i>起点 / vantage</span>
+        <span style="color:var(--info)"><i style="background:var(--info)"></i>geometry 记忆环</span>
       </div>
     </div>
     <div class="flow" id="flow">
@@ -191,6 +192,36 @@ function drawAlerts(events){
   alertLayer=group.addTo(map);
 }
 var seenAlerts=[];
+var memoryLayer=null;
+function drawMemory(entries){
+  if(memoryLayer)map.removeLayer(memoryLayer);
+  var group=L.layerGroup();
+  var palette={hazard:"#FF5C5C",blocked:"#B07BE0",vantage:"#3EDC97",
+    fp_zone:"#E0C341",detection:"#F0913B",geometry:"#5C8DFF",passable:"#4DA3FF"};
+  entries.forEach(function(e){
+    if(e.kind==="geometry"&&e.geo&&e.geo.points){
+      L.polyline(e.geo.points.map(function(p){return [p[0],p[1]];}),
+        {color:"#5C8DFF",weight:2,dashArray:"4 5",opacity:.5}).addTo(group);
+      return;
+    }
+    var pt=e.geo&&e.geo.points
+      ?[(e.geo.points[0][0]+e.geo.points[Math.floor(e.geo.points.length/2)][0])/2,
+        (e.geo.points[0][1]+e.geo.points[Math.floor(e.geo.points.length/2)][1])/2]
+      :[e.geo.lat,e.geo.lng];
+    L.circleMarker(pt,{radius:e.kind==="hazard"?10:6,
+      color:palette[e.kind]||"#8294AC",weight:2,
+      fillColor:palette[e.kind]||"#8294AC",fillOpacity:.3}).addTo(group)
+      .bindPopup("<b>"+e.kind+"</b> ("+e.id+")<br/>conf "+e.confidence+
+        " · "+new Date(e.ts*1000).toLocaleString());
+  });
+  memoryLayer=group.addTo(map);
+}
+function refreshMemory(){
+  fetch("/api/memory").then(function(r){return r.json();}).then(function(j){
+    if(j.ok&&j.entries.length)drawMemory(j.entries);
+  });
+}
+refreshMemory();
 es.addEventListener("hello",function(ev){
   var d=JSON.parse(ev.data);
   setStatus(d.running?"运行中":"空闲",d.running?"running":"");
@@ -261,6 +292,7 @@ es.addEventListener("plan",function(ev){drawPlan(JSON.parse(ev.data));});
 es.addEventListener("done",function(ev){
   var d=JSON.parse(ev.data);
   runBtn.disabled=false;
+  refreshMemory();  // 任务完成后刷新记忆叠加层 (M7.1)
   setStatus("完成 · 工具调用 "+counts.tools+" · 拦截 "+counts.denied+" · 告警 "+counts.alerts,"done");
 });
 es.addEventListener("error",function(ev){

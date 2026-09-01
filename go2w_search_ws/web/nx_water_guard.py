@@ -48,7 +48,9 @@ class WaterGuard:
         self._approval_token = approval_token.strip()
         self._monotonic = monotonic
         self._lock = threading.RLock()
-        self._ring: Optional[list[tuple[float, float]]] = None
+        # M7.1: 多环支持 —— 主禁区 (水域/园区) + 记忆危险带 (hazard)
+        # 全部参与裁决, 最小有符号距离取胜 (哪个环近就听哪个)。
+        self._rings: list[list[tuple[float, float]]] = []
         self._margin_m = 0.0
         self._armed = False
         self._violation_count = 0
@@ -61,13 +63,17 @@ class WaterGuard:
 
     def arm(self, ring: list[tuple[float, float]],
             margin_m: float = 0.0) -> dict[str, Any]:
-        """装载禁区环 (WGS-84 [(lat,lng)...], ≥4 点)。margin_m 额外内收。"""
+        """追加一个禁区环 (WGS-84 [(lat,lng)...], ≥4 点)。
+
+        M7.1 起 arm 是追加语义: 主禁区与记忆危险带逐环叠加, 任一环
+        命中即 veto; disarm(审批) 一次性清空全部。
+        """
         normalized = _normalize_ring(ring)
         if normalized is None:
             return {"ok": False, "reason": "invalid_ring"}
         margin = min(max(float(margin_m), 0.0), 100.0)
         with self._lock:
-            self._ring = normalized
+            self._rings.append(normalized)
             self._margin_m = margin
             self._armed = True
             self._armed_at = self._monotonic()
@@ -75,11 +81,12 @@ class WaterGuard:
             self._last_verdict = None
             self._last_min_dist = None
         return {"ok": True, "vertices": len(normalized),
+                "rings": len(self._rings),
                 "margin_m": margin, "veto_m": self._veto_m,
                 "limit_m": self._limit_m}
 
     def disarm(self, approval_token: str) -> dict[str, Any]:
-        """解除布防。审批令牌不匹配 → 拒绝 (单一真相源在此)。"""
+        """解除布防 (清空全部环)。审批令牌不匹配 → 拒绝 (单一真相源在此)。"""
         with self._lock:
             if not self._armed:
                 return {"ok": True, "note": "not_armed"}
@@ -89,7 +96,7 @@ class WaterGuard:
             if token != self._approval_token:
                 return {"ok": False, "reason": "approval_token_mismatch"}
             self._armed = False
-            self._ring = None
+            self._rings = []
             return {"ok": True}
 
     # ---------- 裁决 ---------------------------------------------------------
@@ -99,7 +106,7 @@ class WaterGuard:
         """对当前位置给出裁决。fail-closed: 位姿超龄 → veto(stale)。"""
         with self._lock:
             self._last_eval_ts = self._monotonic()
-            if not self._armed or self._ring is None:
+            if not self._armed or not self._rings:
                 return {"verdict": "not_armed", "min_dist_m": None,
                         "speed_cap": None, "reason": "guard_not_armed"}
             if fix_age_s is not None and fix_age_s > _HEARTBEAT_STALE_S:
@@ -107,7 +114,8 @@ class WaterGuard:
                 self._last_verdict = "veto"
                 return {"verdict": "veto", "min_dist_m": None,
                         "speed_cap": 0.0, "reason": "fix_stale"}
-            min_dist = _distance_to_ring_m(lat, lng, self._ring)
+            min_dist = min(_distance_to_ring_m(lat, lng, ring)
+                           for ring in self._rings)
             effective = min_dist - self._margin_m
             if effective < self._veto_m:  # 含禁区内 (有符号距离为负)
                 verdict, cap = "veto", 0.0
@@ -125,9 +133,11 @@ class WaterGuard:
 
     def state(self) -> dict[str, Any]:
         with self._lock:
+            primary = self._rings[0] if self._rings else None
             return {
                 "armed": self._armed,
-                "vertices": len(self._ring) if self._ring else 0,
+                "rings": len(self._rings),
+                "vertices": len(primary) if primary else 0,
                 "margin_m": self._margin_m,
                 "veto_m": self._veto_m,
                 "limit_m": self._limit_m,
@@ -142,16 +152,17 @@ class WaterGuard:
             }
 
     def ring_copy(self) -> Optional[list[tuple[float, float]]]:
-        """已装载禁区环的只读副本 (未布防返回 None)。"""
+        """主环 (第一个装载) 的只读副本 (未布防返回 None)。"""
         with self._lock:
-            return list(self._ring) if self._ring is not None else None
+            return list(self._rings[0]) if self._rings else None
 
     def distance_m(self, lat: float, lng: float) -> Optional[float]:
-        """有符号距离 (环内为负)。未布防返回 None。工具层校验用。"""
+        """到全部环的最小有符号距离 (环内为负)。未布防返回 None。"""
         with self._lock:
-            if self._ring is None:
+            if not self._rings:
                 return None
-            return _distance_to_ring_m(float(lat), float(lng), self._ring)
+            return min(_distance_to_ring_m(float(lat), float(lng), ring)
+                       for ring in self._rings)
 
 
 def new_approval_token() -> str:

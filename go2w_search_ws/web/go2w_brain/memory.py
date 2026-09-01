@@ -23,9 +23,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 ENTRY_KINDS = ("passable", "blocked", "vantage", "hazard", "fp_zone",
-               "detection")
+               "detection", "geometry")
 HALFLIFE_DAYS = {"passable": 14.0, "blocked": 3.0, "vantage": 14.0,
-                 "hazard": 7.0, "fp_zone": 3.0, "detection": 7.0}
+                 "hazard": 7.0, "fp_zone": 3.0, "detection": 7.0,
+                 "geometry": 30.0}  # L1 几何层: 长半衰期, 新规划覆盖旧
 _CELL_DEG = 0.001  # ≈110m
 _CONFLICT_RADIUS_M = 60.0
 _SOURCE_HIERARCHY = {"osd": 0, "osm": 0, "observation": 1, "task": 1}
@@ -202,3 +203,15 @@ def _cells_in_radius(lat, lng, radius_m):
 
 def _source_rank(source):
     return _SOURCE_HIERARCHY.get(str(source), 1)
+
+
+def circle_ring(lat: float, lng: float, radius_m: float,
+                n: int = 12) -> list[list[float]]:
+    """点 → 圆形禁区环 (正 n 边形, 供守卫/hazard 布防用)。"""
+    dlat = radius_m / 110540.0
+    dlng = radius_m / (111320.0 * math.cos(math.radians(lat)))
+    ring = []
+    for i in range(n):
+        ang = 2 * math.pi * i / n
+        ring.append([lat + dlat * math.cos(ang), lng + dlng * math.sin(ang)])
+    return ring

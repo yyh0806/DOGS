@@ -25,6 +25,33 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     ctx["log"].append("event", event="water_guard_armed",
                       vertices=result["vertices"],
                       margin_m=result["margin_m"])
+    # M7.1 安全层消费记忆: hazard 经验确定性地自动进守卫 (不经 LLM
+    # 权衡) —— "记忆先让狗更安全"。取规划区域附近的 hazard 条目,
+    # 每个以 15m 圆形禁区环叠加布防。
+    hazard_count = 0
+    memory = ctx.get("memory")
+    if memory is not None and args.get("from_plan"):
+        last = (ctx.get("plan_store") or {}).get("last_route") or {}
+        centroid = (last.get("target") or {}).get("centroid")
+        if centroid:
+            radius = max(400.0, (last.get("stats") or {})
+                         .get("length_m", 400.0) / 2.0)
+            radius = min(radius, 5000.0)
+            hazards = memory.query(centroid[0], centroid[1], radius,
+                                   kinds=("hazard",), min_score=0.3)
+            from ..memory import circle_ring
+            for hazard in hazards:
+                geo = hazard["geo"]
+                if "points" in geo:
+                    guard.arm([tuple(p) for p in geo["points"]],
+                              margin_m=margin)
+                else:
+                    guard.arm(circle_ring(geo["lat"], geo["lng"], 15.0),
+                              margin_m=margin)
+                hazard_count += 1
+                ctx["log"].append("event", event="hazard_auto_armed",
+                                  memory_id=hazard["id"],
+                                  dist_m=hazard["dist_m"])
     # 生产链路: 同步布防到 NX 侧守卫节点 (干跑时仅本会话生效,
     # 由返回字段标明 —— 本地守卫仍然拦截规划期违规)
     sync = None
@@ -38,6 +65,7 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
             sync = {"ok": False, "reason": f"sync_failed:{type(exc).__name__}"}
     state = guard.state()
     return {"ok": True, "vertices": result["vertices"],
+            "rings": state["rings"], "hazards_armed": hazard_count,
             "margin_m": result["margin_m"], "nx_sync": sync,
             "veto_m": state["veto_m"], "limit_m": state["limit_m"]}
 

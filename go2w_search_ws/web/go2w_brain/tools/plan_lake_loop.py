@@ -17,13 +17,26 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
         lat, lng = gps["lat"], gps["lng"]
     offset = args.get("offset_m", 15.0)
     offset = min(max(float(offset), 5.0), 500.0)
-    try:
-        from lake_plan import plan_route  # 姗姗导入: numpy/PIL 只在此需要
-    except ImportError as exc:
-        return {"ok": False, "reason": "lake_plan_import_failed",
-                "detail": str(exc)}
-    result = plan_route(float(lat), float(lng), offset_m=offset)
-    result.setdefault("center", [lat, lng])
+    # M7.1 L1 几何层: 先查记忆复用, 命中即免瓦片 (二次任务零网络)
+    from ..plan_memory import persist_plan, try_reuse
+    reused = try_reuse(ctx.get("memory"), "water", float(lat), float(lng))
+    if reused is not None:
+        result = reused
+        ctx["log"].append("event", event="geometry_reused",
+                          memory_id=result["memory_id"])
+    else:
+        try:
+            from lake_plan import plan_route  # 姗姗导入: numpy/PIL 只在此需要
+        except ImportError as exc:
+            return {"ok": False, "reason": "lake_plan_import_failed",
+                    "detail": str(exc)}
+        result = plan_route(float(lat), float(lng), offset_m=offset)
+        result.setdefault("center", [lat, lng])
+        if result.get("ok"):
+            mem_id = persist_plan(ctx.get("memory"), result)
+            if mem_id:
+                ctx["log"].append("event", event="geometry_persisted",
+                                  memory_id=mem_id)
     if not result.get("ok"):
         return result
     # 引用传递 (上下文经济): 全量结果入 plan_store, LLM 只看摘要;
