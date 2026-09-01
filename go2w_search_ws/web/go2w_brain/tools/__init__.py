@@ -30,6 +30,7 @@ from .load_skill import TOOL as LOAD_SKILL
 from .patrol_report import TOOL as PATROL_REPORT
 from .plan_campus_loop import TOOL as PLAN_CAMPUS_LOOP
 from .plan_lake_loop import TOOL as PLAN_LAKE_LOOP
+from .push_alert import TOOL as PUSH_ALERT
 from .record_observation import TOOL as RECORD_OBSERVATION
 from .scan_water import TOOL as SCAN_WATER
 from .speak import TOOL as SPEAK
@@ -41,5 +42,5 @@ BUILTIN_TOOLS: list[ToolRegistration] = [
     ARM_WATER_GUARD, DISARM_WATER_GUARD, GET_GUARD_STATE,
     LOAD_SKILL, SCAN_WATER, GET_DETECTION_EVENTS,
     APPROACH_VANTAGE, PATROL_REPORT,
-    GET_MEMORY, RECORD_OBSERVATION,
+    GET_MEMORY, RECORD_OBSERVATION, PUSH_ALERT,
 ]

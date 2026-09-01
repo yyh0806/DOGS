@@ -35,7 +35,8 @@ class BrainSession:
                  registry: ToolRegistry, gate: DispatchGate,
                  skills: SkillCatalog, llm: LLMClient, log: SessionLog,
                  guard: Any = None, detector: Any = None,
-                 frame_source: Any = None, memory: Any = None):
+                 frame_source: Any = None, memory: Any = None,
+                 tts: Any = None):
         self._config = config
         self._platform = platform
         self._registry = registry
@@ -47,6 +48,7 @@ class BrainSession:
         self._detector = detector  # M4: 落水检测引擎 (nx_drowning_detect)
         self._frame_source = frame_source  # M4: 帧源 callable → (frame, robot)
         self._memory = memory  # M7: 语义记忆库 (MemoryStore)
+        self._tts = tts  # M7.2: 语音播报后端 (go2w_brain.tts)
         self._events: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._wake = threading.Event()
         self._mission_lock: Any = None
@@ -125,10 +127,11 @@ class BrainSession:
         while steps < max_steps:
             events = self._drain_events()
             for event in events:
-                self._log.append("event", **event)
+                self._log_event(event)
                 history.append({"role": "user", "content":
                                 "[event] " + json.dumps(
                                     event, ensure_ascii=False, default=str)})
+            self._apply_observation_events(events)  # M7.2: 观测→记忆自动回写
             snapshot = self._platform.snapshot()
             self._log.append("snapshot", data=snapshot)
             history.append({"role": "user", "content":
@@ -303,6 +306,11 @@ class BrainSession:
                 break
             step.status = "ok"
             results[step.id] = result
+            # M7.2: 步骤间隙处理执行期观测事件 (可走/堵等 → 记忆回写)
+            step_events = self._drain_events()
+            for event in step_events:
+                self._log_event(event)
+            self._apply_observation_events(step_events)
         else:
             plan.state = "done"
         if any(s.status == "failed" for s in plan.steps):
@@ -330,6 +338,41 @@ class BrainSession:
                 "steps": len(plan.steps), "llm_used": self._llm.available(),
                 "_session_end": {"steps": len(plan.steps),
                                  "llm_used": self._llm.available()}}
+
+    def _log_event(self, event: dict[str, Any]) -> None:
+        """事件落轨迹。观测事件自带 kind 字段, 折叠为 event_kind 防冲突。"""
+        payload = dict(event)
+        if "kind" in payload:
+            payload["event_kind"] = payload.pop("kind")
+        self._log.append("event", **payload)
+
+    def _apply_observation_events(self, events: list[dict[str, Any]]) -> None:
+        """M7.2: 执行期观测事件 → 记忆自动回写 (确定性, 不经 LLM)。
+
+        事件契约: {"kind": "observation", "mem_kind": "blocked"|"passable"|...,
+                   "geo": {"lat","lng"} | {"points":[...]},
+                   "confidence": 0.0-1.0, "data": {...}}
+        来源 (真机/未来): 运动链堵点回调、导航恢复事件、操作员标注。
+        """
+        if self._memory is None:
+            return
+        for event in events:
+            if event.get("kind") != "observation":
+                continue
+            mem_kind = event.get("mem_kind")
+            geo = event.get("geo")
+            if not mem_kind or not isinstance(geo, dict):
+                continue
+            try:
+                entry = self._memory.record(
+                    mem_kind, geo, data=event.get("data") or {},
+                    confidence=float(event.get("confidence", 0.7)),
+                    source="observation")
+                self._log.append("event", event="observation_recorded",
+                                 memory_id=entry["id"],
+                                 mem_kind=mem_kind)
+            except ValueError:
+                pass
 
     def _replan(self, history, failed_step, failure_result):
         """步骤失败 → LLM 修订计划 (一次机会)。任何环节失败返回 None。"""
@@ -374,6 +417,7 @@ class BrainSession:
                "detector": self._detector,
                "frame_source": self._frame_source,
                "memory": self._memory,
+               "tts": self._tts,
                "skills": self._skills,
                "approval_token": self._config.approval_token}
         ok, reason, tool = self._gate.check(name, args, ctx)

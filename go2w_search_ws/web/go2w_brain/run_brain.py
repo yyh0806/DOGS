@@ -48,10 +48,14 @@ def build_session(config: BrainConfig, log: SessionLog):
     # M7: 语义记忆库 (地图式经验层, 跨会话持久)
     from .memory import MemoryStore
     memory = MemoryStore(config.memory_dir / "memory.jsonl")
+    # M7.2: TTS 后端 (GO2W_TTS=console|edge)
+    import os
+    from .tts import build_backend
+    tts = build_backend(os.environ.get("GO2W_TTS", "console"))
     from .brain_loop import BrainSession
     return BrainSession(config, platform, registry, gate, skills, llm, log,
                         guard=guard, detector=detector,
-                        frame_source=frame_source, memory=memory)
+                        frame_source=frame_source, memory=memory, tts=tts)
 
 
 def main(argv: list[str] | None = None) -> int:
