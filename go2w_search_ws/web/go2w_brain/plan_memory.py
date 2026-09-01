@@ -44,6 +44,7 @@ def try_reuse(memory, kind: str, lat: float, lng: float,
         "scan_points": data.get("scan_points") or [],
         "target": data.get("target") or {},
         "stats": data.get("stats") or {},
+        "anchor": data.get("anchor") or {},
         "memory_id": entry["id"],
         "memory_reused": True,
     }
@@ -72,6 +73,7 @@ def persist_plan(memory, result: dict[str, Any]) -> Optional[str]:
             "stats": result.get("stats") or {},
             "polygon": (result.get("water_polygon")
                         or result.get("campus_polygon")),
+            "anchor": result.get("anchor") or {},
         },
         confidence=0.9, source="task")
     return entry["id"]

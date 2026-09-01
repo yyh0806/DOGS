@@ -43,8 +43,13 @@ def plan_route(lat: float, lng: float, provider: str = "osm",
                max_perim_km: float = DEFAULT_MAX_PERIM_KM,
                min_perim_km: float = DEFAULT_MIN_PERIM_KM,
                compact_min: float = config.COMPACT_MIN,
-               campus_radius_m: float = 1200.0) -> dict[str, Any]:
-    """以 (lat,lng) 为中心规划环线。任何失败返回 ok=False + reason。"""
+               campus_radius_m: float = 1200.0,
+               prefer: tuple[float, float] | None = None) -> dict[str, Any]:
+    """以 (lat,lng) 为中心规划环线。任何失败返回 ok=False + reason。
+
+    prefer: M7.3 语义锚定纠正 —— 语义层认定任务所指水体的质心
+    (lat, lng), 选湖改为"距该质心最近的合格水体"而非距本体的。
+    """
     if not (-90.0 <= float(lat) <= 90.0 and -180.0 <= float(lng) <= 180.0):
         return {"ok": False, "reason": "invalid_center"}
     if kind not in ("water", "campus"):
@@ -52,13 +57,13 @@ def plan_route(lat: float, lng: float, provider: str = "osm",
     if kind == "campus":
         return _plan_campus(lat, lng, offset_m, step_m, campus_radius_m)
     return _plan_water(lat, lng, provider, offset_m, step_m,
-                       max_perim_km, min_perim_km, compact_min)
+                       max_perim_km, min_perim_km, compact_min, prefer)
 
 
 # ---------- 绕湖 ------------------------------------------------------------
 
 def _plan_water(lat, lng, provider, offset_m, step_m,
-                max_perim_km, min_perim_km, compact_min):
+                max_perim_km, min_perim_km, compact_min, prefer=None):
     # ---------- 1. 粗扫感知 (先近后远) ----------
     usable: list[dict[str, Any]] = []
     georef_coarse = None
@@ -85,8 +90,13 @@ def _plan_water(lat, lng, provider, offset_m, step_m,
         return {"ok": False, "reason": "no_suitable_lake",
                 "candidates": _slim(last_candidates)}
 
-    # ---------- 2. 选湖 (规则: 距离最近) ----------
-    target = min(usable, key=lambda c: c["dist_km"])
+    # ---------- 2. 选湖 (规则: 距离最近; M7.3 prefer → 距语义锚点最近) ----
+    if prefer is not None:
+        target = min(usable, key=lambda c: haversine_m(
+            float(prefer[0]), float(prefer[1]),
+            c["centroid"][0], c["centroid"][1]))
+    else:
+        target = min(usable, key=lambda c: c["dist_km"])
 
     # ---------- 3. 高分辨率细化 (自 agent.node_refine, 去 LLM) ----------
     poly_px = target["_poly_px"]
@@ -130,6 +140,9 @@ def _plan_water(lat, lng, provider, offset_m, step_m,
         "area_km2": target["area_km2"], "perim_km": target["perim_km"],
         "dist_km": target["dist_km"]})
     out["stats"] = stats
+    # M7.3 语义锚定输入: 视野内其他合格水体 (供"哪个是湖"的歧义清单)
+    out["nearby_candidates"] = _slim(
+        [c for c in usable if c is not target])
     return out
 
 
