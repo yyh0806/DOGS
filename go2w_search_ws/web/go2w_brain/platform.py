@@ -118,6 +118,11 @@ class MockAdapter(PlatformAdapter):
         self._guard_ring = None
         return {"ok": True, "synced": True}
 
+    def post_alert(self, alert: dict):
+        """M7.2: 告警推送 (mock 记录; NX 经 WS 广播)。"""
+        self.calls.append(("post_alert", dict(alert)))
+        return {"ok": True, "broadcast": True}
+
 
 class NxHttpAdapter(PlatformAdapter):
     """NX 生产/仿真接入: GET 读状态 fail-soft; POST 运动指令带控制令牌。
@@ -194,6 +199,10 @@ class NxHttpAdapter(PlatformAdapter):
     def disarm_water_guard(self, approval_token: str):
         return self._post("/api/water_guard/disarm",
                           {"approval_token": str(approval_token)})
+
+    # M7.2: 告警推送 (nx_web_server WS 广播)
+    def post_alert(self, alert: dict):
+        return self._post("/api/alerts", dict(alert))
 
     def snapshot(self) -> dict[str, Any]:
         status = self._get("/api/status") or {}

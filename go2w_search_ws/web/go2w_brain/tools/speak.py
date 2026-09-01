@@ -1,4 +1,4 @@
-"""speak — 语音播报 (M1 桩: 落盘留痕, M5 接入 TTS/狗喇叭)。"""
+"""speak — 语音播报 (M7.2 起经 TTS 后端真实发声)。"""
 from __future__ import annotations
 
 from typing import Any
@@ -11,9 +11,13 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     if not text.strip():
         return {"ok": False, "reason": "empty_text"}
     ctx.get("log", _NoLog()).append("event", event="speak", text=text)
-    # M1: 无 TTS 后端, 诚实报告未发声; M5 在此接入真机播音。
-    return {"ok": True, "text": text, "spoken": False,
-            "note": "M1 stub: TTS/狗喇叭待 M5 接入"}
+    tts = ctx.get("tts")
+    if tts is None:
+        # 无后端 (单元测试直调): 保持诚实桩语义
+        return {"ok": True, "text": text, "spoken": False,
+                "note": "no_tts_backend"}
+    result = tts.speak(text)
+    return {"ok": result.get("ok", False), "text": text, **result}
 
 
 class _NoLog:
@@ -23,8 +27,9 @@ class _NoLog:
 
 TOOL = ToolRegistration(
     name="speak",
-    description=("语音播报一段文本。M1 为桩实现 (spoken=false), "
-                 "M5 起接入 TTS 与狗喇叭。"),
+    description=(
+        "语音播报一段文本 (经 TTS 后端发声: console/edge 由 GO2W_TTS 选择)。"
+        "任务关键节点 (开始/发现 confirmed 告警/完成) 用它向操作员播报。"),
     parameters={"type": "object",
                 "properties": {"text": {"type": "string"}},
                 "required": ["text"]},

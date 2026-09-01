@@ -2957,6 +2957,7 @@ def create_server(host, port, static_dir, mission_root=None):
                 "/api/gps/route", "/api/gps/route_cancel",
                 "/api/gps/calibrate",
                 "/api/water_guard/arm", "/api/water_guard/disarm",
+                "/api/alerts",
             }
             audit_request = p.path in audited_paths
             if p.path == "/api/move" and navigation_arbiter is not None:
@@ -3460,6 +3461,20 @@ def create_server(host, port, static_dir, mission_root=None):
                     "disarm": True, "approval_token": str(token or "")})
                 water_guard_pub.publish(message)
                 self._json({"ok": True, "published": True})
+            elif p.path == '/api/alerts':
+                # M7.2: 落水告警推送 → WS 全客户端广播 (控制台/操作员界面)
+                try:
+                    parsed = json.loads(body) if body else {}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    self._json({"ok": False, "reason": "invalid_json"}, status=400)
+                    return
+                alert = parsed if isinstance(parsed, dict) else {}
+                if not alert.get("lat") or not alert.get("lng"):
+                    self._json({"ok": False, "reason": "invalid_alert"}, status=400)
+                    return
+                ws_broadcast({"type": "lake_alert", "data": alert},
+                             force=True)
+                self._json({"ok": True, "broadcast": True})
             else:
                 self.send_error(404)
 
