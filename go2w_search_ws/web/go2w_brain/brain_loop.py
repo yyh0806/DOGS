@@ -263,6 +263,43 @@ class BrainSession:
                                  reason=result.get("dispatch_denied")
                                  or result.get("reason")
                                  or result.get("error"))
+                # M7.1 重规划: LLM 有且仅一次修订机会 (修订计划仍过强校验)
+                revised = self._replan(history, step, result)
+                if revised is not None:
+                    self._log.append("event", event="plan_replanned",
+                                     source="llm",
+                                     steps=[s.id for s in revised.steps])
+                    for rstep in revised.ordered_steps():
+                        rstep.status = "running"
+                        rresult = self._dispatch_and_run(rstep.verb,
+                                                         rstep.args)
+                        history.append({"role": "user", "content":
+                                        f"[tool_result {rstep.verb}] "
+                                        + json.dumps(rresult,
+                                                     ensure_ascii=False,
+                                                     default=str)})
+                        if (rresult.get("dispatch_denied")
+                                or rresult.get("ok") is False):
+                            rstep.status = "failed"
+                            self._log.append("event",
+                                             event="plan_step_failed",
+                                             step=rstep.id,
+                                             verb=rstep.verb,
+                                             reason=rresult.get(
+                                                 "dispatch_denied")
+                                             or rresult.get("reason")
+                                             or rresult.get("error"))
+                            break
+                        rstep.status = "ok"
+                        results[rstep.id] = rresult
+                    else:
+                        plan.state = "replanned_done"
+                        for s in plan.steps:
+                            if s.status == "failed":
+                                s.status = "replanned"
+                    if any(s.status == "failed"
+                           for s in revised.steps):
+                        plan.state = "failed"
                 break
             step.status = "ok"
             results[step.id] = result
@@ -293,6 +330,40 @@ class BrainSession:
                 "steps": len(plan.steps), "llm_used": self._llm.available(),
                 "_session_end": {"steps": len(plan.steps),
                                  "llm_used": self._llm.available()}}
+
+    def _replan(self, history, failed_step, failure_result):
+        """步骤失败 → LLM 修订计划 (一次机会)。任何环节失败返回 None。"""
+        if not self._llm.available():
+            return None
+        names = sorted(self._registry.get(n).name
+                       for n in self._registry.names())
+        reason = (failure_result.get("dispatch_denied")
+                  or failure_result.get("reason")
+                  or failure_result.get("error"))
+        prompt = (
+            "任务执行中步骤失败, 请修订剩余任务计划。\n"
+            f"失败步骤: {failed_step.verb}, 原因: {reason}\n"
+            "可用工具: " + json.dumps(names, ensure_ascii=False) + "\n"
+            "输出与之前相同的任务列表 JSON 格式 (只包含尚未完成的步骤, "
+            "id 用 r1/r2/... 重新编号; 前置只允许 mission_lock/"
+            "water_guard_armed; from_plan 是布尔 true)。只输出 JSON。")
+        try:
+            resp = self._llm.chat(history + [{"role": "user",
+                                              "content": prompt}],
+                                  tools=None)
+        except LLMUnavailable:
+            return None
+        self._log.append("llm_call", content="replan_draft",
+                         draft_raw=(resp.content or "")[:400])
+        plan = task_plan_mod.parse_draft(resp.content or "")
+        if plan is None:
+            self._log.append("event", event="replan_unparseable")
+            return None
+        ok, errors = plan.validate(self._registry, self._gate, self._memory)
+        if not ok:
+            self._log.append("event", event="replan_invalid", errors=errors)
+            return None
+        return plan
 
     def _dispatch_and_run(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         ctx = {"platform": self._platform, "log": self._log,

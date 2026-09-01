@@ -87,6 +87,11 @@ class ConsoleState:
 
 STATE = ConsoleState()
 HUB = Hub()
+_CURRENT_MEMORY = []  # 供 /api/memory 读取 (build_session 内构造)
+
+
+def _current_memory():
+    return _CURRENT_MEMORY[0] if _CURRENT_MEMORY else None
 
 
 def run_mission(task: str):
@@ -116,6 +121,7 @@ def run_mission(task: str):
     try:
         log = SessionLog(log_path, on_append=broadcast)
         session = build_session(config, log)
+        _CURRENT_MEMORY[:] = [getattr(session, "_memory", None)]
         HUB.publish("status", {"running": True, "task": task})
         result = session.run(task)
         STATE.last_done = result
@@ -137,6 +143,21 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, "text/html; charset=utf-8", body)
         elif self.path == "/events":
             self._sse()
+        elif self.path == "/api/memory":
+            # M7.1: 记忆库只读快照 (地图叠加层用)
+            try:
+                memory = _current_memory()
+                entries = memory.entries() if memory else []
+                self._respond(200, "application/json",
+                              json.dumps({"ok": True,
+                                          "entries": entries,
+                                          "summary": (memory.summary()
+                                                      if memory else {})},
+                                         ensure_ascii=False))
+            except Exception as exc:  # noqa: BLE001
+                self._respond(500, "application/json",
+                              json.dumps({"ok": False,
+                                          "reason": str(exc)}))
         else:
             self._respond(404, "text/plain; charset=utf-8", "not found")
 
