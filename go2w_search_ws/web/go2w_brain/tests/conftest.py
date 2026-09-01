@@ -34,8 +34,11 @@ def registry():
 @pytest.fixture
 def gate(registry):
     g = DispatchGate(registry)
-    from go2w_brain.dispatcher import require_mission_lock
+    from go2w_brain.dispatcher import (require_mission_lock,
+                                       require_water_guard_armed)
     g.register_precondition("mission_lock", require_mission_lock)
+    g.register_precondition("water_guard_armed",
+                            require_water_guard_armed)
     return g
 
 

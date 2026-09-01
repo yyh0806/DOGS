@@ -31,6 +31,10 @@ class DispatchGate:
             raise ValueError(f"非法前置名: {name!r}")
         self._preconditions[name] = fn
 
+    def registered_preconditions(self) -> tuple[str, ...]:
+        """已注册前置名 (任务计划校验器用: 声明了没人实现的前置=不安全)。"""
+        return tuple(sorted(self._preconditions))
+
     def check(self, tool_name: str, args: dict[str, Any],
               ctx: dict[str, Any]) -> tuple[bool, str, ToolRegistration | None]:
         tool = self._registry.get(tool_name)

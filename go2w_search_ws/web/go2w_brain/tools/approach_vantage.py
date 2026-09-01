@@ -41,6 +41,20 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
                     "hint": "环线最近点落入守卫 veto 带, 放弃接近"}
     ctx["log"].append("event", event="vantage_selected",
                       route_index=index, dist_to_alert_m=dist_m)
+    # M7 回写: 观察点经验入记忆 (下次任务直接检索可用观察点)
+    memory = ctx.get("memory")
+    if memory is not None:
+        try:
+            entry = memory.record(
+                "vantage", {"lat": vantage["lat"], "lon": vantage["lon"]},
+                data={"dist_to_alert_m": dist_m,
+                      "guard_dist_m": round(guard_dist, 1)
+                      if guard_dist is not None else None},
+                confidence=0.7)
+            ctx["log"].append("event", event="memory_recorded",
+                              memory_id=entry["id"], mem_kind="vantage")
+        except ValueError:
+            pass
     return {
         "ok": True,
         "vantage": {"lat": vantage["lat"], "lon": vantage["lon"],

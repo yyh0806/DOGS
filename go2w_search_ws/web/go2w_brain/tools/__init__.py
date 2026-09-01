@@ -23,12 +23,14 @@ from .get_battery import TOOL as GET_BATTERY
 from .get_detection_events import TOOL as GET_DETECTION_EVENTS
 from .get_gps import TOOL as GET_GPS
 from .get_guard_state import TOOL as GET_GUARD_STATE
+from .get_memory import TOOL as GET_MEMORY
 from .get_pose import TOOL as GET_POSE
 from .get_route_state import TOOL as GET_ROUTE_STATE
 from .load_skill import TOOL as LOAD_SKILL
 from .patrol_report import TOOL as PATROL_REPORT
 from .plan_campus_loop import TOOL as PLAN_CAMPUS_LOOP
 from .plan_lake_loop import TOOL as PLAN_LAKE_LOOP
+from .record_observation import TOOL as RECORD_OBSERVATION
 from .scan_water import TOOL as SCAN_WATER
 from .speak import TOOL as SPEAK
 
@@ -39,4 +41,5 @@ BUILTIN_TOOLS: list[ToolRegistration] = [
     ARM_WATER_GUARD, DISARM_WATER_GUARD, GET_GUARD_STATE,
     LOAD_SKILL, SCAN_WATER, GET_DETECTION_EVENTS,
     APPROACH_VANTAGE, PATROL_REPORT,
+    GET_MEMORY, RECORD_OBSERVATION,
 ]

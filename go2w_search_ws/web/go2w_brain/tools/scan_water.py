@@ -1,6 +1,7 @@
-"""scan_water — 湖面扫描检测落水者 (M4, 驱动检测管线跑一组帧)。"""
+"""scan_water — 湖面扫描检测落水者 (M4, 驱动检测管线跑一组帧; M7 记忆回写)。"""
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from ..registry import ToolRegistration
@@ -24,6 +25,33 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
             continue
         events += detector.process_frame(frame, robot)
     confirmed = [e for e in events if e["tier"] == "confirmed"]
+    # M7 回写: confirmed 检测历史入记忆; 读误报区/堵点经验作提示
+    memory = ctx.get("memory")
+    memory_note = None
+    if memory is not None:
+        gps = ctx["platform"].snapshot().get("gps") or {}
+        if gps.get("available"):
+            relevant = memory.query(gps["lat"], gps["lng"], 300.0,
+                                    kinds=("fp_zone", "blocked"),
+                                    min_score=0.25)
+            if relevant:
+                memory_note = [
+                    f"{e['kind']} score={e['score']} dist={e['dist_m']}m "
+                    f"data={json.dumps(e.get('data'), ensure_ascii=False)}"
+                    for e in relevant[:3]]
+        for event in confirmed:
+            try:
+                entry = memory.record(
+                    "detection", {"lat": event["lat"], "lng": event["lng"]},
+                    data={"bearing_deg": event["bearing_deg"],
+                          "est_range_m": event["est_range_m"],
+                          "confidence": event["confidence"]},
+                    confidence=0.8)
+                ctx["log"].append("event", event="memory_recorded",
+                                  memory_id=entry["id"],
+                                  mem_kind="detection")
+            except ValueError:
+                pass
     ctx["log"].append("event", event="scan_water",
                       frames=frames, new_events=len(events),
                       confirmed=len(confirmed), frame_errors=errors)
@@ -36,6 +64,7 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
              "confidence": e["confidence"]} for e in events],
         "confirmed_count": len(confirmed),
         "stats": detector.stats(),
+        "memory_note": memory_note,
         "hint": ("发现 confirmed 落水告警! 位置见 new_events, "
                  "可 approach_vantage 接近确认 (M5)" if confirmed else None),
     }
