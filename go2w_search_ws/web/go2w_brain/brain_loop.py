@@ -67,6 +67,10 @@ class BrainSession:
         self._wake.clear()
         return events
 
+    def plan_snapshot(self) -> dict[str, Any]:
+        """最近一次规划的完整结果 (实时控制台/外部观察者取几何用)。"""
+        return dict(self._plan_store.get("last_route") or {})
+
     def acquire_mission_lock(self, token: Any = "mission") -> None:
         self._mission_lock = token
 

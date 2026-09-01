@@ -12,9 +12,11 @@ from typing import Any
 
 
 class SessionLog:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, on_append=None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # 可选广播钩子 (实时控制台用): 每写入一条轨迹即回调 entry
+        self._on_append = on_append
 
     def append(self, kind: str, **fields: Any) -> dict[str, Any]:
         entry: dict[str, Any] = {"ts": round(time.time(), 3), "kind": kind}
@@ -22,6 +24,11 @@ class SessionLog:
         line = json.dumps(entry, ensure_ascii=False, default=str)
         with open(self.path, "a", encoding="utf-8") as fp:
             fp.write(line + "\n")
+        if self._on_append is not None:
+            try:
+                self._on_append(entry)
+            except Exception:  # noqa: BLE001 — 广播失败不得影响轨迹
+                pass
         return entry
 
     def entries(self) -> list[dict[str, Any]]:
