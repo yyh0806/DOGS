@@ -2,8 +2,8 @@
 <html lang="zh-CN"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>GO2W 实时任务控制台</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css"/>
+<script src="/static/vendor/leaflet/leaflet.js"></script>
 <style>
 :root{--bg:#0A111E;--panel:#101A2B;--edge:#1E2C44;--ink:#D8E2F0;--muted:#8294AC;
 --accent:#F0913B;--water:#2A6F97;--ok:#3EDC97;--veto:#FF5C5C;--info:#5C8DFF}
@@ -80,6 +80,7 @@ margin:4px 6px 0 0;font-family:ui-monospace,Consolas,monospace}
   <main>
     <div class="map">
       <div id="map"></div>
+      <div id="maperr" style="display:none;position:absolute;top:10px;left:50%;transform:translateX(-50%);background:rgba(26,18,32,.92);border:1px solid var(--veto);color:var(--veto);padding:8px 16px;font-size:12px;z-index:1001;font-family:ui-monospace,Consolas,monospace">底图瓦片加载失败（缓存未命中且离线）—— Ctrl+F5 刷新；仍失败请告知</div>
       <div class="legend">
         <span style="color:var(--accent)"><i style="background:var(--accent)"></i>环线 / 扫描点</span>
         <span style="color:var(--water)"><i style="background:var(--water)"></i>水域 / 园区禁区</span>
@@ -103,8 +104,9 @@ approach_vantage:"选安全接近点",patrol_report:"生成任务报告"};
 var KIND={session_start:"会话开始",task:"任务",llm_call:"大脑推理",tool_call:"工具调用",
 tool_result:"工具结果",event:"事件",snapshot:"遥测快照",reply:"最终答复",session_end:"会话结束"};
 var map=L.map("map");
-L.tileLayer("https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-  {maxZoom:19,attribution:"&copy; OpenStreetMap &copy; CARTO"}).addTo(map);
+L.tileLayer("/tiles/{z}/{x}/{y}.png",
+  {maxZoom:19,attribution:"本地缓存 OSM 底图"}).addTo(map)
+  .on("tileerror",function(){document.getElementById("maperr").style.display="block";});
 map.setView([31.488192,120.369486],16);
 var routeLayer=null,alertLayer=null,scanLayer=null;
 var flow=document.getElementById("flow");

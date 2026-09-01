@@ -143,6 +143,13 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, "text/html; charset=utf-8", body)
         elif self.path == "/events":
             self._sse()
+        elif self.path.startswith("/tiles/"):
+            # M7.2.1: 本地底图瓦片 (OSM 缓存优先, 零外网依赖)
+            self._serve_tile(self.path)
+        elif self.path.startswith("/static/"):
+            self._serve_static(self.path)
+        elif self.path.startswith("/runs/"):
+            self._serve_static(self.path)
         elif self.path == "/api/memory":
             # M7.1: 记忆库只读快照 (地图叠加层用)
             try:
@@ -160,6 +167,50 @@ class Handler(BaseHTTPRequestHandler):
                                           "reason": str(exc)}))
         else:
             self._respond(404, "text/plain; charset=utf-8", "not found")
+
+    def _serve_static(self, path):
+        rel = path.lstrip("/").replace("\\", "/")
+        if ".." in rel.split("/"):
+            self._respond(403, "text/plain; charset=utf-8", "forbidden")
+            return
+        file_path = (WEB_DIR / rel).resolve()
+        if not str(file_path).startswith(str(WEB_DIR.resolve())):
+            self._respond(403, "text/plain; charset=utf-8", "forbidden")
+            return
+        if not file_path.is_file():
+            self._respond(404, "text/plain; charset=utf-8", "not found")
+            return
+        content_type = {
+            ".html": "text/html; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+            ".js": "application/javascript; charset=utf-8",
+            ".json": "application/json",
+            ".png": "image/png",
+        }.get(file_path.suffix, "application/octet-stream")
+        self._respond(200, content_type, file_path.read_bytes())
+
+    def _serve_tile(self, path):
+        parts = path.strip("/").split("/")  # tiles/z/x/y.png
+        if len(parts) != 4:
+            self._respond(404, "text/plain; charset=utf-8", "not found")
+            return
+        try:
+            z, x, y = (int(parts[1]), int(parts[2]),
+                       int(parts[3].split(".")[0]))
+        except ValueError:
+            self._respond(404, "text/plain; charset=utf-8", "not found")
+            return
+        sys.path.insert(0, str(WEB_DIR))
+        from lake_plan import tiles as tile_lib
+        cache = tile_lib.tile_cache_path("osm", z, x, y)
+        if cache.exists() and cache.stat().st_size > 100:
+            self._respond(200, "image/png", cache.read_bytes())
+            return
+        try:
+            data = tile_lib.fetch_tile("osm", z, x, y)
+            self._respond(200, "image/png", data)
+        except tile_lib.TileError:
+            self._respond(404, "text/plain; charset=utf-8", "tile missing")
 
     def do_POST(self):
         if self.path == "/api/run":

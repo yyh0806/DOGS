@@ -45,8 +45,8 @@ HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>@@TITLE@@ · GO2W 任务回放</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css"/>
+<script src="/static/vendor/leaflet/leaflet.js"></script>
 <style>
 :root{--bg:#0A111E;--panel:#101A2B;--edge:#1E2C44;--ink:#D8E2F0;
 --muted:#8294AC;--accent:#F0913B;--water:#2A6F97;--ok:#3EDC97;
@@ -131,8 +131,8 @@ font-family:ui-monospace,Consolas,monospace;border-radius:2px}
 <script>
 var DATA = @@DATA@@;
 var map = L.map("map");
-L.tileLayer("https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-  {maxZoom: 19, attribution: "&copy; OpenStreetMap &copy; CARTO"}
+L.tileLayer("/tiles/{z}/{x}/{y}.png",
+  {maxZoom: 19, attribution: "本地缓存 OSM 底图"}
 ).addTo(map);
 var bounds = [];
 function latlng(p){ return [p[0], p[1]]; }
