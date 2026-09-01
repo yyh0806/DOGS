@@ -6,12 +6,14 @@ M2: plan_lake_loop / follow_route / cancel_route / calibrate_heading /
 M2.1: plan_campus_loop — 绕园区 (Overpass landuse 聚类 + 凸包);
 M3: arm_water_guard / disarm_water_guard(approve) / get_guard_state —
     离水守卫; follow_route 前置升级为 mission_lock + water_guard_armed;
-M4: scan_water / get_detection_events — 落水检测五级管线 (两级告警)。
+M4: scan_water / get_detection_events — 落水检测五级管线 (两级告警);
+M5: approach_vantage / patrol_report — 安全接近点 + 任务报告 + 续航模型。
 """
 from __future__ import annotations
 
 from ..registry import ToolRegistration
 
+from .approach_vantage import TOOL as APPROACH_VANTAGE
 from .arm_water_guard import TOOL as ARM_WATER_GUARD
 from .calibrate_heading import TOOL as CALIBRATE_HEADING
 from .cancel_route import TOOL as CANCEL_ROUTE
@@ -24,6 +26,7 @@ from .get_guard_state import TOOL as GET_GUARD_STATE
 from .get_pose import TOOL as GET_POSE
 from .get_route_state import TOOL as GET_ROUTE_STATE
 from .load_skill import TOOL as LOAD_SKILL
+from .patrol_report import TOOL as PATROL_REPORT
 from .plan_campus_loop import TOOL as PLAN_CAMPUS_LOOP
 from .plan_lake_loop import TOOL as PLAN_LAKE_LOOP
 from .scan_water import TOOL as SCAN_WATER
@@ -35,4 +38,5 @@ BUILTIN_TOOLS: list[ToolRegistration] = [
     CALIBRATE_HEADING, GET_ROUTE_STATE,
     ARM_WATER_GUARD, DISARM_WATER_GUARD, GET_GUARD_STATE,
     LOAD_SKILL, SCAN_WATER, GET_DETECTION_EVENTS,
+    APPROACH_VANTAGE, PATROL_REPORT,
 ]

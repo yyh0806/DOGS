@@ -60,3 +60,4 @@ DEFAULT_STEP_M = 40.0           # 航点间距
 DEFAULT_MAX_PERIM_KM = 12.0     # 中型城市湖泊 (~10km 周长) 在内; 特大湖被拒
 DEFAULT_MIN_PERIM_KM = 0.3
 COMPACT_MIN = 0.12              # 紧凑度下限 (低于视为河流/水渠)
+DEFAULT_SCAN_SPACING_M = 150.0  # M5: 扫描点间距 (近岸密远岸疏, 后续自适应)

@@ -24,9 +24,16 @@ when_to_use: 任务包含"绕湖/环湖/湖面巡查/落水"等字样时加载
 3. **检测处置** (M4 起):
    - 扫描节奏: 每到扫描点调 scan_water(frames=3); 行进间单帧监视;
    - suspect (疑似): 记录不停步, 下个扫描点继续观察;
-   - confirmed (确认, 含 WGS-84 坐标): speak 声明 + 报位置; 接近确认
-     需 approach_vantage (M5 接入, 没有此动词就如实说明, 不硬编);
+   - confirmed (确认, 含 WGS-84 坐标): speak 声明 + 报位置 →
+     approach_vantage 选安全观察点 → 近距 scan_water 复查;
    - 汇报: 任务结束 get_detection_events(confirmed) 出清单
      (坐标/方位/距离/置信度), 配合守卫状态与航线完成度。
 
-4. **任务结束必须报告**: 环线闭合情况 / 检测结果 / 覆盖率 / 告警清单。
+4. **任务结束必须报告**: patrol_report() 出完整清单 —— 环线/进度/
+   扫描点/守卫/电量/两级告警 (confirmed 含坐标)。
+
+5. **续航与接近** (M5 起):
+   - 续航判决看规划输出里的 endurance: GO 直接走; SEGMENT 分段
+     并设定返航点; REFUSE 只报告不上路; unknown 如实说明并请示;
+   - 接近点取自环线 (构造性安全), 守卫兜底校验不过就放弃接近、
+     保持远距观察。
