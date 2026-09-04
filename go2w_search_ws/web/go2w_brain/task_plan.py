@@ -148,7 +148,12 @@ def detect_plan_kind(task: str) -> Optional[str]:
     text = task or ""
     if any(k in text for k in ("绕湖", "环湖")):
         return "lake"
+    # M7.3 自然说法: "绕着当前园区湖绕行一圈" 等 (湖 + 绕/环/巡)
+    if "湖" in text and any(k in text for k in ("绕", "环", "巡")):
+        return "lake"
     if any(k in text for k in ("绕园区", "园区巡查", "绕厂区")):
+        return "campus"
+    if "园区" in text and any(k in text for k in ("绕", "环", "巡")):
         return "campus"
     if any(k in text for k in ("状态", "报告", "电量", "在哪", "位置", "坐标")):
         return "status"

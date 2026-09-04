@@ -100,6 +100,17 @@ def test_detect_plan_kind():
     assert detect_plan_kind("把门打开") is None
 
 
+def test_detect_plan_kind_natural_phrasings():
+    """M7.3: 自然说法必须识别 (2026-09-04 实测 "绕着当前园区湖绕行一圈"
+    未被识别 → 落入自由循环)。"""
+    assert detect_plan_kind("绕着当前园区湖绕行一圈") == "lake"
+    assert detect_plan_kind("绕湖巡逻") == "lake"
+    assert detect_plan_kind("带我去巡湖") == "lake"
+    assert detect_plan_kind("绕着园区转一圈") == "campus"
+    assert detect_plan_kind("环湖转一圈") == "lake"
+    assert detect_plan_kind("绕水塘一圈") is None  # 无"湖"字不误判
+
+
 def test_rule_compose_shapes():
     lake = rule_compose("lake")
     assert [s.verb for s in lake.steps] == [
