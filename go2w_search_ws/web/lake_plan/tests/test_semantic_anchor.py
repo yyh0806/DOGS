@@ -135,6 +135,48 @@ def test_task_text_reaches_vlm_prompt(monkeypatch):
     assert "绕南湖巡查落水人员" in vlm.prompt
 
 
+class _FlakyVlm:
+    """第一次瞬时失败 (限流/抖动), 第二次成功 —— 应重试一次后给出 vlm 结果。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def available(self):
+        return True
+
+    def vision(self, image, prompt, max_tokens=1024):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("transient rate limit")
+        return ('{"self_near_water": true, "target_idx": 0, '
+                '"ambiguity": [], "why": "retry ok"}')
+
+
+class _BrokenVlm:
+    def available(self):
+        return True
+
+    def vision(self, *a, **k):
+        raise RuntimeError("boom")
+
+
+def test_vlm_transient_failure_retries_once(monkeypatch):
+    _ok_tiles(monkeypatch)
+    vlm = _FlakyVlm()
+    out = anchor_semantics(vlm, "绕湖", ROBOT, _candidates(), CAMPUS_CENTER)
+    assert out["source"] == "vlm"
+    assert out["target"]["idx"] == 0
+    assert vlm.calls == 2
+
+
+def test_vlm_persistent_failure_degrades_to_rule(monkeypatch):
+    _ok_tiles(monkeypatch)
+    out = anchor_semantics(_BrokenVlm(), "绕湖", ROBOT, _candidates(),
+                           CAMPUS_CENTER)
+    assert out["source"] == "rule"
+    assert out["why"] == "vlm_unavailable"
+
+
 # ---------- parse_json_loose ----------
 
 def test_parse_json_loose_fences():

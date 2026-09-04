@@ -100,36 +100,39 @@ def anchor_semantics(vlm, task: str, robot: dict[str, float],
         return _rule_anchor(robot, candidates, why="satellite_unavailable")
 
     if vlm is not None and getattr(vlm, "available", lambda: False)():
-        try:
-            from go2w_brain.vlm import parse_json_loose
-            # 推理型视觉模型: 1024 预算实测不够出 JSON (finish_reason=length),
-            # 4096 才稳定产出答案
-            raw = vlm.vision(img, _ANCHOR_PROMPT.format(
-                lat=robot["lat"], lng=robot["lng"], task=task),
-                max_tokens=4096)
-            payload = parse_json_loose(raw) or {}
-            target_idx = payload.get("target_idx")
-            if not isinstance(target_idx, int) or not (
-                    0 <= target_idx < len(candidates)):
-                raise ValueError("bad target_idx")
-            target = dict(candidates[target_idx])
-            ambiguity = [i for i in payload.get("ambiguity", [])
-                         if isinstance(i, int) and 0 <= i < len(candidates)]
-            return {
-                "source": "vlm",
-                "self": {"lat": robot["lat"], "lng": robot["lng"],
-                         "confirmed": bool(payload.get(
-                             "self_near_water", True))},
-                "target": {"idx": target_idx,
-                           "centroid": target.get("centroid"),
-                           "name": str(payload.get("target_name") or ""),
-                           "why": str(payload.get("why") or "")},
-                "ambiguity": ambiguity,
-                "why": str(payload.get("why") or ""),
-                "raw": raw[:300],
-            }
-        except Exception:  # noqa: BLE001 — VLM 任何失败 → 规则锚定
-            pass
+        # 瞬时失败 (限流/网络抖动) 重试一次; 两次都失败 → 规则锚定
+        for _attempt in range(2):
+            try:
+                from go2w_brain.vlm import parse_json_loose
+                # 推理型视觉模型: 1024 预算实测不够出 JSON
+                # (finish_reason=length), 4096 才稳定产出答案
+                raw = vlm.vision(img, _ANCHOR_PROMPT.format(
+                    lat=robot["lat"], lng=robot["lng"], task=task),
+                    max_tokens=4096)
+                payload = parse_json_loose(raw) or {}
+                target_idx = payload.get("target_idx")
+                if not isinstance(target_idx, int) or not (
+                        0 <= target_idx < len(candidates)):
+                    raise ValueError("bad target_idx")
+                target = dict(candidates[target_idx])
+                ambiguity = [i for i in payload.get("ambiguity", [])
+                             if isinstance(i, int)
+                             and 0 <= i < len(candidates)]
+                return {
+                    "source": "vlm",
+                    "self": {"lat": robot["lat"], "lng": robot["lng"],
+                             "confirmed": bool(payload.get(
+                                 "self_near_water", True))},
+                    "target": {"idx": target_idx,
+                               "centroid": target.get("centroid"),
+                               "name": str(payload.get("target_name") or ""),
+                               "why": str(payload.get("why") or "")},
+                    "ambiguity": ambiguity,
+                    "why": str(payload.get("why") or ""),
+                    "raw": raw[:300],
+                }
+            except Exception:  # noqa: BLE001 — VLM 任何失败 → 规则锚定
+                continue
     return _rule_anchor(robot, candidates, why="vlm_unavailable")
 
 
