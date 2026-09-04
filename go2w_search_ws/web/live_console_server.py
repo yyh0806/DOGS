@@ -100,7 +100,19 @@ _CURRENT_MEMORY = []  # 供 /api/memory 读取 (build_session 内构造)
 
 
 def _current_memory():
-    return _CURRENT_MEMORY[0] if _CURRENT_MEMORY else None
+    if _CURRENT_MEMORY:
+        return _CURRENT_MEMORY[0]
+    # 重启后懒加载磁盘快照: 任务未跑也能在记忆面板看历史经验 (M7.3)
+    try:
+        from go2w_brain.memory import MemoryStore
+        path = BrainConfig.from_env().memory_dir / "memory.jsonl"
+        if path.exists():
+            store = MemoryStore(path)
+            _CURRENT_MEMORY.append(store)
+            return store
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def run_mission(task: str):
