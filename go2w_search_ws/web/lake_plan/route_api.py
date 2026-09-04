@@ -353,54 +353,53 @@ def _candidates(comps, georef, mask_shape, ref_lat, ref_lng):
 
 
 def _refine(target, provider):
-    """湖面 bbox 高分辨率重扫 (自 agent.node_refine)。失败返回 None。
+    """湖面 bbox 聚焦重扫 (自 agent.node_refine, 去 LLM)。失败返回 None。
 
+    M7.3 修复 (聚焦附近区域): 原实现从 z16 向下找层级、且要求 bbox 自身
+    跨 ≥2 张瓦片 —— 几十米级小水体 (园区景观湖) 在任何层级都 1×1,
+    "细化"从未生效。改为:
+    - z19→z16 逐级尝试, bbox 四周各留 1 张瓦片边距 (2×2~8×8 封顶);
+    - 每级重扫后按面积校验: 细扫面积须落在粗扫的 0.4×~2.5× 窗口内
+      (高倍级上 OSM 常把湖与邻近水渠渲染成一体, 面积骤变即弃用并降级;
+      2026-09-01 园区湖实测: z19~z17 均粘连水渠, z16 聚焦重扫面积 ×1.03);
+    - 命中即返回, 全级失败 → 沿用粗扫多边形 (诚实降级)。
     返回 (fine_poly_px, fine_georef, True)。
     """
     poly_ll = target["_poly_ll"]
     lats = [p[0] for p in poly_ll]
     lngs = [p[1] for p in poly_ll]
     w, s, e, n = min(lngs), min(lats), max(lngs), max(lats)
-    best = None
-    for z in range(16, 9, -1):
-        gx0 = int(lng_to_global_px(w, z) // 256)
-        gx1 = int(lng_to_global_px(e, z) // 256)
-        gy0 = int(lat_to_global_px(n, z) // 256)
-        gy1 = int(lat_to_global_px(s, z) // 256)
+    cc_lat, cc_lng = sum(lats) / len(lats), sum(lngs) / len(lngs)
+    coarse_area = target["area_km2"] * 1e6
+    for z in range(19, 15, -1):
+        gx0 = int(lng_to_global_px(w, z) // 256) - 1
+        gx1 = int(lng_to_global_px(e, z) // 256) + 1
+        gy0 = int(lat_to_global_px(n, z) // 256) - 1
+        gy1 = int(lat_to_global_px(s, z) // 256) + 1
         nx, ny = gx1 - gx0 + 1, gy1 - gy0 + 1
-        if nx * ny <= config.MAX_TILES_PER_STITCH and nx >= 2:
-            best = (z, gx0, gy0, nx, ny)
-            break
-    if best is None:
-        return None
-    z, x0, y0, nx, ny = best
-    if (nx + 2) * (ny + 2) <= config.MAX_TILES_PER_STITCH:
-        x0, y0, nx, ny = x0 - 1, y0 - 1, nx + 2, ny + 2  # 留边给外扩
-    img, detail = tiles.stitch_area(provider, z, x0, y0, nx, ny)
-    fine_georef = tiles.georef_from_detail(detail)
-    mask = water.water_mask(
-        img, ref_rgb=config.PROVIDERS[provider]["water_rgb"])
-    comps = water.label_components(mask, down=2, min_area_px=400)
-    if not comps:
-        return None
-    cc_lat = sum(lats) / len(lats)
-    cc_lng = sum(lngs) / len(lngs)
-    ref_px = fine_georef.latlon_to_pixel(cc_lat, cc_lng)
-
-    def _ccomp(c):
-        cy, cx = c["centroid_small"]
-        return math.hypot(cx * c["down"] - ref_px[0],
-                          cy * c["down"] - ref_px[1])
-
-    comp = min(comps[:8], key=_ccomp)  # 质心就近匹配, 防拿到别的水塘
-    fine_poly = water.polygon_from_component(comp, mask.shape)
-    if len(fine_poly) < 4:
-        return None
-    fine_ll = [fine_georef.pixel_to_latlon(x, y) for (x, y) in fine_poly]
-    _, fine_area = water.poly_stats_latlon(fine_ll, fine_ll[0][0])
-    if fine_area < 0.4 * (target["area_km2"] * 1e6):
-        return None  # 面积骤降 = 匹配到别的小水体
-    return fine_poly, fine_georef, True
+        if not (2 <= nx <= 8 and 2 <= ny <= 8):
+            continue
+        img, detail = tiles.stitch_area(provider, z, gx0, gy0, nx, ny)
+        fine_georef = tiles.georef_from_detail(detail)
+        mask = water.water_mask(
+            img, ref_rgb=config.PROVIDERS[provider]["water_rgb"])
+        comps = water.label_components(mask, down=2, min_area_px=400)
+        if not comps:
+            continue
+        ref_px = fine_georef.latlon_to_pixel(cc_lat, cc_lng)
+        comp = min(comps[:8], key=lambda c: math.hypot(
+            c["centroid_small"][1] * c["down"] - ref_px[0],
+            c["centroid_small"][0] * c["down"] - ref_px[1]))
+        fine_poly = water.polygon_from_component(comp, mask.shape)
+        if len(fine_poly) < 4:
+            continue
+        fine_ll = [fine_georef.pixel_to_latlon(x, y)
+                   for (x, y) in fine_poly]
+        _, fine_area = water.poly_stats_latlon(fine_ll, fine_ll[0][0])
+        if not (0.4 * coarse_area <= fine_area <= 2.5 * coarse_area):
+            continue  # 面积骤变 = 粘连水渠或匹配到别的小水体
+        return fine_poly, fine_georef, True
+    return None
 
 
 def _slim(cands):

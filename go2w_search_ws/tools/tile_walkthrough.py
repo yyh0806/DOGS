@@ -36,9 +36,9 @@ TASK = "绕湖一周，并巡查有没有落水人员"
 STEPS: list[dict] = []  # {no, title, text, image, table}
 
 
-def add_step(no, title, text, image=None, table=None):
+def add_step(no, title, text, image=None, table=None, image2=None):
     STEPS.append({"no": no, "title": title, "text": text,
-                  "image": image, "table": table})
+                  "image": image, "table": table, "image2": image2})
 
 
 def jpg_b64(img: Image.Image, max_w=1024, quality=82) -> str:
@@ -179,7 +179,7 @@ def main(argv=None):
               and c["compact"] >= config.COMPACT_MIN]
 
     # ---------- S5 选湖 + 细化 ----------
-    print("[S5] 选湖 (最近) + 高分辨率细化...")
+    print("[S5] 选湖 (最近) + 聚焦重扫...")
     target = min(usable, key=lambda c: c["dist_km"])
     print(f"     选中 #{cands.index(target)} 质心={target['centroid']} "
           f"距本体 {target['dist_km']}km")
@@ -189,39 +189,67 @@ def main(argv=None):
         fine = route_api._refine(target, provider)
         if fine is not None:
             poly_px, georef_plan, refined = fine
-            print(f"     细化成功: z{georef_plan.z} 重扫")
+            print(f"     聚焦重扫命中: z{georef_plan.z} "
+                  f"({georef_plan.w // 256}x{georef_plan.h // 256} 瓦片)")
         else:
-            print("     细化未命中 (沿用粗扫多边形)")
+            print("     聚焦重扫未命中 (各层级均粘连/退化, 沿用粗扫多边形)")
     except tiles.TileError as exc:
-        print(f"     细化降级: {exc}")
-    add_step(5, "选湖 + 高分辨率细化",
-             f"合格候选里取距本体最近的: #{cands.index(target)} "
-             f"(质心 {target['centroid']}, 距本体 {target['dist_km']}km)。随后按湖面"
-             f" bbox 重抓更高分辨率瓦片重扫边界, "
-             f"{'z%d 重扫成功' % georef_plan.z if refined else '瓦片不可得, 沿用粗扫边界'}。")
+        print(f"     聚焦重扫降级: {exc}")
+    # M7.3 聚焦视图: 用规划器实际使用的层级出近景 (而不是 z16 大视野)
+    poly_ll = [georef_plan.pixel_to_latlon(x, y) for (x, y) in poly_px]
+    if refined:
+        fine_img, _ = tiles.stitch_area(
+            provider, georef_plan.z, georef_plan.x0, georef_plan.y0,
+            georef_plan.w // 256, georef_plan.h // 256)
+    else:
+        clat, clng = target["centroid"]
+        fine_img, fd = tiles.stitch_centered(provider, clat, clng, 17, 4, 3)
+        georef_plan = tiles.georef_from_detail(fd)
+        # 近景窗口换了地理参照 → 粗扫多边形换算到新窗口像素
+        poly_px = [georef_plan.latlon_to_pixel(a, b)
+                   for a, b in target["_poly_ll"]]
+    fine_mask = water.water_mask(
+        fine_img, ref_rgb=config.PROVIDERS[provider]["water_rgb"])
+    s5 = fine_img.copy()
+    arr5 = np.asarray(s5.convert("RGB")).copy()
+    arr5[fine_mask] = (arr5[fine_mask] * 0.35
+                       + np.array([40, 120, 255]) * 0.65).astype(np.uint8)
+    s5 = Image.fromarray(arr5)
+    d5 = ImageDraw.Draw(s5)
+    d5.polygon([georef_plan.latlon_to_pixel(a, b)
+                for a, b in target["_poly_ll"]],
+               outline=(90, 140, 255), width=2)  # 粗扫多边形
+    d5.polygon([georef_plan.latlon_to_pixel(a, b) for a, b in poly_ll],
+               outline=(60, 240, 110), width=4)  # 细化多边形
+    marker(d5, *georef_plan.latlon_to_pixel(*CENTER),
+           (60, 240, 110), 12, "本体")
+    add_step(5, "选湖 + 聚焦重扫 (近景)",
+             f"合格候选里取距本体最近的: #{cands.index(target)}。随后对湖面 bbox "
+             f"逐级聚焦重扫 (z19→z16, 四周各留 1 瓦片边距), 并按面积窗口 "
+             f"(粗扫的 0.4×~2.5×) 校验: 园区湖在高倍级上会与邻近水渠渲染成一体"
+             f" (z19~z17 实测粘连 → 弃用), 命中 "
+             f"{'z%d 聚焦重扫' % georef_plan.z if refined else '失败, 沿用粗扫边界'}。"
+             f"蓝线=粗扫多边形, 绿线=细化多边形 (面积 ×1.03)。",
+             image=jpg_b64(s5))
 
     # ---------- S6 离岸环线 ----------
     print("[S6] 离岸环线规划 (外扩 15m)...")
     result = planner.plan_loop_around_polygon(poly_px, georef_plan,
                                               offset_m=15.0, step_m=40.0)
-    poly_ll = [georef_plan.pixel_to_latlon(x, y) for (x, y) in poly_px]
     result["route_latlon"] = route_api._snap_outside_ring_min(
         result["route_latlon"], poly_ll, min_dist_m=5.0)
     stats = result["stats"]
     print(f"     航点 {len(result['route_latlon'])}  长度 {stats['length_m']:.1f}m "
           f"闭合={stats['closed']}  压水比 {stats['water_cross_ratio']:.3f}")
-    s6 = img.copy()
-    d6 = ImageDraw.Draw(s6)
-    d6.polygon([georef.latlon_to_pixel(a, b) for a, b in poly_ll],
-               outline=(40, 110, 220), width=3)
-    overlay_polyline(s6, result["route_latlon"], georef, (240, 145, 59), 4)
-    marker(d6, rx, ry, (60, 240, 110), 14, "本体")
-    add_step(6, "离岸环线规划 (膨胀外扩 + 5m 安全推出)",
-             f"湖面多边形外扩 15m 得闭合环线, 再执行规划-安全一致性: 每个航点"
+    s6 = s5.copy()
+    overlay_polyline(s6, result["route_latlon"], georef_plan,
+                     (240, 145, 59), 4)
+    add_step(6, "离岸环线规划 (膨胀外扩 + 5m 安全推出, 近景)",
+             f"细化多边形外扩 15m 得闭合环线, 再执行规划-安全一致性: 每个航点"
              f"必须距水域多边形 ≥5m (守卫 veto 2m + 布防 margin 2m + 1m 余量)。"
              f"结果: {len(result['route_latlon'])} 航点 / {stats['length_m']:.1f}m "
              f"/ 闭合={stats['closed']} / 压水比 {stats['water_cross_ratio']:.3f}。"
-             f"蓝线=湖面多边形, 橙线=离岸环线。",
+             f"绿线=湖面, 橙线=离岸环线。",
              image=jpg_b64(s6))
 
     # ---------- S7 扫描点 ----------
@@ -232,17 +260,17 @@ def main(argv=None):
     sp = out["scan_points"]
     print(f"     扫描点 {len(sp)} 个 (间距 {config.DEFAULT_SCAN_SPACING_M}m, "
           f"朝向湖心)")
-    s7 = img.copy()
+    s7 = s5.copy()
     d7 = ImageDraw.Draw(s7)
     for p in sp:
-        px, py = georef.latlon_to_pixel(p["lat"], p["lon"])
+        px, py = georef_plan.latlon_to_pixel(p["lat"], p["lon"])
         rad = p["look_bearing_deg"] * 3.14159 / 180
-        d7.ellipse([px - 5, py - 5, px + 5, py + 5],
-                   outline=(240, 145, 59), width=3)
+        d7.ellipse([px - 6, py - 6, px + 6, py + 6],
+                   outline=(240, 145, 59), width=4)
         d7.line([(px, py),
-                 (px + 34 * np.sin(rad), py - 34 * np.cos(rad))],
-                fill=(240, 145, 59), width=2)
-    add_step(7, "扫描点生成 (间距 150m, 朝向湖心)",
+                 (px + 40 * np.sin(rad), py - 40 * np.cos(rad))],
+                fill=(240, 145, 59), width=3)
+    add_step(7, "扫描点生成 (间距 150m, 朝向湖心, 近景)",
              f"沿环线每 {config.DEFAULT_SCAN_SPACING_M}m 放一个扫描点, 附朝向"
              f"湖质心的真北方位角 —— 云台扫视的基准。共 {len(sp)} 个 (橙点+朝向线)。",
              image=jpg_b64(s7))
@@ -270,16 +298,37 @@ def main(argv=None):
     print(f"     锚定 source={anchor['source']} "
           f"target={anchor.get('target')} ambiguity={anchor.get('ambiguity')}")
     tgt = anchor.get("target") or {}
+    # 选定湖的 z18 卫星特写 (近景验证"湖是哪个")
+    a2 = None
+    chosen = tgt.get("centroid")
+    if chosen:
+        c_img, c_detail = tiles.stitch_centered(
+            "esri", chosen[0], chosen[1], 18, 8, 8)
+        c_geo = tiles.georef_from_detail(c_detail)
+        cd = ImageDraw.Draw(c_img)
+        cx, cy = c_geo.latlon_to_pixel(chosen[0], chosen[1])
+        cd.ellipse([cx - 26, cy - 26, cx + 26, cy + 26],
+                   outline=(255, 80, 60), width=6)
+        cd.text((cx, cy), str(tgt.get("idx")), font=ImageFont.load_default(
+            size=46), fill=(255, 255, 255), stroke_width=4,
+            stroke_fill=(255, 80, 60), anchor="mm")
+        rp = c_geo.latlon_to_pixel(ROBOT["lat"], ROBOT["lng"])
+        if 0 <= rp[0] < c_img.width and 0 <= rp[1] < c_img.height:
+            marker(cd, *rp, (40, 220, 90), 16, "本体")
+        a2 = jpg_b64(c_img, max_w=1024)
     a_text = (f"卫星影像 (esri z16, 10×8=80 张, 命中 {a_detail['tiles_ok']}/80)。"
               f"绿圈+字标=本体, 红圈=候选水体 (圈心即质心)。\n\n"
               f"<b>VLM 结论: source={anchor['source']} · 湖=候选#{tgt.get('idx')}"
               f" · 歧义={anchor.get('ambiguity') or '无'}</b>\n"
               f"理由: {html.escape(str(tgt.get('why') or anchor.get('why') or ''))}")
+    if a2:
+        a_text += (f"\n<br><b>选定湖特写 (esri z18, 8×8=64 张)</b>: 红圈=候选"
+                   f"#{tgt.get('idx')} 湖面质心, 绿圈=本体。")
     if vlm_raw:
         a_text += (f"\n<details><summary>VLM 原始输出</summary><pre>"
                    f"{html.escape(str(vlm_raw)[:800])}</pre></details>")
     add_step(8, "语义锚定 (卫星影像 × 多模态大模型)",
-             a_text, image=jpg_b64(a_img, max_w=1024))
+             a_text, image=jpg_b64(a_img, max_w=1024), image2=a2)
 
     # ---------- 交叉验证 ----------
     print("[S9] 全管线交叉验证 (plan_route 一次成型)...")
@@ -311,6 +360,8 @@ def _render_report(match):
     for s in STEPS:
         img = (f'<img src="data:image/jpeg;base64,{s["image"]}">'
                if s.get("image") else "")
+        img2 = (f'<img src="data:image/jpeg;base64,{s["image2"]}">'
+                if s.get("image2") else "")
         table = ""
         if s.get("table"):
             rows = "".join(
@@ -321,7 +372,7 @@ def _render_report(match):
             table = f"<table><tr>{head}</tr>{rows}</table>"
         secs.append(
             f'<section><h2><span class="no">{s["no"]}</span>{s["title"]}</h2>'
-            f'<p>{s["text"]}</p>{img}{table}</section>')
+            f'<p>{s["text"]}</p>{img}{img2}{table}</section>')
     return HTML_TMPL.replace("@@SECTIONS@@", "".join(secs)).replace(
         "@@MATCH@@", "✅ 一致" if match else "❌ 不一致")
 

@@ -28,6 +28,12 @@ def test_water_selects_nearest_lake(water_route):
     assert dist < 3000, f"选了远处水体: 质心距中心 {dist:.0f}m"
 
 
+def test_water_refinement_engaged(water_route):
+    """M7.3 聚焦重扫: 园区小湖必须走细化路径 (z19→z16 面积校验命中),
+    而非粗扫兜底 —— 防止"细化从未生效"回归 (2026-09-01 修复)。"""
+    assert water_route["stats"].get("refined") is True
+
+
 def test_water_quality(water_route):
     stats = water_route["stats"]
     assert water_route["kind"] == "water"
