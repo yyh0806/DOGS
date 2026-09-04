@@ -232,6 +232,30 @@ def main(argv=None):
              f"蓝线=粗扫多边形, 绿线=细化多边形 (面积 ×1.03)。",
              image=jpg_b64(s5))
 
+    # ---------- S5.5 卫星特写 ----------
+    print("[S5.5] 最大倍率卫星特写 (esri z19, 2×2)...")
+    clat, clng = target["centroid"]
+    sat_img, sat_detail = tiles.stitch_centered("esri", clat, clng, 19, 2, 2)
+    sat_geo = tiles.georef_from_detail(sat_detail)
+    sat_span = sat_img.width * sat_geo.mppx()
+    print(f"     {sat_img.size}  命中 {sat_detail['tiles_ok']}/4  "
+          f"(约 {sat_span:.0f}m 见方, {sat_geo.mppx():.2f} m/px)")
+    sd = ImageDraw.Draw(sat_img)
+    sd.polygon([sat_geo.latlon_to_pixel(a, b)
+                for a, b in target["_poly_ll"]],
+               outline=(90, 140, 255), width=2)  # 粗扫
+    sd.polygon([sat_geo.latlon_to_pixel(a, b) for a, b in poly_ll],
+               outline=(60, 240, 110), width=4)  # 细化
+    rp = sat_geo.latlon_to_pixel(*CENTER)
+    if 0 <= rp[0] < sat_img.width and 0 <= rp[1] < sat_img.height:
+        marker(sd, *rp, (60, 240, 110), 12, "本体")
+    add_step("5.5", "最大倍率卫星特写 (esri z19, 2×2=4 张瓦片)",
+             f"公共 Esri 服务在此点位的最高真实层级是 z19 (z20+ 返回无影像占位,"
+             f" OSM 同样止于 z19) —— {sat_geo.mppx():.2f} m/px, 4 张瓦片拼成约 "
+             f"{sat_span:.0f}m 见方, 湖占满画面, 岸线肉眼可辨。"
+             f"蓝线=粗扫边界, 绿线=细化边界。",
+             image=jpg_b64(sat_img, max_w=1024))
+
     # ---------- S6 离岸环线 ----------
     print("[S6] 离岸环线规划 (外扩 15m)...")
     result = planner.plan_loop_around_polygon(poly_px, georef_plan,
@@ -241,16 +265,16 @@ def main(argv=None):
     stats = result["stats"]
     print(f"     航点 {len(result['route_latlon'])}  长度 {stats['length_m']:.1f}m "
           f"闭合={stats['closed']}  压水比 {stats['water_cross_ratio']:.3f}")
-    s6 = s5.copy()
-    overlay_polyline(s6, result["route_latlon"], georef_plan,
+    s6 = sat_img.copy()
+    overlay_polyline(s6, result["route_latlon"], sat_geo,
                      (240, 145, 59), 4)
-    add_step(6, "离岸环线规划 (膨胀外扩 + 5m 安全推出, 近景)",
+    add_step(6, "离岸环线规划 (膨胀外扩 + 5m 安全推出, 卫星特写)",
              f"细化多边形外扩 15m 得闭合环线, 再执行规划-安全一致性: 每个航点"
              f"必须距水域多边形 ≥5m (守卫 veto 2m + 布防 margin 2m + 1m 余量)。"
              f"结果: {len(result['route_latlon'])} 航点 / {stats['length_m']:.1f}m "
              f"/ 闭合={stats['closed']} / 压水比 {stats['water_cross_ratio']:.3f}。"
-             f"绿线=湖面, 橙线=离岸环线。",
-             image=jpg_b64(s6))
+             f"绿线=湖面, 橙线=离岸环线 (画在 z19 卫星特写上)。",
+             image=jpg_b64(s6, max_w=1024))
 
     # ---------- S7 扫描点 ----------
     print("[S7] 扫描点生成...")
@@ -260,20 +284,20 @@ def main(argv=None):
     sp = out["scan_points"]
     print(f"     扫描点 {len(sp)} 个 (间距 {config.DEFAULT_SCAN_SPACING_M}m, "
           f"朝向湖心)")
-    s7 = s5.copy()
+    s7 = sat_img.copy()
     d7 = ImageDraw.Draw(s7)
     for p in sp:
-        px, py = georef_plan.latlon_to_pixel(p["lat"], p["lon"])
+        px, py = sat_geo.latlon_to_pixel(p["lat"], p["lon"])
         rad = p["look_bearing_deg"] * 3.14159 / 180
         d7.ellipse([px - 6, py - 6, px + 6, py + 6],
                    outline=(240, 145, 59), width=4)
         d7.line([(px, py),
                  (px + 40 * np.sin(rad), py - 40 * np.cos(rad))],
                 fill=(240, 145, 59), width=3)
-    add_step(7, "扫描点生成 (间距 150m, 朝向湖心, 近景)",
+    add_step(7, "扫描点生成 (间距 150m, 朝向湖心, 卫星特写)",
              f"沿环线每 {config.DEFAULT_SCAN_SPACING_M}m 放一个扫描点, 附朝向"
              f"湖质心的真北方位角 —— 云台扫视的基准。共 {len(sp)} 个 (橙点+朝向线)。",
-             image=jpg_b64(s7))
+             image=jpg_b64(s7, max_w=1024))
 
     # ---------- S8 语义锚定 ----------
     print("[S8] 语义锚定 (esri 卫星 + VLM)...")
@@ -298,12 +322,12 @@ def main(argv=None):
     print(f"     锚定 source={anchor['source']} "
           f"target={anchor.get('target')} ambiguity={anchor.get('ambiguity')}")
     tgt = anchor.get("target") or {}
-    # 选定湖的 z18 卫星特写 (近景验证"湖是哪个")
+    # 选定湖的 z19 卫星特写 (近景验证"湖是哪个")
     a2 = None
     chosen = tgt.get("centroid")
     if chosen:
         c_img, c_detail = tiles.stitch_centered(
-            "esri", chosen[0], chosen[1], 18, 8, 8)
+            "esri", chosen[0], chosen[1], 19, 2, 2)
         c_geo = tiles.georef_from_detail(c_detail)
         cd = ImageDraw.Draw(c_img)
         cx, cy = c_geo.latlon_to_pixel(chosen[0], chosen[1])
@@ -316,14 +340,17 @@ def main(argv=None):
         if 0 <= rp[0] < c_img.width and 0 <= rp[1] < c_img.height:
             marker(cd, *rp, (40, 220, 90), 16, "本体")
         a2 = jpg_b64(c_img, max_w=1024)
+    robot_dist = haversine_m(ROBOT["lat"], ROBOT["lng"],
+                             chosen[0], chosen[1]) if chosen else 0.0
     a_text = (f"卫星影像 (esri z16, 10×8=80 张, 命中 {a_detail['tiles_ok']}/80)。"
               f"绿圈+字标=本体, 红圈=候选水体 (圈心即质心)。\n\n"
               f"<b>VLM 结论: source={anchor['source']} · 湖=候选#{tgt.get('idx')}"
               f" · 歧义={anchor.get('ambiguity') or '无'}</b>\n"
               f"理由: {html.escape(str(tgt.get('why') or anchor.get('why') or ''))}")
     if a2:
-        a_text += (f"\n<br><b>选定湖特写 (esri z18, 8×8=64 张)</b>: 红圈=候选"
-                   f"#{tgt.get('idx')} 湖面质心, 绿圈=本体。")
+        a_text += (f"\n<br><b>选定湖特写 (esri z19, 2×2=4 张瓦片, 0.25m/px)</b>: "
+                   f"红圈=候选#{tgt.get('idx')} 湖面质心"
+                   f"(本体距湖心约 {robot_dist:.0f}m, 在特写窗口外)。")
     if vlm_raw:
         a_text += (f"\n<details><summary>VLM 原始输出</summary><pre>"
                    f"{html.escape(str(vlm_raw)[:800])}</pre></details>")
