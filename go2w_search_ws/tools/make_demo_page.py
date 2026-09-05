@@ -154,7 +154,11 @@ base.addTo(map);
 setTimeout(function(){ map.invalidateSize(); }, 150);
 setTimeout(function(){ map.invalidateSize(); }, 600);
 var bounds = [];
-function latlng(p){ return [p[0], p[1]]; }
+// 兼容两种坐标形态: 数组 [lat,lng] (多边形) 与对象 {lat,lon} (航点)
+function latlng(p){
+  if (Array.isArray(p)) return [p[0], p[1]];
+  return [p.lat, p.lon !== undefined ? p.lon : p.lng];
+}
 if (DATA.plan && DATA.plan.water_polygon) {
   var wp = DATA.plan.water_polygon.map(latlng);
   L.polygon(wp, {color:"#2A6F97", weight:2, fillOpacity:0.16}).addTo(map);
