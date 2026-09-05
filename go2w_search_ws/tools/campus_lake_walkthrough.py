@@ -79,6 +79,29 @@ def _centroid(ll):
     return (sum(p[0] for p in ll) / len(ll), sum(p[1] for p in ll) / len(ll))
 
 
+def _convex_hull_local(points):
+    """凸包 (Andrew 单调链)。"""
+    pts = sorted(set(points))
+    if len(pts) <= 2:
+        return pts
+
+    def cross(o, a, b):
+        return ((a[0] - o[0]) * (b[1] - o[1])
+                - (a[1] - o[1]) * (b[0] - o[0]))
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
 def _build_vlm(config_key: str = "llm_api_key"):
     from go2w_brain.vlm import build_vlm
     return build_vlm()
@@ -106,30 +129,56 @@ def main(argv=None):
              f"<b>{CAMPUS['name']}</b>, 中心 ({clat}, {clng})。"
              f"这一步只确定\"是哪个园区\", 不画几何。")
 
-    # ---------- S2 VLM 圈园区 (mask) ----------
-    print("[S2] VLM 圈园区 (z18 特写)...")
+    # ---------- S2 园区边界: 地块聚类 (真值) vs VLM mask (IoU 闸门) ----------
+    print("[S2] 园区边界: 地块聚类 vs VLM mask...")
     sat, sat_detail = tiles.stitch_centered("esri", clat, clng, CAMPUS_Z,
                                             8, 8)
     sat_geo = tiles.georef_from_detail(sat_detail)
+    from lake_plan.osm_client import campus_polygon
+    parcel_ll = None
+    try:
+        parcel = campus_polygon(clat, clng, radius_m=1200.0)
+        if "ring" in parcel:
+            parcel_ll = [(p[0], p[1]) for p in parcel["ring"]]
+    except Exception:  # noqa: BLE001
+        pass
+    circle_ll = vlm_mask.circle_poly(clat, clng, CAMPUS["radius_m"])
+    osm_cands = _osm_lake_candidates(CAMPUS, clat, clng, circle_ll,
+                                     tiles, water)
+    union_pts = list(parcel_ll or circle_ll)
+    for ll, _, _, _ in osm_cands:
+        union_pts.extend(ll)
+    base_ll = _convex_hull_local(union_pts)
+    base_ll = base_ll + [base_ll[0]] if len(base_ll) > 2 else circle_ll
+    campus_ll = base_ll
     campus_poly = vlm_mask.vlm_polygon(vlm, sat, vlm_mask.CAMPUS_MASK_PROMPT)
+    vlm_iou = None
+    if campus_poly is not None:
+        cand = vlm_mask.poly_to_latlon(campus_poly["polygon"], sat_geo)
+        vlm_iou = _mc_iou(cand, base_ll)
     s2 = sat.convert("RGB")
     d2 = ImageDraw.Draw(s2)
     rx, ry = sat_geo.latlon_to_pixel(clat, clng)
     marker(d2, rx, ry, (60, 240, 110), 18, "本体", font_mid)
-    if campus_poly is not None:
-        campus_ll = vlm_mask.poly_to_latlon(campus_poly["polygon"], sat_geo)
-        px = [sat_geo.latlon_to_pixel(a, b) for a, b in campus_ll]
-        s2 = fill_mask(s2, px, (255, 120, 60))
-        src_note = ("VLM 直接看卫星图勾画园区边界 (红橙填充 = 园区 mask, "
-                    f"{len(campus_ll) - 1} 顶点): {campus_poly.get('why') or ''}")
+    px = [sat_geo.latlon_to_pixel(a, b) for a, b in base_ll]
+    s2 = fill_mask(s2, px, (255, 120, 60))
+    if campus_poly is not None and vlm_iou is not None:
+        vx = [sat_geo.latlon_to_pixel(a, b)
+              for a, b in vlm_mask.poly_to_latlon(campus_poly["polygon"],
+                                                  sat_geo)]
+        dd = ImageDraw.Draw(s2)
+        dd.polygon(vx, outline=(255, 230, 90), width=4)
+        iou_note = (f"✅≥0.3 采纳" if vlm_iou >= 0.3 else "❌<0.3 不可信")
+        src_note = (f"红橙填充 = 园区 mask (地块聚类 ∪ 园区湖, 确定性, "
+                    f"{len(base_ll) - 1} 顶点); 黄虚线 = VLM 勾画, "
+                    f"IoU(真值) = <b>{vlm_iou:.2f} {iou_note}</b> → "
+                    f"{'VLM' if vlm_iou >= 0.3 else '地块聚类'}生效")
     else:
-        campus_ll = vlm_mask.circle_poly(clat, clng, CAMPUS["radius_m"])
-        px = [sat_geo.latlon_to_pixel(a, b) for a, b in campus_ll]
-        s2 = fill_mask(s2, px, (255, 120, 60))
-        src_note = "VLM 不可用/退化 → 规则半径圆后备 (红橙填充 = 园区近似 mask)"
-    print(f"     campus_mask: {'vlm' if campus_poly else 'rule'} "
-          f"{len(campus_ll) - 1} 顶点")
-    add_step(2, "VLM 圈园区 (卫星图直接 mask)",
+        src_note = (f"红橙填充 = 园区 mask (地块聚类 ∪ 园区湖, "
+                    f"{len(base_ll) - 1} 顶点); VLM 不可用/被拒收 → "
+                    f"确定性地块聚类生效")
+    print(f"     campus_mask: {len(base_ll) - 1} 顶点, vlm_iou={vlm_iou}")
+    add_step(2, "园区边界 (地块聚类真值 + VLM IoU 闸门)",
              src_note + "。绿圈=本体。", image=jpg_b64(s2))
 
     # ---------- S3 湖定位 (OSM) → VLM 在 z19 湖心特写窗上圈湖 ----------

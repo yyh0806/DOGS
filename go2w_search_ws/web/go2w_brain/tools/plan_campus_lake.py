@@ -103,41 +103,71 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     clat, clng = campus["lat"], campus["lng"]
     vlm = ctx.get("vlm")
 
-    # ---------- B. VLM 直接在卫星图上圈园区 (mask) ----------
-    try:
-        sat_img, sat_detail = tiles.stitch_centered(
-            "esri", clat, clng, _SAT_Z, _SAT_NX, _SAT_NY)
-    except tiles.TileError as exc:
-        return {"ok": False, "reason": f"satellite_unavailable:{exc}"}
-    sat_geo = tiles.georef_from_detail(sat_detail)
-    campus_poly = vlm_mask.vlm_polygon(vlm, sat_img,
-                                       vlm_mask.CAMPUS_MASK_PROMPT)
-    if campus_poly is not None:
-        # 质量闸门: 面积 2%~60% 且必须包含本体 (防 GLM 对角线假形状)
-        pts = campus_poly["polygon"]
-        frac = vlm_mask.poly_area_frac(pts)
-        rx, ry = sat_geo.latlon_to_pixel(clat, clng)
-        px, py = rx / sat_geo.w, ry / sat_geo.h
-        if not (0.02 <= frac <= 0.60 and
-                vlm_mask.point_in_poly01(px, py, pts)):
-            campus_poly = None
-    if campus_poly is not None:
-        campus_ll = vlm_mask.poly_to_latlon(campus_poly["polygon"], sat_geo)
-        mask_source = "vlm"
-    else:
-        campus_ll = vlm_mask.circle_poly(clat, clng, campus["radius_m"])
-        mask_source = "rule"
-    ctx["log"].append("event", event="campus_mask", campus=campus["name"],
-                      source=mask_source, vertices=len(campus_ll))
-
-    # ---------- C. 湖定位 (OSM 湖形) → VLM 在 z19 特写窗上圈湖 ----------
+    # ---------- B0. 确定性园区边界: 地块聚类 (M2.1 已验证) ----------
     from lake_plan import planner, route_api
-    from lake_plan.osm_client import _point_in_ring
+    from lake_plan.osm_client import _point_in_ring, campus_polygon
+    from lake_plan.campus_deline import _hull as _convex_hull
     from ..plan_memory import persist_plan
     from ..patrol_math import endurance_check
 
-    osm_cands = _osm_lake_candidates(campus, clat, clng, campus_ll,
+    parcel_ll = None
+    try:
+        parcel = campus_polygon(clat, clng, radius_m=1200.0)
+        if "ring" in parcel:
+            parcel_ll = [(p[0], p[1]) for p in parcel["ring"]]
+    except Exception:  # noqa: BLE001 — Overpass 不可达 → 规则圆
+        pass
+    # C0. OSM 湖形候选 (园区半径内, 用于园区 mask 并集 + 后续裁决)
+    circle_ll = vlm_mask.circle_poly(clat, clng, campus["radius_m"])
+    osm_cands = _osm_lake_candidates(campus, clat, clng, circle_ll,
                                      tiles, water)
+    # 园区 mask = 地块聚类 ∪ 园区湖 (语义: 园区含湖)
+    union_pts = list(parcel_ll or circle_ll)
+    for ll, _, _, _ in osm_cands:
+        union_pts.extend(ll)
+    base_ll = _convex_hull(union_pts)
+    base_ll = base_ll + [base_ll[0]] if len(base_ll) > 2 else circle_ll
+    ctx["log"].append("event", event="campus_parcel",
+                      source="overpass" if parcel_ll else "rule",
+                      vertices=len(base_ll))
+
+    # ---------- B. VLM 圈园区 (IoU 真值闸门; 不可信 → 用地块聚类) ----------
+    try:
+        sat_img, sat_detail = tiles.stitch_centered(
+            "esri", clat, clng, _SAT_Z, _SAT_NX, _SAT_NY)
+        sat_geo = tiles.georef_from_detail(sat_detail)
+        campus_poly = vlm_mask.vlm_polygon(vlm, sat_img,
+                                           vlm_mask.CAMPUS_MASK_PROMPT)
+        if campus_poly is not None:
+            pts = campus_poly["polygon"]
+            frac = vlm_mask.poly_area_frac(pts)
+            rx, ry = sat_geo.latlon_to_pixel(clat, clng)
+            px, py = rx / sat_geo.w, ry / sat_geo.h
+            if not (0.02 <= frac <= 0.60 and
+                    vlm_mask.point_in_poly01(px, py, pts)):
+                campus_poly = None
+    except tiles.TileError:
+        sat_geo = None
+        campus_poly = None
+    vlm_campus_iou = None
+    if campus_poly is not None:
+        vlm_campus_ll = vlm_mask.poly_to_latlon(campus_poly["polygon"],
+                                                sat_geo)
+        vlm_campus_iou = _mc_iou(vlm_campus_ll, base_ll)
+        if vlm_campus_iou >= 0.3:
+            campus_ll = vlm_campus_ll
+            mask_source = "vlm"
+        else:
+            campus_ll = base_ll
+            mask_source = "osm_parcel"
+    else:
+        campus_ll = base_ll
+        mask_source = "osm_parcel"
+    ctx["log"].append("event", event="campus_mask", campus=campus["name"],
+                      source=mask_source, vertices=len(campus_ll),
+                      vlm_iou=vlm_campus_iou)
+
+    # ---------- C. VLM 在 z19 湖心特写窗上圈湖 ----------
     nudge = _centroid_ll(osm_cands[0][0]) if osm_cands \
         else (clat, clng)
     lake_vlm_ll = None
