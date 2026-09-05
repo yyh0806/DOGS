@@ -77,6 +77,13 @@ function drawSaved() {
     }
   });
 }
+function redrawSaved() {
+  // 移除旧的已保存层再重画 (保存覆盖后立即反映)
+  map.eachLayer(function(l) {
+    if (l instanceof L.Polygon && l.getPopup()) map.removeLayer(l);
+  });
+  drawSaved();
+}
 function setStatus(msg, ok) {
   var el = document.getElementById("status");
   el.textContent = msg;
@@ -174,7 +181,10 @@ document.getElementById("btnSave").onclick = function() {
   }).then(function(r){ return r.json(); })
     .then(function(d) {
       if (d.ok) {
-        saved[kind] = pts.slice();
+        saved[kind] = pts.map(function(p){
+          return [+p[0].toFixed(6), +p[1].toFixed(6)];
+        });
+        redrawSaved();
         setStatus("已保存 " + kindName() + " · " + d.vertices + " 顶点 · "
                   + "永久写入记忆库(memory_id=" + (d.memory_id || "-")
                   + ")。回控制台跑任务即可生效", true);
@@ -187,10 +197,16 @@ document.getElementById("btnSave").onclick = function() {
 
 fetch("/api/calibrate").then(function(r){ return r.json(); })
   .then(function(d) {
-    saved = d.entries || {};
+    // 服务器返回 entries = {<园区名>: {boundary: [...], lake: [...]}}
+    saved = (d.entries && d.entries[CAMPUS]) || {boundary: [], lake: []};
     drawSaved();
+    var parts = [];
     if (saved.boundary && saved.boundary.length)
-      setStatus("已加载此前标定 (园区边界 " + saved.boundary.length
-                + " 顶点)", true);
+      parts.push("园区边界 " + saved.boundary.length + " 顶点");
+    if (saved.lake && saved.lake.length)
+      parts.push("湖岸线 " + saved.lake.length + " 顶点");
+    if (parts.length)
+      setStatus("已加载标定: " + parts.join(" · ")
+                + " (红=园区, 蓝=湖)。重新圈选并保存即可覆盖", true);
   });
 </script></body></html>
