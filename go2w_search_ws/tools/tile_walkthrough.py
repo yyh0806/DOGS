@@ -82,27 +82,30 @@ def main(argv=None):
     print(f"缓存: {config.cache_dir()}  offline={config.offline()}")
     print("=" * 70)
 
-    # ---------- S0 感知阶梯 ----------
-    add_step(0, "感知阶梯 (先近后远)",
-             "以本体为中心逐级扩大视野: z16 园区尺度(8×8≈4.9km) → z14 街区"
-             "(≈19.5km) → z12 城区(≈40km)。上一级找到合格水体即停 —— 保证"
-             "\"距离最近\"真正最近, 而不是被远处大湖抢走。")
-    print("[S0] 感知阶梯 z16(8×8) → z14(8×8) → z12(10×10)")
+    # ---------- S0 感知窗口 ----------
+    add_step(0, "感知窗口 (本地两级, 2026-09-04)",
+             "命令通常针对周边 → 感知只扫本地窗口: 最细可用的 z17 8×8"
+             "(约 ±1.0km, z18/z19 上 OSM 会把小湖与邻近水渠渲染成一体而被"
+             "淘汰) 找不到再放宽 z16 8×8 (约 ±2.4km)。不再逐层远扫城区。"
+             "找到合格水体即停, 选距离最近者; 精确岸线由 S5 聚焦重扫给出。")
+    print("[S0] 感知窗口 z17(8×8, ±1.0km) → z16(8×8, ±2.4km)")
 
     # ---------- S1 瓦片拼接 ----------
-    print("[S1] 瓦片获取与拼接 (z16, 8×8)...")
-    img, detail = tiles.stitch_centered(provider, *CENTER, 16, 8, 8)
+    print("[S1] 瓦片获取与拼接 (z17, 8×8)...")
+    img, detail = tiles.stitch_centered(provider, *CENTER, 17, 8, 8)
     georef = tiles.georef_from_detail(detail)
+    span_m = img.size[0] * georef.mppx()
     print(f"     尺寸 {img.size}  命中 {detail['tiles_ok']}/64 "
-          f"未命中 {len(detail['tiles_miss'])}")
+          f"未命中 {len(detail['tiles_miss'])}  (约 ±{span_m / 2:.0f}m)")
     s1 = img.copy()
     d1 = ImageDraw.Draw(s1)
     rx, ry = georef.latlon_to_pixel(*CENTER)
     marker(d1, rx, ry, (60, 240, 110), 14, "本体")
-    add_step(1, "瓦片获取与拼接 (OSM z16, 8×8=64 张)",
+    add_step(1, "瓦片获取与拼接 (OSM z17, 8×8=64 张)",
              f"64 张 256px 瓦片拼成 {img.size[0]}×{img.size[1]} 影像, 覆盖本体"
-             f"周围约 ±2.4km。缓存命中 {detail['tiles_ok']}/64, "
-             f"未命中 {len(detail['tiles_miss'])} 张。绿圈=机器人本体。",
+             f"周围约 ±{span_m / 2:.0f}m (周边尺度)。缓存命中 "
+             f"{detail['tiles_ok']}/64, 未命中 {len(detail['tiles_miss'])} 张。"
+             f"绿圈=机器人本体。",
              image=jpg_b64(s1))
 
     # ---------- S2 水域分割 ----------

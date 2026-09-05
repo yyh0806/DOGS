@@ -137,35 +137,88 @@ def rdp_simplify(pts, eps=2.0):
     return rdp_simplify(pts[: bi + 1], eps)[:-1] + rdp_simplify(pts[bi:], eps)
 
 
-def polygon_from_component(c, shape, eps=2.5):
-    """连通域 -> 原图像素坐标多边形 [(x,y)...]（已简化）。"""
+def polygon_from_component(c, shape, eps=2.5, allow_hull=False):
+    """连通域 -> 原图像素坐标多边形 [(x,y)...]（已简化）。
+
+    allow_hull (2026-09-04): 径向星形自交致面积≈0 时, 允许凸包兜底。
+    仅感知候选阶段 (_candidates) 开启 —— 那里"形状先保住、精确边界交给
+    聚焦重扫"; 细化 (_refine) 必须保持严格: 粘连水渠/退化形状宁可弃级,
+    否则凸包会把粘连形状救活并冒充细化结果 (园区湖实测 30 航点绕湖+水渠)。
+    """
     full = comp_to_full(c, shape)
     bnd = moore_boundary(full)
+    poly = []
     if len(bnd) >= 8:
         pts = [(cc, rr) for (rr, cc) in bnd]  # -> (x, y)
         simp = rdp_simplify(pts, eps)
         if len(simp) >= 4:
-            return simp
-        simp = rdp_simplify(pts, eps * 0.5)
-        if len(simp) >= 4:
-            return simp
-    # 兜底：径向采样轮廓
-    ys, xs = np.where(full)
-    if len(ys) == 0:
-        return []
-    cy, cx = ys.mean(), xs.mean()
-    poly = []
-    for ang in range(0, 360, 5):
-        a = np.deg2rad(ang)
-        last = (int(cx), int(cy))
-        for r in range(0, max(full.shape)):
-            y = int(cy + r * np.sin(a))
-            x = int(cx + r * np.cos(a))
-            if not (0 <= y < full.shape[0] and 0 <= x < full.shape[1]) or not full[y, x]:
-                break
-            last = (x, y)
-        poly.append(last)
+            poly = simp
+        else:
+            simp = rdp_simplify(pts, eps * 0.5)
+            if len(simp) >= 4:
+                poly = simp
+    if len(poly) < 4:
+        # 兜底：径向采样轮廓
+        ys, xs = np.where(full)
+        if len(ys) == 0:
+            return []
+        cy, cx = ys.mean(), xs.mean()
+        for ang in range(0, 360, 5):
+            a = np.deg2rad(ang)
+            last = (int(cx), int(cy))
+            for r in range(0, max(full.shape)):
+                y = int(cy + r * np.sin(a))
+                x = int(cx + r * np.cos(a))
+                if not (0 <= y < full.shape[0] and 0 <= x < full.shape[1]) or not full[y, x]:
+                    break
+                last = (x, y)
+            poly.append(last)
+    if allow_hull and _poly_area_px(poly) < 4.0:
+        # 感知期退化兜底 (2026-09-04): 细颗粒小水体 (z17 下几十米级景观湖)
+        # 的径向星形可能自交 → 鞋带面积≈0, 候选被误淘汰。改取凸包
+        # (对小水体 hull≈轮廓; 精确边界由后续聚焦重扫修正)。
+        ys, xs = np.where(full)
+        if len(ys) == 0:
+            return []
+        hull = _convex_hull(list(zip(xs.tolist(), ys.tolist())))
+        if len(hull) >= 4:
+            poly = hull
     return poly
+
+
+def _poly_area_px(poly):
+    """像素坐标多边形鞋带面积。"""
+    if len(poly) < 3:
+        return 0.0
+    area2 = 0.0
+    for i in range(len(poly)):
+        x1, y1 = poly[i - 1]
+        x2, y2 = poly[i]
+        area2 += x1 * y2 - x2 * y1
+    return abs(area2) / 2.0
+
+
+def _convex_hull(points):
+    """Andrew 单调链凸包 (stdlib, 输入 [(x,y)...], 返回逆时针顶点)。"""
+    pts = sorted(set(points))
+    if len(pts) <= 2:
+        return pts
+
+    def cross(o, a, b):
+        return ((a[0] - o[0]) * (b[1] - o[1])
+                - (a[1] - o[1]) * (b[0] - o[0]))
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
 
 
 # ---------------- 统计 ----------------

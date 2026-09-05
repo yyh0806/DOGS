@@ -82,8 +82,8 @@
    }
   ],
   "target": {
-   "area_km2": 0.001,
-   "perim_km": 0.34,
+   "area_km2": 0.017,
+   "perim_km": 1.11,
    "dist_km": 0.1,
    "kind": "water",
    "centroid": [
@@ -395,70 +395,70 @@
   ],
   "nearby_candidates": [
    {
-    "area_km2": 0.108,
-    "perim_km": 3.01,
-    "compact": 0.15,
+    "area_km2": 0.148,
+    "perim_km": 1.84,
+    "compact": 0.553,
     "clipped": false,
     "centroid": [
-     31.50097,
-     120.37372
+     31.49008,
+     120.37402
     ],
-    "dist_km": 1.48
+    "dist_km": 0.48
    },
    {
-    "area_km2": 0.103,
-    "perim_km": 2.07,
-    "compact": 0.301,
+    "area_km2": 0.049,
+    "perim_km": 0.85,
+    "compact": 0.841,
     "clipped": false,
     "centroid": [
-     31.49261,
-     120.38237
+     31.49081,
+     120.36073
     ],
-    "dist_km": 1.32
+    "dist_km": 0.88
    },
    {
-    "area_km2": 0.008,
-    "perim_km": 0.87,
-    "compact": 0.136,
+    "area_km2": 0.049,
+    "perim_km": 0.97,
+    "compact": 0.661,
     "clipped": false,
     "centroid": [
-     31.50314,
-     120.35663
+     31.48614,
+     120.36297
     ],
-    "dist_km": 2.06
+    "dist_km": 0.66
    },
    {
-    "area_km2": 0.002,
-    "perim_km": 0.46,
-    "compact": 0.128,
+    "area_km2": 0.006,
+    "perim_km": 0.54,
+    "compact": 0.276,
     "clipped": false,
     "centroid": [
-     31.4846,
-     120.35589
+     31.49373,
+     120.37767
     ],
-    "dist_km": 1.35
+    "dist_km": 0.99
    },
    {
-    "area_km2": 0.008,
-    "perim_km": 0.81,
-    "compact": 0.162,
+    "area_km2": 0.025,
+    "perim_km": 0.96,
+    "compact": 0.339,
     "clipped": false,
     "centroid": [
-     31.50122,
-     120.38212
+     31.48387,
+     120.37486
     ],
-    "dist_km": 1.88
+    "dist_km": 0.7
    },
    {
-    "area_km2": 0.009,
-    "perim_km": 0.74,
-    "compact": 0.201,
+    "area_km2": 0.013,
+    "perim_km": 0.53,
+    "compact": 0.564,
     "clipped": false,
     "centroid": [
-     31.50046,
-     120.35358
+     31.48127,
+     120.37339
     ],
-    "dist_km": 2.04
+    "dist_km": 0.85
    }
   ]
  }

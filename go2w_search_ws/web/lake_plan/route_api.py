@@ -28,11 +28,12 @@ from .config import (DEFAULT_LOOP_OFFSET_M, DEFAULT_MAX_PERIM_KM,
 from .geo import (StitchGeoref, haversine_m, lat_to_global_px,
                   lng_to_global_px)
 
-# 感知阶梯: 先近后远 (z16 园区尺度 ~4km → z14 街区 ~17km → z12 城区 ~40km)。
-# 旧的 z13 起步会把园区小湖挤出"面积前几名", 选到 10km 外的大湖 —— 这是
-# 2026-08-31 园区坐标 (31.488192, 120.369486) 实测暴露的缺陷;
-# 先近后远让"距离最近合格水体"真正最近。
-_PERCEIVE_PLANS = ((16, 8, 8), (14, 8, 8), (12, 10, 10))
+# 感知窗口 (2026-09-04 重设计): 命令通常针对周边 → 只扫两级本地窗口,
+# 不再逐层外扩到 z14/z12 城区尺度。z17 8×8 ≈ ±1.0km (最细可用层级:
+# z18/z19 上 OSM 把小湖与邻近水渠渲染成一体, 候选被紧凑度/周长淘汰),
+# 找不到再放宽到 z16 8×8 ≈ ±2.4km。找到即停, 选距离最近者。
+# (更细的聚焦重扫由 _refine 对选定湖面做, 感知只负责"哪片水在附近"。)
+_PERCEIVE_PLANS = ((17, 8, 8), (16, 8, 8))
 _CANDIDATE_SCAN = 24  # 连通域扫描深度 (按面积排序取前 N)
 
 
@@ -323,7 +324,9 @@ def _candidates(comps, georef, mask_shape, ref_lat, ref_lng):
     """连通域 → 候选摘要 (自 agent.node_perceive 的循环体)。"""
     cands = []
     for c in comps[:_CANDIDATE_SCAN]:
-        poly = water.polygon_from_component(c, mask_shape)
+        # allow_hull: 感知阶段允许退化多边形凸包兜底 (小水体在高倍级
+        # 星形自交); 精确边界由 _refine 聚焦重扫给出。
+        poly = water.polygon_from_component(c, mask_shape, allow_hull=True)
         if len(poly) < 4:
             continue
         poly_ll = [georef.pixel_to_latlon(x, y) for (x, y) in poly]
@@ -396,8 +399,12 @@ def _refine(target, provider):
         fine_ll = [fine_georef.pixel_to_latlon(x, y)
                    for (x, y) in fine_poly]
         _, fine_area = water.poly_stats_latlon(fine_ll, fine_ll[0][0])
-        if not (0.4 * coarse_area <= fine_area <= 2.5 * coarse_area):
-            continue  # 面积骤变 = 粘连水渠或匹配到别的小水体
+        # 面积窗口: 上限 2.5× 防粘连水渠 (细扫面积暴涨 = 匹配到合并水体);
+        # 下限 0.05× 只防退化 —— 粗扫多边形可能来自凸包兜底 (小水体在
+        # z17 的自交星形修复, 面积被放大 ~17×), 真细化面积反而小得多,
+        # 而"匹配到别的小水体"已由质心就近匹配拦截。
+        if not (0.05 * coarse_area <= fine_area <= 2.5 * coarse_area):
+            continue
         return fine_poly, fine_georef, True
     return None
 

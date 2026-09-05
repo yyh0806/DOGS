@@ -34,6 +34,14 @@ def test_water_refinement_engaged(water_route):
     assert water_route["stats"].get("refined") is True
 
 
+def test_perceive_ladder_local_two_levels():
+    """2026-09-04 用户决策: 命令通常针对周边 → 感知只用两级本地窗口
+    (最细可用的 z17 ±1km 起, 找不到放宽 z16 ±2.4km), 不再逐层远扫
+    z14/z12 城区尺度。"""
+    from lake_plan import route_api
+    assert route_api._PERCEIVE_PLANS == ((17, 8, 8), (16, 8, 8))
+
+
 def test_water_quality(water_route):
     stats = water_route["stats"]
     assert water_route["kind"] == "water"
