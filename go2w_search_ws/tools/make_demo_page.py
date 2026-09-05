@@ -99,6 +99,9 @@ border:1px solid var(--edge);padding:8px;margin-top:6px;font-size:11px}
 border:1px solid var(--edge);padding:8px 10px;font-size:11px;color:var(--muted);
 font-family:ui-monospace,Consolas,monospace;border-radius:2px}
 .legend i{display:inline-block;width:9px;height:9px;margin-right:5px;border-radius:50%}
+.tile-warn{position:absolute;top:10px;left:10px;right:10px;z-index:1100;
+background:rgba(90,30,25,.92);border:1px solid #a05040;color:#ffd9c9;
+padding:8px 12px;font-size:12px;border-radius:6px}
 @media(max-width:860px){.layout{grid-template-columns:1fr;grid-template-rows:42vh 1fr}
 .map{border-right:none;border-bottom:1px solid var(--edge)}}
 @media (prefers-reduced-motion: reduce){*{transition:none!important}}
@@ -111,6 +114,7 @@ font-family:ui-monospace,Consolas,monospace;border-radius:2px}
 <div class="layout">
   <div class="map">
     <div id="map"></div>
+    <div id="tilewarn" class="tile-warn" hidden>⚠️ 卫星底图瓦片加载失败 (网络/缓存受限)，已自动切换本地 OSM 底图 —— 航线与步骤不受影响</div>
     <div class="legend">
       <span style="color:var(--accent)"><i style="background:var(--accent)"></i>环线/扫描点</span>
       <span style="color:var(--water)"><i style="background:var(--water)"></i>水域禁区</span>
@@ -131,9 +135,21 @@ font-family:ui-monospace,Consolas,monospace;border-radius:2px}
 <script>
 var DATA = @@DATA@@;
 var map = L.map("map");
-L.tileLayer("/tiles/esri/{z}/{x}/{y}.png",
+var tileErrs = 0;
+var base = L.tileLayer("/tiles/esri/{z}/{x}/{y}.png",
   {maxZoom: 19, attribution: "Esri 卫星影像"}
-).addTo(map);
+);
+base.on("tileerror", function(){
+  if (++tileErrs === 3) {
+    // 卫星瓦片不可用 → 本地 OSM 兜底 (回放页永不白图)
+    L.tileLayer("/tiles/osm/{z}/{x}/{y}.png",
+      {maxZoom: 19, attribution: "OSM (本地缓存)"}
+    ).addTo(map);
+    var w = document.getElementById("tilewarn");
+    if (w) w.hidden = false;
+  }
+});
+base.addTo(map);
 var bounds = [];
 function latlng(p){ return [p[0], p[1]]; }
 if (DATA.plan && DATA.plan.water_polygon) {
