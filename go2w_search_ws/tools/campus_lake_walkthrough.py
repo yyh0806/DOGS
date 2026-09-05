@@ -36,7 +36,8 @@ from go2w_brain.tools.plan_campus_lake import (  # noqa: E402
     _zoom_to_bbox)
 
 CAMPUS = CAMPUSES[0]
-CAMPUS_Z = 18   # 园区 mask 层级 (±520m, 园区充满画面)
+CAMPUS_Z = 19               # 园区识别层级: z19 高清
+CAMPUS_NX, CAMPUS_NY = 12, 12  # ±390m
 LAKE_Z, LAKE_NX, LAKE_NY = 19, 4, 4  # 湖 mask 特写层级
 TASK = "绕着当前园区湖绕行一圈"
 ROBOT = {"lat": CAMPUS["lat"], "lng": CAMPUS["lng"]}
@@ -129,10 +130,10 @@ def main(argv=None):
              f"<b>{CAMPUS['name']}</b>, 中心 ({clat}, {clng})。"
              f"这一步只确定\"是哪个园区\", 不画几何。")
 
-    # ---------- S2 园区边界: 地块聚类 (真值) vs VLM mask (IoU 闸门) ----------
-    print("[S2] 园区边界: 地块聚类 vs VLM mask...")
+    # ---------- S2 园区边界 (z19 高清): 地块聚类真值 vs VLM mask ----------
+    print("[S2] 园区边界 (z19): 地块聚类 vs VLM mask...")
     sat, sat_detail = tiles.stitch_centered("esri", clat, clng, CAMPUS_Z,
-                                            8, 8)
+                                            CAMPUS_NX, CAMPUS_NY)
     sat_geo = tiles.georef_from_detail(sat_detail)
     from lake_plan.osm_client import campus_polygon
     parcel_ll = None
@@ -169,14 +170,19 @@ def main(argv=None):
         dd = ImageDraw.Draw(s2)
         dd.polygon(vx, outline=(255, 230, 90), width=4)
         iou_note = (f"✅≥0.3 采纳" if vlm_iou >= 0.3 else "❌<0.3 不可信")
-        src_note = (f"红橙填充 = 园区 mask (地块聚类 ∪ 园区湖, 确定性, "
+        base_desc = ("地块聚类 ∪ 园区湖" if parcel_ll
+                     else "任务范围圆(本体周围) ∪ 园区湖")
+        src_note = (f"红橙填充 = 园区边界 ({base_desc}, 确定性, "
                     f"{len(base_ll) - 1} 顶点); 黄虚线 = VLM 勾画, "
                     f"IoU(真值) = <b>{vlm_iou:.2f} {iou_note}</b> → "
-                    f"{'VLM' if vlm_iou >= 0.3 else '地块聚类'}生效")
+                    f"{'VLM' if vlm_iou >= 0.3 else base_desc}生效")
     else:
-        src_note = (f"红橙填充 = 园区 mask (地块聚类 ∪ 园区湖, "
+        base_desc = ("地块聚类 ∪ 园区湖" if parcel_ll
+                     else "任务范围圆(本体周围) ∪ 园区湖")
+        src_note = (f"红橙填充 = 园区边界 ({base_desc}, "
                     f"{len(base_ll) - 1} 顶点); VLM 不可用/被拒收 → "
-                    f"确定性地块聚类生效")
+                    f"确定性边界生效。不找园区也理解任务范围: "
+                    f"\"当前园区湖\"=本体周围, 湖搜索在该范围内进行。")
     print(f"     campus_mask: {len(base_ll) - 1} 顶点, vlm_iou={vlm_iou}")
     add_step(2, "园区边界 (地块聚类真值 + VLM IoU 闸门)",
              src_note + "。绿圈=本体。", image=jpg_b64(s2))

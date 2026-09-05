@@ -31,8 +31,16 @@ CAMPUSES = [
      "radius_m": 400.0, "source": "user-confirmed:2026-09-05"},
 ]
 
-_SAT_Z, _SAT_NX, _SAT_NY = 18, 8, 8  # 园区 mask 层级: z18 ±520m, 园区充满画面
-_LAKE_Z, _LAKE_NX, _LAKE_NY = 19, 4, 4  # 湖 mask 层级: z19 4×4 湖心特写
+_SAT_Z, _SAT_NX, _SAT_NY = 19, 12, 12  # 园区识别层级: z19 高清 (±390m)
+_LAKE_Z, _LAKE_NX, _LAKE_NY = 19, 4, 4  # 湖 mask 特写层级
+
+
+def _task_scope_radius(task_text: str, default: float) -> float:
+    """任务范围理解 (2026-09-05 用户要求): '当前园区湖' 的范围 = 本体周围。
+    不依赖园区多边形成功 —— 附近/周边词放宽, 缺省 = 园区知识库半径。"""
+    if any(k in task_text for k in ("附近", "周边", "周围")):
+        return max(default, 800.0)
+    return default
 
 
 def _hav_m(lat1, lng1, lat2, lng2):
@@ -103,35 +111,41 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     clat, clng = campus["lat"], campus["lng"]
     vlm = ctx.get("vlm")
 
-    # ---------- B0. 确定性园区边界: 地块聚类 (M2.1 已验证) ----------
+    # ---------- B0. 任务范围 + 确定性园区边界 (地块聚类∪湖, 范围圆兜底) ----------
     from lake_plan import planner, route_api
     from lake_plan.osm_client import _point_in_ring, campus_polygon
     from lake_plan.campus_deline import _hull as _convex_hull
     from ..plan_memory import persist_plan
     from ..patrol_math import endurance_check
 
+    scope_radius = _task_scope_radius(task_text, campus["radius_m"])
+    ctx["log"].append("event", event="task_scope", center=[clat, clng],
+                      radius_m=scope_radius, campus=campus["name"])
     parcel_ll = None
     try:
         parcel = campus_polygon(clat, clng, radius_m=1200.0)
         if "ring" in parcel:
             parcel_ll = [(p[0], p[1]) for p in parcel["ring"]]
-    except Exception:  # noqa: BLE001 — Overpass 不可达 → 规则圆
+    except Exception:  # noqa: BLE001 — Overpass 不可达 → 任务范围圆
         pass
-    # C0. OSM 湖形候选 (园区半径内, 用于园区 mask 并集 + 后续裁决)
-    circle_ll = vlm_mask.circle_poly(clat, clng, campus["radius_m"])
+    circle_ll = vlm_mask.circle_poly(clat, clng, scope_radius)
     osm_cands = _osm_lake_candidates(campus, clat, clng, circle_ll,
                                      tiles, water)
-    # 园区 mask = 地块聚类 ∪ 园区湖 (语义: 园区含湖)
-    union_pts = list(parcel_ll or circle_ll)
+    union_pts = list(parcel_ll or [])
     for ll, _, _, _ in osm_cands:
         union_pts.extend(ll)
-    base_ll = _convex_hull(union_pts)
-    base_ll = base_ll + [base_ll[0]] if len(base_ll) > 2 else circle_ll
+    if union_pts:
+        base_ll = _convex_hull(union_pts)
+        base_ll = base_ll + [base_ll[0]] if len(base_ll) > 2 else circle_ll
+        mask_base_source = "osm_parcel" if parcel_ll else "scope_lake"
+    else:
+        base_ll = circle_ll
+        mask_base_source = "scope"
     ctx["log"].append("event", event="campus_parcel",
-                      source="overpass" if parcel_ll else "rule",
+                      source="overpass" if parcel_ll else "scope",
                       vertices=len(base_ll))
 
-    # ---------- B. VLM 圈园区 (IoU 真值闸门; 不可信 → 用地块聚类) ----------
+    # ---------- B. VLM 在 z19 高清图上圈园区 (IoU 真值闸门) ----------
     try:
         sat_img, sat_detail = tiles.stitch_centered(
             "esri", clat, clng, _SAT_Z, _SAT_NX, _SAT_NY)
@@ -159,10 +173,10 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
             mask_source = "vlm"
         else:
             campus_ll = base_ll
-            mask_source = "osm_parcel"
+            mask_source = mask_base_source
     else:
         campus_ll = base_ll
-        mask_source = "osm_parcel"
+        mask_source = mask_base_source
     ctx["log"].append("event", event="campus_mask", campus=campus["name"],
                       source=mask_source, vertices=len(campus_ll),
                       vlm_iou=vlm_campus_iou)

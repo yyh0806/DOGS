@@ -62,8 +62,9 @@ class _FakeVlm:
                 # 与合成地块 (±0.0015° ≈ ±165m) 重合的园区框
                 return ('{"polygon": [[0.34,0.34],[0.66,0.34],[0.66,0.66],'
                         '[0.34,0.66]], "why": "synthetic campus"}')
-            return ('{"polygon": [[0.15,0.15],[0.85,0.15],[0.85,0.85],'
-                    '[0.15,0.85]], "why": "synthetic campus"}')
+            # 默认: 超大框 (z19 12x12 窗内 ±345m) → 与地块 IoU<0.3 被拒
+            return ('{"polygon": [[0.02,0.02],[0.98,0.02],[0.98,0.98],'
+                    '[0.02,0.98]], "why": "synthetic campus"}')
         if self._masks and "岸线" in prompt:
             return ('{"polygon": [[0.40,0.40],[0.60,0.40],[0.60,0.60],'
                     '[0.40,0.60]], "why": "synthetic lake"}')
@@ -156,8 +157,9 @@ def test_vlm_mask_chain(monkeypatch):
     assert result["closed"] is True
     assert result["waypoint_count"] >= 8
     cm = log.events("campus_mask")
-    assert cm and cm[0]["source"] == "osm_parcel"  # VLM 大框 IoU<0.3 → 地块聚类
-    assert cm[0]["vlm_iou"] is not None and cm[0]["vlm_iou"] < 0.3
+    assert cm and cm[0]["source"] == "osm_parcel"  # VLM 大框被拒 (面积闸门/IoU)
+    # 超大框可能直接被面积闸门拒收 (vlm_iou=None), 或被 IoU<0.3 拒
+    assert cm[0]["vlm_iou"] is None or cm[0]["vlm_iou"] < 0.3
     lm = log.events("lake_mask")
     assert lm and lm[0]["source"] == "vlm"
     plan_ev = log.events("plan_result")[0]
@@ -208,3 +210,25 @@ def test_no_water_in_campus(monkeypatch):
     assert result["ok"] is False
     assert result["reason"] == "no_lake_like_water_in_campus"
     assert log.events("campus_identified")
+
+
+def test_campus_polygon_unavailable_scope_fallback(monkeypatch):
+    """Overpass 不可达 → 任务范围圆兜底 (不找园区也理解任务范围)。"""
+    _fake_stitch(monkeypatch, with_lake=True)
+    from lake_plan import osm_client as osm_mod
+
+    def _boom(*a, **k):
+        raise OSError("overpass down")
+
+    monkeypatch.setattr(osm_mod, "campus_polygon", _boom)
+    log = _Log()
+    result = TOOLS["plan_campus_lake"].execute({}, _ctx(log))
+    assert result["ok"], result.get("reason")
+    cm = log.events("campus_mask")
+    # 无真值时 VLM 框与任务范围圆都可行 (范围语义兜底是硬约束)
+    assert cm and cm[0]["source"] in ("vlm", "scope")
+    ts = log.events("task_scope")
+    assert ts and ts[0]["radius_m"] == HK["radius_m"]
+    # 湖仍由 VLM mask 兜底找到 → 任务范围语义完整
+    lm = log.events("lake_mask")
+    assert lm and lm[0]["source"] == "vlm"
