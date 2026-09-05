@@ -23,6 +23,8 @@ deps/
 # lake_plan golden 回归夹具 (M2.1 起为太科园园区基准: z16 瓦片 64 张 0.7MB
 # + Overpass 响应缓存): 保证双目标航线回归测试在无网络环境可跑
 !go2w_search_ws/web/lake_plan/tests/fixtures/cache/**/*.png
+# lake_plan 运行时瓦片/Overpass 缓存 (演示与控制台在线抓取; 测试夹具除外)
+go2w_search_ws/web/lake_plan/cache/
 .omc/
 
 # 工具缓存 (不在仓库内但常出现在仓库根: locate-anything.cpp 上游克隆 / playwright MCP)
