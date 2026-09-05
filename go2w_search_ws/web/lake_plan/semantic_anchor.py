@@ -28,7 +28,7 @@ _ANCHOR_PROMPT = (
     "质心, 圈的大小不代表水体大小)。\n"
     "任务: {task}\n"
     "请回答三个问题: 1) 本体是否就在水边 (self_near_water, true/false); "
-    "2) 任务里说的'湖'最可能是哪个编号 (target_idx, 整数); "
+    "2) 任务所指的目标水体最可能是哪个编号 (target_idx, 整数); "
     "3) 还有哪些水体可能造成歧义 (ambiguity, 编号数组, 没有则空数组); "
     "补充: target_name (若影像上看得出名称) 与 why (一句话理由)。\n"
     "只输出 JSON: {{\"self_near_water\": bool, \"target_idx\": int, "

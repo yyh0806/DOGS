@@ -29,7 +29,8 @@ from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 from lake_plan import config, planner, plan_route, route_api, tiles, water  # noqa: E402
 from lake_plan.geo import haversine_m  # noqa: E402
 
-CENTER = (31.488192, 120.369486)  # 太科园园区 (基准点 = 机器人 GNSS)
+CENTER = (31.488192, 120.369486)  # 基准点 = 机器人 GNSS: 无锡市新吴区新安街道,
+# 无锡软件园 iPark 南侧工业地块 (OSM 未命名 landuse=industrial) 河南岸 ~75m
 ROBOT = {"lat": CENTER[0], "lng": CENTER[1]}
 TASK = "绕湖一周，并巡查有没有落水人员"
 
@@ -85,7 +86,7 @@ def main(argv=None):
     # ---------- S0 感知窗口 ----------
     add_step(0, "感知窗口 (本地两级, 2026-09-04)",
              "命令通常针对周边 → 感知只扫本地窗口: 最细可用的 z17 8×8"
-             "(约 ±1.0km, z18/z19 上 OSM 会把小湖与邻近水渠渲染成一体而被"
+             "(约 ±1.0km, z18/z19 上 OSM 会把河道宽段与上下游河道渲染成一体而被"
              "淘汰) 找不到再放宽 z16 8×8 (约 ±2.4km)。不再逐层远扫城区。"
              "找到合格水体即停, 选距离最近者; 精确岸线由 S5 聚焦重扫给出。")
     print("[S0] 感知窗口 z17(8×8, ±1.0km) → z16(8×8, ±2.4km)")
@@ -229,7 +230,7 @@ def main(argv=None):
     add_step(5, "选湖 + 聚焦重扫 (近景)",
              f"合格候选里取距本体最近的: #{cands.index(target)}。随后对湖面 bbox "
              f"逐级聚焦重扫 (z19→z16, 四周各留 1 瓦片边距), 并按面积窗口 "
-             f"(粗扫的 0.4×~2.5×) 校验: 园区湖在高倍级上会与邻近水渠渲染成一体"
+             f"(粗扫的 0.4×~2.5×) 校验: 河道宽段在高倍级上会与上下游河道渲染成一体"
              f" (z19~z17 实测粘连 → 弃用), 命中 "
              f"{'z%d 聚焦重扫' % georef_plan.z if refined else '失败, 沿用粗扫边界'}。"
              f"蓝线=粗扫多边形, 绿线=细化多边形 (面积 ×1.03)。",
@@ -325,7 +326,7 @@ def main(argv=None):
     print(f"     锚定 source={anchor['source']} "
           f"target={anchor.get('target')} ambiguity={anchor.get('ambiguity')}")
     tgt = anchor.get("target") or {}
-    # 选定湖的 z19 卫星特写 (近景验证"湖是哪个")
+    # 选定水体的 z19 卫星特写 (近景验证"目标水体是哪个")
     a2 = None
     chosen = tgt.get("centroid")
     if chosen:
@@ -347,11 +348,11 @@ def main(argv=None):
                              chosen[0], chosen[1]) if chosen else 0.0
     a_text = (f"卫星影像 (esri z16, 10×8=80 张, 命中 {a_detail['tiles_ok']}/80)。"
               f"绿圈+字标=本体, 红圈=候选水体 (圈心即质心)。\n\n"
-              f"<b>VLM 结论: source={anchor['source']} · 湖=候选#{tgt.get('idx')}"
+              f"<b>VLM 结论: source={anchor['source']} · 目标水体=候选#{tgt.get('idx')}"
               f" · 歧义={anchor.get('ambiguity') or '无'}</b>\n"
               f"理由: {html.escape(str(tgt.get('why') or anchor.get('why') or ''))}")
     if a2:
-        a_text += (f"\n<br><b>选定湖特写 (esri z19, 2×2=4 张瓦片, 0.25m/px)</b>: "
+        a_text += (f"\n<br><b>选定水体特写 (esri z19, 2×2=4 张瓦片, 0.25m/px)</b>: "
                    f"红圈=候选#{tgt.get('idx')} 湖面质心"
                    f"(本体距湖心约 {robot_dist:.0f}m, 在特写窗口外)。")
     if vlm_raw:
@@ -430,7 +431,7 @@ border-radius:6px}
 .banner{max-width:1060px;margin:0 auto 12px;background:#13241a;border:1px solid #1f4d33;
 border-radius:10px;padding:10px 22px;font-size:14px}
 </style></head><body>
-<h1>大脑如何分析瓦片地图 —— 逐步演示 <small>go2w_brain M7.3 · 无锡太科园 (31.488192, 120.369486)</small></h1>
+<h1>大脑如何分析瓦片地图 —— 逐步演示 <small>go2w_brain M7.3 · 无锡市新吴区新安 · 无锡软件园 iPark 南侧 (31.488192, 120.369486)</small></h1>
 <div class="banner">分步结果与一次成型 plan_route 交叉验证: <b>@@MATCH@@</b></div>
 @@SECTIONS@@
 </body></html>"""
