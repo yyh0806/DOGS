@@ -207,6 +207,8 @@ class Handler(BaseHTTPRequestHandler):
             ".js": "application/javascript; charset=utf-8",
             ".json": "application/json",
             ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
         }.get(file_path.suffix, "application/octet-stream")
         self._respond(200, content_type, file_path.read_bytes())
 
