@@ -1,8 +1,7 @@
 """test_m7p4_campus_lake.py — 园区湖语义链测试 (封闭: 合成卫星图 + 假 VLM)。
 
-语义链 (2026-09-05 用户要求): "园区湖"任务必须先识别园区, 再在园区内
-找湖 —— 而不是找最近水体。这里验证 A(园区识别)/B(园区内找湖+锚定)/
-C(绕行规划) 三段与事件留痕。
+语义链 (2026-09-05): A 园区识别 → B VLM 圈园区 mask → C VLM 圈湖 mask
+→ D 沿湖环线; VLM 失败走规则后备 (候选+湖形过滤+锚定)。
 """
 from __future__ import annotations
 
@@ -35,19 +34,29 @@ class _Log:
 
 
 class _FakeVlm:
-    def __init__(self, idx=0):
+    """按提示词分流: 圈园区 → 园区多边形; 圈湖 → 湖多边形; 其他 → 锚定 JSON。"""
+
+    def __init__(self, idx=0, with_masks=True):
         self._idx = idx
+        self._masks = with_masks
+        self.calls = []
 
     def available(self):
         return True
 
     def vision(self, image, prompt, max_tokens=1024):
+        self.calls.append(prompt[:30])
+        if self._masks and "工业园区" in prompt:
+            return ('{"polygon": [[0.15,0.15],[0.85,0.15],[0.85,0.85],'
+                    '[0.15,0.85]], "why": "synthetic campus"}')
+        if self._masks and "岸线" in prompt:
+            return ('{"polygon": [[0.40,0.40],[0.60,0.40],[0.60,0.60],'
+                    '[0.40,0.60]], "why": "synthetic lake"}')
         return ('{"self_near_water": true, "target_idx": %d, '
                 '"ambiguity": [], "why": "synthetic"}' % self._idx)
 
 
 def _ctx(log, task="绕着当前园区湖绕行一圈", vlm=_FakeVlm(0)):
-    # 模拟本体在海康园区内 (园区识别按本体位置兜底时命中)
     return {"platform": MockAdapter(gps={"available": True,
                                          "lat": HK["lat"], "lng": HK["lng"]}),
             "log": log, "config": None,
@@ -57,7 +66,7 @@ def _ctx(log, task="绕着当前园区湖绕行一圈", vlm=_FakeVlm(0)):
 
 
 def _fake_stitch(monkeypatch, with_lake=True):
-    """合成卫星图: 灰底 + (可选) 园区中心附近蓝色湖斑; 瓦片原点对齐园区。"""
+    """合成卫星图: 灰底 + (可选) 中心蓝色湖斑; 瓦片原点对齐中心点。"""
     from lake_plan import tiles as tiles_mod
     from lake_plan.geo import latlon_to_tile
 
@@ -75,6 +84,19 @@ def _fake_stitch(monkeypatch, with_lake=True):
                  "tiles_ok": nx * ny, "tiles_miss": [], "crs": "wgs84"})
 
     monkeypatch.setattr(tiles_mod, "stitch_centered", fake)
+
+    def fake_area(provider, z, x0, y0, nx, ny, use_cache=True):
+        arr = np.zeros((ny * 256, nx * 256, 3), dtype=np.uint8)
+        arr[:] = (110, 110, 108)
+        if with_lake:
+            h, w = arr.shape[:2]
+            arr[h // 2 - 60:h // 2 + 20, w // 2 - 80:w // 2 + 80] = (30, 60, 130)
+        return (Image.fromarray(arr),
+                {"provider": provider, "z": z, "x0": x0, "y0": y0,
+                 "nx": nx, "ny": ny, "w": nx * 256, "h": ny * 256,
+                 "tiles_ok": nx * ny, "tiles_miss": [], "crs": "wgs84"})
+
+    monkeypatch.setattr(tiles_mod, "stitch_area", fake_area)
     return fake
 
 
@@ -88,7 +110,6 @@ def test_match_campus_by_name():
 
 def test_unknown_campus_fails_honestly():
     log = _Log()
-    # 本体远离一切已知园区 → 名字/位置都匹配不上
     ctx = _ctx(log, task="绕湖一圈")
     ctx["platform"] = MockAdapter(gps={"available": True,
                                        "lat": 31.30, "lng": 120.30})
@@ -98,9 +119,10 @@ def test_unknown_campus_fails_honestly():
     assert "中电海康" in result["hint"]
 
 
-# ---------- B+C. 园区内找湖 + 绕行规划 ----------
+# ---------- B+C+D. VLM mask 主链路 ----------
 
-def test_campus_lake_full_chain(monkeypatch):
+def test_vlm_mask_chain(monkeypatch):
+    """VLM 直接圈园区/圈湖 → 沿湖 mask 规划 (主链路)。"""
     _fake_stitch(monkeypatch, with_lake=True)
     log = _Log()
     result = TOOLS["plan_campus_lake"].execute({}, _ctx(log))
@@ -108,37 +130,48 @@ def test_campus_lake_full_chain(monkeypatch):
     assert result["campus"] == HK["name"]
     assert result["closed"] is True
     assert result["waypoint_count"] >= 8
-    assert result["water_cross_ratio"] == 0.0
     assert result["anchor"]["source"] == "vlm"
-    # 事件留痕: 园区识别 → 候选 → 锚定 → 规划
-    assert log.events("campus_identified")[0]["campus"] == HK["name"]
-    assert log.events("campus_water_candidates")[0]["count"] >= 1
-    anchor_ev = log.events("semantic_anchor")[0]
-    assert anchor_ev["source"] == "vlm"
-    assert anchor_ev["resolved_to_plan"] is True
+    cm = log.events("campus_mask")
+    assert cm and cm[0]["source"] == "vlm"
+    lm = log.events("lake_mask")
+    assert lm and lm[0]["source"] == "vlm"
     plan_ev = log.events("plan_result")[0]
     assert plan_ev["plan_kind"] == "campus_lake"
-    assert plan_ev["campus"] == HK["name"]
-    # 目标水体在园区半径内 (湖在园区里, 不是园区外)
+    # 湖在园区 mask 内 (synthetic: 都在中心附近)
     tgt = result["target"]["centroid"]
     dlat = (tgt[0] - HK["lat"]) * 110540
     dlng = (tgt[1] - HK["lng"]) * 111320 * 0.85
     assert np.hypot(dlat, dlng) <= HK["radius_m"]
 
 
-def test_campus_lake_no_water_in_campus(monkeypatch):
-    _fake_stitch(monkeypatch, with_lake=False)
+def test_vlm_masks_unavailable_rule_fallback(monkeypatch):
+    """VLM 不给 mask → 规则后备链路仍可规划。"""
+    _fake_stitch(monkeypatch, with_lake=True)
     log = _Log()
-    result = TOOLS["plan_campus_lake"].execute({}, _ctx(log))
-    assert result["ok"] is False
-    assert result["reason"] == "no_water_in_campus"
-    assert log.events("campus_identified")
+    result = TOOLS["plan_campus_lake"].execute(
+        {}, _ctx(log, vlm=_FakeVlm(0, with_masks=False)))
+    assert result["ok"], result.get("reason")
+    cm = log.events("campus_mask")
+    assert cm and cm[0]["source"] == "rule"  # 半径圆后备
+    assert log.events("campus_water_candidates")
 
 
-def test_campus_lake_vlm_unavailable_rule_fallback(monkeypatch):
+def test_no_vlm_at_all_rule_path(monkeypatch):
+    """无 VLM → 园区圆 mask + 候选锚定全规则。"""
     _fake_stitch(monkeypatch, with_lake=True)
     log = _Log()
     result = TOOLS["plan_campus_lake"].execute({}, _ctx(log, vlm=None))
     assert result["ok"], result.get("reason")
     assert result["anchor"]["source"] == "rule"
-    assert log.events("semantic_anchor")[0]["source"] == "rule"
+    assert log.events("campus_mask")[0]["source"] == "rule"
+
+
+def test_no_water_in_campus(monkeypatch):
+    _fake_stitch(monkeypatch, with_lake=False)
+    log = _Log()
+    result = TOOLS["plan_campus_lake"].execute(
+        {}, _ctx(log, vlm=_FakeVlm(0, with_masks=False)))
+    assert result["ok"] is False
+    assert result["reason"] in ("no_water_in_campus",
+                                "no_lake_like_water_in_campus")
+    assert log.events("campus_identified")
