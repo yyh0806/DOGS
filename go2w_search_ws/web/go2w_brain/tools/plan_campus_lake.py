@@ -83,6 +83,21 @@ def _zoom_to_bbox(provider, ring_ll, z=18):
     raise tiles.TileError("campus_bbox_too_large")
 
 
+def _georef_for_ring(ring_ll, z=19):
+    """标定多边形 → 纯虚拟地理参照 (不抓瓦片, 供 planner 像素换算)。"""
+    from lake_plan.geo import (StitchGeoref, lat_to_global_px,
+                               lng_to_global_px)
+    lats = [p[0] for p in ring_ll]
+    lngs = [p[1] for p in ring_ll]
+    w, s, e, n = min(lngs), min(lats), max(lngs), max(lats)
+    gx0 = int(lng_to_global_px(w, z) // 256) - 1
+    gx1 = int(lng_to_global_px(e, z) // 256) + 1
+    gy0 = int(lat_to_global_px(n, z) // 256) - 1
+    gy1 = int(lat_to_global_px(s, z) // 256) + 1
+    return StitchGeoref(z, gx0, gy0, (gx1 - gx0 + 1) * 256,
+                        (gy1 - gy0 + 1) * 256, "wgs84")
+
+
 def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     task_text = str(args.get("task") or ctx.get("task") or "")
     from lake_plan import tiles, water
@@ -111,132 +126,159 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     clat, clng = campus["lat"], campus["lng"]
     vlm = ctx.get("vlm")
 
-    # ---------- B0. 任务范围 + 确定性园区边界 (地块聚类∪湖, 范围圆兜底) ----------
+    # ---------- B0. 任务范围 + 确定性园区边界 (标定真值 > 地块聚类 > 范围圆) ----------
     from lake_plan import planner, route_api
     from lake_plan.osm_client import _point_in_ring, campus_polygon
     from lake_plan.campus_deline import _hull as _convex_hull
+    from .. import campus_kb
     from ..plan_memory import persist_plan
     from ..patrol_math import endurance_check
 
     scope_radius = _task_scope_radius(task_text, campus["radius_m"])
     ctx["log"].append("event", event="task_scope", center=[clat, clng],
                       radius_m=scope_radius, campus=campus["name"])
-    parcel_ll = None
-    try:
-        parcel = campus_polygon(clat, clng, radius_m=1200.0)
-        if "ring" in parcel:
-            parcel_ll = [(p[0], p[1]) for p in parcel["ring"]]
-    except Exception:  # noqa: BLE001 — Overpass 不可达 → 任务范围圆
-        pass
-    circle_ll = vlm_mask.circle_poly(clat, clng, scope_radius)
-    osm_cands = _osm_lake_candidates(campus, clat, clng, circle_ll,
-                                     tiles, water)
-    union_pts = list(parcel_ll or [])
-    for ll, _, _, _ in osm_cands:
-        union_pts.extend(ll)
-    if union_pts:
-        base_ll = _convex_hull(union_pts)
-        base_ll = base_ll + [base_ll[0]] if len(base_ll) > 2 else circle_ll
-        mask_base_source = "osm_parcel" if parcel_ll else "scope_lake"
+    cal = campus_kb.get(campus["name"]) or {}
+    cal_boundary = cal.get("boundary")
+    cal_lake = cal.get("lake")
+    osm_cands: list = []
+    lake_vlm_why = ""
+    lake_vlm_iou = None
+    if cal_boundary and len(cal_boundary) >= 3:
+        campus_ll = [tuple(p) for p in cal_boundary]
+        if campus_ll[0] != campus_ll[-1]:
+            campus_ll = campus_ll + [campus_ll[0]]
+        ctx["log"].append("event", event="campus_mask",
+                          campus=campus["name"], source="calibrated",
+                          vertices=len(campus_ll), vlm_iou=None)
     else:
-        base_ll = circle_ll
-        mask_base_source = "scope"
-    ctx["log"].append("event", event="campus_parcel",
-                      source="overpass" if parcel_ll else "scope",
-                      vertices=len(base_ll))
+        parcel_ll = None
+        try:
+            parcel = campus_polygon(clat, clng, radius_m=1200.0)
+            if "ring" in parcel:
+                parcel_ll = [(p[0], p[1]) for p in parcel["ring"]]
+        except Exception:  # noqa: BLE001 — Overpass 不可达 → 任务范围圆
+            pass
+        circle_ll = vlm_mask.circle_poly(clat, clng, scope_radius)
+        osm_cands = _osm_lake_candidates(campus, clat, clng, circle_ll,
+                                         tiles, water)
+        union_pts = list(parcel_ll or [])
+        for ll, _, _, _ in osm_cands:
+            union_pts.extend(ll)
+        if union_pts:
+            base_ll = _convex_hull(union_pts)
+            base_ll = base_ll + [base_ll[0]] if len(base_ll) > 2 else circle_ll
+            mask_base_source = "osm_parcel" if parcel_ll else "scope_lake"
+        else:
+            base_ll = circle_ll
+            mask_base_source = "scope"
+        ctx["log"].append("event", event="campus_parcel",
+                          source="overpass" if parcel_ll else "scope",
+                          vertices=len(base_ll))
 
-    # ---------- B. VLM 在 z19 高清图上圈园区 (IoU 真值闸门) ----------
-    try:
-        sat_img, sat_detail = tiles.stitch_centered(
-            "esri", clat, clng, _SAT_Z, _SAT_NX, _SAT_NY)
-        sat_geo = tiles.georef_from_detail(sat_detail)
-        campus_poly = vlm_mask.vlm_polygon(vlm, sat_img,
-                                           vlm_mask.CAMPUS_MASK_PROMPT)
+        # ---------- B. VLM 在 z19 高清图上圈园区 (IoU 真值闸门) ----------
+        try:
+            sat_img, sat_detail = tiles.stitch_centered(
+                "esri", clat, clng, _SAT_Z, _SAT_NX, _SAT_NY)
+            sat_geo = tiles.georef_from_detail(sat_detail)
+            campus_poly = vlm_mask.vlm_polygon(vlm, sat_img,
+                                               vlm_mask.CAMPUS_MASK_PROMPT)
+            if campus_poly is not None:
+                pts = campus_poly["polygon"]
+                frac = vlm_mask.poly_area_frac(pts)
+                rx, ry = sat_geo.latlon_to_pixel(clat, clng)
+                px, py = rx / sat_geo.w, ry / sat_geo.h
+                if not (0.02 <= frac <= 0.60 and
+                        vlm_mask.point_in_poly01(px, py, pts)):
+                    campus_poly = None
+        except tiles.TileError:
+            sat_geo = None
+            campus_poly = None
+        vlm_campus_iou = None
         if campus_poly is not None:
-            pts = campus_poly["polygon"]
-            frac = vlm_mask.poly_area_frac(pts)
-            rx, ry = sat_geo.latlon_to_pixel(clat, clng)
-            px, py = rx / sat_geo.w, ry / sat_geo.h
-            if not (0.02 <= frac <= 0.60 and
-                    vlm_mask.point_in_poly01(px, py, pts)):
-                campus_poly = None
-    except tiles.TileError:
-        sat_geo = None
-        campus_poly = None
-    vlm_campus_iou = None
-    if campus_poly is not None:
-        vlm_campus_ll = vlm_mask.poly_to_latlon(campus_poly["polygon"],
-                                                sat_geo)
-        vlm_campus_iou = _mc_iou(vlm_campus_ll, base_ll)
-        if vlm_campus_iou >= 0.3:
-            campus_ll = vlm_campus_ll
-            mask_source = "vlm"
+            vlm_campus_ll = vlm_mask.poly_to_latlon(
+                campus_poly["polygon"], sat_geo)
+            vlm_campus_iou = _mc_iou(vlm_campus_ll, base_ll)
+            if vlm_campus_iou >= 0.3:
+                campus_ll = vlm_campus_ll
+                mask_source = "vlm"
+            else:
+                campus_ll = base_ll
+                mask_source = mask_base_source
         else:
             campus_ll = base_ll
             mask_source = mask_base_source
-    else:
-        campus_ll = base_ll
-        mask_source = mask_base_source
-    ctx["log"].append("event", event="campus_mask", campus=campus["name"],
-                      source=mask_source, vertices=len(campus_ll),
-                      vlm_iou=vlm_campus_iou)
+        ctx["log"].append("event", event="campus_mask",
+                          campus=campus["name"], source=mask_source,
+                          vertices=len(campus_ll), vlm_iou=vlm_campus_iou)
 
-    # ---------- C. VLM 在 z19 湖心特写窗上圈湖 ----------
-    nudge = _centroid_ll(osm_cands[0][0]) if osm_cands \
-        else (clat, clng)
-    lake_vlm_ll = None
-    lake_vlm_why = ""
-    lake_vlm_iou = None
-    try:
+    # ---------- C. 湖界: 标定真值 > OSM 精修 > VLM 兜底 ----------
+    if cal_lake and len(cal_lake) >= 3:
+        lake_ll = [tuple(p) for p in cal_lake]
+        if lake_ll[0] != lake_ll[-1]:
+            lake_ll = lake_ll + [lake_ll[0]]
+        lake_geo = _georef_for_ring(lake_ll)
+        final_source = "calibrated"
+        ctx["log"].append("event", event="lake_mask", source="calibrated",
+                          vertices=len(lake_ll))
+        osm_cands = []
+    else:
+        nudge = _centroid_ll(osm_cands[0][0]) if osm_cands \
+            else (clat, clng)
+        lake_vlm_ll = None
+        lake_vlm_why = ""
+        lake_vlm_iou = None
+        try:
+            if osm_cands:
+                # 湖心 z19 特写窗 (4×4 ≈ ±130m, 湖充满画面)
+                lake_img, ld = tiles.stitch_centered(
+                    "esri", nudge[0], nudge[1], _LAKE_Z, _LAKE_NX, _LAKE_NY)
+                lake_geo = tiles.georef_from_detail(ld)
+            else:
+                lake_img, lake_geo = _zoom_to_bbox("esri", campus_ll, z=18)
+            lake_poly = vlm_mask.vlm_polygon(vlm, lake_img,
+                                             vlm_mask.LAKE_MASK_PROMPT)
+            if lake_poly is not None:
+                cand = vlm_mask.poly_to_latlon(lake_poly["polygon"], lake_geo)
+                c_lat, c_lng = _centroid_ll(cand)
+                frac = vlm_mask.poly_area_frac(lake_poly["polygon"])
+                if _point_in_ring((c_lat, c_lng), campus_ll) \
+                        and 0.002 <= frac <= 0.30:
+                    lake_vlm_ll = cand
+                    lake_vlm_why = str(lake_poly.get("why") or "")
+        except tiles.TileError:
+            pass
+        if lake_vlm_ll is not None:
+            # 真值闸门 (2026-09-05): 有 OSM 候选时 VLM mask 必须 IoU≥0.3
+            # (GLM 免费模型实测湖 IoU=0.00, 圈出 406m 街区当湖)
+            if osm_cands:
+                lake_vlm_iou = _mc_iou(lake_vlm_ll, osm_cands[0][0])
+            ctx["log"].append("event", event="lake_mask", source="vlm",
+                              vertices=len(lake_vlm_ll), iou=lake_vlm_iou,
+                              why=lake_vlm_why)
+
+        # ---------- D. 最终湖界裁决 (OSM 精修 > VLM 兜底) ----------
+        final = None
+        final_source = "osm_rule"
         if osm_cands:
-            # 湖心 z19 特写窗 (4×4 ≈ ±130m, 湖充满画面)
-            lake_img, ld = tiles.stitch_centered(
-                "esri", nudge[0], nudge[1], _LAKE_Z, _LAKE_NX, _LAKE_NY)
-            lake_geo = tiles.georef_from_detail(ld)
+            sort_key_nudge = lake_vlm_ll if (lake_vlm_iou or 0) >= 0.3 \
+                else None
+            final = _osm_lake_final(ctx, osm_cands, clat, clng, campus_ll,
+                                    sort_key_nudge or nudge, route_api)
+        if final is not None:
+            lake_ll, lake_geo = final
+            ctx["log"].append("event", event="lake_mask", source="osm_rule",
+                              vertices=len(lake_ll))
+        elif lake_vlm_ll is not None:
+            lake_ll = lake_vlm_ll
+            final_source = "vlm_fallback"
+            ctx["log"].append("event", event="lake_mask",
+                              source="vlm_fallback",
+                              vertices=len(lake_ll))
         else:
-            lake_img, lake_geo = _zoom_to_bbox("esri", campus_ll, z=18)
-        lake_poly = vlm_mask.vlm_polygon(vlm, lake_img,
-                                         vlm_mask.LAKE_MASK_PROMPT)
-        if lake_poly is not None:
-            cand = vlm_mask.poly_to_latlon(lake_poly["polygon"], lake_geo)
-            c_lat, c_lng = _centroid_ll(cand)
-            frac = vlm_mask.poly_area_frac(lake_poly["polygon"])
-            if _point_in_ring((c_lat, c_lng), campus_ll) \
-                    and 0.002 <= frac <= 0.30:
-                lake_vlm_ll = cand
-                lake_vlm_why = str(lake_poly.get("why") or "")
-    except tiles.TileError:
-        pass
-    if lake_vlm_ll is not None:
-        # 真值闸门 (2026-09-05): 有 OSM 候选时 VLM mask 必须 IoU≥0.3
-        # (GLM 免费模型实测湖 IoU=0.00, 圈出 406m 街区当湖)
-        if osm_cands:
-            lake_vlm_iou = _mc_iou(lake_vlm_ll, osm_cands[0][0])
-        ctx["log"].append("event", event="lake_mask", source="vlm",
-                          vertices=len(lake_vlm_ll), iou=lake_vlm_iou,
-                          why=lake_vlm_why)
-
-    # ---------- D. 最终湖界裁决 + 沿湖环线 ----------
-    final = None
-    final_source = "osm_rule"
-    if osm_cands:
-        sort_key_nudge = lake_vlm_ll if (lake_vlm_iou or 0) >= 0.3 \
-            else None
-        final = _osm_lake_final(ctx, osm_cands, clat, clng, campus_ll,
-                                sort_key_nudge or nudge, route_api)
-    if final is not None:
-        lake_ll, lake_geo = final
-        ctx["log"].append("event", event="lake_mask", source="osm_rule",
-                          vertices=len(lake_ll))
-    elif lake_vlm_ll is not None:
-        lake_ll = lake_vlm_ll
-        final_source = "vlm_fallback"
-        ctx["log"].append("event", event="lake_mask", source="vlm_fallback",
-                          vertices=len(lake_ll))
-    else:
-        return {"ok": False, "reason": "no_lake_like_water_in_campus",
-                "campus": campus["name"],
-                "hint": "园区 mask 内无湖形水体 (OSM + satellite 均未检出)"}
+            return {"ok": False, "reason": "no_lake_like_water_in_campus",
+                    "campus": campus["name"],
+                    "hint": "园区 mask 内无湖形水体 (OSM + satellite "
+                            "均未检出)"}
 
     poly_px = [lake_geo.latlon_to_pixel(a, b) for a, b in lake_ll]
     perim_m, area_m2 = water.poly_stats_latlon(lake_ll, clat)

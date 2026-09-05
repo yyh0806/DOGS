@@ -232,3 +232,35 @@ def test_campus_polygon_unavailable_scope_fallback(monkeypatch):
     # 湖仍由 VLM mask 兜底找到 → 任务范围语义完整
     lm = log.events("lake_mask")
     assert lm and lm[0]["source"] == "vlm"
+
+
+def test_calibrated_boundary_and_lake_take_priority(monkeypatch):
+    """标定真值优先: 园区边界/湖岸线直接用用户圈的多边形, 不再猜。"""
+    _fake_stitch(monkeypatch, with_lake=True)
+    from go2w_brain import campus_kb
+    cal = {
+        "boundary": [[HK["lat"] - 0.002, HK["lng"] - 0.002],
+                     [HK["lat"] + 0.002, HK["lng"] - 0.002],
+                     [HK["lat"] + 0.002, HK["lng"] + 0.002],
+                     [HK["lat"] - 0.002, HK["lng"] + 0.002]],
+        "lake": [[HK["lat"] + 0.0006, HK["lng"] - 0.0006],
+                 [HK["lat"] + 0.0006, HK["lng"] + 0.0006],
+                 [HK["lat"] + 0.0012, HK["lng"] + 0.0006],
+                 [HK["lat"] + 0.0012, HK["lng"] - 0.0006]],
+    }
+    monkeypatch.setattr(campus_kb, "get", lambda name: dict(cal))
+    log = _Log()
+    result = TOOLS["plan_campus_lake"].execute({}, _ctx(log, vlm=None))
+    assert result["ok"], result.get("reason")
+    assert result["waypoint_count"] >= 8
+    assert result["closed"] is True
+    cm = log.events("campus_mask")
+    assert cm and cm[0]["source"] == "calibrated"
+    lm = log.events("lake_mask")
+    assert lm and lm[0]["source"] == "calibrated"
+    assert result["anchor"]["source"] == "calibrated"
+    # 环线在标定湖周围 (~0.001° 内)
+    tgt = result["target"]["centroid"]
+    dlat = abs(tgt[0] - HK["lat"])
+    dlng = abs(tgt[1] - HK["lng"])
+    assert dlat < 0.01 and dlng < 0.01

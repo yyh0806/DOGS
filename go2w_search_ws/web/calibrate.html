@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>园区标定 — 在地图上圈出园区边界与湖岸线</title>
+<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css"/>
+<style>
+:root{--bg:#0A111E;--panel:#101A2B;--edge:#1E2C44;--ink:#D8E2F0;
+--muted:#8294AC;--accent:#F0913B;--ok:#3EDC97;--info:#5C8DFF}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--ink);
+font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;
+display:flex;flex-direction:column}
+header{padding:12px 20px;border-bottom:1px solid var(--edge);
+background:var(--panel);display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+header h1{font-size:16px;letter-spacing:.1em}
+header .sub{font-size:12px;color:var(--muted)}
+.tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+padding:8px 16px;border-bottom:1px solid var(--edge);background:var(--panel)}
+button{border:1px solid var(--edge);background:none;color:var(--muted);
+font:inherit;font-size:13px;padding:6px 14px;border-radius:4px;cursor:pointer}
+button.active{color:var(--bg);background:var(--ink);border-color:var(--ink)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#161006}
+.hint{font-size:12px;color:var(--muted)}
+#map{flex:1;background:#111}
+.status{position:fixed;right:16px;bottom:16px;z-index:1000;background:var(--panel);
+border:1px solid var(--edge);padding:8px 14px;font-size:12px;border-radius:6px}
+.status.ok{border-color:var(--ok);color:var(--ok)}
+</style></head><body>
+<header>
+  <h1>园区标定</h1>
+  <span class="sub">在卫星图上按顺序点击顶点, 圈出园区边界与湖岸线 —— 保存后大脑永久使用该真值 (不再猜测)</span>
+</header>
+<div class="tools">
+  <button id="btnBoundary" class="active">① 圈园区边界</button>
+  <button id="btnLake">② 圈湖岸线</button>
+  <button id="btnUndo">撤销一点</button>
+  <button id="btnClear">清除当前</button>
+  <button id="btnSave" class="primary">保存标定</button>
+  <span class="hint" id="hint">点击地图添加顶点 · 双击/右键完成 · 多边形会自动闭合</span>
+</div>
+<div id="map"></div>
+<div class="status" id="status">就绪</div>
+<script src="/static/vendor/leaflet/leaflet.js"></script>
+<script>
+var CAMPUS = "中电海康无锡物联网产业园";
+var CENTER = [31.488192, 120.369486];
+var map = L.map("map");
+L.tileLayer("/tiles/esri/{z}/{x}/{y}.png",
+  {maxZoom: 19, attribution: "Esri 卫星影像"}
+).addTo(map);
+map.setView(CENTER, 17);
+
+var kind = "boundary";
+var pts = [];          // 当前编辑的多边形
+var layer = null;      // 当前编辑层
+var saved = {boundary: [], lake: []};  // 已保存的标定
+
+function renderPolygon() {
+  if (layer) { map.removeLayer(layer); layer = null; }
+  if (pts.length < 3) return;
+  var ll = pts.map(function(p){ return [p[0], p[1]]; });
+  layer = L.polygon(ll, {color: kind === "boundary" ? "#FF7848" : "#4A8CFF",
+                         weight: 2, fillOpacity: 0.18}).addTo(map);
+}
+function drawSaved() {
+  var colors = {boundary: "#FF7848", lake: "#4A8CFF"};
+  ["boundary", "lake"].forEach(function(k) {
+    if (saved[k] && saved[k].length >= 3) {
+      L.polygon(saved[k], {color: colors[k], weight: 3,
+                           fillOpacity: 0.1}).addTo(map)
+        .bindPopup(k === "boundary" ? "园区边界 (已保存)" : "湖岸线 (已保存)");
+    }
+  });
+}
+function setStatus(msg, ok) {
+  var el = document.getElementById("status");
+  el.textContent = msg;
+  el.className = "status" + (ok ? " ok" : "");
+}
+
+map.on("click", function(ev) {
+  pts.push([ev.latlng.lat, ev.latlng.lng]);
+  renderPolygon();
+  setStatus(kind === "boundary" ? "园区边界" : "湖岸线"
+            + " · 已点 " + pts.length + " 点 (双击完成)");
+});
+map.on("dblclick", function(ev) {
+  pts.push([ev.latlng.lat, ev.latlng.lng]);
+  if (pts.length >= 3) renderPolygon();
+  setStatus("顶点输入完成, 点【保存标定】提交", true);
+});
+map.on("contextmenu", function(ev) {
+  if (pts.length >= 3) renderPolygon();
+});
+
+document.getElementById("btnBoundary").onclick = function() {
+  kind = "boundary"; pts = [];
+  document.getElementById("btnBoundary").classList.add("active");
+  document.getElementById("btnLake").classList.remove("active");
+  renderPolygon();
+  setStatus("模式: 圈园区边界 (沿围墙/地块拐角点)");
+};
+document.getElementById("btnLake").onclick = function() {
+  kind = "lake"; pts = [];
+  document.getElementById("btnLake").classList.add("active");
+  document.getElementById("btnBoundary").classList.remove("active");
+  renderPolygon();
+  setStatus("模式: 圈湖岸线 (沿水岸点一圈)");
+};
+document.getElementById("btnUndo").onclick = function() {
+  pts.pop(); renderPolygon();
+};
+document.getElementById("btnClear").onclick = function() {
+  pts = []; renderPolygon(); setStatus("已清除当前编辑");
+};
+document.getElementById("btnSave").onclick = function() {
+  if (pts.length < 3) { setStatus("至少点 3 个顶点才能保存"); return; }
+  fetch("/api/calibrate", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({campus: CAMPUS, kind: kind,
+                          polygon: pts.map(function(p){
+                            return [+p[0].toFixed(6), +p[1].toFixed(6)];
+                          })})
+  }).then(function(r){ return r.json(); })
+    .then(function(d) {
+      if (d.ok) {
+        saved[kind] = pts.slice();
+        setStatus("已保存 " + (kind === "boundary" ? "园区边界" : "湖岸线")
+                  + " · " + d.vertices + " 顶点。回控制台跑任务即可生效", true);
+      } else {
+        setStatus("保存失败: " + (d.reason || "?"), false);
+      }
+    })
+    .catch(function(e){ setStatus("网络错误: " + e, false); });
+};
+
+fetch("/api/calibrate").then(function(r){ return r.json(); })
+  .then(function(d) {
+    saved = d.entries || {};
+    drawSaved();
+    if (saved.boundary && saved.boundary.length)
+      setStatus("已加载此前标定 (园区边界 " + saved.boundary.length
+                + " 顶点)", true);
+  });
+</script></body></html>

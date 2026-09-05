@@ -162,6 +162,21 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/" or self.path == "/index.html":
             body = HTML_PATH.read_text(encoding="utf-8")
             self._respond(200, "text/html; charset=utf-8", body)
+        elif self.path == "/calibrate":
+            body = (WEB_DIR / "calibrate.html").read_text(encoding="utf-8")
+            self._respond(200, "text/html; charset=utf-8", body)
+        elif self.path == "/api/calibrate":
+            try:
+                from go2w_brain import campus_kb
+                self._respond(200, "application/json",
+                              json.dumps({"ok": True,
+                                          "entries": campus_kb.load()},
+                                         ensure_ascii=False))
+            except Exception as exc:  # noqa: BLE001
+                self._respond(500, "application/json",
+                              json.dumps({"ok": False,
+                                          "reason": str(exc)},
+                                         ensure_ascii=False))
         elif self.path == "/events":
             self._sse()
         elif self.path.startswith("/tiles/"):
@@ -238,7 +253,32 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(404, "text/plain; charset=utf-8", "tile missing")
 
     def do_POST(self):
-        if self.path == "/api/run":
+        if self.path == "/api/calibrate":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                self._respond(400, "application/json",
+                              json.dumps({"ok": False,
+                                          "reason": "invalid_json"}))
+                return
+            campus = str((payload or {}).get("campus", "")).strip()
+            kind = str((payload or {}).get("kind", "")).strip()
+            polygon = (payload or {}).get("polygon")
+            from go2w_brain import campus_kb
+            if (not campus or kind not in ("boundary", "lake")
+                    or not campus_kb.validate(polygon)):
+                self._respond(400, "application/json",
+                              json.dumps({"ok": False,
+                                          "reason": "invalid_payload"}))
+                return
+            entry = campus_kb.upsert(campus, kind, polygon)
+            self._respond(200, "application/json",
+                          json.dumps({"ok": True,
+                                      "vertices": len(polygon),
+                                      "entry": entry},
+                                     ensure_ascii=False))
+        elif self.path == "/api/run":
             length = int(self.headers.get("Content-Length", 0))
             try:
                 payload = json.loads(self.rfile.read(length) or b"{}")
