@@ -31,7 +31,8 @@ CAMPUSES = [
      "radius_m": 400.0, "source": "user-confirmed:2026-09-05"},
 ]
 
-_SAT_Z, _SAT_NX, _SAT_NY = 17, 8, 8
+_SAT_Z, _SAT_NX, _SAT_NY = 18, 8, 8  # 园区 mask 层级: z18 ±520m, 园区充满画面
+_LAKE_Z, _LAKE_NX, _LAKE_NY = 19, 4, 4  # 湖 mask 层级: z19 4×4 湖心特写
 
 
 def _hav_m(lat1, lng1, lat2, lng2):
@@ -129,15 +130,30 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     ctx["log"].append("event", event="campus_mask", campus=campus["name"],
                       source=mask_source, vertices=len(campus_ll))
 
-    # ---------- C. VLM 圈湖 (语义择向; 不可靠时 OSM 链裁决) ----------
+    # ---------- C. 湖定位 (OSM 湖形) → VLM 在 z19 特写窗上圈湖 ----------
+    from lake_plan import planner, route_api
+    from lake_plan.osm_client import _point_in_ring
+    from ..plan_memory import persist_plan
+    from ..patrol_math import endurance_check
+
+    osm_cands = _osm_lake_candidates(campus, clat, clng, campus_ll,
+                                     tiles, water)
+    nudge = _centroid_ll(osm_cands[0][0]) if osm_cands \
+        else (clat, clng)
     lake_vlm_ll = None
     lake_vlm_why = ""
+    lake_vlm_iou = None
     try:
-        lake_img, lake_geo = _zoom_to_bbox("esri", campus_ll, z=18)
+        if osm_cands:
+            # 湖心 z19 特写窗 (4×4 ≈ ±130m, 湖充满画面)
+            lake_img, ld = tiles.stitch_centered(
+                "esri", nudge[0], nudge[1], _LAKE_Z, _LAKE_NX, _LAKE_NY)
+            lake_geo = tiles.georef_from_detail(ld)
+        else:
+            lake_img, lake_geo = _zoom_to_bbox("esri", campus_ll, z=18)
         lake_poly = vlm_mask.vlm_polygon(vlm, lake_img,
                                          vlm_mask.LAKE_MASK_PROMPT)
         if lake_poly is not None:
-            from lake_plan.osm_client import _point_in_ring
             cand = vlm_mask.poly_to_latlon(lake_poly["polygon"], lake_geo)
             c_lat, c_lng = _centroid_ll(cand)
             frac = vlm_mask.poly_area_frac(lake_poly["polygon"])
@@ -148,25 +164,29 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     except tiles.TileError:
         pass
     if lake_vlm_ll is not None:
+        # 真值闸门 (2026-09-05): 有 OSM 候选时 VLM mask 必须 IoU≥0.3
+        # (GLM 免费模型实测湖 IoU=0.00, 圈出 406m 街区当湖)
+        if osm_cands:
+            lake_vlm_iou = _mc_iou(lake_vlm_ll, osm_cands[0][0])
         ctx["log"].append("event", event="lake_mask", source="vlm",
-                          vertices=len(lake_vlm_ll),
+                          vertices=len(lake_vlm_ll), iou=lake_vlm_iou,
                           why=lake_vlm_why)
 
     # ---------- D. 最终湖界裁决 + 沿湖环线 ----------
-    from lake_plan import planner, route_api
-    from lake_plan.osm_client import _point_in_ring
-    from ..plan_memory import persist_plan
-    from ..patrol_math import endurance_check
-
-    nudge = _centroid_ll(lake_vlm_ll) if lake_vlm_ll else (clat, clng)
-    final = _osm_lake_final(ctx, campus, clat, clng, campus_ll, nudge,
-                            tiles, water, route_api)
+    final = None
+    final_source = "osm_rule"
+    if osm_cands:
+        sort_key_nudge = lake_vlm_ll if (lake_vlm_iou or 0) >= 0.3 \
+            else None
+        final = _osm_lake_final(ctx, osm_cands, clat, clng, campus_ll,
+                                sort_key_nudge or nudge, route_api)
     if final is not None:
         lake_ll, lake_geo = final
         ctx["log"].append("event", event="lake_mask", source="osm_rule",
                           vertices=len(lake_ll))
     elif lake_vlm_ll is not None:
-        lake_ll, lake_geo = lake_vlm_ll, lake_geo
+        lake_ll = lake_vlm_ll
+        final_source = "vlm_fallback"
         ctx["log"].append("event", event="lake_mask", source="vlm_fallback",
                           vertices=len(lake_ll))
     else:
@@ -189,11 +209,12 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
         "perim_km": round(perim_m / 1000.0, 2),
         "dist_km": round(_hav_m(clat, clng, tgt_c[0], tgt_c[1]) / 1000.0, 3),
         "campus": campus["name"]})
-    out["anchor"] = {"source": "vlm_mask" if lake_vlm_ll else "osm_rule",
+    out["anchor"] = {"source": final_source,
                      "self": {"lat": clat, "lng": clng, "confirmed": True},
                      "target": {"idx": 0, "centroid": [round(tgt_c[0], 5),
                                                        round(tgt_c[1], 5)],
-                                "why": lake_vlm_why or "osm_shape_filtered"},
+                                "why": lake_vlm_why or "osm_shape_filtered",
+                                "vlm_mask_iou": lake_vlm_iou},
                      "ambiguity": []}
     out["campus"] = campus["name"]
 
@@ -227,14 +248,39 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _osm_lake_final(ctx, campus, clat, clng, campus_ll, nudge,
-                    tiles, water, route_api):
-    """OSM 湖形过滤 + 聚焦精修 → 精确湖界线; 拿不到返回 None。"""
+def _mc_iou(a, b, n=140, seed: int = 7) -> float:
+    """蒙特卡洛 IoU (两多边形 bbox 并集内采样)。"""
+    import random
+    from lake_plan.osm_client import _point_in_ring
+
+    def bbox(ring):
+        lats = [p[0] for p in ring]
+        lngs = [p[1] for p in ring]
+        return (min(lats), min(lngs), max(lats), max(lngs))
+
+    b1, b2 = bbox(a), bbox(b)
+    rng = random.Random(seed)
+    inter = uni = 0
+    for _ in range(n):
+        la = rng.uniform(min(b1[0], b2[0]), max(b1[2], b2[2]))
+        ln = rng.uniform(min(b1[1], b2[1]), max(b1[3], b2[3]))
+        ina = _point_in_ring((la, ln), a)
+        inb = _point_in_ring((la, ln), b)
+        if ina or inb:
+            uni += 1
+            if ina and inb:
+                inter += 1
+    return inter / uni if uni else 0.0
+
+
+def _osm_lake_candidates(campus, clat, clng, campus_ll, tiles, water):
+    """OSM 渲染水体 + 湖形过滤 + 园区 mask 内 → [(ll, geo, poly, area)] 按距
+    园区中心排序; 拿不到返回 []。"""
     from lake_plan.osm_client import _point_in_ring
     try:
         img, detail = tiles.stitch_centered("osm", clat, clng, 16, 8, 8)
     except tiles.TileError:
-        return None
+        return []
     geo = tiles.georef_from_detail(detail)
     mask = water.water_mask(img, ref_rgb=(170, 211, 223))
     comps = water.label_components(mask, down=4, min_area_px=200)
@@ -252,11 +298,15 @@ def _osm_lake_final(ctx, campus, clat, clng, campus_ll, nudge,
         compact = 4 * math.pi * area / (perim ** 2) if perim else 0.0
         if 300.0 <= area <= 80000.0 and compact >= 0.12:
             cands.append((ll, geo, poly, area))
-    if not cands:
-        return None
-    cands.sort(key=lambda t: _hav_m(nudge[0], nudge[1],
-                                    *_centroid_ll(t[0])))
-    for ll, geo, poly, area in cands[:4]:
+    cands.sort(key=lambda t: _hav_m(clat, clng, *_centroid_ll(t[0])))
+    return cands
+
+
+def _osm_lake_final(ctx, cands, clat, clng, campus_ll, nudge, route_api):
+    """湖形候选 → z19..z16 聚焦精修 → 精确湖界; 拿不到返回 None。"""
+    ordered = sorted(cands, key=lambda t: _hav_m(nudge[0], nudge[1],
+                                                 *_centroid_ll(t[0])))
+    for ll, geo, poly, area in ordered[:4]:
         try:
             target = {"_poly_ll": ll, "_poly_px": poly, "_georef": geo,
                       "area_km2": area / 1e6}
@@ -269,8 +319,8 @@ def _osm_lake_final(ctx, campus, clat, clng, campus_ll, nudge,
             ctx["log"].append("event", event="lake_refined",
                               vertices=len(fll))
             return fll, fgeo
-    # 精修全失败 → 用形状合格的粗边界
-    return cands[0][0], cands[0][1]
+    # 精修全失败 → 用形状合格的粗边界 (hull, 含桥等略胀) 兜底
+    return ordered[0][0], ordered[0][1]
 
 
 TOOL = ToolRegistration(

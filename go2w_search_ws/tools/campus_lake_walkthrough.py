@@ -31,10 +31,13 @@ from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 from lake_plan import (planner, route_api, tiles, vlm_mask,  # noqa: E402
                        water)
 from lake_plan.osm_client import _point_in_ring  # noqa: E402
-from go2w_brain.tools.plan_campus_lake import (CAMPUSES,  # noqa: E402
-                                               _hav_m, _zoom_to_bbox)
+from go2w_brain.tools.plan_campus_lake import (  # noqa: E402
+    CAMPUSES, _hav_m, _mc_iou, _osm_lake_candidates, _osm_lake_final,
+    _zoom_to_bbox)
 
 CAMPUS = CAMPUSES[0]
+CAMPUS_Z = 18   # 园区 mask 层级 (±520m, 园区充满画面)
+LAKE_Z, LAKE_NX, LAKE_NY = 19, 4, 4  # 湖 mask 特写层级
 TASK = "绕着当前园区湖绕行一圈"
 ROBOT = {"lat": CAMPUS["lat"], "lng": CAMPUS["lng"]}
 STEPS: list[dict] = []
@@ -104,8 +107,9 @@ def main(argv=None):
              f"这一步只确定\"是哪个园区\", 不画几何。")
 
     # ---------- S2 VLM 圈园区 (mask) ----------
-    print("[S2] VLM 圈园区...")
-    sat, sat_detail = tiles.stitch_centered("esri", clat, clng, 17, 8, 8)
+    print("[S2] VLM 圈园区 (z18 特写)...")
+    sat, sat_detail = tiles.stitch_centered("esri", clat, clng, CAMPUS_Z,
+                                            8, 8)
     sat_geo = tiles.georef_from_detail(sat_detail)
     campus_poly = vlm_mask.vlm_polygon(vlm, sat, vlm_mask.CAMPUS_MASK_PROMPT)
     s2 = sat.convert("RGB")
@@ -128,60 +132,51 @@ def main(argv=None):
     add_step(2, "VLM 圈园区 (卫星图直接 mask)",
              src_note + "。绿圈=本体。", image=jpg_b64(s2))
 
-    # ---------- S3 VLM 圈湖 (mask; VLM 失败 → 湖形过滤规则后备对齐工具) ----------
-    print("[S3] VLM 圈湖...")
-    lake_img, lake_geo = _zoom_to_bbox("esri", campus_ll, z=18)
+    # ---------- S3 湖定位 (OSM) → VLM 在 z19 湖心特写窗上圈湖 ----------
+    print("[S3] VLM 圈湖 (z19 湖心特写)...")
+    osm_cands = _osm_lake_candidates(CAMPUS, clat, clng, campus_ll,
+                                     tiles, water)
+    nudge = _centroid(osm_cands[0][0]) if osm_cands else (clat, clng)
+    if osm_cands:
+        lake_img, ld = tiles.stitch_centered("esri", nudge[0], nudge[1],
+                                             LAKE_Z, LAKE_NX, LAKE_NY)
+        lake_geo = tiles.georef_from_detail(ld)
+    else:
+        lake_img, lake_geo = _zoom_to_bbox("esri", campus_ll, z=18)
     lake_poly = vlm_mask.vlm_polygon(vlm, lake_img, vlm_mask.LAKE_MASK_PROMPT)
-    lake_ll, lake_src = None, "rule"
+    lake_ll, lake_src, lake_iou = None, "rule", None
     if lake_poly is not None:
         cand = vlm_mask.poly_to_latlon(lake_poly["polygon"], lake_geo)
-        c = (sum(p[0] for p in cand) / len(cand),
-             sum(p[1] for p in cand) / len(cand))
+        c = _centroid(cand)
         frac = vlm_mask.poly_area_frac(lake_poly["polygon"])
-        if _point_in_ring(c, campus_ll) and 0.002 <= frac <= 0.7:
-            lake_ll, lake_src = cand, "vlm"
+        if _point_in_ring(c, campus_ll) and 0.002 <= frac <= 0.30:
+            lake_ll = cand
+            if osm_cands:
+                lake_iou = _mc_iou(lake_ll, osm_cands[0][0])
     s3 = lake_img.convert("RGB")
     if lake_ll is None:
-        # 规则后备 (与工具一致): OSM 渲染水体 → 湖形过滤 → 园区 mask 内最近
-        osm_img, osm_detail = tiles.stitch_centered("osm", clat, clng, 16, 8, 8)
-        osm_g = tiles.georef_from_detail(osm_detail)
-        wm = water
-        wmask = wm.water_mask(osm_img, ref_rgb=(170, 211, 223))
-        comps = wm.label_components(wmask, down=4, min_area_px=200)
-        lake_like = []
-        for comp in comps:
-            cy, cx = comp["centroid_small"]
-            lat, lng = osm_g.pixel_to_latlon(cx * 4, cy * 4)
-            poly = wm.polygon_from_component(comp, wmask.shape,
-                                             allow_hull=True)
-            if len(poly) < 4:
-                continue
-            ll = [osm_g.pixel_to_latlon(x, y) for (x, y) in poly]
-            perim, area = wm.poly_stats_latlon(ll, clat)
-            compact = 4 * math.pi * area / (perim ** 2) if perim else 0.0
-            if area >= 300.0 and compact >= 0.12 \
-                    and _point_in_ring((lat, lng), campus_ll):
-                lake_like.append((math.hypot((lat - clat) * 110540,
-                                             (lng - clng) * 111320 * 0.85),
-                                  ll))
-        if lake_like:
-            lake_like.sort(key=lambda t: t[0])
-            lake_ll = lake_like[0][1]
-            lake_geo = osm_g
-        src_note = ("VLM 圈湖失败 (限流/退化) → 规则后备: OSM 渲染水体 + "
-                    "湖形过滤 (面积/紧凑度) + 园区 mask 内最近。"
+        # 规则后备: OSM 湖形候选 (含精修在 S4)
+        if osm_cands:
+            lake_ll = osm_cands[0][0]
+            lake_geo = osm_cands[0][1]
+        src_note = ("VLM 圈湖失败/被拒收 → 规则后备: OSM 渲染水体 + 湖形"
+                    "过滤 (面积/紧凑度) + 园区 mask 内最近。"
                     if lake_ll else "无湖形水体 (诚实失败)")
     else:
-        src_note = (f"VLM 在园区放大卫星图上勾画湖岸线 (蓝填充 = 湖 mask, "
-                    f"{len(lake_ll) - 1} 顶点): {lake_poly.get('why') or ''}")
+        src_note = (f"VLM 在 z19 湖心特写上勾画湖岸线 (蓝填充 = 湖 mask, "
+                    f"{len(lake_ll) - 1} 顶点)"
+                    + (f"; 与 OSM 真值 IoU = <b>{lake_iou:.2f}</b>"
+                       f"{' ✅≥0.3 确认' if (lake_iou or 0) >= 0.3 else ' ❌<0.3 不可信'}"
+                       if lake_iou is not None else "")
+                    + f": {lake_poly.get('why') or ''}")
     if lake_ll:
         px = [lake_geo.latlon_to_pixel(a, b) for a, b in lake_ll]
         s3 = fill_mask(s3, px, (60, 130, 255), alpha=100)
     d3 = ImageDraw.Draw(s3)
     marker(d3, *lake_geo.latlon_to_pixel(clat, clng), (60, 240, 110), 16,
            "本体", font_mid)
-    add_step(3, "VLM 圈湖 (园区内岸线 mask)",
-             src_note + f"。底图 = 园区 mask bbox 放大的 z18 卫星。",
+    add_step(3, "VLM 圈湖 (z19 湖心特写 + IoU 真值校验)",
+             src_note + f"。底图 z{LAKE_Z} {LAKE_NX}×{LAKE_NY} 湖心特写窗。",
              image=jpg_b64(s3))
 
     # ---------- S4 湖岸线精修 + 沿湖环线 ----------
@@ -189,20 +184,17 @@ def main(argv=None):
     if lake_ll is None:
         add_step(4, "沿湖环线规划", "园区内未找到可规划的湖形水体 —— 如实终止。")
     else:
-        # 湖岸线精修: VLM/规则指认湖位 → z19..z16 聚焦重扫修正 (同工具路径)
-        lc_lat, lc_lng = _centroid(lake_ll)
+        # 湖岸线精修 (与工具同路径): OSM 候选 → z19..z16 聚焦重扫
         refined = False
-        try:
-            poly_hull = [lake_geo.latlon_to_pixel(a, b) for a, b in lake_ll]
-            target = {"_poly_ll": lake_ll, "_poly_px": poly_hull,
-                      "_georef": lake_geo, "area_km2": 0.02}
-            fine = route_api._refine(target, "osm")
-            if fine is not None:
-                fp, fg, refined = fine
-                lake_ll = [fg.pixel_to_latlon(x, y) for (x, y) in fp]
-                lake_geo = fg
-        except Exception:  # noqa: BLE001
-            pass
+        if osm_cands:
+            _null_log = type("L", (), {"append":
+                                       staticmethod(lambda *a, **k: None)})
+            final = _osm_lake_final({"log": _null_log()},
+                                    osm_cands, clat, clng, campus_ll,
+                                    nudge, route_api)
+            if final is not None:
+                lake_ll, lake_geo = final
+                refined = True
         poly_px = [lake_geo.latlon_to_pixel(a, b) for a, b in lake_ll]
         result = planner.plan_loop_around_polygon(poly_px, lake_geo,
                                                   offset_m=15.0, step_m=40.0)
