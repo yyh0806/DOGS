@@ -64,10 +64,10 @@ padding:14px 20px;border-bottom:1px solid var(--edge);background:var(--panel)}
 border:1px solid var(--edge);padding:4px 10px;border-radius:2px;color:var(--muted)}
 .stat b{color:var(--ink);font-weight:600}
 .layout{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(340px,1fr);
-height:calc(100% - 61px)}
-.map{position:relative;border-right:1px solid var(--edge)}
+grid-template-rows:minmax(0,1fr);height:calc(100% - 61px)}
+.map{position:relative;border-right:1px solid var(--edge);min-height:0}
 #map{position:absolute;inset:0}
-.timeline{overflow-y:auto;background:var(--bg)}
+.timeline{overflow-y:auto;background:var(--bg);min-height:0}
 .tl-head{position:sticky;top:0;background:var(--panel);border-bottom:1px solid
 var(--edge);padding:8px 16px;display:flex;gap:8px;z-index:5}
 .tl-head button{background:none;border:1px solid var(--edge);color:var(--muted);
@@ -150,6 +150,9 @@ base.on("tileerror", function(){
   }
 });
 base.addTo(map);
+// 容器尺寸保险: grid 行在布局稳定后强制重算 (防 0 高度/行高塌缩 → 灰图)
+setTimeout(function(){ map.invalidateSize(); }, 150);
+setTimeout(function(){ map.invalidateSize(); }, 600);
 var bounds = [];
 function latlng(p){ return [p[0], p[1]]; }
 if (DATA.plan && DATA.plan.water_polygon) {

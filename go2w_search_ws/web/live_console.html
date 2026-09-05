@@ -29,15 +29,16 @@ button.primary{background:var(--accent);border-color:var(--accent);color:#14100A
 button:hover{border-color:var(--ink)}
 button:disabled{opacity:.45;cursor:not-allowed}
 button.preset{color:var(--muted);font-size:12px;padding:8px 10px}
-main{flex:1;display:grid;grid-template-columns:minmax(0,1.1fr) minmax(330px,1fr);min-height:0}
-.map{position:relative;border-right:1px solid var(--edge)}
+main{flex:1;display:grid;grid-template-columns:minmax(0,1.1fr) minmax(330px,1fr);
+grid-template-rows:minmax(0,1fr);min-height:0}
+.map{position:relative;border-right:1px solid var(--edge);min-height:0}
 #map{position:absolute;inset:0}
 .legend{position:absolute;left:10px;bottom:10px;z-index:1000;background:rgba(10,17,30,.85);
 border:1px solid var(--edge);padding:7px 10px;font-size:11px;color:var(--muted);
 font-family:ui-monospace,Consolas,monospace;border-radius:2px}
 .legend i{display:inline-block;width:9px;height:9px;margin-right:5px;border-radius:50%}
 .legend span{display:block;margin:2px 0}
-.flow{overflow-y:auto;padding:10px 16px;background:var(--bg)}
+.flow{overflow-y:auto;padding:10px 16px;background:var(--bg);min-height:0}
 .flow .empty{color:var(--muted);font-size:13px;line-height:1.7}
 .step{padding:9px 12px;border-bottom:1px solid var(--edge);border-left:3px solid var(--edge);
 animation:fadein .35s ease}
@@ -108,6 +109,9 @@ L.tileLayer("/tiles/esri/{z}/{x}/{y}.png",
   {maxZoom:19,attribution:"Esri 卫星影像"}).addTo(map)
   .on("tileerror",function(){document.getElementById("maperr").style.display="block";});
 map.setView([31.488192,120.369486],16);
+// 容器尺寸保险: grid 行在布局稳定后强制重算 (防 0 高度/行高塌缩 → 灰图)
+setTimeout(function(){map.invalidateSize();},150);
+setTimeout(function(){map.invalidateSize();},600);
 var routeLayer=null,alertLayer=null,scanLayer=null;
 var flow=document.getElementById("flow");
 var status=document.getElementById("status");
