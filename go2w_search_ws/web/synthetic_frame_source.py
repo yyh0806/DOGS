@@ -14,6 +14,21 @@ _W, _H = 1280, 720
 _ROBOT = {"lat": 31.488192, "lng": 120.369486, "yaw_deg": 0.0}
 
 
+def _robot_meta() -> dict[str, Any]:
+    """帧元数据本体位置: 跟随 GO2W_MOCK_GPS (控制台演示切换园区时告警
+    坐标随之移动), 未设置时回退 M2.1 基准点。"""
+    import os
+    meta = dict(_ROBOT)
+    mock = os.environ.get("GO2W_MOCK_GPS", "")
+    if mock:
+        try:
+            lat, lng = (float(v) for v in mock.split(",")[:2])
+            meta["lat"], meta["lng"] = lat, lng
+        except ValueError:
+            pass
+    return meta
+
+
 class SyntheticPatrolSource:
     """callable 帧源 → (PIL.Image, robot_meta)。drowning_prob 控制出场率。"""
 
@@ -56,4 +71,4 @@ class SyntheticPatrolSource:
             d.line([cx + head_h, cy - head_h // 2,
                     cx + head_h // 2, cy - head_h // 3],
                    fill=(220, 140, 80), width=max(3, head_h // 6))
-        return img, dict(_ROBOT)
+        return img, _robot_meta()

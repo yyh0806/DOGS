@@ -28,6 +28,7 @@ from .get_pose import TOOL as GET_POSE
 from .get_route_state import TOOL as GET_ROUTE_STATE
 from .load_skill import TOOL as LOAD_SKILL
 from .patrol_report import TOOL as PATROL_REPORT
+from .plan_campus_lake import TOOL as PLAN_CAMPUS_LAKE
 from .plan_campus_loop import TOOL as PLAN_CAMPUS_LOOP
 from .plan_lake_loop import TOOL as PLAN_LAKE_LOOP
 from .push_alert import TOOL as PUSH_ALERT
@@ -37,8 +38,8 @@ from .speak import TOOL as SPEAK
 
 BUILTIN_TOOLS: list[ToolRegistration] = [
     GET_GPS, GET_BATTERY, GET_POSE, SPEAK,
-    PLAN_LAKE_LOOP, PLAN_CAMPUS_LOOP, FOLLOW_ROUTE, CANCEL_ROUTE,
-    CALIBRATE_HEADING, GET_ROUTE_STATE,
+    PLAN_CAMPUS_LAKE, PLAN_LAKE_LOOP, PLAN_CAMPUS_LOOP, FOLLOW_ROUTE,
+    CANCEL_ROUTE, CALIBRATE_HEADING, GET_ROUTE_STATE,
     ARM_WATER_GUARD, DISARM_WATER_GUARD, GET_GUARD_STATE,
     LOAD_SKILL, SCAN_WATER, GET_DETECTION_EVENTS,
     APPROACH_VANTAGE, PATROL_REPORT,

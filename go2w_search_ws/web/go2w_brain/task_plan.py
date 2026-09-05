@@ -121,6 +121,8 @@ class TaskPlan:
 
 _RULE_TEMPLATES = {
     "lake": [
+        # 离线规则保底: 通用最近水体; 园区湖语义链 (plan_campus_lake) 由
+        # LLM 计划路径选用 (draft_prompt 4b 指引), 规则模式无园区知识
         ("p1", "plan_lake_loop", {}, [], []),
         ("g1", "arm_water_guard", {"from_plan": True}, [], ["p1"]),
         ("f1", "follow_route", {"from_plan": True},
@@ -192,6 +194,9 @@ def draft_prompt(tool_schemas, memory_summary: str, task: str) -> str:
         "如 \"lake-patrol\"), 不要写成 skill;\n"
         "3. memory_refs 引用下方记忆摘要里的条目 id (没有就省略该字段);\n"
         "4. 不要发明清单外的动词; 参数只填工具 schema 允许的字段;\n"
+        "4b. 任务说\"园区湖/当前园区湖/我们园区的湖/绕湖\"时, 规划步骤用 "
+        "plan_campus_lake (先识别园区再找园区内的湖); 只有明确不点名园区"
+        "的水体任务才用 plan_lake_loop;\n"
         "5. 任务: " + task + "\n\n"
         "记忆摘要 (本任务相关经验):\n" + memory_summary + "\n"
         "只输出 JSON, 不要解释。"

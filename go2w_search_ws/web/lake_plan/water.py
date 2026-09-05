@@ -26,13 +26,7 @@ def water_mask(img: Image.Image, ref_rgb=(170, 211, 223), hue_lo=170, hue_hi=240
     diff = mx - mn + 1e-9
     v = mx
     s = diff / (mx + 1e-9)
-    h = np.zeros_like(mx)
-    m = (mx == r) & (diff > 0)
-    h[m] = (60 * ((g[m] - b[m]) / diff[m])) % 360
-    m = (mx == g) & (diff > 0)
-    h[m] = 60 * ((b[m] - r[m]) / diff[m] + 2)
-    m = (mx == b) & (diff > 0)
-    h[m] = 60 * ((r[m] - g[m]) / diff[m] + 4)
+    h = _hue(r, g, b, mx, diff)
     hue_ok = (h >= hue_lo) & (h <= hue_hi)
     cond_hsv = hue_ok & (s >= min_sat) & (v >= min_val)
     rr, gg, bb = ref_rgb
@@ -40,6 +34,36 @@ def water_mask(img: Image.Image, ref_rgb=(170, 211, 223), hue_lo=170, hue_hi=240
                     (arr[..., 1].astype(np.float32) - gg) ** 2 +
                     (arr[..., 2].astype(np.float32) - bb) ** 2))
     return cond_hsv & (dist <= color_tol)
+
+
+def water_mask_hsv(img: Image.Image, hue_lo=150, hue_hi=260,
+                   min_sat=0.05, min_val=0.08) -> np.ndarray:
+    """HSV-only 水体掩码 —— 卫星影像用 (2026-09-05 园区湖语义链)。
+
+    卫星图水色随天候/悬浮物变化, 没有稳定参考色, 只靠蓝青色相窗;
+    会有蓝屋顶等误报, 由连通域尺寸 + VLM 锚定兜底筛除。
+    """
+    arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
+    r = arr[..., 0].astype(np.float32) / 255.0
+    g = arr[..., 1].astype(np.float32) / 255.0
+    b = arr[..., 2].astype(np.float32) / 255.0
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    diff = mx - mn + 1e-9
+    s = diff / (mx + 1e-9)
+    h = _hue(r, g, b, mx, diff)
+    return ((h >= hue_lo) & (h <= hue_hi)) & (s >= min_sat) & (mx >= min_val)
+
+
+def _hue(r, g, b, mx, diff):
+    h = np.zeros_like(mx)
+    m = (mx == r) & (diff > 0)
+    h[m] = (60 * ((g[m] - b[m]) / diff[m])) % 360
+    m = (mx == g) & (diff > 0)
+    h[m] = 60 * ((b[m] - r[m]) / diff[m] + 2)
+    m = (mx == b) & (diff > 0)
+    h[m] = 60 * ((r[m] - g[m]) / diff[m] + 4)
+    return h
 
 
 # ---------------- 连通域 ----------------

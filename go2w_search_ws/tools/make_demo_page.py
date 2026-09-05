@@ -311,6 +311,8 @@ def build_steps(entries):
                   "scan_water": "湖面扫描", "patrol_report": "报告生成",
                   "vantage_selected": "安全接近点选定",
                   "semantic_anchor": "语义锚定",
+                  "campus_identified": "园区识别",
+                  "campus_water_candidates": "园区内候选水体",
                   "anchor_replan": "锚定纠正重规划",
                   "geometry_reused": "几何记忆复用",
                   "geometry_persisted": "几何记忆写入",

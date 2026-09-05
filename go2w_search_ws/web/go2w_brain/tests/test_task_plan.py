@@ -113,6 +113,7 @@ def test_detect_plan_kind_natural_phrasings():
 
 def test_rule_compose_shapes():
     lake = rule_compose("lake")
+    # 离线规则保底用通用最近水体; 园区湖语义链走 LLM 计划路径 (plan_campus_lake)
     assert [s.verb for s in lake.steps] == [
         "plan_lake_loop", "arm_water_guard", "follow_route",
         "scan_water", "patrol_report"]

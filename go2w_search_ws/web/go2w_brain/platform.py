@@ -46,12 +46,21 @@ class MockAdapter(PlatformAdapter):
     """测试/干跑用: 固定遥测 + 内存航线状态机 + 调用记录。"""
 
     def __init__(self, **overrides: Any):
+        # GO2W_MOCK_GPS="lat,lng" 覆盖演示/控制台的模拟 GNSS (测试不设 → 默认)
+        import os
+        mock_gps = os.environ.get("GO2W_MOCK_GPS", "")
+        gps_lat, gps_lng = 31.488192, 120.369486
+        if mock_gps:
+            try:
+                gps_lat, gps_lng = (float(v) for v in mock_gps.split(",")[:2])
+            except ValueError:
+                pass
         base: dict[str, Any] = {
             "gps": {
                 "available": True,
                 # 默认中心: 无锡市新吴区新安街道, 无锡软件园 iPark 南侧
                 # 工业地块 (M2.1 基准点, 河南岸 ~75m)
-                "lat": 31.488192, "lng": 120.369486,
+                "lat": gps_lat, "lng": gps_lng,
                 "hdop": 0.8, "sats": 18,
                 "quality": "fix", "fix_age_s": 0.4,
             },

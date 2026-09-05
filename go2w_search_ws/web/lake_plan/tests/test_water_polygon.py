@@ -44,3 +44,16 @@ def test_hull_fallback_only_in_perception():
         assert water._poly_area_px(relaxed) >= 4.0
     else:
         assert relaxed == strict  # 非退化时两路径必须一致
+
+
+def test_water_mask_hsv_satellite():
+    """卫星图 HSV-only: 蓝青水面检出, 灰地/红屋顶/绿地不误报。"""
+    from PIL import Image
+    arr = np.zeros((64, 96, 3), dtype=np.uint8)
+    arr[:] = (110, 110, 108)       # 灰地
+    arr[10:40, 20:60] = (30, 60, 130)   # 深蓝 (hue≈220) 水面
+    arr[45:60, 5:20] = (180, 60, 50)    # 红屋顶
+    mask = water.water_mask_hsv(Image.fromarray(arr))
+    assert bool(mask[25, 40]) is True          # 水面
+    assert bool(mask[2, 2]) is False           # 灰地
+    assert bool(mask[50, 10]) is False         # 红屋顶
