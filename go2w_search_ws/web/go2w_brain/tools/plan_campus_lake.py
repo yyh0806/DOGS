@@ -1,19 +1,19 @@
 """plan_campus_lake — 园区湖语义链 (2026-09-05, VLM 直接 mask 版)。
 
 用户要求: "绕着当前园区湖绕行一圈" 必须先识别园区, 再在园区内找湖;
-且希望【卫星图上直接用 VLM 做 mask 圈出园区/湖】, 而不是画半径圆或
-切街道图。
+且主张【卫星图上直接用 VLM 做 mask 圈出园区/湖】。
 
 链路 (每步留痕):
   A. 园区识别: 任务文本/本体位置 → 园区知识库 (CAMPUSES) → 园区中心+名称;
   B. VLM 圈园区: esri 卫星 z17 拼接 → VLM 直接勾画园区边界多边形 (归一化
-     坐标 → 经纬度 mask); VLM 不可用/退化 → 规则半径圆后备;
-  C. VLM 圈湖: 按园区 mask bbox 裁剪放大 (z18) 卫星 → VLM 勾画湖岸线 mask
-     (质心必须在园区 mask 内); 失败 → 规则后备链路 (OSM/HSV 候选+湖形
-     过滤+锚定, 见 _plan_rule_fallback);
-  D. 绕行规划: 沿湖 mask 多边形离岸环线 (15m) + 5m 安全推出 → 扫描点。
-事件: campus_identified / campus_mask / lake_mask / semantic_anchor /
-plan_result / geometry_persisted。
+     坐标 → 经纬度 mask), 质量闸门: 必须包含本体 + 面积占比 2%~60%;
+     VLM 不可用/假形状 → 规则半径圆后备;
+  C. VLM 圈湖: 按园区 mask bbox 放大 (z18) 卫星 → VLM 勾画湖岸线 mask;
+  D. 最终湖界裁决 (2026-09-05, VLM 湖 mask 曾圈出 6.7km 周长假形状):
+     OSM 渲染水体 + 湖形过滤 (面积/紧凑度) + 园区 mask 内 + 距 VLM 择向最近
+     → z19..z16 聚焦精修 → 精确岸线; OSM 链拿不到时才用 VLM mask 兜底。
+事件: campus_identified / campus_mask / lake_mask / plan_result / \
+geometry_persisted。
 """
 from __future__ import annotations
 
@@ -50,8 +50,13 @@ def _match_campus(task_text: str, args: dict[str, Any]) -> dict | None:
     return None
 
 
+def _centroid_ll(ring_ll):
+    return (sum(p[0] for p in ring_ll) / len(ring_ll),
+            sum(p[1] for p in ring_ll) / len(ring_ll))
+
+
 def _zoom_to_bbox(provider, ring_ll, z=18):
-    """园区 mask bbox → 放大卫星窗口 (z 起步逐级降, 2×2~8×8 瓦片)。"""
+    """mask bbox → 放大卫星窗口 (z 起步逐级降, 2×2~8×8 瓦片)。"""
     from lake_plan import tiles
     from lake_plan.geo import lat_to_global_px, lng_to_global_px
     lats = [p[0] for p in ring_ll]
@@ -67,11 +72,6 @@ def _zoom_to_bbox(provider, ring_ll, z=18):
             img, detail = tiles.stitch_area(provider, zz, gx0, gy0, nx, ny)
             return img, tiles.georef_from_detail(detail)
     raise tiles.TileError("campus_bbox_too_large")
-
-
-def _centroid_ll(ring_ll):
-    return (sum(p[0] for p in ring_ll) / len(ring_ll),
-            sum(p[1] for p in ring_ll) / len(ring_ll))
 
 
 def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
@@ -112,6 +112,15 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     campus_poly = vlm_mask.vlm_polygon(vlm, sat_img,
                                        vlm_mask.CAMPUS_MASK_PROMPT)
     if campus_poly is not None:
+        # 质量闸门: 面积 2%~60% 且必须包含本体 (防 GLM 对角线假形状)
+        pts = campus_poly["polygon"]
+        frac = vlm_mask.poly_area_frac(pts)
+        rx, ry = sat_geo.latlon_to_pixel(clat, clng)
+        px, py = rx / sat_geo.w, ry / sat_geo.h
+        if not (0.02 <= frac <= 0.60 and
+                vlm_mask.point_in_poly01(px, py, pts)):
+            campus_poly = None
+    if campus_poly is not None:
         campus_ll = vlm_mask.poly_to_latlon(campus_poly["polygon"], sat_geo)
         mask_source = "vlm"
     else:
@@ -120,46 +129,51 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     ctx["log"].append("event", event="campus_mask", campus=campus["name"],
                       source=mask_source, vertices=len(campus_ll))
 
-    # ---------- C. 园区 mask 内找湖: 放大卫星 → VLM 圈湖 ----------
-    lake_ll, lake_geo, anchor = None, None, None
+    # ---------- C. VLM 圈湖 (语义择向; 不可靠时 OSM 链裁决) ----------
+    lake_vlm_ll = None
+    lake_vlm_why = ""
     try:
         lake_img, lake_geo = _zoom_to_bbox("esri", campus_ll, z=18)
         lake_poly = vlm_mask.vlm_polygon(vlm, lake_img,
                                          vlm_mask.LAKE_MASK_PROMPT)
         if lake_poly is not None:
-            cand = vlm_mask.poly_to_latlon(lake_poly["polygon"], lake_geo)
             from lake_plan.osm_client import _point_in_ring
+            cand = vlm_mask.poly_to_latlon(lake_poly["polygon"], lake_geo)
             c_lat, c_lng = _centroid_ll(cand)
-            if _point_in_ring((c_lat, c_lng), campus_ll):
-                lake_ll = cand
-                anchor = {"source": "vlm",
-                          "self": {"lat": clat, "lng": clng,
-                                   "confirmed": True},
-                          "target": {"idx": 0,
-                                     "centroid": [round(c_lat, 5),
-                                                  round(c_lng, 5)],
-                                     "why": str(lake_poly.get("why") or "")},
-                          "ambiguity": [],
-                          "why": str(lake_poly.get("why") or "")}
+            frac = vlm_mask.poly_area_frac(lake_poly["polygon"])
+            if _point_in_ring((c_lat, c_lng), campus_ll) \
+                    and 0.002 <= frac <= 0.30:
+                lake_vlm_ll = cand
+                lake_vlm_why = str(lake_poly.get("why") or "")
     except tiles.TileError:
         pass
-    if lake_ll is not None:
+    if lake_vlm_ll is not None:
         ctx["log"].append("event", event="lake_mask", source="vlm",
-                          vertices=len(lake_ll))
-        ctx["log"].append("event", event="semantic_anchor",
-                          source=anchor["source"], target=anchor["target"],
-                          ambiguity=anchor.get("ambiguity"),
-                          resolved_to_plan=True)
-    else:
-        # 规则后备: OSM/HSV 候选 + 湖形过滤 + 锚定 (老链路)
-        fallback = _plan_rule_fallback(ctx, task_text, campus, clat, clng,
-                                       vlm, tiles, water)
-        if isinstance(fallback, dict) and not fallback.get("ok", True):
-            return fallback
-        lake_ll, lake_geo, anchor = fallback
+                          vertices=len(lake_vlm_ll),
+                          why=lake_vlm_why)
 
-    # ---------- D. 沿湖 mask 规划环线 (离岸 15m + 5m 安全推出) ----------
+    # ---------- D. 最终湖界裁决 + 沿湖环线 ----------
     from lake_plan import planner, route_api
+    from lake_plan.osm_client import _point_in_ring
+    from ..plan_memory import persist_plan
+    from ..patrol_math import endurance_check
+
+    nudge = _centroid_ll(lake_vlm_ll) if lake_vlm_ll else (clat, clng)
+    final = _osm_lake_final(ctx, campus, clat, clng, campus_ll, nudge,
+                            tiles, water, route_api)
+    if final is not None:
+        lake_ll, lake_geo = final
+        ctx["log"].append("event", event="lake_mask", source="osm_rule",
+                          vertices=len(lake_ll))
+    elif lake_vlm_ll is not None:
+        lake_ll, lake_geo = lake_vlm_ll, lake_geo
+        ctx["log"].append("event", event="lake_mask", source="vlm_fallback",
+                          vertices=len(lake_ll))
+    else:
+        return {"ok": False, "reason": "no_lake_like_water_in_campus",
+                "campus": campus["name"],
+                "hint": "园区 mask 内无湖形水体 (OSM + satellite 均未检出)"}
+
     poly_px = [lake_geo.latlon_to_pixel(a, b) for a, b in lake_ll]
     perim_m, area_m2 = water.poly_stats_latlon(lake_ll, clat)
     try:
@@ -169,14 +183,18 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "reason": f"plan_failed:{exc}"}
     result["route_latlon"] = route_api._snap_outside_ring_min(
         result["route_latlon"], lake_ll, min_dist_m=5.0)
-    tgt_c = anchor.get("target") or {}
-    tgt_c = tgt_c.get("centroid") or list(_centroid_ll(lake_ll))
+    tgt_c = _centroid_ll(lake_ll)
     out = route_api._finish(result, lake_ll, "water", {
         "area_km2": round(area_m2 / 1e6, 3),
         "perim_km": round(perim_m / 1000.0, 2),
         "dist_km": round(_hav_m(clat, clng, tgt_c[0], tgt_c[1]) / 1000.0, 3),
         "campus": campus["name"]})
-    out["anchor"] = anchor
+    out["anchor"] = {"source": "vlm_mask" if lake_vlm_ll else "osm_rule",
+                     "self": {"lat": clat, "lng": clng, "confirmed": True},
+                     "target": {"idx": 0, "centroid": [round(tgt_c[0], 5),
+                                                       round(tgt_c[1], 5)],
+                                "why": lake_vlm_why or "osm_shape_filtered"},
+                     "ambiguity": []}
     out["campus"] = campus["name"]
 
     plan_store = ctx.get("plan_store")
@@ -186,13 +204,11 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
                       waypoint_count=len(out["waypoints"]),
                       length_m=result["stats"]["length_m"],
                       campus=campus["name"], target=out["target"])
-    from ..plan_memory import persist_plan
     mem_id = persist_plan(ctx.get("memory"), out)
     if mem_id:
         ctx["log"].append("event", event="geometry_persisted",
                           memory_id=mem_id)
 
-    from ..patrol_math import endurance_check
     battery = ctx["platform"].snapshot().get("battery_soc")
     endurance = endurance_check(result["stats"]["length_m"], battery)
     return {
@@ -204,111 +220,57 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
         "closed": result["stats"]["closed"],
         "water_cross_ratio": result["stats"]["water_cross_ratio"],
         "target": out["target"],
-        "anchor": {"source": anchor.get("source"),
-                   "self": anchor.get("self"),
-                   "target": anchor.get("target"),
-                   "ambiguity": anchor.get("ambiguity") or []},
+        "anchor": out["anchor"],
         "endurance": endurance,
         "first_waypoints": out["waypoints"][:3],
         "usage": "调用 follow_route 并传 from_plan=true 即可受理这条航线",
     }
 
 
-def _plan_rule_fallback(ctx, task_text, campus, clat, clng, vlm,
-                        tiles, water):
-    """VLM mask 失败时的规则后备 (老链路): OSM/HSV 候选 + 湖形过滤 + 锚定。
-
-    返回 (lake_ll, lake_geo, anchor) 或 {"ok": False, "reason": ...}。
-    """
-    near, georef, mask = [], None, None
-    for source, provider, mask_fn, min_area in (
-            ("osm", "osm", lambda im: water.water_mask(
-                im, ref_rgb=(170, 211, 223)), 200),
-            ("satellite", "esri", water.water_mask_hsv, 150)):
-        try:
-            img, detail = tiles.stitch_centered(
-                provider, clat, clng, _SAT_Z, _SAT_NX, _SAT_NY)
-        except tiles.TileError:
+def _osm_lake_final(ctx, campus, clat, clng, campus_ll, nudge,
+                    tiles, water, route_api):
+    """OSM 湖形过滤 + 聚焦精修 → 精确湖界线; 拿不到返回 None。"""
+    from lake_plan.osm_client import _point_in_ring
+    try:
+        img, detail = tiles.stitch_centered("osm", clat, clng, 16, 8, 8)
+    except tiles.TileError:
+        return None
+    geo = tiles.georef_from_detail(detail)
+    mask = water.water_mask(img, ref_rgb=(170, 211, 223))
+    comps = water.label_components(mask, down=4, min_area_px=200)
+    cands = []
+    for comp in comps:
+        cy, cx = comp["centroid_small"]
+        lat, lng = geo.pixel_to_latlon(cx * 4, cy * 4)
+        if not _point_in_ring((lat, lng), campus_ll):
             continue
-        georef = tiles.georef_from_detail(detail)
-        mask = mask_fn(img)
-        comps = water.label_components(mask, down=4, min_area_px=min_area)
-        for c in comps:
-            cy, cx = c["centroid_small"]
-            lat, lng = georef.pixel_to_latlon(cx * c["down"], cy * c["down"])
-            dist = _hav_m(clat, clng, lat, lng)
-            if dist <= campus["radius_m"]:
-                near.append((dist, c, [round(lat, 5), round(lng, 5)]))
-        if near:
-            break
-    lake_like = []
-    for dist, c, c3 in near:
-        poly = water.polygon_from_component(c, mask.shape, allow_hull=True)
+        poly = water.polygon_from_component(comp, mask.shape, allow_hull=True)
         if len(poly) < 4:
             continue
-        poly_ll = [georef.pixel_to_latlon(x, y) for (x, y) in poly]
-        perim_m, area_m2 = water.poly_stats_latlon(poly_ll, clat)
-        compact = (4 * math.pi * area_m2 / (perim_m ** 2)) if perim_m else 0.0
-        if area_m2 >= 300.0 and compact >= 0.12:
-            lake_like.append((dist, c, c3, poly, poly_ll,
-                              perim_m, area_m2, compact))
-    lake_like.sort(key=lambda t: t[0])
-    if not lake_like:
-        if not near:
-            return {"ok": False, "reason": "no_water_in_campus",
-                    "campus": campus["name"],
-                    "hint": f"园区 {campus['radius_m']}m 半径内 OSM 渲染与"
-                            f"卫星图均未检出候选水体"}
-        return {"ok": False, "reason": "no_lake_like_water_in_campus",
-                "campus": campus["name"],
-                "hint": "园区半径内只有细长河道/碎斑, 无湖形水体"}
-    cands = [{"centroid": c3, "dist_km": round(d / 1000.0, 3)}
-             for (d, _, c3, *_rest) in lake_like[:10]]
-    ctx["log"].append("event", event="campus_water_candidates",
-                      campus=campus["name"], count=len(cands),
-                      source="rule")
-    from lake_plan import semantic_anchor
-    anchor = semantic_anchor.anchor_semantics(
-        vlm, task_text or "绕着园区里的湖绕行一圈",
-        {"lat": clat, "lng": clng}, cands, (clat, clng),
-        provider="esri", z=_SAT_Z, nx=_SAT_NX, ny=_SAT_NY)
-    ctx["log"].append("event", event="semantic_anchor",
-                      source=anchor["source"], target=anchor.get("target"),
-                      ambiguity=anchor.get("ambiguity"),
-                      resolved_to_plan=(
-                          (anchor.get("target") or {}).get("idx", 0) == 0))
-    tgt_centroid = (anchor.get("target") or {}).get("centroid")
-    if not tgt_centroid:
-        return {"ok": False, "reason": "anchor_failed", "anchor": anchor}
-    pick_i = min(range(len(lake_like)), key=lambda i:
-                 (lake_like[i][2][0] - tgt_centroid[0]) ** 2
-                 + (lake_like[i][2][1] - tgt_centroid[1]) ** 2)
-    ladder = [lake_like[pick_i]] + [t for i, t in enumerate(lake_like)
-                                    if i != pick_i]
-    for (dist, comp, comp_ll, poly, poly_ll, perim_m, area_m2,
-         compact) in ladder[:4]:
-        p_poly, p_geo, refined = poly, georef, False
+        ll = [geo.pixel_to_latlon(x, y) for (x, y) in poly]
+        perim, area = water.poly_stats_latlon(ll, clat)
+        compact = 4 * math.pi * area / (perim ** 2) if perim else 0.0
+        if 300.0 <= area <= 80000.0 and compact >= 0.12:
+            cands.append((ll, geo, poly, area))
+    if not cands:
+        return None
+    cands.sort(key=lambda t: _hav_m(nudge[0], nudge[1],
+                                    *_centroid_ll(t[0])))
+    for ll, geo, poly, area in cands[:4]:
         try:
-            from lake_plan import route_api
-            target = {"_poly_ll": poly_ll, "_poly_px": poly,
-                      "_georef": georef, "area_km2": area_m2 / 1e6}
+            target = {"_poly_ll": ll, "_poly_px": poly, "_georef": geo,
+                      "area_km2": area / 1e6}
             fine = route_api._refine(target, "osm")
-            if fine is not None:
-                p_poly, p_geo, refined = fine
-                poly_ll = [p_geo.pixel_to_latlon(x, y)
-                           for (x, y) in p_poly]
         except Exception:  # noqa: BLE001
-            pass
-        from lake_plan import planner
-        try:
-            planner.plan_loop_around_polygon(
-                p_poly, p_geo, offset_m=15.0, step_m=40.0)
-        except ValueError:
-            continue
-        ctx["log"].append("event", event="lake_mask", source="rule",
-                          vertices=len(poly_ll))
-        return poly_ll, p_geo, anchor
-    return {"ok": False, "reason": "plan_failed:no_candidate_planable"}
+            fine = None
+        if fine is not None:
+            fpoly, fgeo, _ = fine
+            fll = [fgeo.pixel_to_latlon(x, y) for (x, y) in fpoly]
+            ctx["log"].append("event", event="lake_refined",
+                              vertices=len(fll))
+            return fll, fgeo
+    # 精修全失败 → 用形状合格的粗边界
+    return cands[0][0], cands[0][1]
 
 
 TOOL = ToolRegistration(
@@ -316,10 +278,10 @@ TOOL = ToolRegistration(
     description=(
         "绕【园区里的湖】规划环线 (先识别园区, 再在园区内找湖): 任务说"
         "\"园区湖/当前园区湖/我们园区的湖\"时用它。链路: 园区知识库识别园区"
-        " → esri 卫星图上【VLM 直接勾画园区边界 mask】→ 按园区 mask 放大卫星"
-        " → VLM 直接勾画园区里的湖岸线 mask → 沿湖 mask 离岸环线规划;"
-        " VLM 不可用时规则后备 (候选+湖形过滤+锚定)。已知园区: "
-        "中电海康无锡物联网产业园。绕非园区水体才用 plan_lake_loop。"),
+        " → esri 卫星图上 VLM 直接勾画园区边界 mask → 按园区 mask 放大卫星"
+        " → VLM 勾画湖 mask (语义择向) → OSM 湖形过滤+z16 聚焦精修出精确"
+        "岸线 → 离岸环线规划; VLM 不可用时规则后备。已知园区: 中电海康无锡"
+        "物联网产业园。绕非园区水体才用 plan_lake_loop。"),
     parameters={"type": "object",
                 "properties": {
                     "campus": {"type": "string"},

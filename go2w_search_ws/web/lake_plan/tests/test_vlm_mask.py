@@ -73,3 +73,24 @@ def test_circle_poly_radius():
         dlat = (lat - 31.488192) * 110540
         dlng = (lng - 120.369486) * 111320 * 0.852
         assert 395 < (dlat ** 2 + dlng ** 2) ** 0.5 < 405
+
+
+def test_poly_area_frac():
+    square = [[0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9], [0.1, 0.1]]
+    assert abs(vlm_mask.poly_area_frac(square) - 0.64) < 1e-9
+    # 未闭合也能算 (自动按列表)
+    open_ = square[:-1]
+    assert abs(vlm_mask.poly_area_frac(open_) - 0.64) < 1e-9
+    assert vlm_mask.poly_area_frac([[0.1, 0.1], [0.2, 0.2]]) == 0.0
+
+
+def test_point_in_poly01():
+    square = [[0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9], [0.1, 0.1]]
+    assert vlm_mask.point_in_poly01(0.5, 0.5, square) is True
+    assert vlm_mask.point_in_poly01(0.05, 0.5, square) is False
+    # GLM 免费模型实测的对角线假形状: 机器人 (0.5,0.5) 不在带内
+    band = [[0.2, 0.3], [0.4, 0.5], [0.6, 0.7], [0.8, 0.9], [0.9, 0.95],
+            [0.85, 0.98], [0.75, 0.99], [0.55, 0.95], [0.35, 0.91],
+            [0.15, 0.87], [0.01, 0.83], [0.2, 0.3]]
+    assert vlm_mask.point_in_poly01(0.5, 0.5, band) is False
+    assert vlm_mask.point_in_poly01(0.5, 0.9, band) is True

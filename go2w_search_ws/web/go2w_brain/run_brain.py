@@ -52,11 +52,9 @@ def build_session(config: BrainConfig, log: SessionLog):
     import os
     from .tts import build_backend
     tts = build_backend(os.environ.get("GO2W_TTS", "console"))
-    # M7.3: VLM 客户端 (卫星图语义锚定, 无 key 时自动落到规则锚定)
-    from .vlm import DEFAULT_VLM_MODEL, VLMClient
-    vlm = VLMClient(config.llm_api_key,
-                    model=os.environ.get("GO2W_VLM_MODEL",
-                                         DEFAULT_VLM_MODEL))
+    # M7.3: VLM 客户端 (语义锚定/mask; 凭据自动选择: GLM 优先→DeepSeek)
+    from .vlm import build_vlm
+    vlm = build_vlm()
     from .brain_loop import BrainSession
     return BrainSession(config, platform, registry, gate, skills, llm, log,
                         guard=guard, detector=detector,

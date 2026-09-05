@@ -16,7 +16,34 @@ from typing import Any
 from PIL import Image
 
 DEFAULT_VLM_MODEL = "deepseek-v4-flash-vision-exp"
+# 智谱 GLM 视觉 (2026-09-05 接入; glm-4v-flash 免费可用, 付费模型需余额)
+GLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+GLM_DEFAULT_MODEL = "glm-4v-flash"
 _MAX_EDGE = 1024
+
+
+def build_vlm() -> VLMClient:
+    """按可用凭据构建 VLM 客户端:
+    - GO2W_VLM_MODEL 显式指定 → DeepSeek key + 该模型 (旧行为);
+    - GLM_API_KEY (或 ~/.dsh refs 的 glm) 存在 → GLM (glm-4v-flash 免费);
+    - 否则 DeepSeek 默认视觉模型。"""
+    import os
+
+    from .config import _read_credential
+    ds_key = (os.environ.get("DEEPSEEK_API_KEY", "").strip()
+              or _read_credential("deepseek"))
+    glm_key = (os.environ.get("GLM_API_KEY", "").strip()
+               or _read_credential("glm"))
+    model_explicit = os.environ.get("GO2W_VLM_MODEL", "").strip()
+    if model_explicit:
+        return VLMClient(ds_key, model=model_explicit)
+    if glm_key:
+        return VLMClient(
+            glm_key,
+            model=os.environ.get("GO2W_GLM_MODEL", "").strip()
+            or GLM_DEFAULT_MODEL,
+            base_url=GLM_BASE_URL)
+    return VLMClient(ds_key, model=DEFAULT_VLM_MODEL)
 
 
 class VLMUnavailable(Exception):
@@ -34,6 +61,10 @@ class VLMClient:
 
     def available(self) -> bool:
         return bool(self._key)
+
+    def max_output_tokens(self) -> int:
+        """供应商输出上限: GLM 4096 会 400 (实测), 1024 可用; DeepSeek 4096。"""
+        return 1024 if "bigmodel" in self._base else 4096
 
     def vision(self, image: Image.Image, prompt: str,
                max_tokens: int = 1024) -> str:

@@ -30,6 +30,7 @@ from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 
 from lake_plan import (planner, route_api, tiles, vlm_mask,  # noqa: E402
                        water)
+from lake_plan.osm_client import _point_in_ring  # noqa: E402
 from go2w_brain.tools.plan_campus_lake import (CAMPUSES,  # noqa: E402
                                                _hav_m, _zoom_to_bbox)
 
@@ -71,10 +72,13 @@ def marker(draw, x, y, color, r, label=None, font=None):
         draw.text((x + r + 5, y - r - 5), label, font=font, fill=color)
 
 
+def _centroid(ll):
+    return (sum(p[0] for p in ll) / len(ll), sum(p[1] for p in ll) / len(ll))
+
+
 def _build_vlm(config_key: str = "llm_api_key"):
-    from go2w_brain.config import BrainConfig
-    from go2w_brain.vlm import VLMClient
-    return VLMClient(BrainConfig.from_env().llm_api_key)
+    from go2w_brain.vlm import build_vlm
+    return build_vlm()
 
 
 def main(argv=None):
@@ -124,32 +128,48 @@ def main(argv=None):
     add_step(2, "VLM 圈园区 (卫星图直接 mask)",
              src_note + "。绿圈=本体。", image=jpg_b64(s2))
 
-    # ---------- S3 VLM 圈湖 (mask) ----------
+    # ---------- S3 VLM 圈湖 (mask; VLM 失败 → 湖形过滤规则后备对齐工具) ----------
     print("[S3] VLM 圈湖...")
     lake_img, lake_geo = _zoom_to_bbox("esri", campus_ll, z=18)
     lake_poly = vlm_mask.vlm_polygon(vlm, lake_img, vlm_mask.LAKE_MASK_PROMPT)
     lake_ll, lake_src = None, "rule"
     if lake_poly is not None:
         cand = vlm_mask.poly_to_latlon(lake_poly["polygon"], lake_geo)
-        from lake_plan.osm_client import _point_in_ring
         c = (sum(p[0] for p in cand) / len(cand),
              sum(p[1] for p in cand) / len(cand))
-        if _point_in_ring(c, campus_ll):
+        frac = vlm_mask.poly_area_frac(lake_poly["polygon"])
+        if _point_in_ring(c, campus_ll) and 0.002 <= frac <= 0.7:
             lake_ll, lake_src = cand, "vlm"
     s3 = lake_img.convert("RGB")
     if lake_ll is None:
-        # 规则后备: HSV 候选 (取园区内最大)
-        from lake_plan import water as wm
-        mask = wm.water_mask_hsv(lake_img)
-        comps = wm.label_components(mask, down=4, min_area_px=150)
-        comps = [c for c in comps if c["area_small"] >= 40]
-        if comps:
-            comp = comps[0]
-            poly = wm.polygon_from_component(comp, mask.shape, allow_hull=True)
-            if len(poly) >= 4:
-                lake_ll = [lake_geo.pixel_to_latlon(x, y)
-                           for (x, y) in poly]
-        src_note = ("VLM 圈湖失败 (限流/退化) → 规则后备: 卫星 HSV 最大水斑。"
+        # 规则后备 (与工具一致): OSM 渲染水体 → 湖形过滤 → 园区 mask 内最近
+        osm_img, osm_detail = tiles.stitch_centered("osm", clat, clng, 16, 8, 8)
+        osm_g = tiles.georef_from_detail(osm_detail)
+        wm = water
+        wmask = wm.water_mask(osm_img, ref_rgb=(170, 211, 223))
+        comps = wm.label_components(wmask, down=4, min_area_px=200)
+        lake_like = []
+        for comp in comps:
+            cy, cx = comp["centroid_small"]
+            lat, lng = osm_g.pixel_to_latlon(cx * 4, cy * 4)
+            poly = wm.polygon_from_component(comp, wmask.shape,
+                                             allow_hull=True)
+            if len(poly) < 4:
+                continue
+            ll = [osm_g.pixel_to_latlon(x, y) for (x, y) in poly]
+            perim, area = wm.poly_stats_latlon(ll, clat)
+            compact = 4 * math.pi * area / (perim ** 2) if perim else 0.0
+            if area >= 300.0 and compact >= 0.12 \
+                    and _point_in_ring((lat, lng), campus_ll):
+                lake_like.append((math.hypot((lat - clat) * 110540,
+                                             (lng - clng) * 111320 * 0.85),
+                                  ll))
+        if lake_like:
+            lake_like.sort(key=lambda t: t[0])
+            lake_ll = lake_like[0][1]
+            lake_geo = osm_g
+        src_note = ("VLM 圈湖失败 (限流/退化) → 规则后备: OSM 渲染水体 + "
+                    "湖形过滤 (面积/紧凑度) + 园区 mask 内最近。"
                     if lake_ll else "无湖形水体 (诚实失败)")
     else:
         src_note = (f"VLM 在园区放大卫星图上勾画湖岸线 (蓝填充 = 湖 mask, "
@@ -164,11 +184,25 @@ def main(argv=None):
              src_note + f"。底图 = 园区 mask bbox 放大的 z18 卫星。",
              image=jpg_b64(s3))
 
-    # ---------- S4 沿湖环线 ----------
-    print("[S4] 沿湖环线...")
+    # ---------- S4 湖岸线精修 + 沿湖环线 ----------
+    print("[S4] 湖岸线精修 + 沿湖环线...")
     if lake_ll is None:
         add_step(4, "沿湖环线规划", "园区内未找到可规划的湖形水体 —— 如实终止。")
     else:
+        # 湖岸线精修: VLM/规则指认湖位 → z19..z16 聚焦重扫修正 (同工具路径)
+        lc_lat, lc_lng = _centroid(lake_ll)
+        refined = False
+        try:
+            poly_hull = [lake_geo.latlon_to_pixel(a, b) for a, b in lake_ll]
+            target = {"_poly_ll": lake_ll, "_poly_px": poly_hull,
+                      "_georef": lake_geo, "area_km2": 0.02}
+            fine = route_api._refine(target, "osm")
+            if fine is not None:
+                fp, fg, refined = fine
+                lake_ll = [fg.pixel_to_latlon(x, y) for (x, y) in fp]
+                lake_geo = fg
+        except Exception:  # noqa: BLE001
+            pass
         poly_px = [lake_geo.latlon_to_pixel(a, b) for a, b in lake_ll]
         result = planner.plan_loop_around_polygon(poly_px, lake_geo,
                                                   offset_m=15.0, step_m=40.0)
@@ -176,12 +210,10 @@ def main(argv=None):
             result["route_latlon"], lake_ll, min_dist_m=5.0)
         out = route_api._finish(result, lake_ll, "water", {
             "area_km2": 0.001, "perim_km": 0.3, "dist_km": 0.1})
-        c_lat = sum(p[0] for p in lake_ll) / len(lake_ll)
-        c_lng = sum(p[1] for p in lake_ll) / len(lake_ll)
+        c_lat, c_lng = _centroid(lake_ll)
         close, cd_detail = tiles.stitch_centered("esri", c_lat, c_lng,
                                                  19, 2, 2)
         cgeo = tiles.georef_from_detail(cd_detail)
-        cd = ImageDraw.Draw(close)
         px = [cgeo.latlon_to_pixel(a, b) for a, b in lake_ll]
         close = fill_mask(close, px, (60, 130, 255), alpha=60)
         cd = ImageDraw.Draw(close)
@@ -198,12 +230,14 @@ def main(argv=None):
             cd.line([(x, y), (x + 42 * math.sin(rad),
                               y - 42 * math.cos(rad))],
                     fill=(240, 145, 59), width=4)
-        add_step(4, "沿湖 mask 离岸环线 (z19 特写)",
-                 f"蓝=湖 mask, 橙=离岸环线 (外扩15m+5m安全推出): "
+        add_step(4, "湖岸线精修 + 沿湖环线 (z19 特写)",
+                 f"蓝=湖 mask (VLM 或规则), 绿=精修岸线"
+                 f"({'已聚焦重扫' if refined else '沿用手动 mask'}), "
+                 f"橙=离岸环线 (15m+5m安全推出): "
                  f"<b>{len(result['route_latlon'])} 航点 / "
                  f"{result['stats']['length_m']:.1f}m / "
                  f"闭合={result['stats']['closed']}</b>, 扫描点 "
-                 f"{len(out['scan_points'])} 个 (朝向湖心)。",
+                 f"{len(out['scan_points'])} 个。",
                  image=jpg_b64(close, max_w=1024))
 
     report = _render()

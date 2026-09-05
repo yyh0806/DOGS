@@ -30,15 +30,18 @@ _LAKE_MASK_PROMPT = (
 
 
 def vlm_polygon(vlm, image: Image.Image, prompt: str,
-                max_tokens: int = 4096,
+                max_tokens: int = 0,
                 attempts: int = 2,
                 min_area_frac: float = 0.005) -> Optional[dict[str, Any]]:
     """VLM 直接分割 → 归一化多边形 mask。失败/退化 → None (诚实降级)。
 
+    max_tokens=0 → 按供应商自适应 (GLM 1024 / DeepSeek 4096)。
     返回 {"polygon": [[x01,y01],...], "why": str, "raw": str}。
     """
     if vlm is None or not getattr(vlm, "available", lambda: False)():
         return None
+    if not max_tokens:
+        max_tokens = getattr(vlm, "max_output_tokens", lambda: 4096)()
     from go2w_brain.vlm import parse_json_loose
     for _ in range(attempts):
         try:
@@ -65,6 +68,32 @@ def vlm_polygon(vlm, image: Image.Image, prompt: str,
                     return {"polygon": pts, "why": str(payload.get("why") or ""),
                             "raw": raw[:300]}
     return None
+
+
+def poly_area_frac(poly: list[list[float]]) -> float:
+    """归一化多边形面积占比 (闭合鞋带, 未闭合自动补首点)。"""
+    if len(poly) < 4:
+        return 0.0
+    pts = poly if poly[0] == poly[-1] else poly + [poly[0][:]]
+    area2 = 0.0
+    for i in range(len(pts) - 1):
+        area2 += (pts[i][0] * pts[i + 1][1] - pts[i + 1][0] * pts[i][1])
+    return abs(area2) / 2.0
+
+
+def point_in_poly01(x: float, y: float, poly: list[list[float]]) -> bool:
+    """归一化坐标射线法判断点是否在多边形内。"""
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and (
+                x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-9) + xi):
+            inside = not inside
+        j = i
+    return inside
 
 
 def poly_to_latlon(poly: list[list[float]], georef) -> list[tuple[float, float]]:

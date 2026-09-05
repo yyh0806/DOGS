@@ -104,11 +104,11 @@ def anchor_semantics(vlm, task: str, robot: dict[str, float],
         for _attempt in range(2):
             try:
                 from go2w_brain.vlm import parse_json_loose
-                # 推理型视觉模型: 1024 预算实测不够出 JSON
-                # (finish_reason=length), 4096 才稳定产出答案
+                # 供应商自适应: DeepSeek 4096 才稳定出 JSON, GLM 4096 会 400
                 raw = vlm.vision(img, _ANCHOR_PROMPT.format(
                     lat=robot["lat"], lng=robot["lng"], task=task),
-                    max_tokens=4096)
+                    max_tokens=getattr(vlm, "max_output_tokens",
+                                       lambda: 4096)())
                 payload = parse_json_loose(raw) or {}
                 target_idx = payload.get("target_idx")
                 if not isinstance(target_idx, int) or not (

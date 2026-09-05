@@ -34,11 +34,15 @@ class _Log:
 
 
 class _FakeVlm:
-    """按提示词分流: 圈园区 → 园区多边形; 圈湖 → 湖多边形; 其他 → 锚定 JSON。"""
+    """按提示词分流: 圈园区 → 园区多边形; 圈湖 → 湖多边形; 其他 → 锚定 JSON。
 
-    def __init__(self, idx=0, with_masks=True):
+    junk_campus=True 模拟 GLM 免费模型的对角线假形状 (闸门应拒收)。
+    """
+
+    def __init__(self, idx=0, with_masks=True, junk_campus=False):
         self._idx = idx
         self._masks = with_masks
+        self._junk = junk_campus
         self.calls = []
 
     def available(self):
@@ -47,6 +51,11 @@ class _FakeVlm:
     def vision(self, image, prompt, max_tokens=1024):
         self.calls.append(prompt[:30])
         if self._masks and "工业园区" in prompt:
+            if self._junk:
+                return ('{"polygon": [[0.2,0.3],[0.4,0.5],[0.6,0.7],'
+                        '[0.8,0.9],[0.9,0.95],[0.85,0.98],[0.75,0.99],'
+                        '[0.55,0.95],[0.35,0.91],[0.15,0.87],[0.01,0.83],'
+                        '[0.2,0.3]], "why": "junk band"}')
             return ('{"polygon": [[0.15,0.15],[0.85,0.15],[0.85,0.85],'
                     '[0.15,0.85]], "why": "synthetic campus"}')
         if self._masks and "岸线" in prompt:
@@ -122,7 +131,7 @@ def test_unknown_campus_fails_honestly():
 # ---------- B+C+D. VLM mask 主链路 ----------
 
 def test_vlm_mask_chain(monkeypatch):
-    """VLM 直接圈园区/圈湖 → 沿湖 mask 规划 (主链路)。"""
+    """VLM 圈园区/圈湖 → 湖界规划 (合成图 OSM 链拿不到 → VLM mask 兜底)。"""
     _fake_stitch(monkeypatch, with_lake=True)
     log = _Log()
     result = TOOLS["plan_campus_lake"].execute({}, _ctx(log))
@@ -130,48 +139,43 @@ def test_vlm_mask_chain(monkeypatch):
     assert result["campus"] == HK["name"]
     assert result["closed"] is True
     assert result["waypoint_count"] >= 8
-    assert result["anchor"]["source"] == "vlm"
     cm = log.events("campus_mask")
     assert cm and cm[0]["source"] == "vlm"
     lm = log.events("lake_mask")
     assert lm and lm[0]["source"] == "vlm"
     plan_ev = log.events("plan_result")[0]
     assert plan_ev["plan_kind"] == "campus_lake"
-    # 湖在园区 mask 内 (synthetic: 都在中心附近)
     tgt = result["target"]["centroid"]
     dlat = (tgt[0] - HK["lat"]) * 110540
     dlng = (tgt[1] - HK["lng"]) * 111320 * 0.85
     assert np.hypot(dlat, dlng) <= HK["radius_m"]
 
 
-def test_vlm_masks_unavailable_rule_fallback(monkeypatch):
-    """VLM 不给 mask → 规则后备链路仍可规划。"""
+def test_junk_campus_mask_rejected(monkeypatch):
+    """GLM 免费模型对角线假形状 → 闸门拒收 → 园区 mask 规则圆后备。"""
     _fake_stitch(monkeypatch, with_lake=True)
     log = _Log()
     result = TOOLS["plan_campus_lake"].execute(
-        {}, _ctx(log, vlm=_FakeVlm(0, with_masks=False)))
+        {}, _ctx(log, vlm=_FakeVlm(0, junk_campus=True)))
     assert result["ok"], result.get("reason")
     cm = log.events("campus_mask")
-    assert cm and cm[0]["source"] == "rule"  # 半径圆后备
-    assert log.events("campus_water_candidates")
+    assert cm and cm[0]["source"] == "rule"  # 假形状被拒 → 圆
 
 
 def test_no_vlm_at_all_rule_path(monkeypatch):
-    """无 VLM → 园区圆 mask + 候选锚定全规则。"""
+    """无 VLM → 园区圆 mask; 合成图无 OSM 水体 → 诚实失败。"""
     _fake_stitch(monkeypatch, with_lake=True)
     log = _Log()
     result = TOOLS["plan_campus_lake"].execute({}, _ctx(log, vlm=None))
-    assert result["ok"], result.get("reason")
-    assert result["anchor"]["source"] == "rule"
+    assert result["ok"] is False
+    assert result["reason"] == "no_lake_like_water_in_campus"
     assert log.events("campus_mask")[0]["source"] == "rule"
 
 
 def test_no_water_in_campus(monkeypatch):
     _fake_stitch(monkeypatch, with_lake=False)
     log = _Log()
-    result = TOOLS["plan_campus_lake"].execute(
-        {}, _ctx(log, vlm=_FakeVlm(0, with_masks=False)))
+    result = TOOLS["plan_campus_lake"].execute({}, _ctx(log, vlm=None))
     assert result["ok"] is False
-    assert result["reason"] in ("no_water_in_campus",
-                                "no_lake_like_water_in_campus")
+    assert result["reason"] == "no_lake_like_water_in_campus"
     assert log.events("campus_identified")

@@ -56,6 +56,11 @@ class BrainConfig:
 
 def _read_legacy_credential() -> str:
     """兼容 lake_loop 的凭据位置: ~/.dsh/.credentials.yaml 中的 deepseek key。"""
+    return _read_credential("deepseek")
+
+
+def _read_credential(keyword: str) -> str:
+    """从 ~/.dsh/.credentials.yaml 读取 refs 里的 API key (keyword 匹配)。"""
     p = Path.home() / ".dsh" / ".credentials.yaml"
     if not p.exists():
         return ""
@@ -68,7 +73,7 @@ def _read_legacy_credential() -> str:
         if ":" not in line:
             continue
         key, _, value = line.partition(":")
-        if "deepseek" in key.lower():
+        if keyword.lower() in key.lower():
             value = value.strip().strip("\"'")
             if value:
                 return value
