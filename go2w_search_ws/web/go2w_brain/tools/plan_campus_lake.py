@@ -137,9 +137,35 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     scope_radius = _task_scope_radius(task_text, campus["radius_m"])
     ctx["log"].append("event", event="task_scope", center=[clat, clng],
                       radius_m=scope_radius, campus=campus["name"])
-    cal = campus_kb.get(campus["name"]) or {}
-    cal_boundary = cal.get("boundary")
-    cal_lake = cal.get("lake")
+    # 标定真值: 记忆库优先 (永久记录, 指令×记忆), 文件后备
+    cal_boundary = None
+    cal_lake = None
+    memory = ctx.get("memory")
+    if memory is not None:
+        try:
+            entries = memory.query(clat, clng, 1500.0,
+                                   kinds=("geometry",), min_score=0.05)
+            for e in entries:
+                d = e.get("data") or {}
+                if d.get("campus") != campus["name"]:
+                    continue
+                ck = d.get("calibrated_kind")
+                ring = (e.get("geo") or {}).get("points")
+                if not (ring and len(ring) >= 3
+                        and ck in ("campus_boundary", "lake_shore")):
+                    continue
+                if ck == "campus_boundary":
+                    cal_boundary = cal_boundary or [tuple(p) for p in ring]
+                else:
+                    cal_lake = cal_lake or [tuple(p) for p in ring]
+        except Exception:  # noqa: BLE001
+            pass
+    kb = campus_kb.get(campus["name"]) or {}
+    cal_boundary = cal_boundary or kb.get("boundary")
+    cal_lake = cal_lake or kb.get("lake")
+    if cal_boundary:
+        ctx["log"].append("event", event="calibration_loaded",
+                          source="memory", campus=campus["name"])
     osm_cands: list = []
     lake_vlm_why = ""
     lake_vlm_iou = None

@@ -29,15 +29,17 @@ border:1px solid var(--edge);padding:8px 14px;font-size:12px;border-radius:6px}
 </style></head><body>
 <header>
   <h1>园区标定</h1>
-  <span class="sub">在卫星图上按顺序点击顶点, 圈出园区边界与湖岸线 —— 保存后大脑永久使用该真值 (不再猜测)</span>
+  <span class="sub">卫星图上点选圈出园区边界与湖岸线 (含⚡快速矩形/圆) —— 保存后永久写入地图式记忆库, 大脑每次任务自动使用 (指令×记忆)</span>
 </header>
 <div class="tools">
   <button id="btnBoundary" class="active">① 圈园区边界</button>
   <button id="btnLake">② 圈湖岸线</button>
+  <button id="btnRect">⚡快速矩形区域</button>
+  <button id="btnCircle">⚡快速圆形区域</button>
   <button id="btnUndo">撤销一点</button>
   <button id="btnClear">清除当前</button>
   <button id="btnSave" class="primary">保存标定</button>
-  <span class="hint" id="hint">点击地图添加顶点 · 双击/右键完成 · 多边形会自动闭合</span>
+  <span class="hint" id="hint">点击地图添加顶点 · 双击/右键完成 · 快速模式: 点两下即出区域</span>
 </div>
 <div id="map"></div>
 <div class="status" id="status">就绪</div>
@@ -55,6 +57,8 @@ var kind = "boundary";
 var pts = [];          // 当前编辑的多边形
 var layer = null;      // 当前编辑层
 var saved = {boundary: [], lake: []};  // 已保存的标定
+var quickMode = null;  // null | "rect" | "circle"
+var anchor = null;     // 快速模式第一点
 
 function renderPolygon() {
   if (layer) { map.removeLayer(layer); layer = null; }
@@ -80,10 +84,44 @@ function setStatus(msg, ok) {
 }
 
 map.on("click", function(ev) {
-  pts.push([ev.latlng.lat, ev.latlng.lng]);
+  var lat = ev.latlng.lat, lng = ev.latlng.lng;
+  if (quickMode === "rect") {
+    if (anchor === null) {
+      anchor = [lat, lng];
+      setStatus("快速矩形: 已定角1, 点对角 → " + kindName());
+      return;
+    }
+    pts = [[anchor[0], anchor[1]], [lat, anchor[1]],
+           [lat, lng], [anchor[0], lng]];
+    anchor = null; quickMode = null;
+    renderPolygon();
+    setStatus(kindName() + " 矩形已生成 (4 顶点), 点【保存标定】", true);
+    return;
+  }
+  if (quickMode === "circle") {
+    if (anchor === null) {
+      anchor = [lat, lng];
+      setStatus("快速圆: 已定圆心, 点边界点 → " + kindName());
+      return;
+    }
+    var dLat = (lat - anchor[0]) * 110540;
+    var dLng = (lng - anchor[1]) * 111320 * Math.cos(anchor[0] * Math.PI / 180);
+    var r = Math.hypot(dLat, dLng);
+    var ring = [];
+    for (var i = 0; i < 32; i++) {
+      var a = i / 32 * 2 * Math.PI;
+      ring.push([anchor[0] + r * Math.sin(a) / 110540,
+                 anchor[1] + r * Math.cos(a) / (111320 * Math.cos(anchor[0] * Math.PI / 180))]);
+    }
+    pts = ring;
+    anchor = null; quickMode = null;
+    renderPolygon();
+    setStatus(kindName() + " 圆已生成 (32 顶点), 点【保存标定】", true);
+    return;
+  }
+  pts.push([lat, lng]);
   renderPolygon();
-  setStatus(kind === "boundary" ? "园区边界" : "湖岸线"
-            + " · 已点 " + pts.length + " 点 (双击完成)");
+  setStatus(kindName() + " · 已点 " + pts.length + " 点 (双击完成)");
 });
 map.on("dblclick", function(ev) {
   pts.push([ev.latlng.lat, ev.latlng.lng]);
@@ -94,19 +132,29 @@ map.on("contextmenu", function(ev) {
   if (pts.length >= 3) renderPolygon();
 });
 
-document.getElementById("btnBoundary").onclick = function() {
-  kind = "boundary"; pts = [];
-  document.getElementById("btnBoundary").classList.add("active");
-  document.getElementById("btnLake").classList.remove("active");
+function kindName() { return kind === "boundary" ? "园区边界" : "湖岸线"; }
+function setStatus(msg, ok) {
+  var el = document.getElementById("status");
+  el.textContent = msg;
+  el.className = "status" + (ok ? " ok" : "");
+}
+function setKind(k) {
+  kind = k; pts = []; anchor = null; quickMode = null;
+  document.getElementById("btnBoundary").classList.toggle("active", k === "boundary");
+  document.getElementById("btnLake").classList.toggle("active", k === "lake");
   renderPolygon();
-  setStatus("模式: 圈园区边界 (沿围墙/地块拐角点)");
+  setStatus("模式: " + (k === "boundary" ? "圈园区边界" : "圈湖岸线"));
+}
+
+document.getElementById("btnBoundary").onclick = function() { setKind("boundary"); };
+document.getElementById("btnLake").onclick = function() { setKind("lake"); };
+document.getElementById("btnRect").onclick = function() {
+  quickMode = "rect"; anchor = null; pts = []; renderPolygon();
+  setStatus("快速矩形 (当前保存为 " + kindName() + "): 点第一个角");
 };
-document.getElementById("btnLake").onclick = function() {
-  kind = "lake"; pts = [];
-  document.getElementById("btnLake").classList.add("active");
-  document.getElementById("btnBoundary").classList.remove("active");
-  renderPolygon();
-  setStatus("模式: 圈湖岸线 (沿水岸点一圈)");
+document.getElementById("btnCircle").onclick = function() {
+  quickMode = "circle"; anchor = null; pts = []; renderPolygon();
+  setStatus("快速圆 (当前保存为 " + kindName() + "): 点圆心");
 };
 document.getElementById("btnUndo").onclick = function() {
   pts.pop(); renderPolygon();
@@ -127,8 +175,9 @@ document.getElementById("btnSave").onclick = function() {
     .then(function(d) {
       if (d.ok) {
         saved[kind] = pts.slice();
-        setStatus("已保存 " + (kind === "boundary" ? "园区边界" : "湖岸线")
-                  + " · " + d.vertices + " 顶点。回控制台跑任务即可生效", true);
+        setStatus("已保存 " + kindName() + " · " + d.vertices + " 顶点 · "
+                  + "永久写入记忆库(memory_id=" + (d.memory_id || "-")
+                  + ")。回控制台跑任务即可生效", true);
       } else {
         setStatus("保存失败: " + (d.reason || "?"), false);
       }

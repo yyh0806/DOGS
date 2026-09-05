@@ -273,10 +273,24 @@ class Handler(BaseHTTPRequestHandler):
                                           "reason": "invalid_payload"}))
                 return
             entry = campus_kb.upsert(campus, kind, polygon)
+            # 永久记录: 同步写入地图式记忆库 (append-only, 指令×记忆)
+            mem_kind = ("campus_boundary" if kind == "boundary"
+                        else "lake_shore")
+            memory_id = None
+            try:
+                from go2w_brain.config import BrainConfig
+                from go2w_brain.memory import MemoryStore
+                store = MemoryStore(BrainConfig.from_env().memory_dir
+                                    / "memory.jsonl")
+                memory_id = campus_kb.record_to_memory(
+                    store, campus, mem_kind, polygon)
+            except Exception:  # noqa: BLE001 — 记忆写入失败不阻断标定
+                pass
             self._respond(200, "application/json",
                           json.dumps({"ok": True,
                                       "vertices": len(polygon),
-                                      "entry": entry},
+                                      "entry": entry,
+                                      "memory_id": memory_id},
                                      ensure_ascii=False))
         elif self.path == "/api/run":
             length = int(self.headers.get("Content-Length", 0))

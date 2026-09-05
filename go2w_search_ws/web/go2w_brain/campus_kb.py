@@ -70,3 +70,22 @@ def _valid_ring(polygon) -> bool:
 
 def validate(polygon) -> bool:
     return _valid_ring(polygon)
+
+
+def record_to_memory(memory, campus_name: str, kind: str,
+                     polygon: list[list[float]]) -> Optional[str]:
+    """标定 → 地图式记忆 (2026-09-05 用户要求: 永久记录, 使用记忆)。
+
+    kind=geometry 条目 (append-only jsonl + 网格索引), 数据标记
+    calibrated_kind (campus_boundary|lake_shore); 大脑下次任务的
+    记忆检索 (指令×记忆) 即能看到, plan_campus_lake 优先取用。
+    """
+    if memory is None:
+        return None
+    entry = memory.record(
+        "geometry", {"points": [list(p) for p in polygon]},
+        data={"plan_kind": "calibration",
+              "calibrated_kind": kind,
+              "campus": campus_name},
+        confidence=1.0, source="calibration")
+    return entry["id"]

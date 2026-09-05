@@ -264,3 +264,35 @@ def test_calibrated_boundary_and_lake_take_priority(monkeypatch):
     dlat = abs(tgt[0] - HK["lat"])
     dlng = abs(tgt[1] - HK["lng"])
     assert dlat < 0.01 and dlng < 0.01
+
+
+def test_calibrated_memory_persistent_reuse(monkeypatch, tmp_path):
+    """标定写入记忆库 → 大脑从记忆读取 (永久记录, 指令×记忆复用)。"""
+    _fake_stitch(monkeypatch, with_lake=True)
+    from go2w_brain import campus_kb
+    from go2w_brain.memory import MemoryStore
+    path = tmp_path / "memory.jsonl"
+    store = MemoryStore(path)
+    campus_kb.record_to_memory(
+        store, HK["name"], "campus_boundary",
+        [[HK["lat"] - 0.002, HK["lng"] - 0.002],
+         [HK["lat"] + 0.002, HK["lng"] - 0.002],
+         [HK["lat"] + 0.002, HK["lng"] + 0.002],
+         [HK["lat"] - 0.002, HK["lng"] + 0.002]])
+    campus_kb.record_to_memory(
+        store, HK["name"], "lake_shore",
+        [[HK["lat"] + 0.0006, HK["lng"] - 0.0006],
+         [HK["lat"] + 0.0006, HK["lng"] + 0.0006],
+         [HK["lat"] + 0.0012, HK["lng"] + 0.0006],
+         [HK["lat"] + 0.0012, HK["lng"] - 0.0006]])
+    # 模拟"下次任务": 新 store 从文件重载 (重启语义)
+    store2 = MemoryStore(path)
+    log = _Log()
+    ctx = _ctx(log, vlm=None)
+    ctx["memory"] = store2
+    result = TOOLS["plan_campus_lake"].execute({}, ctx)
+    assert result["ok"], result.get("reason")
+    assert log.events("calibration_loaded")
+    assert log.events("campus_mask")[0]["source"] == "calibrated"
+    assert log.events("lake_mask")[0]["source"] == "calibrated"
+    assert result["waypoint_count"] >= 8
