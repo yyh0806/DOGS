@@ -265,32 +265,45 @@ class Handler(BaseHTTPRequestHandler):
             campus = str((payload or {}).get("campus", "")).strip()
             kind = str((payload or {}).get("kind", "")).strip()
             polygon = (payload or {}).get("polygon")
+            polygons = (payload or {}).get("polygons")  # 多块湖: [ring,...]
             from go2w_brain import campus_kb
+            multi = bool(polygons)
+            rings = polygons if multi else ([polygon] if polygon else [])
             if (not campus or kind not in ("boundary", "lake")
-                    or not campus_kb.validate(polygon)):
+                    or not rings
+                    or not all(campus_kb.validate(r) for r in rings)):
                 self._respond(400, "application/json",
                               json.dumps({"ok": False,
                                           "reason": "invalid_payload"}))
                 return
-            entry = campus_kb.upsert(campus, kind, polygon)
-            # 永久记录: 同步写入地图式记忆库 (append-only, 指令×记忆)
+            if multi:
+                entry = campus_kb.upsert(campus, kind, rings,
+                                         multipoly=True)
+            else:
+                entry = campus_kb.upsert(campus, kind, rings[0])
+            # 永久记录: 一次标定 = 一条记忆条目 (含全部块, 重标定自动
+            # 覆盖 —— 工具取 ts 最新)
             mem_kind = ("campus_boundary" if kind == "boundary"
                         else "lake_shore")
-            memory_id = None
+            memory_ids = []
             try:
                 from go2w_brain.config import BrainConfig
                 from go2w_brain.memory import MemoryStore
                 store = MemoryStore(BrainConfig.from_env().memory_dir
                                     / "memory.jsonl")
-                memory_id = campus_kb.record_to_memory(
-                    store, campus, mem_kind, polygon)
+                mid = campus_kb.record_to_memory(
+                    store, campus, mem_kind, rings)
+                if mid:
+                    memory_ids.append(mid)
             except Exception:  # noqa: BLE001 — 记忆写入失败不阻断标定
                 pass
             self._respond(200, "application/json",
                           json.dumps({"ok": True,
-                                      "vertices": len(polygon),
+                                      "vertices": sum(len(r) for r in rings),
+                                      "parts": len(rings),
                                       "entry": entry,
-                                      "memory_id": memory_id},
+                                      "memory_ids": memory_ids,
+                                      "memory_id": (memory_ids or [None])[0]},
                                      ensure_ascii=False))
         elif self.path == "/api/run":
             length = int(self.headers.get("Content-Length", 0))

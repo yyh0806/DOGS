@@ -82,10 +82,17 @@ def _ctx(log, task="绕着当前园区湖绕行一圈", vlm=_FakeVlm(0)):
 
 
 def _fake_stitch(monkeypatch, with_lake=True):
-    """合成卫星图 + 合成地块聚类 (campus_polygon monkeypatch)。"""
+    """合成卫星图 + 合成地块聚类 (campus_polygon monkeypatch)。
+
+    同时屏蔽真实标定文件 (runs/campus_kb.json 有用户真值, 测试不得读到)。
+    """
+    from go2w_brain import campus_kb as kb_mod
     from lake_plan import osm_client as osm_mod
     from lake_plan import tiles as tiles_mod
     from lake_plan.geo import latlon_to_tile
+
+    monkeypatch.setattr(kb_mod, "get", lambda name: None)
+    monkeypatch.setattr(kb_mod, "lake_rings", lambda entry: [])
 
     def fake_campus_polygon(lat, lng, radius_m=1200.0):
         d = 0.0015  # ±165m
@@ -249,6 +256,10 @@ def test_calibrated_boundary_and_lake_take_priority(monkeypatch):
                  [HK["lat"] + 0.0012, HK["lng"] - 0.0006]],
     }
     monkeypatch.setattr(campus_kb, "get", lambda name: dict(cal))
+    # _fake_stitch 屏蔽了 lake_rings; 此测试需要单环兼容语义
+    monkeypatch.setattr(campus_kb, "lake_rings",
+                        lambda entry: ([entry["lake"]]
+                                       if entry.get("lake") else []))
     log = _Log()
     result = TOOLS["plan_campus_lake"].execute({}, _ctx(log, vlm=None))
     assert result["ok"], result.get("reason")
@@ -296,3 +307,43 @@ def test_calibrated_memory_persistent_reuse(monkeypatch, tmp_path):
     assert log.events("campus_mask")[0]["source"] == "calibrated"
     assert log.events("lake_mask")[0]["source"] == "calibrated"
     assert result["waypoint_count"] >= 8
+
+
+def test_calibrated_multpart_lake_multi_ring_route(monkeypatch, tmp_path):
+    """多块不连通湖面: 每块单独出环线, 顺路串联成一条巡逻路线。"""
+    _fake_stitch(monkeypatch, with_lake=True)
+    from go2w_brain import campus_kb
+    from go2w_brain.memory import MemoryStore
+    path = tmp_path / "memory.jsonl"
+    store = MemoryStore(path)
+    campus_kb.record_to_memory(
+        store, HK["name"], "campus_boundary",
+        [[HK["lat"] - 0.003, HK["lng"] - 0.003],
+         [HK["lat"] + 0.003, HK["lng"] - 0.003],
+         [HK["lat"] + 0.003, HK["lng"] + 0.003],
+         [HK["lat"] - 0.003, HK["lng"] + 0.003]])
+    # 两块分离的湖 (相距 ~350m)
+    campus_kb.record_to_memory(
+        store, HK["name"], "lake_shore",
+        [[[HK["lat"] + 0.0006, HK["lng"] - 0.0015],
+          [HK["lat"] + 0.0006, HK["lng"] - 0.0006],
+          [HK["lat"] + 0.0012, HK["lng"] - 0.0006],
+          [HK["lat"] + 0.0012, HK["lng"] - 0.0015]],
+         [[HK["lat"] - 0.0015, HK["lng"] + 0.0006],
+          [HK["lat"] - 0.0015, HK["lng"] + 0.0015],
+          [HK["lat"] - 0.0009, HK["lng"] + 0.0015],
+          [HK["lat"] - 0.0009, HK["lng"] + 0.0006]]])
+    store2 = MemoryStore(path)
+    log = _Log()
+    ctx = _ctx(log, vlm=None)
+    ctx["memory"] = store2
+    result = TOOLS["plan_campus_lake"].execute({}, ctx)
+    assert result["ok"], result.get("reason")
+    lm = log.events("lake_mask")
+    assert lm and lm[0]["source"] == "calibrated"
+    assert lm[0]["parts"] == 2  # 两块湖
+    # 每块至少 8 航点的环 + 过渡段
+    assert result["waypoint_count"] >= 16
+    # plan_store 里有 water_polygons (守卫多环布防用)
+    store_rings = ctx["plan_store"]["last_route"].get("water_polygons")
+    assert store_rings and len(store_rings) == 2

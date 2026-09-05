@@ -10,20 +10,34 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     guard = ctx.get("guard")
     if guard is None:
         return {"ok": False, "reason": "guard_unavailable"}
+    rings_arg = args.get("polygons")  # 多块湖: [ring, ring, ...]
     ring = args.get("polygon")
-    if args.get("from_plan") or ring is None:
+    if args.get("from_plan") or (ring is None and not rings_arg):
         plan_store = ctx.get("plan_store") or {}
         last = plan_store.get("last_route") or {}
-        ring = last.get("water_polygon") or last.get("campus_polygon")
-        if not ring:
+        rings_arg = rings_arg or last.get("water_polygons")
+        ring = ring or last.get("water_polygon") or last.get("campus_polygon")
+        if not ring and not rings_arg:
             return {"ok": False, "reason": "no_polygon_in_session",
                     "hint": "先 plan_lake_loop/plan_campus_loop, 或显式传 polygon"}
     margin = args.get("margin_m", 2.0)
-    result = guard.arm([tuple(p) for p in ring], margin_m=margin)
-    if not result.get("ok"):
-        return result
+    # 多块湖 (2026-09-05): 每块水体单独布防 (守卫多环叠加)
+    armed = 0
+    result = None
+    if rings_arg:
+        for rg in rings_arg:
+            result = guard.arm([tuple(p) for p in rg], margin_m=margin)
+            if not result.get("ok"):
+                return result
+            armed += 1
+    else:
+        result = guard.arm([tuple(p) for p in ring], margin_m=margin)
+        if not result.get("ok"):
+            return result
+        armed = 1
     ctx["log"].append("event", event="water_guard_armed",
                       vertices=result["vertices"],
+                      rings_armed=armed,
                       margin_m=result["margin_m"])
     # M7.1 安全层消费记忆: hazard 经验确定性地自动进守卫 (不经 LLM
     # 权衡) —— "记忆先让狗更安全"。取规划区域附近的 hazard 条目,
@@ -60,7 +74,11 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     dry = config is not None and getattr(config, "dry_run", False)
     if not dry and hasattr(platform, "arm_water_guard"):
         try:
-            sync = platform.arm_water_guard(ring, margin_m=margin)
+            sync_rings = rings_arg or ([ring] if ring else [])
+            sync = None
+            for rg in sync_rings:
+                sync = platform.arm_water_guard(
+                    [list(p) for p in rg], margin_m=margin)
         except Exception as exc:  # noqa: BLE001
             sync = {"ok": False, "reason": f"sync_failed:{type(exc).__name__}"}
     state = guard.state()

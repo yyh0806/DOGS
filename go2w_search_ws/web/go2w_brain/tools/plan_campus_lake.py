@@ -139,30 +139,48 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
                       radius_m=scope_radius, campus=campus["name"])
     # 标定真值: 记忆库优先 (永久记录, 指令×记忆), 文件后备
     cal_boundary = None
-    cal_lake = None
+    cal_lakes: list = []          # 湖面可多块 (不连通水体, 2026-09-05)
     memory = ctx.get("memory")
     if memory is not None:
         try:
             entries = memory.query(clat, clng, 1500.0,
                                    kinds=("geometry",), min_score=0.05)
+            latest: dict = {}   # (campus, calibrated_kind) → ts 最新条目
             for e in entries:
                 d = e.get("data") or {}
                 if d.get("campus") != campus["name"]:
                     continue
                 ck = d.get("calibrated_kind")
-                ring = (e.get("geo") or {}).get("points")
-                if not (ring and len(ring) >= 3
-                        and ck in ("campus_boundary", "lake_shore")):
+                if ck not in ("campus_boundary", "lake_shore"):
+                    continue
+                key = ck
+                if key not in latest or e.get("ts", 0) > latest[key].get("ts", 0):
+                    latest[key] = e
+            for ck, e in latest.items():
+                d = e.get("data") or {}
+                parts = d.get("parts")
+                if parts:
+                    rings = [[tuple(p) for p in ring] for ring in parts
+                             if len(ring) >= 3]
+                else:
+                    ring = (e.get("geo") or {}).get("points")
+                    rings = [[tuple(p) for p in ring] if ring and
+                             len(ring) >= 3 else []]
+                rings = [r for r in rings if len(r) >= 3]
+                if not rings:
                     continue
                 if ck == "campus_boundary":
-                    cal_boundary = cal_boundary or [tuple(p) for p in ring]
+                    cal_boundary = rings[0]
                 else:
-                    cal_lake = cal_lake or [tuple(p) for p in ring]
+                    cal_lakes = rings
         except Exception:  # noqa: BLE001
             pass
     kb = campus_kb.get(campus["name"]) or {}
     cal_boundary = cal_boundary or kb.get("boundary")
-    cal_lake = cal_lake or kb.get("lake")
+    if not cal_lakes:
+        cal_lakes = [[tuple(p) for p in r]
+                     for r in campus_kb.lake_rings(kb)]
+    cal_lake = cal_lakes[0] if cal_lakes else None
     if cal_boundary:
         ctx["log"].append("event", event="calibration_loaded",
                           source="memory", campus=campus["name"])
@@ -237,17 +255,22 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
                           campus=campus["name"], source=mask_source,
                           vertices=len(campus_ll), vlm_iou=vlm_campus_iou)
 
-    # ---------- C. 湖界: 标定真值 > OSM 精修 > VLM 兜底 ----------
-    if cal_lake and len(cal_lake) >= 3:
-        lake_ll = [tuple(p) for p in cal_lake]
-        if lake_ll[0] != lake_ll[-1]:
-            lake_ll = lake_ll + [lake_ll[0]]
-        lake_geo = _georef_for_ring(lake_ll)
+    # ---------- C. 湖界: 标定真值(可多块) > OSM 精修 > VLM 兜底 ----------
+    cal_lakes = [r for r in cal_lakes if len(r) >= 3]
+    if cal_lakes:
+        # 多块湖: 每块单独出环线, 顺路串联成一条巡逻路线 (2026-09-05)
+        lake_rings = [list(r) for r in cal_lakes]
+        lake_geo = None
         final_source = "calibrated"
+        for r in lake_rings:
+            if r[0] != r[-1]:
+                r.append(r[0])
         ctx["log"].append("event", event="lake_mask", source="calibrated",
-                          vertices=len(lake_ll))
+                          vertices=sum(len(r) - 1 for r in lake_rings),
+                          parts=len(lake_rings))
         osm_cands = []
     else:
+        lake_rings = None
         nudge = _centroid_ll(osm_cands[0][0]) if osm_cands \
             else (clat, clng)
         lake_vlm_ll = None
@@ -306,21 +329,66 @@ def execute(args: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
                     "hint": "园区 mask 内无湖形水体 (OSM + satellite "
                             "均未检出)"}
 
-    poly_px = [lake_geo.latlon_to_pixel(a, b) for a, b in lake_ll]
-    perim_m, area_m2 = water.poly_stats_latlon(lake_ll, clat)
-    try:
-        result = planner.plan_loop_around_polygon(
-            poly_px, lake_geo, offset_m=15.0, step_m=40.0)
-    except ValueError as exc:
-        return {"ok": False, "reason": f"plan_failed:{exc}"}
-    result["route_latlon"] = route_api._snap_outside_ring_min(
-        result["route_latlon"], lake_ll, min_dist_m=5.0)
-    tgt_c = _centroid_ll(lake_ll)
-    out = route_api._finish(result, lake_ll, "water", {
+    # ---------- E. 沿湖环线 (多块湖: 每块一环, 顺路串联) ----------
+    rings = lake_rings if lake_rings else [lake_ll]
+    # 按距本体排序 (先近后远, 巡逻路线自然)
+    rings.sort(key=lambda r: _hav_m(clat, clng, *_centroid_ll(r)))
+    combined: list[tuple[float, float]] = []
+    total_len = 0.0
+    per_ring_closed = True
+    ring_stats = []
+    for ring in rings:
+        ring = [tuple(p) for p in ring]
+        if ring[0] != ring[-1]:
+            ring.append(ring[0])
+        geo = _georef_for_ring(ring)
+        poly_px = [geo.latlon_to_pixel(a, b) for a, b in ring]
+        try:
+            r_result = planner.plan_loop_around_polygon(
+                poly_px, geo, offset_m=15.0, step_m=40.0)
+        except ValueError as exc:
+            return {"ok": False, "reason": f"plan_failed:{exc}"}
+        r_route = route_api._snap_outside_ring_min(
+            r_result["route_latlon"], ring, min_dist_m=5.0)
+        ring_stats.append({"waypoints": len(r_route),
+                           "length_m": round(r_result["stats"]["length_m"], 1),
+                           "closed": r_result["stats"]["closed"]})
+        per_ring_closed = per_ring_closed and r_result["stats"]["closed"]
+        if combined:
+            # 串联过渡: 上一环终点 → 本环起点, 每 ~40m 采样, 推出所有环外
+            prev = combined[-1]
+            nxt = r_route[0]
+            seg_len = _hav_m(prev[0], prev[1], nxt[0], nxt[1])
+            steps = max(1, int(seg_len / 40.0))
+            for i in range(1, steps):
+                t = i / steps
+                mid = (prev[0] + (nxt[0] - prev[0]) * t,
+                       prev[1] + (nxt[1] - prev[1]) * t)
+                for rg in rings:  # 过渡点不得入任何湖块
+                    mid = route_api._snap_outside_ring_min(
+                        [mid], [tuple(p) for p in rg],
+                        min_dist_m=5.0)[0]
+                combined.append(mid)
+            total_len += seg_len
+        combined.extend(r_route)
+        total_len += r_result["stats"]["length_m"]
+
+    all_pts = [p for ring in rings for p in ring]
+    perim_m, area_m2 = water.poly_stats_latlon(all_pts, clat)
+    tgt_c = _centroid_ll(all_pts)
+    result = {"route_latlon": combined,
+              "stats": {"length_m": total_len,
+                        "closed": per_ring_closed and len(rings) == 1,
+                        "water_cross_ratio": 0.0}}
+    out = route_api._finish(result, rings[0], "water", {
         "area_km2": round(area_m2 / 1e6, 3),
         "perim_km": round(perim_m / 1000.0, 2),
         "dist_km": round(_hav_m(clat, clng, tgt_c[0], tgt_c[1]) / 1000.0, 3),
         "campus": campus["name"]})
+    out["water_polygons"] = [[list(p) for p in ring] for ring in rings]
+    if len(rings) > 1:
+        out["lake_parts"] = len(rings)
+        out["ring_stats"] = ring_stats
     out["anchor"] = {"source": final_source,
                      "self": {"lat": clat, "lng": clng, "confirmed": True},
                      "target": {"idx": 0, "centroid": [round(tgt_c[0], 5),

@@ -39,15 +39,26 @@ def get(campus_name: str) -> Optional[dict[str, Any]]:
 
 
 def upsert(campus_name: str, kind: str,
-           polygon: list[list[float]]) -> dict[str, Any]:
-    """保存某园区某类标定 (kind: boundary|lake)。返回更新后的条目。"""
+           polygon: list[list[float]] | list[list[list[float]]],
+           multipoly: bool = False) -> dict[str, Any]:
+    """保存某园区某类标定。kind: boundary|lake。
+
+    multipoly=True 时 polygon 为多环 (湖面由多个不连通水体组成,
+    2026-09-05 用户实测园区湖为三块), 存为 lake_parts=[ring,ring,...];
+    单环湖沿用 lake 字段。返回更新后的条目。
+    """
     import datetime
     with _LOCK:
         data = load()
         entry = data.get(campus_name) or {}
-        entry[kind] = [list(p) for p in polygon]
+        if multipoly:
+            entry["lake_parts"] = [[list(p) for p in ring]
+                                   for ring in polygon]
+            entry.pop("lake", None)  # 多块覆盖旧单环
+        else:
+            entry[kind] = [list(p) for p in polygon]
         entry["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
-        if kind == "boundary" and polygon:
+        if kind == "boundary" and polygon and not multipoly:
             lats = [p[0] for p in polygon]
             lngs = [p[1] for p in polygon]
             entry.setdefault("center",
@@ -58,6 +69,15 @@ def upsert(campus_name: str, kind: str,
         p.write_text(json.dumps(data, ensure_ascii=False, indent=1),
                      encoding="utf-8")
         return dict(entry)
+
+
+def lake_rings(entry: dict[str, Any]) -> list[list[list[float]]]:
+    """从标定条目取湖面环列表 (多块优先, 单环兼容)。"""
+    parts = entry.get("lake_parts")
+    if parts:
+        return parts
+    legacy = entry.get("lake")
+    return [legacy] if legacy else []
 
 
 def _valid_ring(polygon) -> bool:
@@ -73,19 +93,22 @@ def validate(polygon) -> bool:
 
 
 def record_to_memory(memory, campus_name: str, kind: str,
-                     polygon: list[list[float]]) -> Optional[str]:
+                     rings: list) -> Optional[str]:
     """标定 → 地图式记忆 (2026-09-05 用户要求: 永久记录, 使用记忆)。
 
-    kind=geometry 条目 (append-only jsonl + 网格索引), 数据标记
-    calibrated_kind (campus_boundary|lake_shore); 大脑下次任务的
-    记忆检索 (指令×记忆) 即能看到, plan_campus_lake 优先取用。
+    每次标定保存为一条 geometry 条目 (多块湖 = 一条含全部环的条目,
+    data.parts), 大脑取同园区同种类中 ts 最新的条目 —— 重新标定
+    自然覆盖旧值, 不残留。
     """
     if memory is None:
         return None
+    if rings and isinstance(rings[0][0], (int, float)):
+        rings = [rings]  # 单环 → 包一层
     entry = memory.record(
-        "geometry", {"points": [list(p) for p in polygon]},
+        "geometry", {"points": [list(p) for p in rings[0]]},
         data={"plan_kind": "calibration",
               "calibrated_kind": kind,
-              "campus": campus_name},
+              "campus": campus_name,
+              "parts": [[list(p) for p in ring] for ring in rings]},
         confidence=1.0, source="calibration")
     return entry["id"]

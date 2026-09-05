@@ -34,12 +34,13 @@ border:1px solid var(--edge);padding:8px 14px;font-size:12px;border-radius:6px}
 <div class="tools">
   <button id="btnBoundary" class="active">① 圈园区边界</button>
   <button id="btnLake">② 圈湖岸线</button>
+  <button id="btnNextPart" style="display:none">＋下一块</button>
   <button id="btnRect">⚡快速矩形区域</button>
   <button id="btnCircle">⚡快速圆形区域</button>
   <button id="btnUndo">撤销一点</button>
   <button id="btnClear">清除当前</button>
   <button id="btnSave" class="primary">保存标定</button>
-  <span class="hint" id="hint">点击地图添加顶点 · 双击/右键完成 · 快速模式: 点两下即出区域</span>
+  <span class="hint" id="hint">点击地图添加顶点 · 双击/右键完成 · 湖面有多块不连通水体时: 圈完一块点【＋下一块】</span>
 </div>
 <div id="map"></div>
 <div class="status" id="status">就绪</div>
@@ -55,8 +56,10 @@ map.setView(CENTER, 17);
 
 var kind = "boundary";
 var pts = [];          // 当前编辑的多边形
+var parts = [];        // 已完成的湖块 (多块不连通水体)
+var partLayers = [];   // 已完成湖块的图层
 var layer = null;      // 当前编辑层
-var saved = {boundary: [], lake: []};  // 已保存的标定
+var saved = {boundary: [], lake_parts: []};  // 已保存的标定
 var quickMode = null;  // null | "rect" | "circle"
 var anchor = null;     // 快速模式第一点
 
@@ -68,13 +71,17 @@ function renderPolygon() {
                          weight: 2, fillOpacity: 0.18}).addTo(map);
 }
 function drawSaved() {
-  var colors = {boundary: "#FF7848", lake: "#4A8CFF"};
-  ["boundary", "lake"].forEach(function(k) {
-    if (saved[k] && saved[k].length >= 3) {
-      L.polygon(saved[k], {color: colors[k], weight: 3,
-                           fillOpacity: 0.1}).addTo(map)
-        .bindPopup(k === "boundary" ? "园区边界 (已保存)" : "湖岸线 (已保存)");
-    }
+  if (saved.boundary && saved.boundary.length >= 3) {
+    L.polygon(saved.boundary, {color: "#FF7848", weight: 3,
+                               fillOpacity: 0.1}).addTo(map)
+      .bindPopup("园区边界 (已保存)");
+  }
+  var lakes = saved.lake_parts
+    || (saved.lake && saved.lake.length ? [saved.lake] : []);
+  lakes.forEach(function(lk, i) {
+    if (lk.length >= 3)
+      L.polygon(lk, {color: "#4A8CFF", weight: 3, fillOpacity: 0.1})
+        .addTo(map).bindPopup("湖面 第" + (i + 1) + "块 (已保存)");
   });
 }
 function redrawSaved() {
@@ -146,15 +153,42 @@ function setStatus(msg, ok) {
   el.className = "status" + (ok ? " ok" : "");
 }
 function setKind(k) {
-  kind = k; pts = []; anchor = null; quickMode = null;
+  kind = k; pts = []; parts = []; anchor = null; quickMode = null;
+  clearParts();
   document.getElementById("btnBoundary").classList.toggle("active", k === "boundary");
   document.getElementById("btnLake").classList.toggle("active", k === "lake");
+  document.getElementById("btnNextPart").style.display =
+    (k === "lake") ? "" : "none";
   renderPolygon();
-  setStatus("模式: " + (k === "boundary" ? "圈园区边界" : "圈湖岸线"));
+  setStatus("模式: " + (k === "boundary" ? "圈园区边界" : "圈湖岸线"
+    + " (多块水体: 圈完一块点【＋下一块】)"));
+}
+function clearParts() {
+  partLayers.forEach(function(l){ map.removeLayer(l); });
+  partLayers = [];
+}
+function commitPart() {
+  if (pts.length < 3) return false;
+  parts.push(pts.map(function(p){
+    return [+p[0].toFixed(6), +p[1].toFixed(6)];
+  }));
+  var l = L.polygon(parts[parts.length - 1],
+                    {color: "#4A8CFF", weight: 2, fillOpacity: 0.15,
+                     dashArray: "4 4"}).addTo(map);
+  partLayers.push(l);
+  pts = []; renderPolygon();
+  return true;
 }
 
 document.getElementById("btnBoundary").onclick = function() { setKind("boundary"); };
 document.getElementById("btnLake").onclick = function() { setKind("lake"); };
+document.getElementById("btnNextPart").onclick = function() {
+  if (commitPart())
+    setStatus("第 " + parts.length + " 块已暂存 (蓝虚线)。继续点下一块, "
+              + "或直接【保存标定】", true);
+  else
+    setStatus("当前块至少 3 个顶点才能暂存");
+};
 document.getElementById("btnRect").onclick = function() {
   quickMode = "rect"; anchor = null; pts = []; renderPolygon();
   setStatus("快速矩形 (当前保存为 " + kindName() + "): 点第一个角");
@@ -170,43 +204,60 @@ document.getElementById("btnClear").onclick = function() {
   pts = []; renderPolygon(); setStatus("已清除当前编辑");
 };
 document.getElementById("btnSave").onclick = function() {
+  if (kind === "lake") {
+    // 多块湖: 当前编辑中的块 + 已暂存块 一起保存
+    if (pts.length >= 3) commitPart();
+    if (parts.length === 0) { setStatus("至少圈一块 (3+ 顶点) 才能保存"); return; }
+    fetch("/api/calibrate", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({campus: CAMPUS, kind: "lake",
+                            polygons: parts})
+    }).then(function(r){ return r.json(); })
+      .then(function(d) { onSaveDone(d, parts.length, true); })
+      .catch(function(e){ setStatus("网络错误: " + e, false); });
+    return;
+  }
   if (pts.length < 3) { setStatus("至少点 3 个顶点才能保存"); return; }
+  var poly = pts.map(function(p){
+    return [+p[0].toFixed(6), +p[1].toFixed(6)];
+  });
   fetch("/api/calibrate", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({campus: CAMPUS, kind: kind,
-                          polygon: pts.map(function(p){
-                            return [+p[0].toFixed(6), +p[1].toFixed(6)];
-                          })})
+    body: JSON.stringify({campus: CAMPUS, kind: kind, polygon: poly})
   }).then(function(r){ return r.json(); })
-    .then(function(d) {
-      if (d.ok) {
-        saved[kind] = pts.map(function(p){
-          return [+p[0].toFixed(6), +p[1].toFixed(6)];
-        });
-        redrawSaved();
-        setStatus("已保存 " + kindName() + " · " + d.vertices + " 顶点 · "
-                  + "永久写入记忆库(memory_id=" + (d.memory_id || "-")
-                  + ")。回控制台跑任务即可生效", true);
-      } else {
-        setStatus("保存失败: " + (d.reason || "?"), false);
-      }
-    })
+    .then(function(d) { onSaveDone(d, 1, false); })
     .catch(function(e){ setStatus("网络错误: " + e, false); });
 };
+function onSaveDone(d, count, multi) {
+  if (d.ok) {
+    if (multi) saved.lake_parts = parts.slice();
+    else saved[kind] = pts.slice();
+    redrawSaved();
+    setStatus("已保存 " + (multi ? count + " 块湖面" : kindName())
+              + " · 永久写入记忆库(memory_id=" + (d.memory_id || "-")
+              + ")。回控制台跑任务即可生效", true);
+    parts = []; clearParts();
+  } else {
+    setStatus("保存失败: " + (d.reason || "?"), false);
+  }
+}
 
 fetch("/api/calibrate").then(function(r){ return r.json(); })
   .then(function(d) {
-    // 服务器返回 entries = {<园区名>: {boundary: [...], lake: [...]}}
-    saved = (d.entries && d.entries[CAMPUS]) || {boundary: [], lake: []};
+    saved = (d.entries && d.entries[CAMPUS])
+            || {boundary: [], lake_parts: []};
     drawSaved();
-    var parts = [];
+    var parts2 = saved.lake_parts
+      || (saved.lake && saved.lake.length ? [saved.lake] : []);
+    var msg2 = [];
     if (saved.boundary && saved.boundary.length)
-      parts.push("园区边界 " + saved.boundary.length + " 顶点");
-    if (saved.lake && saved.lake.length)
-      parts.push("湖岸线 " + saved.lake.length + " 顶点");
-    if (parts.length)
-      setStatus("已加载标定: " + parts.join(" · ")
-                + " (红=园区, 蓝=湖)。重新圈选并保存即可覆盖", true);
+      msg2.push("园区边界 " + saved.boundary.length + " 顶点");
+    if (parts2.length)
+      msg2.push("湖面 " + parts2.length + " 块");
+    if (msg2.length)
+      setStatus("已加载标定: " + msg2.join(" · ")
+                + "。重新圈选并保存即可覆盖", true);
   });
 </script></body></html>
